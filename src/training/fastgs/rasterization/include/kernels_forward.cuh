@@ -7,10 +7,23 @@
 #include "buffer_utils.h"
 #include "helper_math.h"
 #include "kernel_utils.cuh"
+#include "kernels/hip_compat.h"
 #include "rasterization_config.h"
 #include "utils.h"
 #include <cooperative_groups.h>
 #include <cstdint>
+
+// CUB/hipcub for block reductions
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+    #include <hipcub/hipcub.hpp>
+    namespace cub = hipcub;
+#else
+    #include <cub/block/block_reduce.cuh>
+#endif
+
+// Thrust for functors
+#include <thrust/functional.h>
+
 namespace cg = cooperative_groups;
 
 namespace fast_gs::rasterization::kernels::forward {
@@ -66,7 +79,7 @@ namespace fast_gs::rasterization::kernels::forward {
             active = false;
 
         // early exit if whole warp is inactive
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (LFS_WARP_BALLOT(active) == 0)
             return;
 
         // load opacity
@@ -171,7 +184,7 @@ namespace fast_gs::rasterization::kernels::forward {
             active = false;
 
         // early exit if whole warp is inactive
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (LFS_WARP_BALLOT(active) == 0)
             return;
 
         // compute exact number of tiles the primitive overlaps
@@ -237,7 +250,7 @@ namespace fast_gs::rasterization::kernels::forward {
             idx = n_visible_primitives - 1;
         }
 
-        if (__ballot_sync(0xffffffffu, active) == 0)
+        if (LFS_WARP_BALLOT(active) == 0)
             return;
 
         const uint primitive_idx = primitive_indices_sorted[idx];
@@ -277,15 +290,15 @@ namespace fast_gs::rasterization::kernels::forward {
         const uint warp_idx = cg::this_thread_block().thread_rank() / 32u;
         const uint lane_mask_allprev_excl = 0xffffffffu >> (32u - lane_idx);
         const int compute_cooperatively = active && tile_count > config::n_sequential_threshold;
-        const uint remaining_threads = __ballot_sync(0xffffffffu, compute_cooperatively);
+        const uint remaining_threads = LFS_WARP_BALLOT(compute_cooperatively);
         if (remaining_threads == 0)
             return;
 
         const uint n_remaining_threads = __popc(remaining_threads);
         for (int n = 0; n < n_remaining_threads && n < 32; n++) {
             int current_lane = __fns(remaining_threads, 0, n + 1);
-            uint primitive_idx_coop = __shfl_sync(0xffffffffu, primitive_idx, current_lane);
-            uint current_write_offset_coop = __shfl_sync(0xffffffffu, current_write_offset, current_lane);
+            uint primitive_idx_coop = LFS_WARP_SHFL(primitive_idx, current_lane);
+            uint current_write_offset_coop = LFS_WARP_SHFL(current_write_offset, current_lane);
 
             const ushort4 screen_bounds_coop = collected_screen_bounds[warp.meta_group_rank() * 32 + current_lane];
             const uint screen_bounds_width_coop = static_cast<uint>(screen_bounds_coop.y - screen_bounds_coop.x);
@@ -304,7 +317,7 @@ namespace fast_gs::rasterization::kernels::forward {
                 const uint tile_y = screen_bounds_coop.z + (instance_idx / screen_bounds_width_coop);
                 const uint tile_x = screen_bounds_coop.x + (instance_idx % screen_bounds_width_coop);
                 const uint write = active_current && will_primitive_contribute(mean2d_shifted_coop, conic_coop, tile_x, tile_y, power_threshold_coop);
-                const uint write_ballot = __ballot_sync(0xffffffffu, write);
+                const uint write_ballot = LFS_WARP_BALLOT(write);
                 const uint n_writes = __popc(write_ballot);
                 const uint write_offset_current = __popc(write_ballot & lane_mask_allprev_excl);
                 const uint write_offset = current_write_offset_coop + write_offset_current;

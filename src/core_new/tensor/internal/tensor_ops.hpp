@@ -4,7 +4,7 @@
 #pragma once
 
 #include "tensor_functors.hpp"
-#include <cuda_runtime.h>
+#include "kernels/hip_runtime_compat.h"
 #include <vector>
 
 namespace lfs::core {
@@ -20,7 +20,7 @@ namespace lfs::core {
 // ============= Generic CUDA Operations =============
 // Include template implementation for inline instantiation
 // Only include in CUDA compilation units - C++ files will link to .cu implementations
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include "tensor_generic_ops.cuh"
 #else
 // Forward declaration for C++ files - implementation in tensor_ops.cu
@@ -170,8 +170,8 @@ namespace lfs::core::tensor_ops {
 } // namespace lfs::core::tensor_ops
 
 // Include template implementation for inline instantiation
-// Only include in CUDA compilation units - C++ files will link to .cu implementations
-#ifdef __CUDACC__
+// Only include in CUDA/HIP compilation units - C++ files will link to .cu implementations
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include "tensor_broadcast_ops.cuh"
 #else
 // Forward declaration for C++ files - implementation in tensor_broadcast_ops.cu

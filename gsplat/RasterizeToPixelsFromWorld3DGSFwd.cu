@@ -1,10 +1,17 @@
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
-#include <c10/cuda/CUDAStream.h>
+
+// Include Common.h first for HIP/CUDA compatibility
+#include "Common.h"
+
+#if USE_HIP
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#endif
 
 #include "Cameras.cuh"
-#include "Common.h"
 #include "Rasterization.h"
 #include "Utils.cuh"
 
@@ -340,10 +347,17 @@ namespace gsplat {
         // TODO: an optimization can be done by passing the actual number of
         // channels into the kernel functions and avoid necessary global memory
         // writes. This requires moving the channel padding from python to C side.
+#if USE_HIP
+        if (hipFuncSetAttribute(
+                (const void*)rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>,
+                hipFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_size) != hipSuccess) {
+#else
         if (cudaFuncSetAttribute(
                 rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 shmem_size) != cudaSuccess) {
+#endif
             AT_ERROR(
                 "Failed to set maximum shared memory size (requested ",
                 shmem_size,

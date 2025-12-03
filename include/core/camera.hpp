@@ -5,7 +5,24 @@
 #pragma once
 
 #include "Common.h"
+// HIP/CUDA stream compatibility for PyTorch
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+#include <c10/hip/HIPStream.h>
+namespace lfs_pt_stream {
+    using StreamType = c10::hip::HIPStream;
+    inline StreamType getStreamFromPool(bool high_priority = false) {
+        return c10::hip::getStreamFromPool(high_priority);
+    }
+}
+#else
 #include <c10/cuda/CUDAStream.h>
+namespace lfs_pt_stream {
+    using StreamType = c10::cuda::CUDAStream;
+    inline StreamType getStreamFromPool(bool high_priority = false) {
+        return c10::cuda::getStreamFromPool(high_priority);
+    }
+}
+#endif
 #include <filesystem>
 #include <future>
 #include <string>
@@ -121,8 +138,8 @@ namespace gs {
         torch::Tensor _cached_mask;
         bool _mask_loaded = false;
 
-        // CUDA stream for async operations
-        at::cuda::CUDAStream _stream = at::cuda::getStreamFromPool(false);
+        // CUDA/HIP stream for async operations
+        lfs_pt_stream::StreamType _stream = lfs_pt_stream::getStreamFromPool(false);
     };
     inline float focal2fov(float focal, int pixels) {
         return 2.0f * std::atan(pixels / (2.0f * focal));

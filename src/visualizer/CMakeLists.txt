@@ -77,7 +77,7 @@ target_link_libraries(gs_visualizer
         TBB::tbb
         spdlog::spdlog
         nlohmann_json::nlohmann_json
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
         ${OPENGL_LIBRARIES}
 )
 

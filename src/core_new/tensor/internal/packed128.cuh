@@ -6,16 +6,27 @@
  *
  * This provides:
  * - 128-bit aligned loads/stores for any data type
- * - Streaming cache hints (__ldcs, __stcs) for better cache utilization
- * - Cache-global stores (__stcg) for gradients/intermediate values
+ * - Streaming cache hints (__ldcs, __stcs) for better cache utilization (CUDA only)
+ * - Cache-global stores (__stcg) for gradients/intermediate values (CUDA only)
+ * - HIP compatible: cache hints fall back to regular loads/stores
  */
 
 #pragma once
 
 #include <cstring>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+
+// HIP/CUDA compatibility for FP16/BF16 types
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(USE_HIP) && USE_HIP)
+    #include <hip/hip_runtime.h>
+    #include <hip/hip_fp16.h>
+    #include <hip/hip_bfloat16.h>
+    #define LFS_PACKED128_USE_HIP 1
+#else
+    #include <cuda_bf16.h>
+    #include <cuda_fp16.h>
+    #include <cuda_runtime.h>
+    #define LFS_PACKED128_USE_HIP 0
+#endif
 
 namespace lfs::core {
 
@@ -109,11 +120,17 @@ namespace lfs::core {
      * - Streaming data that would thrash L1 cache
      * - Read-once patterns
      *
-     * This is the __ldcs instruction: "load streaming"
+     * This is the __ldcs instruction on CUDA: "load streaming"
+     * On HIP, falls back to regular load (no streaming hint available)
      */
     template <typename ElementType>
     __device__ inline Packed128<ElementType> load128cs(const ElementType* address) {
+#if LFS_PACKED128_USE_HIP
+        // HIP doesn't have __ldcs, use regular load
+        return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
+#else
         return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
+#endif
     }
 
     /**
@@ -136,11 +153,17 @@ namespace lfs::core {
      * - Data that won't be read back soon
      * - Write-once patterns
      *
-     * This is the __stcs instruction: "store streaming"
+     * This is the __stcs instruction on CUDA: "store streaming"
+     * On HIP, falls back to regular store
      */
     template <typename ElementType>
     __device__ inline void store128cs(ElementType* target, Packed128<ElementType> value) {
+#if LFS_PACKED128_USE_HIP
+        // HIP doesn't have __stcs, use regular store
+        *reinterpret_cast<int4*>(target) = value.get_bits();
+#else
         __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+#endif
     }
 
     /**
@@ -151,11 +174,17 @@ namespace lfs::core {
      * - Intermediate results that won't be reused immediately
      * - Reduces L1 cache pressure
      *
-     * This is the __stcg instruction: "store cache global" (L2 only)
+     * This is the __stcg instruction on CUDA: "store cache global" (L2 only)
+     * On HIP, falls back to regular store
      */
     template <typename ElementType>
     __device__ inline void store128cg(ElementType* target, Packed128<ElementType> value) {
+#if LFS_PACKED128_USE_HIP
+        // HIP doesn't have __stcg, use regular store
+        *reinterpret_cast<int4*>(target) = value.get_bits();
+#else
         __stcg(reinterpret_cast<int4*>(target), value.get_bits());
+#endif
     }
 
     // ============================================================================
@@ -164,7 +193,11 @@ namespace lfs::core {
 
     using f128 = Packed128<float>;          // 4 floats (16 bytes)
     using half128 = Packed128<half>;        // 8 halves (16 bytes)
+#if LFS_PACKED128_USE_HIP
+    using bf128 = Packed128<hip_bfloat16>;  // 8 bfloat16s (16 bytes)
+#else
     using bf128 = Packed128<__nv_bfloat16>; // 8 bfloat16s (16 bytes)
+#endif
     using i128 = Packed128<int>;            // 4 ints (16 bytes)
     using u128 = Packed128<unsigned int>;   // 4 uints (16 bytes)
 
@@ -172,7 +205,7 @@ namespace lfs::core {
     // Compatibility Shims for Older CUDA Versions
     // ============================================================================
 
-#if defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && \
+#if !LFS_PACKED128_USE_HIP && defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && \
     !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
 
     // Older CUDA doesn't provide __ldcs/__stcs for bfloat16

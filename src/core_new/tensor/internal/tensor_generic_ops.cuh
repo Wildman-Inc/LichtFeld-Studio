@@ -3,7 +3,15 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+// HIP/CUDA compatibility
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(USE_HIP) && USE_HIP)
+    #include <hip/hip_runtime.h>
+    #define LFS_THRUST_SYSTEM thrust::hip
+#else
+    #include <cuda_runtime.h>
+    #define LFS_THRUST_SYSTEM thrust::cuda
+#endif
+
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/constant_iterator.h>
@@ -21,9 +29,9 @@ namespace lfs::core::tensor_ops {
     template <typename Func>
     inline void run_with_thrust_policy(cudaStream_t stream, Func&& func) {
         if (stream) {
-            func(thrust::cuda::par.on(stream));
+            func(LFS_THRUST_SYSTEM::par.on(stream));
         } else {
-            func(thrust::cuda::par);
+            func(LFS_THRUST_SYSTEM::par);
         }
     }
 

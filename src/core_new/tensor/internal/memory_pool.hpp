@@ -4,7 +4,7 @@
 #pragma once
 
 #include "core_new/logger.hpp"
-#include <cuda_runtime.h>
+#include "kernels/hip_runtime_compat.h"
 
 namespace lfs::core {
 

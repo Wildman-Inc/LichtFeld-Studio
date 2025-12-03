@@ -51,7 +51,14 @@ typedef unsigned short ushort;
 #define EXIT_WAIVED 2
 #endif
 
-#ifndef __CUDACC__
+// For HIP builds, use HIP's built-in vector math operations
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+    // HIP provides its own vector operations in hip_vector_types.h
+    #define LFS_HELPER_MATH_SKIP_OPERATORS 1
+    #include <hip/hip_runtime.h>
+#endif
+
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
 #include <math.h>
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -214,6 +221,9 @@ inline __host__ __device__ uint4 make_uint4(uint3 a, uint w) {
 inline __host__ __device__ uint4 make_uint4(int4 a) {
     return make_uint4(uint(a.x), uint(a.y), uint(a.z), uint(a.w));
 }
+
+// HIP provides these operators in hip_vector_types.h, so skip them for HIP builds
+#ifndef LFS_HELPER_MATH_SKIP_OPERATORS
 
 ////////////////////////////////////////////////////////////////////////////////
 // negate
@@ -851,6 +861,8 @@ inline __host__ __device__ void operator/=(float4& a, float b) {
 inline __host__ __device__ float4 operator/(float b, float4 a) {
     return make_float4(b / a.x, b / a.y, b / a.z, b / a.w);
 }
+
+#endif // LFS_HELPER_MATH_SKIP_OPERATORS (close here, before min/max functions)
 
 ////////////////////////////////////////////////////////////////////////////////
 // min

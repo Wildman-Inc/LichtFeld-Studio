@@ -7,7 +7,18 @@
 #include "core/logger.hpp"
 #include "loader/cache_image_loader.hpp"
 
+// HIP/CUDA stream guard compatibility for PyTorch
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+#include <c10/hip/HIPGuard.h>
+namespace lfs_pt_guard {
+    using StreamGuard = c10::hip::HIPStreamGuard;
+}
+#else
 #include <c10/cuda/CUDAGuard.h>
+namespace lfs_pt_guard {
+    using StreamGuard = c10::cuda::CUDAStreamGuard;
+}
+#endif
 #include <torch/torch.h>
 
 using torch::indexing::None;
@@ -130,7 +141,7 @@ namespace gs {
             pinned_options);
 
         // Use the CUDA stream for async transfer
-        at::cuda::CUDAStreamGuard guard(_stream);
+        lfs_pt_guard::StreamGuard guard(_stream);
 
         image = image.to(torch::kCUDA, /*non_blocking=*/true)
                     .permute({2, 0, 1})
@@ -180,7 +191,7 @@ namespace gs {
             pinned_options);
 
         // Use the CUDA stream for async transfer
-        at::cuda::CUDAStreamGuard guard(_stream);
+        lfs_pt_guard::StreamGuard guard(_stream);
 
         // Transfer to GPU and convert to float [0, 1]
         // For grayscale, take first channel only

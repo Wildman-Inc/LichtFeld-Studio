@@ -43,18 +43,31 @@ set(LFS_TENSOR_CUDA_SOURCES
     tensor_strided_ops.cu   # CUDA kernels for strided tensor operations
 )
 
-# Create CUDA library for tensor operations (C++20)
+# Create CUDA/HIP library for tensor operations (C++20)
 if(LFS_TENSOR_CUDA_SOURCES)
-    add_library(lfs_tensor_kernels STATIC ${LFS_TENSOR_CUDA_SOURCES})
+    # Build the kernel library based on GPU backend
+    if(USE_HIP)
+        # Use lfs_hip_add_library from HIPUtils.cmake for Windows-compatible HIP support
+        set(HIP_HIPCC_FLAGS "${HIP_HIPCC_FLAGS} -std=c++20")
+        lfs_hip_add_library(lfs_tensor_kernels STATIC ${LFS_TENSOR_CUDA_SOURCES})
+    else()
+        add_library(lfs_tensor_kernels STATIC ${LFS_TENSOR_CUDA_SOURCES})
+    endif()
 
-    set_target_properties(lfs_tensor_kernels PROPERTIES
-            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-            CUDA_SEPARABLE_COMPILATION ON
-            POSITION_INDEPENDENT_CODE ON
-            CUDA_RESOLVE_DEVICE_SYMBOLS ON
-            CUDA_STANDARD 20  # CUDA only supports up to C++20
-            CUDA_STANDARD_REQUIRED ON
-    )
+    if(USE_CUDA)
+        set_target_properties(lfs_tensor_kernels PROPERTIES
+                CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+                CUDA_SEPARABLE_COMPILATION ON
+                POSITION_INDEPENDENT_CODE ON
+                CUDA_RESOLVE_DEVICE_SYMBOLS ON
+                CUDA_STANDARD 20  # CUDA only supports up to C++20
+                CUDA_STANDARD_REQUIRED ON
+        )
+    elseif(USE_HIP)
+        set_target_properties(lfs_tensor_kernels PROPERTIES
+                POSITION_INDEPENDENT_CODE ON
+        )
+    endif()
 
     target_include_directories(lfs_tensor_kernels
             PUBLIC
@@ -62,15 +75,15 @@ if(LFS_TENSOR_CUDA_SOURCES)
             ${CMAKE_BINARY_DIR}/include
             PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}  # For internal/ headers
-            ${CUDAToolkit_INCLUDE_DIRS}
+            ${GPU_INCLUDE_DIRS}
     )
 
     target_link_libraries(lfs_tensor_kernels
             PUBLIC
-            CUDA::cudart
-            CUDA::cublas      # For matrix operations
-            CUDA::curand      # For random number generation
-            CUDA::cusolver    # Optional: for advanced linear algebra
+            ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
+            ${GPU_BLAS_LIBRARY}      # CUDA::cublas or hipBLAS for matrix operations
+            ${GPU_RAND_LIBRARY}      # CUDA::curand or hipRAND for random number generation
+            $<$<BOOL:${GPU_SOLVER_LIBRARY}>:${GPU_SOLVER_LIBRARY}>  # CUDA::cusolver or hipSOLVER (optional)
             spdlog::spdlog
     )
 
@@ -82,6 +95,10 @@ if(LFS_TENSOR_CUDA_SOURCES)
             # CUDA device code for non-Windows
             $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo>
             $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --ptxas-options=-v>
+
+            # HIP compile options
+            $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Debug>:-O0 -g>>
+            $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Release>:-O3 -ffast-math>>
     )
 
     # Windows: Add compile definition to tell fmt that UTF-8 is enabled for CUDA files
@@ -115,7 +132,7 @@ target_include_directories(lfs_tensor
         PUBLIC
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_BINARY_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}  # For internal/ headers
 )
@@ -127,11 +144,11 @@ target_link_libraries(lfs_tensor
         nlohmann_json::nlohmann_json
         glm::glm
         spdlog::spdlog
-        CUDA::cudart
-        CUDA::cublas          # For matrix operations
-        CUDA::curand          # For random operations
+        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
+        ${GPU_BLAS_LIBRARY}      # CUDA::cublas or hipBLAS for matrix operations
+        ${GPU_RAND_LIBRARY}      # CUDA::curand or hipRAND for random operations
         PRIVATE
-        lfs_tensor_kernels    # CUDA kernels are implementation detail (linked privately)
+        lfs_tensor_kernels    # CUDA/HIP kernels are implementation detail (linked privately)
 )
 
 # Platform-specific settings

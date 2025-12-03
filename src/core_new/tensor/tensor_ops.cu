@@ -7,13 +7,13 @@
 #include "internal/tensor_impl.hpp"
 #include "internal/tensor_ops.hpp"
 #include "internal/warp_reduce.cuh"
+#include "internal/tensor_generic_ops.cuh"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-#include <cub/device/device_reduce.cuh>
-#include <cub/device/device_segmented_reduce.cuh>
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
+// Use CUB shims for HIP compatibility
+#include "cuda_shim/cub/device/device_reduce.cuh"
+#include "cuda_shim/cub/device/device_segmented_reduce.cuh"
 #include <limits>
 
 // Thrust headers
@@ -254,10 +254,10 @@ namespace lfs::core::tensor_ops {
             auto in_ptr = thrust::device_pointer_cast(input);
             auto out_ptr = thrust::device_pointer_cast(output);
             if (stream) {
-                thrust::copy(thrust::cuda::par.on(stream),
+                thrust::copy(LFS_THRUST_SYSTEM::par.on(stream),
                              in_ptr, in_ptr + output_size, out_ptr);
             } else {
-                thrust::copy(thrust::cuda::par,
+                thrust::copy(LFS_THRUST_SYSTEM::par,
                              in_ptr, in_ptr + output_size, out_ptr);
             }
             return;
@@ -265,19 +265,24 @@ namespace lfs::core::tensor_ops {
 
         // OPTIMIZED PATH: Contiguous segments - use CUB's segmented reduce
         if (inner_size == 1) {
-            // begin_offsets: [0, N, 2N, 3N, ...]
+            // For hipcub compatibility, we need both offset iterators to have the same type.
+            // We use a single functor that computes offsets as: index * reduce_size
+            // begin_offsets: [0, N, 2N, 3N, ...] (starts from counting_iterator(0))
+            // end_offsets: [N, 2N, 3N, 4N, ...] (starts from counting_iterator(1))
+            struct SegmentOffsetFunctor {
+                int segment_size;
+                __host__ __device__ SegmentOffsetFunctor(int s) : segment_size(s) {}
+                __host__ __device__ int operator()(int i) const {
+                    return i * segment_size;
+                }
+            };
+            
+            SegmentOffsetFunctor offset_func(static_cast<int>(reduce_size));
+            
             auto begin_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(0),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
-
-            // end_offsets: [N, 2N, 3N, 4N, ...]
+                thrust::counting_iterator<int>(0), offset_func);
             auto end_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(1),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+                thrust::counting_iterator<int>(1), offset_func);
 
             void* d_temp_storage = nullptr;
             size_t temp_storage_bytes = 0;
@@ -329,7 +334,7 @@ namespace lfs::core::tensor_ops {
         //
         // TODO: Implement optimized strided reduction kernel or use CUB with proper setup
         if (stream) {
-            thrust::for_each(thrust::cuda::par.on(stream),
+            thrust::for_each(LFS_THRUST_SYSTEM::par.on(stream),
                              thrust::counting_iterator<size_t>(0),
                              thrust::counting_iterator<size_t>(output_size),
                              [=] __device__(size_t out_idx) {
@@ -344,7 +349,7 @@ namespace lfs::core::tensor_ops {
                                  output[out_idx] = result;
                              });
         } else {
-            thrust::for_each(thrust::cuda::par,
+            thrust::for_each(LFS_THRUST_SYSTEM::par,
                              thrust::counting_iterator<size_t>(0),
                              thrust::counting_iterator<size_t>(output_size),
                              [=] __device__(size_t out_idx) {
@@ -940,7 +945,7 @@ namespace lfs::core::tensor_ops {
             thrust::device_vector<int> keys(total_elements);
 
             if (stream) {
-                thrust::transform(thrust::cuda::par.on(stream),
+                thrust::transform(LFS_THRUST_SYSTEM::par.on(stream),
                                   thrust::counting_iterator<size_t>(0),
                                   thrust::counting_iterator<size_t>(total_elements),
                                   keys.begin(),
@@ -948,11 +953,11 @@ namespace lfs::core::tensor_ops {
                                       return static_cast<int>(idx / dim_size);
                                   });
 
-                thrust::inclusive_scan_by_key(thrust::cuda::par.on(stream),
+                thrust::inclusive_scan_by_key(LFS_THRUST_SYSTEM::par.on(stream),
                                               keys.begin(), keys.end(),
                                               data_ptr, data_ptr);
             } else {
-                thrust::transform(thrust::cuda::par,
+                thrust::transform(LFS_THRUST_SYSTEM::par,
                                   thrust::counting_iterator<size_t>(0),
                                   thrust::counting_iterator<size_t>(total_elements),
                                   keys.begin(),
@@ -960,7 +965,7 @@ namespace lfs::core::tensor_ops {
                                       return static_cast<int>(idx / dim_size);
                                   });
 
-                thrust::inclusive_scan_by_key(thrust::cuda::par,
+                thrust::inclusive_scan_by_key(LFS_THRUST_SYSTEM::par,
                                               keys.begin(), keys.end(),
                                               data_ptr, data_ptr);
             }
@@ -987,16 +992,16 @@ namespace lfs::core::tensor_ops {
             if (dtype == DataType::Float32) {
                 auto data_ptr = thrust::device_pointer_cast(static_cast<float*>(data));
                 if (stream) {
-                    thrust::inclusive_scan(thrust::cuda::par.on(stream), data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(LFS_THRUST_SYSTEM::par.on(stream), data_ptr, data_ptr + total, data_ptr);
                 } else {
-                    thrust::inclusive_scan(thrust::cuda::par, data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(LFS_THRUST_SYSTEM::par, data_ptr, data_ptr + total, data_ptr);
                 }
             } else if (dtype == DataType::Int32) {
                 auto data_ptr = thrust::device_pointer_cast(static_cast<int*>(data));
                 if (stream) {
-                    thrust::inclusive_scan(thrust::cuda::par.on(stream), data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(LFS_THRUST_SYSTEM::par.on(stream), data_ptr, data_ptr + total, data_ptr);
                 } else {
-                    thrust::inclusive_scan(thrust::cuda::par, data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(LFS_THRUST_SYSTEM::par, data_ptr, data_ptr + total, data_ptr);
                 }
             }
             return;
@@ -1221,18 +1226,18 @@ namespace lfs::core::tensor_ops {
 
         if (stream) {
             if (descending) {
-                thrust::sort_by_key(thrust::cuda::par.on(stream), values_ptr, values_ptr + n,
+                thrust::sort_by_key(LFS_THRUST_SYSTEM::par.on(stream), values_ptr, values_ptr + n,
                                     indices_ptr, thrust::greater<float>());
             } else {
-                thrust::sort_by_key(thrust::cuda::par.on(stream), values_ptr, values_ptr + n,
+                thrust::sort_by_key(LFS_THRUST_SYSTEM::par.on(stream), values_ptr, values_ptr + n,
                                     indices_ptr, thrust::less<float>());
             }
         } else {
             if (descending) {
-                thrust::sort_by_key(thrust::cuda::par, values_ptr, values_ptr + n,
+                thrust::sort_by_key(LFS_THRUST_SYSTEM::par, values_ptr, values_ptr + n,
                                     indices_ptr, thrust::greater<float>());
             } else {
-                thrust::sort_by_key(thrust::cuda::par, values_ptr, values_ptr + n,
+                thrust::sort_by_key(LFS_THRUST_SYSTEM::par, values_ptr, values_ptr + n,
                                     indices_ptr, thrust::less<float>());
             }
         }
@@ -1276,14 +1281,14 @@ namespace lfs::core::tensor_ops {
                     values, thrust::raw_pointer_cast(temp_vals.data()),
                     outer_size, dim_size, inner_size, outer, inner);
 
-                thrust::sequence(thrust::cuda::par.on(stream), temp_idx.begin(), temp_idx.end(), 0LL);
+                thrust::sequence(LFS_THRUST_SYSTEM::par.on(stream), temp_idx.begin(), temp_idx.end(), 0LL);
 
                 if (descending) {
-                    thrust::sort_by_key(thrust::cuda::par.on(stream),
+                    thrust::sort_by_key(LFS_THRUST_SYSTEM::par.on(stream),
                                         temp_vals.begin(), temp_vals.end(), temp_idx.begin(),
                                         thrust::greater<float>());
                 } else {
-                    thrust::sort_by_key(thrust::cuda::par.on(stream),
+                    thrust::sort_by_key(LFS_THRUST_SYSTEM::par.on(stream),
                                         temp_vals.begin(), temp_vals.end(), temp_idx.begin(),
                                         thrust::less<float>());
                 }

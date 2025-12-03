@@ -4,6 +4,7 @@
 #include "core_new/logger.hpp"
 #include "internal/memory_pool.hpp"
 #include "internal/tensor_functors.hpp"
+#include "internal/tensor_generic_ops.cuh"
 #include "internal/tensor_ops.hpp"
 #include <cuda_runtime.h>
 #include <thrust/copy.h>

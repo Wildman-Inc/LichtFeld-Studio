@@ -1,11 +1,18 @@
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/Atomic.cuh>
-#include <c10/cuda/CUDAStream.h>
+
+// Include Common.h first for HIP/CUDA compatibility
+#include "Common.h"
+
+#if USE_HIP
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#endif
 
 #include "Cameras.cuh"
-#include "Common.h"
 #include "Rasterization.h"
 #include "Utils.cuh"
 
@@ -199,8 +206,17 @@ namespace gsplat {
         // each thread loads one gaussian at a time before rasterizing
         const uint32_t tr = block.thread_rank();
         cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+#if USE_HIP
+        // HIP: use shuffle-based warp reduction for max
+        int32_t warp_bin_final = bin_final;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+            int32_t other = __shfl_xor(warp_bin_final, offset);
+            warp_bin_final = warp_bin_final > other ? warp_bin_final : other;
+        }
+#else
         const int32_t warp_bin_final =
             cg::reduce(warp, bin_final, cg::greater<int>());
+#endif
         for (uint32_t b = 0; b < num_batches; ++b) {
             // resync all threads before writing next batch of shared mem
             block.sync();
@@ -445,10 +461,17 @@ namespace gsplat {
         // TODO: an optimization can be done by passing the actual number of
         // channels into the kernel functions and avoid necessary global memory
         // writes. This requires moving the channel padding from python to C side.
+#if USE_HIP
+        if (hipFuncSetAttribute(
+                (const void*)rasterize_to_pixels_from_world_3dgs_bwd_kernel<CDIM, float>,
+                hipFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_size) != hipSuccess) {
+#else
         if (cudaFuncSetAttribute(
                 rasterize_to_pixels_from_world_3dgs_bwd_kernel<CDIM, float>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 shmem_size) != cudaSuccess) {
+#endif
             AT_ERROR(
                 "Failed to set maximum shared memory size (requested ",
                 shmem_size,

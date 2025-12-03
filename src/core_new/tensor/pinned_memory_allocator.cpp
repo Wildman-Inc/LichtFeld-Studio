@@ -5,7 +5,7 @@
 #include "core_new/logger.hpp"
 #include <chrono>
 #include <cmath>
-#include <cuda_runtime.h>
+#include "kernels/hip_runtime_compat.h"
 
 #define CHECK_CUDA(call)                              \
     do {                                              \

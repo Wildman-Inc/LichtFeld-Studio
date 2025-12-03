@@ -26,6 +26,13 @@
 #include <thrust/transform.h>
 #include <thrust/tuple.h>
 
+// HIP/CUDA Thrust backend selection
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(USE_HIP) && USE_HIP)
+    #define LFS_THRUST_SYSTEM thrust::hip
+#else
+    #define LFS_THRUST_SYSTEM LFS_THRUST_SYSTEM
+#endif
+
 namespace lfs::core::tensor_ops {
 
     // ============= Import broadcast index calculator =============
@@ -120,21 +127,21 @@ namespace lfs::core::tensor_ops {
     void launch_compare_scalar_eq(const float* a, float val, unsigned char* r, size_t n, cudaStream_t s) {
         auto a_ptr = thrust::device_pointer_cast(a);
         auto r_ptr = thrust::device_pointer_cast(r);
-        thrust::transform(thrust::cuda::par.on(s), a_ptr, a_ptr + n, r_ptr,
+        thrust::transform(LFS_THRUST_SYSTEM::par.on(s), a_ptr, a_ptr + n, r_ptr,
                           ops::equal_scalar_op<float>(val));
     }
 
     void launch_compare_scalar_lt(const float* a, float val, unsigned char* r, size_t n, cudaStream_t s) {
         auto a_ptr = thrust::device_pointer_cast(a);
         auto r_ptr = thrust::device_pointer_cast(r);
-        thrust::transform(thrust::cuda::par.on(s), a_ptr, a_ptr + n, r_ptr,
+        thrust::transform(LFS_THRUST_SYSTEM::par.on(s), a_ptr, a_ptr + n, r_ptr,
                           ops::less_scalar_op<float>(val));
     }
 
     void launch_compare_scalar_gt(const float* a, float val, unsigned char* r, size_t n, cudaStream_t s) {
         auto a_ptr = thrust::device_pointer_cast(a);
         auto r_ptr = thrust::device_pointer_cast(r);
-        thrust::transform(thrust::cuda::par.on(s), a_ptr, a_ptr + n, r_ptr,
+        thrust::transform(LFS_THRUST_SYSTEM::par.on(s), a_ptr, a_ptr + n, r_ptr,
                           ops::greater_scalar_op<float>(val));
     }
 
@@ -205,7 +212,7 @@ namespace lfs::core::tensor_ops {
     void launch_logical_not(const unsigned char* a, unsigned char* r, size_t n, cudaStream_t s) {
         auto a_ptr = thrust::device_pointer_cast(a);
         auto r_ptr = thrust::device_pointer_cast(r);
-        thrust::transform(thrust::cuda::par.on(s), a_ptr, a_ptr + n, r_ptr,
+        thrust::transform(LFS_THRUST_SYSTEM::par.on(s), a_ptr, a_ptr + n, r_ptr,
                           ops::logical_not_op());
     }
 
@@ -336,7 +343,7 @@ namespace lfs::core::tensor_ops {
         auto mask_ptr = thrust::device_pointer_cast(mask);
         auto begin = thrust::make_zip_iterator(thrust::make_tuple(data_ptr, mask_ptr));
         auto end = thrust::make_zip_iterator(thrust::make_tuple(data_ptr + n, mask_ptr + n));
-        thrust::transform(thrust::cuda::par.on(s), begin, end, data_ptr,
+        thrust::transform(LFS_THRUST_SYSTEM::par.on(s), begin, end, data_ptr,
                           ops::masked_fill_op<float>(val));
     }
 
@@ -356,7 +363,7 @@ namespace lfs::core::tensor_ops {
         auto transform_end = thrust::make_transform_iterator(end, ops::extract_value_op());
         auto mask_begin = thrust::make_transform_iterator(begin, ops::extract_mask_op());
 
-        thrust::copy_if(thrust::cuda::par.on(stream),
+        thrust::copy_if(LFS_THRUST_SYSTEM::par.on(stream),
                         transform_begin, transform_end, mask_begin, output_ptr, [] __device__(bool x) { return x; });
     }
 
@@ -438,7 +445,7 @@ namespace lfs::core::tensor_ops {
         auto data_ptr = thrust::device_pointer_cast(data);
 
         // Thrust count_if returns to host, so we get it first
-        size_t result = thrust::count_if(thrust::cuda::par.on(stream),
+        size_t result = thrust::count_if(LFS_THRUST_SYSTEM::par.on(stream),
                                          data_ptr, data_ptr + n,
                                          ops::is_nonzero_bool_op());
 
@@ -460,7 +467,7 @@ namespace lfs::core::tensor_ops {
         auto data_ptr = thrust::device_pointer_cast(data);
 
         // Thrust count_if returns to host, so we get it first
-        size_t result = thrust::count_if(thrust::cuda::par.on(stream),
+        size_t result = thrust::count_if(LFS_THRUST_SYSTEM::par.on(stream),
                                          data_ptr, data_ptr + n,
                                          ops::is_nonzero_op<float>());
 
@@ -627,7 +634,7 @@ namespace lfs::core::tensor_ops {
         auto out_ptr = thrust::device_pointer_cast(out);
         auto transform_idx = thrust::make_transform_iterator(idx_ptr,
                                                              ops::index_clamp_op(in_size));
-        thrust::gather(thrust::cuda::par.on(stream), transform_idx, transform_idx + out_size,
+        thrust::gather(LFS_THRUST_SYSTEM::par.on(stream), transform_idx, transform_idx + out_size,
                        in_ptr, out_ptr);
     }
 
@@ -650,7 +657,7 @@ namespace lfs::core::tensor_ops {
         auto permuted_view = thrust::make_permutation_iterator(in_ptr, clamped_idx);
 
         // Single fused kernel: gather + unary operation!
-        thrust::transform(thrust::cuda::par.on(stream),
+        thrust::transform(LFS_THRUST_SYSTEM::par.on(stream),
                           permuted_view, permuted_view + out_size,
                           out_ptr,
                           op);
@@ -698,7 +705,7 @@ namespace lfs::core::tensor_ops {
                            size_t n_idx, cudaStream_t stream) {
         CudaDeviceMemory<float> val_buffer(n_idx);
         auto val_ptr = thrust::device_pointer_cast(val_buffer.get());
-        thrust::fill(thrust::cuda::par.on(stream), val_ptr, val_ptr + n_idx, val);
+        thrust::fill(LFS_THRUST_SYSTEM::par.on(stream), val_ptr, val_ptr + n_idx, val);
 
         size_t in_shape[10] = {0};
         std::copy(shape, shape + rank, in_shape);
@@ -731,7 +738,7 @@ namespace lfs::core::tensor_ops {
         auto vals_ptr = thrust::device_pointer_cast(vals);
         auto transform_idx = thrust::make_transform_iterator(idx_ptr,
                                                              ops::index_clamp_op(data_size));
-        thrust::scatter(thrust::cuda::par.on(stream), vals_ptr, vals_ptr + idx_size,
+        thrust::scatter(LFS_THRUST_SYSTEM::par.on(stream), vals_ptr, vals_ptr + idx_size,
                         transform_idx, data_ptr);
     }
 
@@ -742,7 +749,7 @@ namespace lfs::core::tensor_ops {
         auto data_ptr = thrust::device_pointer_cast(data);
         auto indices_ptr = thrust::device_pointer_cast(indices);
         auto counting = thrust::counting_iterator<int64_t>(0);
-        thrust::copy_if(thrust::cuda::par.on(stream), counting, counting + n, data_ptr,
+        thrust::copy_if(LFS_THRUST_SYSTEM::par.on(stream), counting, counting + n, data_ptr,
                         indices_ptr, ops::nonzero_predicate<float>());
     }
 
@@ -752,7 +759,7 @@ namespace lfs::core::tensor_ops {
         auto data_ptr = thrust::device_pointer_cast(data);
         auto indices_ptr = thrust::device_pointer_cast(indices);
         auto counting = thrust::counting_iterator<int64_t>(0);
-        thrust::copy_if(thrust::cuda::par.on(stream), counting, counting + n, data_ptr,
+        thrust::copy_if(LFS_THRUST_SYSTEM::par.on(stream), counting, counting + n, data_ptr,
                         indices_ptr, ops::nonzero_bool_predicate());
     }
 
@@ -788,7 +795,7 @@ namespace lfs::core::tensor_ops {
             thrust::make_tuple(out1_ptr, out2_ptr));
 
         // Single gather operation copies both tensors!
-        thrust::copy(thrust::cuda::par.on(stream),
+        thrust::copy(LFS_THRUST_SYSTEM::par.on(stream),
                      permuted, permuted + index_size,
                      zipped_output);
     }
@@ -823,7 +830,7 @@ namespace lfs::core::tensor_ops {
             thrust::make_tuple(out1_ptr, out2_ptr, out3_ptr));
 
         // Single gather for all three tensors!
-        thrust::copy(thrust::cuda::par.on(stream),
+        thrust::copy(LFS_THRUST_SYSTEM::par.on(stream),
                      permuted, permuted + index_size,
                      zipped_output);
     }

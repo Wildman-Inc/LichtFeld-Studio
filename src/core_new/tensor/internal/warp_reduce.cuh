@@ -8,8 +8,10 @@
 #pragma once
 
 #include <cstdint>
-#include <cuda_runtime.h>
 #include <type_traits>
+
+// Include HIP compatibility layer for portable warp operations
+#include "kernels/hip_compat.h"
 
 namespace lfs::core {
     namespace warp_ops {
@@ -19,7 +21,7 @@ namespace lfs::core {
         /**
          * @brief Warp-level sum reduction using shuffle instructions
          *
-         * Reduces a value across all threads in a warp using __shfl_xor_sync.
+         * Reduces a value across all threads in a warp using shuffle XOR.
          * This is 5-10x faster than shared memory because:
          * - No synchronization needed within warp
          * - No shared memory access (stays in registers)
@@ -32,8 +34,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_sum(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                val += __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                val += LFS_WARP_SHFL_XOR(val, offset);
             }
             return val;
         }
@@ -44,8 +46,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_max(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                T other = LFS_WARP_SHFL_XOR(val, offset);
                 val = (val > other) ? val : other;
             }
             return val;
@@ -57,8 +59,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_min(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                T other = LFS_WARP_SHFL_XOR(val, offset);
                 val = (val < other) ? val : other;
             }
             return val;
@@ -70,8 +72,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_prod(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                val *= __shfl_xor_sync(0xffffffff, val, offset);
+            for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                val *= LFS_WARP_SHFL_XOR(val, offset);
             }
             return val;
         }

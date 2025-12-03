@@ -16,7 +16,14 @@
 #include "project/project.hpp"
 #include "rasterization/rasterizer.hpp"
 #include "strategies/istrategy.hpp"
+#if defined(USE_HIP) && USE_HIP
+#include <ATen/hip/HIPEvent.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include <c10/hip/HIPStream.h>
+#else
 #include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
 #include <atomic>
 #include <expected>
 #include <memory>
@@ -226,8 +233,13 @@ namespace gs::training {
         // Callback system for async operations
         std::function<void()> callback_;
         std::atomic<bool> callback_busy_{false};
-        at::cuda::CUDAStream callback_stream_ = at::cuda::getStreamFromPool(false);
+#if defined(USE_HIP) && USE_HIP
+        c10::hip::HIPStreamMasqueradingAsCUDA callback_stream_ = c10::hip::getStreamFromPoolMasqueradingAsCUDA(false);
+        at::cuda::CUDAEvent callback_launch_event_; // HIPEvent.h defines this in at::cuda namespace
+#else
+        c10::cuda::CUDAStream callback_stream_ = c10::cuda::getStreamFromPool(false);
         at::cuda::CUDAEvent callback_launch_event_;
+#endif
 
         // camera id to cam
         std::map<int, std::shared_ptr<const Camera>> m_cam_id_to_cam;

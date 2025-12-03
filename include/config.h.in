@@ -5,6 +5,11 @@
 #cmakedefine CUDA_GL_INTEROP_ENABLED
 #endif
 
+// GPU Backend configuration
+#cmakedefine USE_CUDA @USE_CUDA@
+#cmakedefine USE_HIP @USE_HIP@
+#cmakedefine USE_ROCM @USE_ROCM@
+
 // Version information
 #define PROJECT_VERSION_MAJOR @PROJECT_VERSION_MAJOR @
 #define PROJECT_VERSION_MINOR @PROJECT_VERSION_MINOR @
@@ -25,6 +30,21 @@
 #define PLATFORM_LINUX
 #else
 #define PLATFORM_UNKNOWN
+#endif
+
+// GPU Backend detection at runtime
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || USE_HIP
+    #define GPU_BACKEND_HIP 1
+    #define GPU_BACKEND_CUDA 0
+    #define GPU_BACKEND_NAME "ROCm/HIP"
+#elif defined(__CUDACC__) || defined(CUDA_VERSION) || USE_CUDA
+    #define GPU_BACKEND_HIP 0
+    #define GPU_BACKEND_CUDA 1
+    #define GPU_BACKEND_NAME "CUDA"
+#else
+    #define GPU_BACKEND_HIP 0
+    #define GPU_BACKEND_CUDA 0
+    #define GPU_BACKEND_NAME "None"
 #endif
 
 // Feature flags

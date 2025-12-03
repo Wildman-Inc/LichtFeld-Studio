@@ -1,12 +1,16 @@
 # LichtFeld-Studio One-Shot Build Script for Windows
 # This script verifies prerequisites, sets up dependencies, and builds the project
-# Usage: .\build_lichtfeld.ps1 [-Configuration Debug|Release] [-Clean] [-Help]
+# Usage: .\build_lichtfeld.ps1 [-Configuration Debug|Release] [-GpuBackend CUDA|HIP] [-Clean] [-Help]
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
+
+    [Parameter()]
+    [ValidateSet('CUDA', 'HIP', 'Auto')]
+    [string]$GpuBackend = 'Auto',
 
     [switch]$SkipVerification,
     [switch]$SkipVcpkg,
@@ -22,13 +26,17 @@ LichtFeld-Studio One-Shot Build Script
 Usage: .\build_lichtfeld.ps1 [options]
 
 This script automatically:
-  1. Verifies build prerequisites (VS 2022, CUDA 12.8, CMake, Git)
+  1. Verifies build prerequisites (VS 2022, CUDA/HIP, CMake, Git)
   2. Sets up vcpkg in the parent directory
   3. Downloads LibTorch (Debug & Release) if missing
   4. Configures and builds LichtFeld-Studio
 
 Options:
   -Configuration <Debug|Release>  Build configuration (default: Release)
+  -GpuBackend <CUDA|HIP|Auto>     GPU backend to use (default: Auto)
+                                   Auto: Detect available GPU (NVIDIA->CUDA, AMD->HIP)
+                                   CUDA: Force NVIDIA CUDA backend
+                                   HIP:  Force AMD ROCm/HIP backend
   -SkipVerification               Skip environment verification
   -SkipVcpkg                      Skip vcpkg setup
   -SkipLibTorch                   Skip LibTorch download
@@ -36,10 +44,16 @@ Options:
   -Help                           Show this help message
 
 Examples:
-  .\build_lichtfeld.ps1                        Build Release (default)
+  .\build_lichtfeld.ps1                        Build Release with CUDA (default)
+  .\build_lichtfeld.ps1 -GpuBackend HIP        Build with AMD ROCm/HIP
   .\build_lichtfeld.ps1 -Configuration Debug   Build Debug
   .\build_lichtfeld.ps1 -Clean                 Clean and rebuild
   .\build_lichtfeld.ps1 -SkipLibTorch          Skip LibTorch download (if already present)
+
+Requirements for HIP/ROCm build:
+  - AMD HIP SDK installed (https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
+  - AMD Software: PyTorch on Windows driver
+  - Supported GPU: RX 7900 XTX, RX 9070 series, PRO W7900, or Ryzen AI
 "@
     exit 0
 }
@@ -133,8 +147,13 @@ function Find-VSInstallPath {
     }
 
     try {
-        # Try full VS IDE first
-        $VSPath = & $VSWherePath -latest -products Microsoft.VisualStudio.Product.Community,Microsoft.VisualStudio.Product.Professional,Microsoft.VisualStudio.Product.Enterprise -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        # Try with wildcard for all products first (most reliable)
+        $VSPath = & $VSWherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+
+        if (-not $VSPath) {
+            # Try full VS IDE explicitly
+            $VSPath = & $VSWherePath -latest -products Microsoft.VisualStudio.Product.Community,Microsoft.VisualStudio.Product.Professional,Microsoft.VisualStudio.Product.Enterprise -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        }
 
         if (-not $VSPath) {
             # Try Build Tools
@@ -220,6 +239,71 @@ if (-not (Test-VSDevEnvironment)) {
 }
 
 # ============================================================================
+# GPU Detection and Backend Selection
+# ============================================================================
+
+function Detect-GpuBackend {
+    # Check for NVIDIA GPU
+    $NvidiaGpu = Get-CimInstance -ClassName Win32_VideoController | Where-Object { $_.Name -match "NVIDIA" }
+    
+    # Check for AMD GPU
+    $AmdGpu = Get-CimInstance -ClassName Win32_VideoController | Where-Object { $_.Name -match "AMD|Radeon" }
+    
+    if ($NvidiaGpu) {
+        return "CUDA"
+    } elseif ($AmdGpu) {
+        return "HIP"
+    } else {
+        return "CUDA"  # Default fallback
+    }
+}
+
+function Find-HipSdk {
+    # Check environment variable
+    if ($env:HIP_PATH -and (Test-Path $env:HIP_PATH)) {
+        return $env:HIP_PATH
+    }
+    
+    # Check common installation paths
+    $RocmPaths = @(
+        "C:\Program Files\AMD\ROCm\6.2",
+        "C:\Program Files\AMD\ROCm\6.1",
+        "C:\Program Files\AMD\ROCm\6.0",
+        "C:\Program Files\AMD\ROCm"
+    )
+    
+    foreach ($path in $RocmPaths) {
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+    
+    # Try to find any ROCm installation
+    if (Test-Path "C:\Program Files\AMD\ROCm") {
+        $versions = Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory | Sort-Object Name -Descending
+        if ($versions) {
+            return $versions[0].FullName
+        }
+    }
+    
+    return $null
+}
+
+# Determine GPU backend
+$SelectedBackend = $GpuBackend
+if ($GpuBackend -eq 'Auto') {
+    $SelectedBackend = Detect-GpuBackend
+    Write-Host "Auto-detected GPU backend: $SelectedBackend" -ForegroundColor Cyan
+}
+
+$script:UseHip = ($SelectedBackend -eq 'HIP')
+$script:HipSdkPath = $null
+
+if ($script:UseHip) {
+    $script:HipSdkPath = Find-HipSdk
+}
+
+# ============================================================================
 # Environment Verification
 # ============================================================================
 
@@ -278,27 +362,72 @@ function Test-BuildEnvironment {
             "Download CMake 3.30+ from: https://cmake.org/download/"
     }
 
-    # Check 4: CUDA Toolkit
-    Write-Host "[4/7] Checking CUDA Toolkit 12.8..." -ForegroundColor Yellow
-    if (Test-Command "nvcc") {
-        try {
-            $NvccOutput = nvcc --version 2>&1 | Select-String "release"
-            $CudaVersion = ($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1
-
-            if ($CudaVersion -match "12\.8") {
-                Write-Status "CUDA Toolkit (nvcc)" $true "v$CudaVersion"
-            } else {
-                Write-Status "CUDA Toolkit (nvcc)" $false "v$CudaVersion" `
-                    "CUDA 12.8 is required (found $CudaVersion)" `
-                    "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+    # Check 4: GPU Toolkit (CUDA or HIP)
+    Write-Host "[4/7] Checking GPU Toolkit..." -ForegroundColor Yellow
+    
+    if ($script:UseHip) {
+        # Check for AMD HIP SDK
+        if ($script:HipSdkPath) {
+            $HipVersion = "Unknown"
+            $VersionFile = Join-Path $script:HipSdkPath ".info\version"
+            if (Test-Path $VersionFile) {
+                $HipVersion = Get-Content $VersionFile -First 1
             }
-        } catch {
-            Write-Status "CUDA Toolkit (nvcc)" $true "Found (version check failed)"
+            Write-Status "AMD HIP SDK" $true "v$HipVersion at $($script:HipSdkPath)"
+            
+            # Check for hipcc/clang++ (HIP SDK 6.4+ uses lib\llvm\bin)
+            $HipCompiler = Join-Path $script:HipSdkPath "lib\llvm\bin\clang++.exe"
+            if (-not (Test-Path $HipCompiler)) {
+                # Fallback to bin directory for older SDK versions
+                $HipCompiler = Join-Path $script:HipSdkPath "bin\clang++.exe"
+            }
+            if (-not (Test-Path $HipCompiler)) {
+                $HipCompiler = Join-Path $script:HipSdkPath "bin\hipcc.bat"
+            }
+            
+            if (Test-Path $HipCompiler) {
+                Write-Status "HIP Compiler" $true $HipCompiler
+            } else {
+                Write-Status "HIP Compiler" $false "" `
+                    "HIP compiler not found in SDK" `
+                    "Reinstall AMD HIP SDK"
+            }
+        } else {
+            Write-Status "AMD HIP SDK" $false "" `
+                "HIP SDK not found" `
+                "Download HIP SDK from: https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+        }
+        
+        # Check for PyTorch ROCm driver
+        $AmdDriver = Get-CimInstance -ClassName Win32_VideoController | Where-Object { $_.Name -match "AMD|Radeon" }
+        if ($AmdDriver) {
+            Write-Status "AMD GPU Driver" $true $AmdDriver.DriverVersion
+        } else {
+            Write-Warning-Status "AMD GPU" "No AMD GPU detected" `
+                "HIP requires an AMD GPU. Supported: RX 7900 XTX, RX 9070, PRO W7900, Ryzen AI"
         }
     } else {
-        Write-Status "CUDA Toolkit (nvcc)" $false "" `
-            "CUDA Toolkit not found or nvcc not in PATH" `
-            "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+        # Check for NVIDIA CUDA
+        if (Test-Command "nvcc") {
+            try {
+                $NvccOutput = nvcc --version 2>&1 | Select-String "release"
+                $CudaVersion = ($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1
+
+                if ($CudaVersion -match "12\.8") {
+                    Write-Status "CUDA Toolkit (nvcc)" $true "v$CudaVersion"
+                } else {
+                    Write-Status "CUDA Toolkit (nvcc)" $false "v$CudaVersion" `
+                        "CUDA 12.8 is required (found $CudaVersion)" `
+                        "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+                }
+            } catch {
+                Write-Status "CUDA Toolkit (nvcc)" $true "Found (version check failed)"
+            }
+        } else {
+            Write-Status "CUDA Toolkit (nvcc)" $false "" `
+                "CUDA Toolkit not found or nvcc not in PATH" `
+                "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+        }
     }
 
     # Check 5: Git
@@ -430,79 +559,138 @@ function Setup-LibTorch {
     Write-Host ""
 
     $ExternalDir = Join-Path $ProjectRoot "external"
-    $DebugDir = Join-Path $ExternalDir "debug"
-    $ReleaseDir = Join-Path $ExternalDir "release"
-    $DebugLibTorch = Join-Path $DebugDir "libtorch"
-    $ReleaseLibTorch = Join-Path $ReleaseDir "libtorch"
-
-    # Create directories
-    if (-not (Test-Path $ExternalDir)) {
-        New-Item -ItemType Directory -Path $ExternalDir | Out-Null
-        Write-Host "Created: external/" -ForegroundColor Gray
-    }
-    if (-not (Test-Path $DebugDir)) {
-        New-Item -ItemType Directory -Path $DebugDir | Out-Null
-        Write-Host "Created: external/debug/" -ForegroundColor Gray
-    }
-    if (-not (Test-Path $ReleaseDir)) {
-        New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
-        Write-Host "Created: external/release/" -ForegroundColor Gray
-    }
-
-    # Download Debug LibTorch if missing
-    if (-not (Test-Path $DebugLibTorch)) {
-        Write-Host ""
-        Write-Host "Downloading LibTorch (Debug)..." -ForegroundColor Yellow
-        Write-Host "This is a large download (~3.2 GB). Please wait..." -ForegroundColor Gray
-
-        $DebugZip = Join-Path $ProjectRoot "libtorch-debug.zip"
-        $DebugUrl = "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-debug-2.7.0%2Bcu128.zip"
-
-        try {
-            curl.exe -L -o "$DebugZip" "$DebugUrl" --progress-bar
-            if ($LASTEXITCODE -ne 0) { throw "Download failed" }
-
-            Write-Host "Extracting LibTorch (Debug)..." -ForegroundColor Yellow
-            tar -xf "$DebugZip" -C "$DebugDir"
-            if ($LASTEXITCODE -ne 0) { throw "Extraction failed" }
-
-            Remove-Item $DebugZip -Force
-            Write-Host "LibTorch (Debug) installed successfully!" -ForegroundColor Green
-        } catch {
-            Write-Host "ERROR: Failed to download/extract Debug LibTorch: $_" -ForegroundColor Red
-            if (Test-Path $DebugZip) { Remove-Item $DebugZip -Force }
-            exit 1
+    
+    if ($script:UseHip) {
+        # For HIP/ROCm, we need ROCm-enabled LibTorch
+        # Currently, Windows ROCm LibTorch is not available as pre-built binary
+        # Users need to use PyTorch ROCm Python environment
+        
+        $RocmLibTorch = Join-Path $ExternalDir "libtorch-rocm"
+        
+        if (-not (Test-Path $ExternalDir)) {
+            New-Item -ItemType Directory -Path $ExternalDir | Out-Null
+            Write-Host "Created: external/" -ForegroundColor Gray
         }
-    } else {
-        Write-Host "LibTorch (Debug) already exists. Skipping download." -ForegroundColor Green
-    }
-
-    # Download Release LibTorch if missing
-    if (-not (Test-Path $ReleaseLibTorch)) {
+        
         Write-Host ""
-        Write-Host "Downloading LibTorch (Release)..." -ForegroundColor Yellow
-        Write-Host "This is a large download (~3.2 GB). Please wait..." -ForegroundColor Gray
-
-        $ReleaseZip = Join-Path $ProjectRoot "libtorch-release.zip"
-        $ReleaseUrl = "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.7.0%2Bcu128.zip"
-
+        Write-Host "NOTE: Windows ROCm/HIP build requires special LibTorch setup." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Option 1: Use PyTorch ROCm environment" -ForegroundColor Cyan
+        Write-Host "  1. Install AMD Software: PyTorch on Windows driver" -ForegroundColor Gray
+        Write-Host "  2. Install PyTorch ROCm via pip:" -ForegroundColor Gray
+        Write-Host "     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2" -ForegroundColor White
+        Write-Host "  3. Set Torch_DIR to your Python site-packages torch path" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "Option 2: Build LibTorch from source with ROCm" -ForegroundColor Cyan
+        Write-Host "  See: https://github.com/pytorch/pytorch#from-source" -ForegroundColor Gray
+        Write-Host ""
+        
+        # Try to find PyTorch in Python environment
         try {
-            curl.exe -L -o "$ReleaseZip" "$ReleaseUrl" --progress-bar
-            if ($LASTEXITCODE -ne 0) { throw "Download failed" }
-
-            Write-Host "Extracting LibTorch (Release)..." -ForegroundColor Yellow
-            tar -xf "$ReleaseZip" -C "$ReleaseDir"
-            if ($LASTEXITCODE -ne 0) { throw "Extraction failed" }
-
-            Remove-Item $ReleaseZip -Force
-            Write-Host "LibTorch (Release) installed successfully!" -ForegroundColor Green
+            $TorchPath = python -c "import torch; print(torch.__path__[0])" 2>$null
+            if ($TorchPath -and (Test-Path $TorchPath)) {
+                $TorchCmakePath = Join-Path $TorchPath "share\cmake\Torch"
+                if (Test-Path $TorchCmakePath) {
+                    Write-Host "Found PyTorch at: $TorchPath" -ForegroundColor Green
+                    Write-Host "CMake config at: $TorchCmakePath" -ForegroundColor Green
+                    
+                    # Create symlink or copy
+                    if (-not (Test-Path $RocmLibTorch)) {
+                        New-Item -ItemType Directory -Path $RocmLibTorch -Force | Out-Null
+                    }
+                    
+                    # Create marker file with path
+                    "$TorchCmakePath" | Out-File -FilePath (Join-Path $RocmLibTorch "cmake_path.txt")
+                    
+                    Write-Host ""
+                    Write-Host "LibTorch ROCm setup complete!" -ForegroundColor Green
+                    return
+                }
+            }
         } catch {
-            Write-Host "ERROR: Failed to download/extract Release LibTorch: $_" -ForegroundColor Red
-            if (Test-Path $ReleaseZip) { Remove-Item $ReleaseZip -Force }
-            exit 1
+            # Python or torch not found
         }
+        
+        Write-Host "PyTorch ROCm not found in Python environment." -ForegroundColor Yellow
+        Write-Host "Please install PyTorch ROCm first, then run this script again." -ForegroundColor Yellow
+        Write-Host ""
+        
     } else {
-        Write-Host "LibTorch (Release) already exists. Skipping download." -ForegroundColor Green
+        # CUDA LibTorch setup (original code)
+        $DebugDir = Join-Path $ExternalDir "debug"
+        $ReleaseDir = Join-Path $ExternalDir "release"
+        $DebugLibTorch = Join-Path $DebugDir "libtorch"
+        $ReleaseLibTorch = Join-Path $ReleaseDir "libtorch"
+
+        # Create directories
+        if (-not (Test-Path $ExternalDir)) {
+            New-Item -ItemType Directory -Path $ExternalDir | Out-Null
+            Write-Host "Created: external/" -ForegroundColor Gray
+        }
+        if (-not (Test-Path $DebugDir)) {
+            New-Item -ItemType Directory -Path $DebugDir | Out-Null
+            Write-Host "Created: external/debug/" -ForegroundColor Gray
+        }
+        if (-not (Test-Path $ReleaseDir)) {
+            New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
+            Write-Host "Created: external/release/" -ForegroundColor Gray
+        }
+
+        # Download Debug LibTorch if missing
+        if (-not (Test-Path $DebugLibTorch)) {
+            Write-Host ""
+            Write-Host "Downloading LibTorch (Debug)..." -ForegroundColor Yellow
+            Write-Host "This is a large download (~3.2 GB). Please wait..." -ForegroundColor Gray
+
+            $DebugZip = Join-Path $ProjectRoot "libtorch-debug.zip"
+            $DebugUrl = "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-debug-2.7.0%2Bcu128.zip"
+
+            try {
+                curl.exe -L -o "$DebugZip" "$DebugUrl" --progress-bar
+                if ($LASTEXITCODE -ne 0) { throw "Download failed" }
+
+                Write-Host "Extracting LibTorch (Debug)..." -ForegroundColor Yellow
+                tar -xf "$DebugZip" -C "$DebugDir"
+                if ($LASTEXITCODE -ne 0) { throw "Extraction failed" }
+
+                Remove-Item $DebugZip -Force
+                Write-Host "LibTorch (Debug) installed successfully!" -ForegroundColor Green
+            } catch {
+                Write-Host "ERROR: Failed to download/extract Debug LibTorch: $_" -ForegroundColor Red
+                if (Test-Path $DebugZip) { Remove-Item $DebugZip -Force }
+                exit 1
+            }
+        } else {
+            Write-Host "LibTorch (Debug) already exists. Skipping download." -ForegroundColor Green
+        }
+
+        # Download Release LibTorch if missing
+        if (-not (Test-Path $ReleaseLibTorch)) {
+            Write-Host ""
+            Write-Host "Downloading LibTorch (Release)..." -ForegroundColor Yellow
+            Write-Host "This is a large download (~3.2 GB). Please wait..." -ForegroundColor Gray
+
+            $ReleaseZip = Join-Path $ProjectRoot "libtorch-release.zip"
+            $ReleaseUrl = "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.7.0%2Bcu128.zip"
+
+            try {
+                curl.exe -L -o "$ReleaseZip" "$ReleaseUrl" --progress-bar
+                if ($LASTEXITCODE -ne 0) { throw "Download failed" }
+
+                Write-Host "Extracting LibTorch (Release)..." -ForegroundColor Yellow
+                tar -xf "$ReleaseZip" -C "$ReleaseDir"
+                if ($LASTEXITCODE -ne 0) { throw "Extraction failed" }
+
+                Remove-Item $ReleaseZip -Force
+                Write-Host "LibTorch (Release) installed successfully!" -ForegroundColor Green
+            } catch {
+                Write-Host "ERROR: Failed to download/extract Release LibTorch: $_" -ForegroundColor Red
+                if (Test-Path $ReleaseZip) { Remove-Item $ReleaseZip -Force }
+                exit 1
+            }
+        } else {
+            Write-Host "LibTorch (Release) already exists. Skipping download." -ForegroundColor Green
+        }
     }
 
     Write-Host ""
@@ -566,21 +754,66 @@ function Build-LichtFeldStudio {
         Write-Host "Configuring CMake..." -ForegroundColor Yellow
         Write-Host "  Generator: $Generator" -ForegroundColor Gray
         Write-Host "  Configuration: $Configuration" -ForegroundColor Gray
+        Write-Host "  GPU Backend: $SelectedBackend" -ForegroundColor Gray
         Write-Host "  Toolchain: $VcpkgToolchain" -ForegroundColor Gray
         Write-Host ""
 
+        # Build CMake arguments
+        $CMakeArgs = @(
+            "-B", "build",
+            "-G", "$Generator",
+            "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
+        )
+
+        # Add configuration for Ninja
         if ($Generator -eq "Ninja") {
-            cmake -B build `
-                "-DCMAKE_BUILD_TYPE=$Configuration" `
-                -G "$Generator" `
-                "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
+            $CMakeArgs += "-DCMAKE_BUILD_TYPE=$Configuration"
         } else {
-            # VS generator doesn't use CMAKE_BUILD_TYPE at configure time
-            cmake -B build `
-                -G "$Generator" `
-                -A x64 `
-                "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
+            $CMakeArgs += "-A", "x64"
         }
+
+        # Add GPU backend options
+        if ($script:UseHip) {
+            $CMakeArgs += "-DUSE_HIP=ON"
+            $CMakeArgs += "-DUSE_CUDA=OFF"
+            
+            # Set HIP architectures for Windows-supported GPUs
+            # Windows PyTorch ROCm 7.1.1 supports: gfx1100 (RX 7900), gfx1200/gfx1201 (RDNA4)
+            $CMakeArgs += "-DHIP_ARCHITECTURES=gfx1100;gfx1200;gfx1201"
+            
+            if ($script:HipSdkPath) {
+                $CMakeArgs += "-DHIP_SDK_PATH=$($script:HipSdkPath)"
+                Write-Host "  HIP SDK: $($script:HipSdkPath)" -ForegroundColor Gray
+                
+                # Set clang++ as the C/C++ compiler for HIP on Windows
+                # HIP SDK 6.4+ places clang in lib\llvm\bin
+                $HipClang = Join-Path $script:HipSdkPath "lib\llvm\bin\clang++.exe"
+                $HipClangC = Join-Path $script:HipSdkPath "lib\llvm\bin\clang.exe"
+                
+                # Fallback to bin directory for older SDK versions
+                if (-not (Test-Path $HipClang)) {
+                    $HipClang = Join-Path $script:HipSdkPath "bin\clang++.exe"
+                }
+                if (-not (Test-Path $HipClangC)) {
+                    $HipClangC = Join-Path $script:HipSdkPath "bin\clang.exe"
+                }
+                
+                if (Test-Path $HipClang) {
+                    $CMakeArgs += "-DCMAKE_CXX_COMPILER=$HipClang"
+                    Write-Host "  CXX Compiler: $HipClang" -ForegroundColor Gray
+                }
+                if (Test-Path $HipClangC) {
+                    $CMakeArgs += "-DCMAKE_C_COMPILER=$HipClangC"
+                    Write-Host "  C Compiler: $HipClangC" -ForegroundColor Gray
+                }
+            }
+        } else {
+            $CMakeArgs += "-DUSE_HIP=OFF"
+            $CMakeArgs += "-DUSE_CUDA=ON"
+        }
+
+        # Run CMake configure
+        & cmake @CMakeArgs
 
         if ($LASTEXITCODE -ne 0) {
             Write-Host "ERROR: CMake configuration failed!" -ForegroundColor Red
@@ -637,6 +870,10 @@ Write-Host "================================================================" -F
 Write-Host ""
 Write-Host "Project: $ProjectRoot" -ForegroundColor Gray
 Write-Host "Configuration: $Configuration" -ForegroundColor Gray
+Write-Host "GPU Backend: $SelectedBackend" -ForegroundColor Gray
+if ($script:UseHip -and $script:HipSdkPath) {
+    Write-Host "HIP SDK: $($script:HipSdkPath)" -ForegroundColor Gray
+}
 Write-Host ""
 
 # Phase 1: Environment Verification

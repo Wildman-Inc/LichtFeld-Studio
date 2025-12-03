@@ -23,7 +23,7 @@ target_include_directories(gs_core
         ${CMAKE_BINARY_DIR}/include  # For generated config.h
         ${CMAKE_SOURCE_DIR}/gsplat    # For gsplat headers (Common.h)
         ${CMAKE_SOURCE_DIR}/fastgs    # For fastgs headers
-        ${CUDAToolkit_INCLUDE_DIRS}   # For CUDA interop in Camera
+        ${GPU_INCLUDE_DIRS}           # For GPU interop in Camera
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src       # For inter-module includes (training/, visualizer/, etc.)
         ${CMAKE_SOURCE_DIR}/external  # For tinyply and STB headers
@@ -62,7 +62,7 @@ target_link_libraries(gs_core
         nlohmann_json::nlohmann_json
         glm::glm
         Threads::Threads
-        CUDA::cudart    # For Camera CUDA operations
+        ${GPU_RUNTIME_LIBRARY}    # For Camera CUDA/HIP operations
         spdlog::spdlog
         ${WEBP_LIB}     # WebP for SOG compression
         ${ARCHIVE_LIB}  # LibArchive for SOG bundle support

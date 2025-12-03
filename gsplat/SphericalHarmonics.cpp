@@ -1,12 +1,11 @@
 #include <ATen/TensorUtils.h>
 #include <ATen/core/Tensor.h>
-#include <c10/cuda/CUDAGuard.h> // for DEVICE_GUARD
 #include <tuple>
 
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 
-#include "Common.h"             // where all the macros are defined
+#include "Common.h"             // where all the macros are defined (includes stream/guard headers)
 #include "Ops.h"                // a collection of all gsplat operators
 #include "SphericalHarmonics.h" // where the launch function is declared
 

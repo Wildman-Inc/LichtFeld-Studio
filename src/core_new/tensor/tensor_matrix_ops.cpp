@@ -3,8 +3,8 @@
 
 #include "internal/tensor_impl.hpp"
 #include "internal/tensor_ops.hpp"
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
+#include "kernels/hip_blas_compat.h"
+#include "kernels/hip_runtime_compat.h"
 
 #define CHECK_CUDA(call)                              \
     do {                                              \

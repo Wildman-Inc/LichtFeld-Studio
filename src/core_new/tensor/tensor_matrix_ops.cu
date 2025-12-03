@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "internal/tensor_ops.hpp"
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
+#include "kernels/hip_blas_compat.h"
+#include "kernels/hip_runtime_compat.h"
 
 namespace lfs::core::tensor_ops {
 

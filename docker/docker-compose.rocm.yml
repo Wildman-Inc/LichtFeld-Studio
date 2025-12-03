@@ -1,0 +1,68 @@
+# ROCm Docker Compose for LichtFeld-Studio
+# Usage: docker-compose -f docker-compose.rocm.yml up -d
+
+version: '3.8'
+
+services:
+  lichtfeld-studio-rocm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rocm
+      args:
+        ROCM_VERSION: "7.0"
+        USER_UID: ${UID:-1000}
+        USER_GID: ${GID:-1000}
+        USERNAME: ${USER:-developer}
+    image: lichtfeld-studio-rocm:latest
+    container_name: lichtfeld-studio-rocm
+    
+    # Required for AMD GPU access
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    
+    # Security options for GPU access
+    security_opt:
+      - seccomp:unconfined
+    
+    # Group access for render/video
+    group_add:
+      - video
+      - render
+    
+    # Environment variables
+    environment:
+      - DISPLAY=${DISPLAY}
+      - ROCM_PATH=/opt/rocm
+      - HIP_PATH=/opt/rocm
+      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}  # Set for specific GPU compatibility
+      - TERM=xterm-256color
+    
+    # Mount points
+    volumes:
+      - ..:/workspace:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${HOME}/.Xauthority:/home/${USER:-developer}/.Xauthority:ro
+    
+    # Working directory
+    working_dir: /workspace
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Network mode for X11
+    network_mode: host
+    
+    # Resource limits (optional)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 32G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "rocminfo"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

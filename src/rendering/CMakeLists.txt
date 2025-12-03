@@ -43,7 +43,7 @@ target_link_libraries(gs_rendering
         glad::glad
         glfw
         ${OPENGL_LIBRARIES}
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
         spdlog::spdlog
         Freetype::Freetype
 )

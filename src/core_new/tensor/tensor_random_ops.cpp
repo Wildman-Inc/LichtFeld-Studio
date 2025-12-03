@@ -4,8 +4,12 @@
 #include "internal/tensor_impl.hpp"
 #include "internal/tensor_ops.hpp"
 #include <atomic>
-#include <curand.h>
+#include "kernels/hip_rand_compat.h"
+#if LFS_USE_HIP
+#include <hiprand/hiprand_kernel.h>
+#else
 #include <curand_kernel.h>
+#endif
 #include <random>
 
 #define CHECK_CUDA(call)                              \

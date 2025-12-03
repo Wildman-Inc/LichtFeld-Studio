@@ -22,15 +22,27 @@ set(FASTGS_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/optimizer/src/adam.cu
 )
 
-# One unified library
-add_library(fastgs_backend STATIC ${FASTGS_SOURCES})
+# Create library based on GPU backend
+if(USE_HIP)
+    # Use lfs_hip_add_library from HIPUtils.cmake for Windows-compatible HIP support
+    set(HIP_HIPCC_FLAGS "${HIP_HIPCC_FLAGS} -std=c++20")
+    lfs_hip_add_library(fastgs_backend STATIC ${FASTGS_SOURCES})
+else()
+    add_library(fastgs_backend STATIC ${FASTGS_SOURCES})
+endif()
 
-set_target_properties(fastgs_backend PROPERTIES
-        CUDA_ARCHITECTURES "${gaussian_splatting_cuda_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION ON
-        POSITION_INDEPENDENT_CODE ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
+if(USE_CUDA)
+    set_target_properties(fastgs_backend PROPERTIES
+            CUDA_ARCHITECTURES "${gaussian_splatting_cuda_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION ON
+            POSITION_INDEPENDENT_CODE ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+elseif(USE_HIP)
+    set_target_properties(fastgs_backend PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
 target_include_directories(fastgs_backend
         PUBLIC
@@ -38,7 +50,7 @@ target_include_directories(fastgs_backend
         ${CMAKE_CURRENT_SOURCE_DIR}/optimizer/include
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
         ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         ${OPENGL_INCLUDE_DIRS}
         ${TORCH_INCLUDE_DIRS}
         PRIVATE
@@ -46,9 +58,9 @@ target_include_directories(fastgs_backend
 
 target_link_libraries(fastgs_backend
         PUBLIC
-        CUDA::cudart
-        CUDA::curand
-        CUDA::cublas
+        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
+        ${GPU_RAND_LIBRARY}      # CUDA::curand or hipRAND
+        ${GPU_BLAS_LIBRARY}      # CUDA::cublas or hipBLAS
         ${TORCH_LIBRARIES}
 )
 
@@ -61,11 +73,15 @@ target_compile_options(fastgs_backend PRIVATE
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo>
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --use_fast_math --expt-relaxed-constexpr --diag-suppress=20012,186,221>
 
+  # HIP compile options
+  $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Debug>:-O0 -g>>
+  $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Release>:-O3 -ffast-math>>
+
   # C++ MSVC
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:/Od /Z7>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:/O2 /DNDEBUG>
 
-  # C++ no-MSVC (GCC/Clang/AppleClang/IntelLLVM)
+  # C++ non-MSVC (GCC/Clang/AppleClang/IntelLLVM)
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -DNDEBUG>
 )

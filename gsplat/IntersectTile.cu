@@ -1,13 +1,25 @@
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
-#include <c10/cuda/CUDAStream.h>
+
+// Common.h includes stream/guard headers with HIP compatibility
+#include "Common.h"
+
+#if USE_HIP
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cooperative_groups.h>
+#endif
 
 // for CUB_WRAPPER
+#if USE_HIP
+#include <c10/hip/HIPCachingAllocator.h>
+#include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#else
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cub/cub.cuh>
+#endif
 
-#include "Common.h"
 #include "Intersect.h"
 #include "Utils.cuh"
 

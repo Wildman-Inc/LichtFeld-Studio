@@ -92,7 +92,7 @@ target_include_directories(lichtfeld_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_BINARY_DIR}/include
     ${CMAKE_SOURCE_DIR}/tests
-    ${CUDAToolkit_INCLUDE_DIRS}
+    ${GPU_INCLUDE_DIRS}
     ${OPENGL_INCLUDE_DIRS}
 )
 
@@ -130,11 +130,11 @@ target_link_libraries(lichtfeld_tests PRIVATE
     ${OPENGL_LIBRARIES}
     OpenImageIO::OpenImageIO
 
-    # CUDA libraries
-    CUDA::cudart
-    CUDA::cublas
-    CUDA::curand
-    CUDA::cupti      # Required by PyTorch profiling
+    # GPU runtime libraries (CUDA or HIP)
+    ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
+    ${GPU_BLAS_LIBRARY}      # CUDA::cublas or hipBLAS
+    ${GPU_RAND_LIBRARY}      # CUDA::curand or hipRAND
+    $<$<BOOL:${USE_CUDA}>:CUDA::cupti>  # Required by PyTorch profiling (CUDA only)
 
     # System libraries
     spdlog::spdlog

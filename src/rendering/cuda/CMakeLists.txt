@@ -2,21 +2,33 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# CUDA rasterization backend for rendering module
+# CUDA/HIP rasterization backend for rendering module
 set(CUDA_RASTERIZER_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/src/rasterization_api.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/src/forward.cu
 )
 
-# Create internal CUDA rasterization library
-add_library(rendering_cuda_backend STATIC ${CUDA_RASTERIZER_SOURCES})
+# Create library based on GPU backend
+if(USE_HIP)
+    # Use lfs_hip_add_library from HIPUtils.cmake for Windows-compatible HIP support
+    set(HIP_HIPCC_FLAGS "${HIP_HIPCC_FLAGS} -std=c++20")
+    lfs_hip_add_library(rendering_cuda_backend STATIC ${CUDA_RASTERIZER_SOURCES})
+else()
+    add_library(rendering_cuda_backend STATIC ${CUDA_RASTERIZER_SOURCES})
+endif()
 
-set_target_properties(rendering_cuda_backend PROPERTIES
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION ON
-        POSITION_INDEPENDENT_CODE ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
+if(USE_CUDA)
+    set_target_properties(rendering_cuda_backend PROPERTIES
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION ON
+            POSITION_INDEPENDENT_CODE ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+elseif(USE_HIP)
+    set_target_properties(rendering_cuda_backend PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
 target_include_directories(rendering_cuda_backend
         PUBLIC
@@ -24,15 +36,15 @@ target_include_directories(rendering_cuda_backend
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
         PRIVATE
         ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         ${TORCH_INCLUDE_DIRS}
 )
 
 target_link_libraries(rendering_cuda_backend
         PUBLIC
-        CUDA::cudart
-        CUDA::curand
-        CUDA::cublas
+        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
+        ${GPU_RAND_LIBRARY}      # CUDA::curand or hipRAND
+        ${GPU_BLAS_LIBRARY}      # CUDA::cublas or hipBLAS
         ${TORCH_LIBRARIES}
 )
 
@@ -44,6 +56,10 @@ target_compile_options(rendering_cuda_backend PRIVATE
         # CUDA device code for non-Windows
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --use_fast_math --expt-relaxed-constexpr --diag-suppress=20012,186,221>
+
+        # HIP compile options
+        $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Debug>:-O0 -g>>
+        $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Release>:-O3 -ffast-math>>
 
         # C++ MSVC
         $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:/Od /Z7>

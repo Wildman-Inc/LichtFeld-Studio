@@ -7,7 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <concepts>
-#include <cuda_runtime.h>
+#include "kernels/hip_runtime_compat.h"
 #include <functional>
 #include <initializer_list>
 #include <limits>

@@ -5,39 +5,59 @@
 # Build the tensor library first
 add_subdirectory(tensor)
 
-# Core CUDA kernels library (kmeans, morton encoding)
-add_library(lfs_core_kernels STATIC
+# Core CUDA/HIP kernels library (kmeans, morton encoding)
+set(LFS_CORE_KERNEL_SOURCES
     kernels/kmeans_new.cu
     kernels/morton_encoding_new.cu
 )
 
+# Build the kernel library based on GPU backend
+if(USE_HIP)
+    # Use lfs_hip_add_library from HIPUtils.cmake for Windows-compatible HIP support
+    # This works on both Linux and Windows HIP builds
+    set(HIP_HIPCC_FLAGS "${HIP_HIPCC_FLAGS} -std=c++20")
+    lfs_hip_add_library(lfs_core_kernels STATIC ${LFS_CORE_KERNEL_SOURCES})
+else()
+    add_library(lfs_core_kernels STATIC ${LFS_CORE_KERNEL_SOURCES})
+endif()
+
 target_include_directories(lfs_core_kernels
     PUBLIC
         ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         ${CMAKE_SOURCE_DIR}/src/core_new/tensor/internal  # For memory_pool.hpp and other internal headers
 )
 
 target_link_libraries(lfs_core_kernels
     PUBLIC
         lfs_tensor
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
 )
 
-set_target_properties(lfs_core_kernels PROPERTIES
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
-    CUDA_SEPARABLE_COMPILATION ON
-    POSITION_INDEPENDENT_CODE ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
+if(USE_CUDA)
+    set_target_properties(lfs_core_kernels PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+elseif(USE_HIP)
+    set_target_properties(lfs_core_kernels PROPERTIES
+        HIP_ARCHITECTURES "${HIP_ARCHITECTURES}"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
-# CUDA compiler options for lfs_core_kernels
+# CUDA/HIP compiler options for lfs_core_kernels
 target_compile_options(lfs_core_kernels PRIVATE
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --ptxas-options=-v -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:GNU>>:-O3 -use_fast_math --ptxas-options=-v>
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>,$<CXX_COMPILER_ID:GNU>>:-O0 -g -G -lineinfo>
+    # HIP compile options
+    $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Debug>:-O0 -g>>
+    $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Release>:-O3 -ffast-math>>
 )
 
 # Windows: Add compile definition to tell fmt that UTF-8 is enabled for CUDA files
@@ -67,7 +87,7 @@ target_include_directories(lfs_core
         ${CMAKE_BINARY_DIR}/include  # For generated config.h
         ${CMAKE_SOURCE_DIR}/gsplat    # For gsplat headers (Common.h)
         ${CMAKE_SOURCE_DIR}/fastgs    # For fastgs headers
-        ${CUDAToolkit_INCLUDE_DIRS}   # For CUDA interop in Camera
+        ${GPU_INCLUDE_DIRS}           # For GPU interop in Camera
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src       # For inter-module includes (training/, visualizer/, etc.)
         ${CMAKE_SOURCE_DIR}/external  # For tinyply and STB headers
@@ -101,12 +121,12 @@ endif()
 target_link_libraries(lfs_core
     PUBLIC
         lfs_tensor      # LFS Tensor library (includes lfs_tensor_kernels)
-        lfs_core_kernels # Core CUDA kernels (kmeans, morton encoding)
+        lfs_core_kernels # Core CUDA/HIP kernels (kmeans, morton encoding)
         TBB::tbb
         nlohmann_json::nlohmann_json
         glm::glm
         Threads::Threads
-        CUDA::cudart    # For Camera CUDA operations
+        ${GPU_RUNTIME_LIBRARY}    # For Camera CUDA/HIP operations
         spdlog::spdlog
         ${WEBP_LIB}     # WebP for SOG compression
         ${ARCHIVE_LIB}  # LibArchive for SOG bundle support
