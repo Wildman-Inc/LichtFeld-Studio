@@ -13,6 +13,16 @@ endif()
 
 cmake_minimum_required(VERSION 3.30)
 
+# Suppress CMake developer warnings
+set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS ON CACHE BOOL "" FORCE)
+
+# Default to Release build
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    message(STATUS "No build type specified, defaulting to Release")
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
 # ============================================================================
 # GPU Backend Selection
 # ============================================================================
@@ -30,6 +40,13 @@ if(NOT USE_CUDA AND NOT USE_HIP)
     set(USE_CUDA ON)
 endif()
 
+# Disable C++20 module scanning - clang-scan-deps causes file locking issues on Windows
+# This must be set before any targets are created
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
+# Add cmake module path for custom find modules
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 # Set up languages based on selected backend
 # Note: On Windows, CMake HIP language is not supported. We use CXX with hipcc as compiler.
 if(USE_HIP)
@@ -44,10 +61,10 @@ if(USE_HIP)
         else()
             set(_cxx_compiler_name "")
         endif()
-        
+
         if(NOT _cxx_compiler_name MATCHES "clang")
             # Check if HIP SDK clang is available
-            # HIP SDK 6.4+ places clang in lib/llvm/bin
+            # HIP SDK 7.10 places clang in lib/llvm/bin
             if(DEFINED ENV{HIP_PATH})
                 set(_hip_clang "$ENV{HIP_PATH}/lib/llvm/bin/clang++.exe")
                 if(NOT EXISTS "${_hip_clang}")
@@ -71,7 +88,7 @@ if(USE_HIP)
                     endif()
                 endif()
             endif()
-            
+
             if(EXISTS "${_hip_clang}")
                 message(STATUS "HIP clang++ found: ${_hip_clang}")
                 message(STATUS "")
@@ -85,7 +102,7 @@ if(USE_HIP)
                 message(WARNING "HIP SDK clang++ not found. Please install AMD HIP SDK.")
             endif()
         endif()
-        
+
         project(LichtFeld-Studio LANGUAGES CXX C)
         message(STATUS "Building with AMD ROCm/HIP backend (Windows - using clang++)")
     else()
@@ -98,50 +115,47 @@ else()
     message(STATUS "Building with NVIDIA CUDA backend")
 endif()
 
-# Disable C++20 module scanning - clang-scan-deps causes file locking issues on Windows
-# This must be set before any targets are created
-set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
-
-# Add cmake module path for custom find modules
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-
-# Get git commit hash (short and full)
+# Get git version info
 execute_process(
-        COMMAND git rev-parse --short HEAD
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        OUTPUT_VARIABLE GIT_COMMIT_HASH_SHORT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_HASH_SHORT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
 )
-
 execute_process(
-        COMMAND git describe --dirty
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        OUTPUT_VARIABLE GIT_TAGGED_VERSION
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
+    COMMAND git describe --dirty
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_TAGGED_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
 )
-
-# Fallback if not in a git repo
 if(NOT GIT_COMMIT_HASH_SHORT)
     set(GIT_COMMIT_HASH_SHORT "unknown")
 endif()
-
 if(NOT GIT_TAGGED_VERSION)
     set(GIT_TAGGED_VERSION "unknown")
 endif()
 
-message(STATUS "Git commit (short): ${GIT_COMMIT_HASH_SHORT}")
-message(STATUS "Git commit (full): ${GIT_TAGGED_VERSION}")
+# Generate git_version.h at configure time
+file(WRITE "${CMAKE_BINARY_DIR}/include/git_version.h"
+"#pragma once\n\
+#define GIT_COMMIT_HASH_SHORT \"${GIT_COMMIT_HASH_SHORT}\"\n\
+#define GIT_TAGGED_VERSION \"${GIT_TAGGED_VERSION}\"\n"
+)
 
 # Setup
 get_filename_component(PROJ_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}" ABSOLUTE)
 
 option(ENABLE_CUDA_GL_INTEROP "Enable CUDA-OpenGL interoperability" ON)
 option(BUILD_TESTS "Build tests" OFF)
+option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path test (no CUDA)" OFF)
+option(ENABLE_ALLOCATION_PROFILING "Enable tensor allocation profiling" OFF)
 
-# Build fat binaries for all modern SMs (>= minimum). When OFF (default), build for the native GPU only.
-option(BUILD_CUDA_ALL_SM "Build CUDA fat binaries targeting all modern SMs (>= minimum SM)" OFF)
+# Debug options
+option(ENABLE_TENSOR_VALIDATION "Enable runtime tensor NaN/Inf validation" OFF)
+option(ENABLE_CUDA_DEBUG_SYNC "Enable synchronous CUDA kernel checking (slow)" OFF)
+option(ENABLE_TENSOR_OP_TRACING "Enable tensor operation tracing" OFF)
 
 # Minimum SM (compute capability) to include when BUILD_CUDA_ALL_SM=ON.
 # Examples: 75, 80, 86, 89, 90, 100...
@@ -158,7 +172,15 @@ set(BUILD_CUDA_ALL_MIN_SM "86" CACHE STRING "Minimum SM (compute capability) use
 # gfx1030 - RX 6800/6900 (RDNA 2)
 # gfx1100 - RX 7900 (RDNA 3)
 # gfx1101 - RX 7600/7700 (RDNA 3)
-set(HIP_ARCHITECTURES "gfx90a;gfx940;gfx942;gfx1100;gfx1101" CACHE STRING "HIP GPU architectures to build for (ROCm)")
+# gfx1200 - RX 9070/9060 (RDNA 4)
+# gfx1201 - RX 9070/9060 (RDNA 4)
+if(NOT DEFINED HIP_ARCHITECTURES)
+    if(WIN32)
+        set(HIP_ARCHITECTURES "gfx1100;gfx1200;gfx1201" CACHE STRING "HIP GPU architectures to build for (ROCm 7.10+ on Windows)")
+    else()
+        set(HIP_ARCHITECTURES "gfx90a;gfx940;gfx942;gfx1100;gfx1101" CACHE STRING "HIP GPU architectures to build for (ROCm)")
+    endif()
+endif()
 
 # Set Torch_DIR based on platform and build type
 if (WIN32)
@@ -245,6 +267,48 @@ else()
     endif()
 endif()
 
+# Add -rdynamic for backtrace symbol resolution
+if(UNIX AND NOT APPLE)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
+endif()
+
+# PTX-only: smaller binary (~66MB vs ~750MB), JIT compiles at runtime
+option(BUILD_CUDA_PTX_ONLY "Build PTX-only (JIT at runtime, ~5-15s first startup)" OFF)
+
+# Portable: PTX-only + bundled libs, no tests
+option(BUILD_PORTABLE "Build portable distribution" OFF)
+if(BUILD_PORTABLE)
+    set(BUILD_CUDA_PTX_ONLY ON CACHE BOOL "" FORCE)
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    message(STATUS "Portable: PTX-only, tests disabled")
+endif()
+
+# Compiler cache (CUDA caching disabled on Windows due to nvcc compatibility issues)
+find_program(SCCACHE_PROGRAM sccache)
+find_program(CCACHE_PROGRAM ccache)
+if(SCCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+    if(WIN32)
+        message(STATUS "Compiler cache: sccache (C/C++ only, CUDA uncached)")
+    else()
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+        message(STATUS "Compiler cache: sccache")
+    endif()
+elseif(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    if(WIN32)
+        message(STATUS "Compiler cache: ccache (C/C++ only, CUDA uncached)")
+    else()
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        message(STATUS "Compiler cache: ccache")
+    endif()
+endif()
+
+# Minimum SM for PTX-only (75=Turing, 80=Ampere, 86=GA102, 89=Ada, 90=Hopper)
+set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -289,6 +353,7 @@ if(NVIDIA_SMI)
             OUTPUT_VARIABLE DETECTED_COMPUTE_CAP
             OUTPUT_STRIP_TRAILING_WHITESPACE
     )
+    string(REGEX REPLACE "\n.*" "" DETECTED_COMPUTE_CAP "${DETECTED_COMPUTE_CAP}")
 
     message(STATUS "Detected GPU compute capability: ${DETECTED_COMPUTE_CAP}")
     set(LichtFeld-Studio_CUDA_ARCH "native")
@@ -299,116 +364,39 @@ else()
 endif()
 
 
-# Detect supported SMs by querying 'ptxas --help' and filter by a minimum SM.
-# We cannot use all or all-major since 5x and 6x versions are not supported
-# in the CUDA code.
-function(gs_detect_supported_sms OUT_VAR)
-    set(options)
-    set(oneValueArgs MIN_SM)
-    cmake_parse_arguments(GS "${options}" "${oneValueArgs}" "" ${ARGN})
-
-    # Use 'ptxas --help' to get the valid families
-    set(_sms_list "")
-    get_filename_component(_cuda_bin "${CMAKE_CUDA_COMPILER}" DIRECTORY)
-    find_program(PTXAS_EXECUTABLE NAMES ptxas
-            HINTS "${_cuda_bin}" "${_cuda_bin}/.." "${CUDAToolkit_BIN_DIR}"
-            PATHS ENV PATH)
-
-    if(PTXAS_EXECUTABLE)
-        execute_process(COMMAND "${PTXAS_EXECUTABLE}" --help
-                OUTPUT_VARIABLE _ptxas_help
-                ERROR_VARIABLE  _ptxas_err
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_STRIP_TRAILING_WHITESPACE)
-        set(_help "${_ptxas_help}\n${_ptxas_err}")
-
-        string(REGEX MATCHALL "sm_[0-9]+" _matches "${_help}")
-        if(_matches)
-            string(REPLACE "sm_" "" _nums "${_matches}")
-            string(REPLACE " "  ";" _nums "${_nums}")
-            separate_arguments(_nums)
-            list(REMOVE_DUPLICATES _nums)
-            list(SORT _nums COMPARE NATURAL)
-            foreach(n IN LISTS _nums)
-                if(GS_MIN_SM)
-                    if(n GREATER_EQUAL ${GS_MIN_SM})
-                        list(APPEND _sms_list ${n})
-                    endif()
-                else()
-                    list(APPEND _sms_list ${n})
-                endif()
-            endforeach()
-        endif()
-    endif()
-
-    if(NOT _sms_list)
-        set(_sms_list 75 80 86 87 89 90 100 101 120)
-        if(GS_MIN_SM)
-            set(_filtered "")
-            foreach(n IN LISTS _sms_list)
-                if(n GREATER_EQUAL ${GS_MIN_SM})
-                    list(APPEND _filtered ${n})
-                endif()
-            endforeach()
-            set(_sms_list "${_filtered}")
-        endif()
-    endif()
-
-    set(${OUT_VAR} "${_sms_list}" PARENT_SCOPE)
-endfunction()
-
 if(DEFINED TORCH_CUDA_ARCH_LIST)
     unset(TORCH_CUDA_ARCH_LIST CACHE)
 endif()
 
-if(BUILD_CUDA_ALL_SM)
-    # Validate BUILD_CUDA_ALL_MIN_SM
-    if(NOT BUILD_CUDA_ALL_MIN_SM MATCHES "^[0-9]+$")
-        message(FATAL_ERROR "BUILD_CUDA_ALL_MIN_SM must be an integer like 70, 75, 86, 90.")
+if(BUILD_CUDA_PTX_ONLY)
+    # PTX-only: JIT compile at runtime, smaller binary
+    if(NOT BUILD_CUDA_MIN_SM MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "BUILD_CUDA_MIN_SM must be an integer (70, 75, 86, 90, ...)")
+    endif()
+    if(BUILD_CUDA_MIN_SM LESS 70)
+        message(FATAL_ERROR "BUILD_CUDA_MIN_SM must be >= 70")
     endif()
 
-    # Enforce lower bound 70
-    if(BUILD_CUDA_ALL_MIN_SM LESS 70)
-        message(FATAL_ERROR "BUILD_CUDA_ALL_MIN_SM must be >= 70 when BUILD_CUDA_ALL_SM=ON.")
-    endif()
+    set(LichtFeld-Studio_CUDA_ARCH "${BUILD_CUDA_MIN_SM}-virtual")
+    set(LFS_DEFER_DEVICE_SYMBOLS ON CACHE INTERNAL "Disable separable compilation for PTX-only")
 
-    # Fat binary for all the families
-    gs_detect_supported_sms(CUDA_SMS MIN_SM ${BUILD_CUDA_ALL_MIN_SM})
-    if(CUDA_SMS)
-        # Build Torch list with decimals and add +PTX only to the highest SM
-        list(SORT CUDA_SMS COMPARE NATURAL)
-        list(GET CUDA_SMS -1 _max_sm)
-        set(_torch_list "")
-        foreach(sm IN LISTS CUDA_SMS)
-            math(EXPR _maj "${sm}/10")
-            math(EXPR _min "${sm}%10")
-            set(_ver "${_maj}.${_min}")
-            if(sm EQUAL ${_max_sm})
-                list(APPEND _torch_list "${_ver}+PTX")
-            else()
-                list(APPEND _torch_list "${_ver}")
-            endif()
-        endforeach()
-        list(JOIN _torch_list ";" TORCH_CUDA_ARCH_LIST)
-        set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING "Torch CUDA arch list" FORCE)
+    math(EXPR _maj "${BUILD_CUDA_MIN_SM}/10")
+    math(EXPR _min "${BUILD_CUDA_MIN_SM}%10")
+    set(TORCH_CUDA_ARCH_LIST "${_maj}.${_min}+PTX" CACHE STRING "" FORCE)
 
-        # Per target CUDA architectures for CMake to be set after find_package(Torch)
-        set(LichtFeld-Studio_CUDA_ARCH "${CUDA_SMS};${_max_sm}-virtual")
-        message(STATUS "CUDA architectures (auto >=${BUILD_CUDA_ALL_MIN_SM}): ${LichtFeld-Studio_CUDA_ARCH}")
-        message(STATUS "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}")
-    else()
-        message(FATAL_ERROR "Failed to detect any CUDA architecture >= ${BUILD_CUDA_ALL_MIN_SM}. Please check your CUDA toolkit installation.")
-    endif()
+    message(STATUS "CUDA: PTX-only (SM >= ${BUILD_CUDA_MIN_SM}, JIT at runtime)")
 else()
-    # Native NVidia family only
-    message(STATUS "CUDA architectures: ${LichtFeld-Studio_CUDA_ARCH} (native)")
-    # Set Torch to the detected compute capability
-    set(TORCH_CUDA_ARCH_LIST "${DETECTED_COMPUTE_CAP}" CACHE STRING "Torch CUDA arch list" FORCE)
-    message(STATUS "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}")
+    # Native GPU only
+    set(TORCH_CUDA_ARCH_LIST "${DETECTED_COMPUTE_CAP}" CACHE STRING "" FORCE)
+    message(STATUS "CUDA: native (${LichtFeld-Studio_CUDA_ARCH})")
 endif()
 
 enable_language(CUDA)
 find_package(CUDAToolkit 12.8 REQUIRED)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr")
+if(WIN32)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --diag-suppress 221 -Xcompiler=/wd4267")
+endif()
 
 # Create nvToolsExt target BEFORE finding Torch (PyTorch expects this)
 if(NOT TARGET CUDA::nvToolsExt)
@@ -455,10 +443,10 @@ elseif(USE_HIP)
         if(DEFINED ENV{HIP_PATH})
             set(HIP_PATH "$ENV{HIP_PATH}")
         else()
-            # Default HIP SDK installation path on Windows
-            set(HIP_PATH "C:/Program Files/AMD/ROCm/6.2")
+            # Default HIP SDK installation path on Windows (ROCm 7.10)
+            set(HIP_PATH "C:/Program Files/AMD/ROCm/7.10")
             if(NOT EXISTS "${HIP_PATH}")
-                set(HIP_PATH "C:/Program Files/AMD/ROCm/6.1")
+                set(HIP_PATH "C:/Program Files/AMD/ROCm/7.1")
             endif()
             if(NOT EXISTS "${HIP_PATH}")
                 # Try to find via registry or common paths
@@ -504,9 +492,9 @@ elseif(USE_HIP)
             # Set HIP_FOUND manually (since we're not using find_package(HIP))
             set(HIP_FOUND TRUE)
             # HIP_VERSION needs to be in MAJOR.MINOR.PATCH format for AMD's scripts
-            set(HIP_VERSION "7.1.0" CACHE STRING "HIP Version" FORCE)
+            set(HIP_VERSION "7.10.0" CACHE STRING "HIP Version" FORCE)
             set(HIP_VERSION_MAJOR "7" CACHE STRING "" FORCE)
-            set(HIP_VERSION_MINOR "1" CACHE STRING "" FORCE)
+            set(HIP_VERSION_MINOR "10" CACHE STRING "" FORCE)
             set(HIP_VERSION_PATCH "0" CACHE STRING "" FORCE)
             
             message(STATUS "HIP SDK configured manually (avoiding AMD's FindHIP.cmake)")
@@ -650,47 +638,38 @@ endif()
 # Find packages
 find_package(Torch REQUIRED)
 
-# For Windows HIP builds with clang, we need to filter out MSVC-style flags from Torch
-# that are incompatible with clang (e.g., /permissive-, /EHsc, /bigobj, etc.)
+# For Windows HIP builds with clang, filter out MSVC-style flags from Torch
 if(USE_HIP AND WIN32)
-    # Use Python script as compiler launcher to filter MSVC flags
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(MSVC_FLAG_FILTER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/filter_msvc_flags.py")
-    
+    set(MSVC_FLAG_FILTER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/filter_msvc_flags.ps1")
+
     # Set compiler launcher to filter MSVC flags from PyTorch
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${Python3_EXECUTABLE}" "${MSVC_FLAG_FILTER_SCRIPT}")
-    set(CMAKE_C_COMPILER_LAUNCHER "${Python3_EXECUTABLE}" "${MSVC_FLAG_FILTER_SCRIPT}")
-    
+    set(CMAKE_CXX_COMPILER_LAUNCHER "pwsh" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "${MSVC_FLAG_FILTER_SCRIPT}")
+    set(CMAKE_C_COMPILER_LAUNCHER "pwsh" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "${MSVC_FLAG_FILTER_SCRIPT}")
+
     message(STATUS "Windows HIP build: Using MSVC flag filter: ${MSVC_FLAG_FILTER_SCRIPT}")
-    
+
     # For Windows HIP builds, set the ROCm path for clang to find device libraries
     # Use 8.3 short path format to avoid issues with spaces
     set(HIP_ROCM_PATH "C:/PROGRA~1/AMD/ROCm/7.10")
     set(HIP_DEVICE_LIB_PATH "${HIP_ROCM_PATH}/lib/llvm/amdgcn/bitcode")
-    
+
     # Set CMAKE_CXX_FLAGS to include ROCm paths
     # IMPORTANT: Add -fno-openmp to prevent clang's OpenMP wrappers from conflicting
     # with MSVC STL type_traits (causes vectorcall redefinition errors)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --rocm-path=${HIP_ROCM_PATH} --rocm-device-lib-path=${HIP_DEVICE_LIB_PATH} -fno-openmp")
-    
+
     # Add global compile options for HIP builds
     # Force include hip_runtime_compat.h to intercept cuda_runtime.h includes
     # and provide CUDA->HIP API mappings for all translation units
     # Note: hip_runtime_compat.h includes hip_warp_override.h to handle warp sync functions
     add_compile_options(
         "-Wno-unused-command-line-argument"
-        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels/hip_runtime_compat.h"
+        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/src/core/include/core/cuda/hip_runtime_compat.h"
     )
-    
+
     # Add cuda_shim directory as highest priority include path
     # This intercepts #include <cuda_runtime.h> etc. and redirects to HIP equivalents
     include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_shim")
-    
-    # Create a helper function to apply HIP settings to a target
-    function(lfs_filter_torch_options_for_cxx TARGET_NAME)
-        # This function is now mostly a placeholder since we use compiler launcher
-        # But can be used for additional per-target customization if needed
-    endfunction()
 endif()
 
 find_package(TBB REQUIRED)
@@ -724,6 +703,8 @@ find_package(Freetype REQUIRED)
 find_package(WebP REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(OpenImageIO REQUIRED)
+find_package(Boost REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # Set GPU_RUNTIME_LIBRARY after find_package(Torch) for HIP builds
 # PyTorch's LoadHIP.cmake creates the hip::device target
@@ -764,6 +745,13 @@ if(ENABLE_CUDA_GL_INTEROP)
             #include <windows.h>
             #endif
             #include <cuda_runtime.h>
+
+            // On ARM machines, you must include the gl headers before including cuda_gl_interop.h
+            // Please refer to /usr/local/cuda/include/cuda_gl_interop.h
+            #if defined(__arm__) || defined(__aarch64__)
+            #include <GL/gl.h>
+            #endif
+
             #include <cuda_gl_interop.h>
             int main() {
                 cudaGraphicsResource_t resource;
@@ -796,12 +784,13 @@ else()
     set(CUDA_GL_INTEROP_ENABLED 0)
 endif()
 
-# Create a configuration header
+# Create configuration header (static options)
 configure_file(
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/config.h.in"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/config.h.in"
         "${CMAKE_CURRENT_BINARY_DIR}/include/config.h"
         @ONLY
 )
+
 
 # Project-wide definitions
 add_definitions(-DPROJECT_ROOT_PATH="${PROJ_ROOT_DIR}")
@@ -823,113 +812,32 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
-# =============================================================================
-# Kernel libs
-# =============================================================================
-add_subdirectory(gsplat)
-add_subdirectory(src/training/fastgs)
-
-if(USE_CUDA)
-    set_target_properties(gsplat_backend PROPERTIES CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}")
-    set_target_properties(fastgs_backend PROPERTIES CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}")
-elseif(USE_HIP)
-    set_target_properties(gsplat_backend PROPERTIES HIP_ARCHITECTURES "${HIP_ARCHITECTURES}")
-    set_target_properties(fastgs_backend PROPERTIES HIP_ARCHITECTURES "${HIP_ARCHITECTURES}")
-endif()
-
-# =============================================================================
-# SHARED CUDA KERNELS (only if needed)
-# =============================================================================
-set(KERNEL_SOURCES)
-if(CUDA_GL_INTEROP_FOUND)
-    list(APPEND KERNEL_SOURCES kernels/cuda_gl_interop.cu)
-endif()
-
-# Add SOG-related kernels
-list(APPEND KERNEL_SOURCES
-        kernels/morton_encoding.cu
-        kernels/kmeans.cu
-)
-
-# Only create gaussian_kernels if there are kernels
-if(KERNEL_SOURCES)
-    if(USE_CUDA)
-        add_library(gs_kernels STATIC ${KERNEL_SOURCES})
-        set_target_properties(gs_kernels PROPERTIES
-                CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-                CUDA_SEPARABLE_COMPILATION ON
-                POSITION_INDEPENDENT_CODE ON
-                CUDA_RESOLVE_DEVICE_SYMBOLS ON
-        )
-    elseif(USE_HIP)
-        # For HIP, use lfs_hip_add_library from HIPUtils.cmake for Windows-compatible HIP support
-        set(HIP_HIPCC_FLAGS "${HIP_HIPCC_FLAGS} -std=c++20")
-        lfs_hip_add_library(gs_kernels STATIC ${KERNEL_SOURCES})
-        set_target_properties(gs_kernels PROPERTIES
-                POSITION_INDEPENDENT_CODE ON
-        )
-    endif()
-
-    target_include_directories(gs_kernels
-            PUBLIC
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_BINARY_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/kernels
-            ${GPU_INCLUDE_DIRS}
-            ${OPENGL_INCLUDE_DIRS}
-            PRIVATE
-    )
-
-    target_link_libraries(gs_kernels
-            PUBLIC
-            ${GPU_RUNTIME_LIBRARY}
-            ${GPU_RAND_LIBRARY}
-            ${GPU_BLAS_LIBRARY}
-            ${TORCH_LIBRARIES}
-            glm::glm
-            ${OPENGL_LIBRARIES}
-            spdlog::spdlog
-    )
-
-    if(USE_CUDA)
-        target_compile_options(gs_kernels PRIVATE
-                # CUDA device code + MSVC host compiler flags (Windows only)
-                $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo -Xcompiler=/Od -Xcompiler=/Z7>
-                $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --ptxas-options=-v -Xcompiler=/O2 -Xcompiler=/DNDEBUG>
-
-                # CUDA device code for non-Windows
-                $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo>
-                $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --ptxas-options=-v>
-        )
-    elseif(USE_HIP)
-        target_compile_options(gs_kernels PRIVATE
-                $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Debug>:-O0 -g>>
-                $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Release>:-O3 -ffast-math>>
-        )
-    endif()
-else()
-    # Create empty interface library if no kernels
-    add_library(gs_kernels INTERFACE)
-endif()
+# External dependencies (EXCLUDE_FROM_ALL to handle install ourselves)
+add_subdirectory(external EXCLUDE_FROM_ALL)
 
 # =============================================================================
 # LIBRARY MODULES
 # =============================================================================
-add_subdirectory(src/core_new)     # New core module (lfs::core namespace)
-add_subdirectory(src/training_new) # New training module (lfs::training namespace)
-add_subdirectory(src/loader_new)   # New loader module (lfs::loader namespace)
-add_subdirectory(src/core)         # Foundation module
-add_subdirectory(src/geometry)     # Geometry utilities
-add_subdirectory(src/project)      # Project management
-add_subdirectory(src/loader)       # Data loading
-add_subdirectory(src/training)     # Training functionality
-add_subdirectory(src/rendering)   # Rendering pipeline
-add_subdirectory(src/visualizer)  # GUI and visualization
+add_subdirectory(src/core)      # Core module (lfs::core namespace)
+add_subdirectory(src/training)  # Training module (lfs::training namespace)
+add_subdirectory(src/io)        # I/O module (lfs::io namespace)
+add_subdirectory(src/rendering) # Rendering module (lfs::rendering namespace)
+add_subdirectory(src/visualizer) # Visualizer module (lfs::vis namespace)
+add_subdirectory(src/geometry)  # Geometry utilities
 
 # =============================================================================
-# MAIN EXECUTABLE
+# MAIN EXECUTABLES
 # =============================================================================
-add_executable(${PROJECT_NAME} src/main.cpp resources/lichtfeld-studio.rc)
+
+# -----------------------------------------------------------------------------
+# LichtFeld-Studio
+# -----------------------------------------------------------------------------
+add_executable(${PROJECT_NAME}
+    src/app/main.cpp
+    src/app/application.cpp
+    src/app/splash_screen.cpp
+    resources/lichtfeld-studio.rc
+)
 
 if(USE_CUDA)
     set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -947,6 +855,9 @@ target_include_directories(${PROJECT_NAME}
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_BINARY_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/include  # For app headers
+        ${CMAKE_CURRENT_SOURCE_DIR}/src              # For training/, visualizer/, etc.
+        ${CMAKE_CURRENT_SOURCE_DIR}/external         # For external headers
 
         ${GPU_INCLUDE_DIRS}
         ${OPENGL_INCLUDE_DIRS}
@@ -954,40 +865,188 @@ target_include_directories(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME}
         PRIVATE
-        gs_core
-        gs_geometry
-        gs_project
-        gs_loader
-        gs_training
-        gs_rendering
-        gs_visualizer
-        gs_kernels
-        gsplat_backend
-        fastgs_backend
+        # Application layer dependencies (needed by application.cpp)
+        lfs_visualizer     # For Visualizer class
+        lfs_training       # For training setup
+        lfs_geometry       # For EuclideanTransform
+        lfs_core           # Core library
+        lfs_io             # For CacheLoader
+        fastlfs_backend    # Rasterizer and optimizer
 
         ${OPENGL_LIBRARIES}
         ${GPU_RUNTIME_LIBRARY}
         spdlog::spdlog
         taywee::args
         OpenImageIO::OpenImageIO
+        glad::glad         # For splash screen
+        glfw               # For splash screen
 )
 
+# Copy nvImageCodec shared libraries next to executable for easy deployment
+if(TARGET nvimgcodec)
+    # Force build of nvimgcodec even with EXCLUDE_FROM_ALL
+    add_dependencies(${PROJECT_NAME} nvimgcodec)
+
+    # Add post-build command to copy libraries and create symlinks (Unix only)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:nvimgcodec>"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMENT "Copying nvImageCodec library"
+    )
+
+    # Create symlinks only on Unix-like systems (not Windows)
+    if(UNIX)
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                "$<TARGET_FILE_NAME:nvimgcodec>"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>/libnvimgcodec.so.0"
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                "libnvimgcodec.so.0"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>/libnvimgcodec.so"
+            COMMENT "Creating nvImageCodec symlinks"
+        )
+    endif()
+
+    message(STATUS "Post-build: nvImageCodec libraries will be copied to executable directory")
+endif()
+
+# Before extension post-build copying: remove stale 'extensions' file if present (prevent mkdir failure)
+set(_target_extensions_dir "${CMAKE_BINARY_DIR}/extensions")
+if(EXISTS "${_target_extensions_dir}" AND NOT IS_DIRECTORY "${_target_extensions_dir}")
+    file(REMOVE "${_target_extensions_dir}")
+    message(STATUS "Removed stale file '${_target_extensions_dir}' to make way for extensions/ directory")
+endif()
+
+# =============================================================================
+# EXTENSIONS COPYING - Copy nvImageCodec extensions to build/extensions
+# =============================================================================
+if(TARGET nvjpeg_ext)
+    # Force build of nvjpeg_ext even with EXCLUDE_FROM_ALL
+    add_dependencies(${PROJECT_NAME} nvjpeg_ext)
+
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${PROJECT_NAME}>/extensions"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:nvjpeg_ext>"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/extensions/"
+        COMMENT "Copying nvjpeg extension binary only"
+    )
+endif()
+
+if(TARGET nvjpeg2k_ext)
+    # Force build of nvjpeg2k_ext even with EXCLUDE_FROM_ALL
+    add_dependencies(${PROJECT_NAME} nvjpeg2k_ext)
+
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${PROJECT_NAME}>/extensions"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:nvjpeg2k_ext>"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/extensions/"
+        COMMENT "Copying nvjpeg2k extension binary only"
+    )
+endif()
+
+# =============================================================================
+# RESOURCE COPYING - Copy all resources to build/resources for runtime access
+# =============================================================================
+set(RESOURCE_DIR "$<TARGET_FILE_DIR:${PROJECT_NAME}>/resources")
+
+# Create resource directory structure
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESOURCE_DIR}/shaders"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESOURCE_DIR}/assets/icon"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESOURCE_DIR}/assets/icon/scene"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESOURCE_DIR}/assets/fonts"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESOURCE_DIR}/assets/themes"
+    COMMENT "Creating resource directory structure"
+)
+
+# Copy rendering shaders
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/src/rendering/resources/shaders"
+        "${RESOURCE_DIR}/shaders"
+    COMMENT "Copying rendering shaders"
+)
+
+# Copy visualizer icons
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/icon"
+        "${RESOURCE_DIR}/assets/icon"
+    COMMENT "Copying visualizer icons"
+)
+
+# Copy fonts (from visualizer)
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/fonts"
+        "${RESOURCE_DIR}/assets/fonts"
+    COMMENT "Copying visualizer fonts"
+)
+
+# Copy fonts (from rendering - JetBrainsMono for viewport gizmo)
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/rendering/resources/assets/JetBrainsMono-Regular.ttf"
+        "${RESOURCE_DIR}/assets/fonts/"
+    COMMENT "Copying rendering fonts"
+)
+
+# Copy themes
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/themes"
+        "${RESOURCE_DIR}/assets/themes"
+    COMMENT "Copying themes"
+)
+
+# Copy additional assets (logo, splash images, etc.)
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-icon.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-logo.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-logo-dark.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-loading.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-loading-dark.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/core11-logo.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/core11-logo-dark.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMENT "Copying application assets"
+)
+
+# Copy locale files
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/locales"
+        "${RESOURCE_DIR}/locales"
+    COMMENT "Copying locale files"
+)
+
+message(STATUS "Post-build: Resources will be copied to \${BUILD_DIR}/resources/")
+
 # Platform-specific settings
-if(WIN32)
-    file(GLOB TORCH_DLLS "${Torch_DIR}/../../../lib/*.dll")
-    foreach(TORCH_DLL ${TORCH_DLLS})
-        add_custom_command(
-                TARGET ${PROJECT_NAME}
-                POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TORCH_DLL}"
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>")
-    endforeach()
-elseif(UNIX)
+if(UNIX)
     target_link_libraries(${PROJECT_NAME} PRIVATE GL GLU)
 
-    find_path(TORCH_LIB_DIR libtorch_cpu.so
-            PATHS "${Torch_DIR}/../../../lib"
-            NO_DEFAULT_PATH)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+            INSTALL_RPATH "$ORIGIN:$ORIGIN/lib:${CUDAToolkit_LIBRARY_DIR}"
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH_USE_LINK_PATH TRUE
+    )
 
     if(TORCH_LIB_DIR)
         if(USE_CUDA)
@@ -1004,9 +1063,12 @@ elseif(UNIX)
             )
         endif()
         message(STATUS "Torch library directory: ${TORCH_LIB_DIR}")
-    else()
-        message(WARNING "Could not find Torch library directory")
     endif()
+elseif(WIN32)
+    # On Windows, DLLs in the same directory as the .exe are automatically found
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
 endif()
 
 # Build type configuration function
@@ -1016,32 +1078,61 @@ function(configure_build_type target)
     if(target_type STREQUAL "INTERFACE_LIBRARY")
         if(CMAKE_BUILD_TYPE STREQUAL "Debug")
             target_compile_definitions(${target} INTERFACE DEBUG_BUILD)
-        elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+        elseif(CMAKE_BUILD_TYPE STREQUAL "Release|RelWithDebInfo|MinSizeRel")
             target_compile_definitions(${target} INTERFACE RELEASE_BUILD)
+        endif()
+        # Debug options for interface libraries
+        if(ENABLE_TENSOR_VALIDATION)
+            target_compile_definitions(${target} INTERFACE TENSOR_VALIDATION_ENABLED)
+        endif()
+        if(ENABLE_CUDA_DEBUG_SYNC)
+            target_compile_definitions(${target} INTERFACE CUDA_DEBUG_SYNC)
+        endif()
+        if(ENABLE_TENSOR_OP_TRACING)
+            target_compile_definitions(${target} INTERFACE TENSOR_OP_TRACING)
         endif()
     else()
         if(CMAKE_BUILD_TYPE STREQUAL "Debug")
             target_compile_definitions(${target} PRIVATE DEBUG_BUILD)
-        elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+        elseif(CMAKE_BUILD_TYPE STREQUAL "Release|RelWithDebInfo|MinSizeRel")
             target_compile_definitions(${target} PRIVATE RELEASE_BUILD)
+        endif()
+        # Debug options for regular libraries
+        if(ENABLE_TENSOR_VALIDATION)
+            target_compile_definitions(${target} PRIVATE TENSOR_VALIDATION_ENABLED)
+        endif()
+        if(ENABLE_CUDA_DEBUG_SYNC)
+            target_compile_definitions(${target} PRIVATE CUDA_DEBUG_SYNC)
+        endif()
+        if(ENABLE_TENSOR_OP_TRACING)
+            target_compile_definitions(${target} PRIVATE TENSOR_OP_TRACING)
         endif()
     endif()
 endfunction()
 
 # Apply build configuration to all targets
-configure_build_type(gs_core)
-configure_build_type(gs_kernels)
-configure_build_type(gsplat_backend)
-configure_build_type(fastgs_backend)
+configure_build_type(fastlfs_backend)
+configure_build_type(lfs_core)
+configure_build_type(lfs_core_cuda)
+configure_build_type(lfs_tensor)
+configure_build_type(lfs_training)
+configure_build_type(lfs_rendering)
+configure_build_type(lfs_visualizer)
+configure_build_type(lfs_io)
+configure_build_type(lfs_geometry)
 configure_build_type(${PROJECT_NAME})
 
 # =============================================================================
 # TESTING (Optional)
 # =============================================================================
-if(BUILD_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY)
     enable_testing()
     add_subdirectory(tests)
-    message(STATUS "Tests enabled. Build with 'ninja lichtfeld_tests' and run with 'ninja run_tests' or 'ctest'")
+    if(BUILD_UNICODE_TEST_ONLY)
+        message(STATUS "Unicode path test enabled. Build with 'ninja unicode_path_test' and run with 'ctest -R UnicodePathTest'")
+    else()
+        message(STATUS "Tests enabled. Build with 'ninja lichtfeld_tests' and run with 'ninja run_tests' or 'ctest'")
+    endif()
 endif()
 
 # =============================================================================
@@ -1074,11 +1165,170 @@ elseif(USE_HIP)
 endif()
 message(STATUS "  OpenImageIO Found: ${OpenImageIO_FOUND}")
 message(STATUS "  Tests: ${BUILD_TESTS}")
+message(STATUS "  Unicode Test Only: ${BUILD_UNICODE_TEST_ONLY}")
+message(STATUS "  Portable Build: ${BUILD_PORTABLE}")
+if(BUILD_PORTABLE)
+    message(STATUS "  -> PTX-only: ON (SM >= ${BUILD_CUDA_MIN_SM}, JIT at runtime)")
+    message(STATUS "  -> Use: cmake --install build --prefix ./dist")
+endif()
 message(STATUS "===========================================")
 
-# Enable ccache if available
-find_program(CCACHE_PROGRAM ccache)
+# =============================================================================
+# INSTALLATION (cmake --install build --prefix ./dist)
+# =============================================================================
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "" FORCE)
+endif()
+
+set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
+set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
+
+include(GNUInstallDirs)
+include(InstallRequiredSystemLibraries)
+
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
+
+set(INSTALL_RESOURCE_DIR "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio")
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/rendering/resources/shaders" DESTINATION "${INSTALL_RESOURCE_DIR}")
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/icon" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/fonts" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/rendering/resources/assets/JetBrainsMono-Regular.ttf" DESTINATION "${INSTALL_RESOURCE_DIR}/assets/fonts")
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/themes" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-icon.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-logo.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-logo-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-loading.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-loading-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/core11-logo.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/core11-logo-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+
+if(TARGET nvimgcodec)
+    install(TARGETS nvimgcodec LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    if(TARGET nvjpeg_ext)
+        install(TARGETS nvjpeg_ext LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/extensions")
+    endif()
+    if(TARGET nvjpeg2k_ext)
+        install(TARGETS nvjpeg2k_ext LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/extensions")
+    endif()
+endif()
+
+# Portable build: bundle runtime dependencies via GET_RUNTIME_DEPENDENCIES
+if(BUILD_PORTABLE)
+    # Exclusion patterns for system libraries
+    # nvcuda.dll is provided by the NVIDIA GPU driver, not the CUDA Toolkit
+    set(_PRE_EXCLUDE [[api-ms-.*]] [[ext-ms-.*]] [[API-MS-.*]] [[EXT-MS-.*]] [[nvcuda[.]dll]])
+    set(_POST_EXCLUDE
+            [[.*[Ss]ystem32.*]] [[.*[Ww]indows.*]]
+            [[/lib/x86_64-linux-gnu/.*]] [[/lib64/ld-linux.*]] [[/usr/lib.*]]
+            [[.*ld-linux.*]] [[.*libc[.]so[.].*]] [[.*libpthread.*]]
+            [[.*libdl[.]so.*]] [[.*libm[.]so[.].*]] [[.*librt[.]so.*]]
+            [[.*libstdc[+][+].*]] [[.*libgcc_s.*]]
+            [[.*libnvimgcodec.*]] [[.*libnvjpeg_ext.*]])
+
+    # Search directories for runtime dependencies (quoted for paths with spaces on Windows)
+    set(_SEARCH_DIRS_STR "\"${CMAKE_BINARY_DIR}\" \"${CMAKE_BINARY_DIR}/external/nvImageCodec\" \"${CUDAToolkit_BIN_DIR}\" \"${CUDAToolkit_LIBRARY_DIR}\"")
+
+    # Helper: bundle runtime dependencies for a target
+    function(bundle_runtime_deps TARGET_FILE IS_LIBRARY)
+        if(IS_LIBRARY)
+            set(_type "LIBRARIES")
+        else()
+            set(_type "EXECUTABLES")
+        endif()
+        install(CODE "
+            set(_lib \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\")
+            file(GET_RUNTIME_DEPENDENCIES
+                ${_type} \"${TARGET_FILE}\"
+                RESOLVED_DEPENDENCIES_VAR _deps
+                DIRECTORIES ${_SEARCH_DIRS_STR}
+                PRE_EXCLUDE_REGEXES ${_PRE_EXCLUDE}
+                POST_EXCLUDE_REGEXES ${_POST_EXCLUDE})
+            foreach(_d IN LISTS _deps)
+                file(INSTALL \"\${_d}\" DESTINATION \"\${_lib}\" FOLLOW_SYMLINK_CHAIN)
+            endforeach()
+        " COMPONENT runtime)
+    endfunction()
+
+    bundle_runtime_deps("$<TARGET_FILE:${PROJECT_NAME}>" FALSE)
+    if(TARGET nvjpeg_ext)
+        bundle_runtime_deps("$<TARGET_FILE:nvjpeg_ext>" TRUE)
+    endif()
+
+    if(UNIX AND NOT APPLE)
+        configure_file(
+                "${CMAKE_SOURCE_DIR}/cmake/templates/run_lichtfeld.sh.in"
+                "${CMAKE_BINARY_DIR}/run_lichtfeld.sh"
+                @ONLY)
+        install(PROGRAMS "${CMAKE_BINARY_DIR}/run_lichtfeld.sh" DESTINATION ${CMAKE_INSTALL_BINDIR})
+    elseif(WIN32)
+        # Copy DLLs to bin/ for Windows search path
+        install(CODE "
+            # Copy all DLLs from lib/ to bin/
+            file(GLOB _dlls \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/*.dll\")
+            foreach(_d IN LISTS _dlls)
+                file(INSTALL \"\${_d}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
+            endforeach()
+            # Copy extensions/ from build to dist/extensions/
+            # Handle both single-config (Ninja) and multi-config (VS) generators
+            foreach(_cfg IN ITEMS \"\" \"Release\" \"Debug\" \"RelWithDebInfo\" \"MinSizeRel\")
+                if(_cfg)
+                    set(_ext_dir \"${CMAKE_BINARY_DIR}/\${_cfg}/extensions\")
+                else()
+                    set(_ext_dir \"${CMAKE_BINARY_DIR}/extensions\")
+                endif()
+                if(EXISTS \"\${_ext_dir}\")
+                    # Install only DLLs from the build extensions directory to avoid non-binary files
+                    file(GLOB _ext_dlls \"\${_ext_dir}/*.dll\")
+                    if(_ext_dlls)
+                        foreach(_e IN LISTS _ext_dlls)
+                            file(INSTALL \"\${_e}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/extensions\")
+                        endforeach()
+                    endif()
+                    break()
+                endif()
+            endforeach()
+            # Copy vcpkg DLLs
+            if(EXISTS \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin\")
+                file(GLOB _vcpkg \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll\")
+                foreach(_v IN LISTS _vcpkg)
+                    file(INSTALL \"\${_v}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
+                endforeach()
+            endif()
+        " COMPONENT runtime)
+    endif()
+endif()
+
+# Build statistics (parses .ninja_log, no Python required)
+if(CMAKE_GENERATOR MATCHES "Ninja")
+    # Manual target: ninja build_stats
+    add_custom_target(build_stats
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/cmake/BuildStats.cmake
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "Build time statistics by module"
+    )
+
+    # Auto-show after build: cmake -DSHOW_BUILD_STATS=ON ..
+    option(SHOW_BUILD_STATS "Show build stats after every build" OFF)
+    if(SHOW_BUILD_STATS)
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/cmake/BuildStats.cmake
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        )
+    endif()
+endif()
+
+# Clean build target: ninja clean_all (clears build + compiler cache)
 if(CCACHE_PROGRAM)
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
-    message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
+    add_custom_target(clean_all
+        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean
+        COMMAND ${CCACHE_PROGRAM} --clear
+        COMMENT "Cleaning build and compiler cache (ccache)"
+    )
+elseif(SCCACHE_PROGRAM)
+    add_custom_target(clean_all
+        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean
+        COMMAND ${SCCACHE_PROGRAM} --zero-stats
+        COMMENT "Cleaning build and resetting sccache stats"
+    )
 endif()
