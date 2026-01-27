@@ -7,7 +7,7 @@
 #include "gl_state_guard.hpp"
 #include "shader_paths.hpp"
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     RenderBoundingBox::RenderBoundingBox() : color_(1.0f, 1.0f, 0.0f), // Yellow by default
                                              line_width_(2.0f),
@@ -30,7 +30,9 @@ namespace gs::rendering {
         createCubeGeometry();
 
         if (isInitialized()) {
-            setupVertexData();
+            if (auto result = setupVertexData(); !result) {
+                LOG_ERROR("Failed to setup vertex data for render bounding box: {}", result.error());
+            }
         }
     }
 
@@ -171,18 +173,29 @@ namespace gs::rendering {
         // Use GLLineGuard for line width management
         GLLineGuard line_guard(line_width_);
 
-        // Bind shader and setup uniforms
         ShaderScope s(shader_);
 
-        auto box2World = world2BBox_.inv().toMat4();
-        // Set uniforms
-        glm::mat4 mvp = projection * view * box2World;
+        const glm::mat4 box2world = use_mat4_transform_ ? box2world_mat4_ : world2BBox_.inv().toMat4();
+        const glm::mat4 mvp = projection * view * box2world;
+
+        const glm::mat4 inv_view = glm::inverse(view);
+        const glm::vec3 camera_pos = glm::vec3(inv_view[3]);
+        const glm::vec3 local_center = (min_bounds_ + max_bounds_) * 0.5f;
+        const glm::vec3 world_center = glm::vec3(box2world * glm::vec4(local_center, 1.0f));
+        const glm::vec3 view_dir = glm::normalize(world_center - camera_pos);
+
+        const glm::mat4 world2box = use_mat4_transform_ ? glm::inverse(box2world_mat4_) : world2BBox_.toMat4();
+        const glm::vec3 local_view_dir = glm::mat3(world2box) * view_dir;
 
         LOG_TRACE("Rendering bounding box with color ({}, {}, {})", color_.r, color_.g, color_.b);
 
         if (auto result = s->set("u_mvp", mvp); !result)
             return result;
         if (auto result = s->set("u_color", color_); !result)
+            return result;
+        if (auto result = s->set("u_box_center", local_center); !result)
+            return result;
+        if (auto result = s->set("u_view_dir", local_view_dir); !result)
             return result;
 
         // Bind VAO and draw
@@ -211,4 +224,4 @@ namespace gs::rendering {
         // Vertical edges
         0, 4, 1, 5, 2, 6, 3, 7};
 
-} // namespace gs::rendering
+} // namespace lfs::rendering

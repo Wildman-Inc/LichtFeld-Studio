@@ -9,7 +9,7 @@
 #include <format>
 #include <string>
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     // Error types for rendering operations
     enum class RenderError {
@@ -69,4 +69,4 @@ namespace gs::rendering {
         return std::unexpected(RenderErrorInfo{code, std::string(details)});
     }
 
-} // namespace gs::rendering
+} // namespace lfs::rendering

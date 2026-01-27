@@ -1,7 +1,7 @@
 #!/bin/bash
 
 SCENE_DIR="data"
-RESULT_DIR="results/benchmark"
+RESULT_DIR="results/benchmark_mcmc"
 SCENE_LIST="garden bicycle stump bonsai counter kitchen room" # treehill flowers
 
 # Check if results directory exists and prompt for deletion
@@ -61,16 +61,15 @@ format_with_commas() {
 
 # Print formatted results table
 echo
-echo "=============================================================================="
+echo "========================================================================"
 echo "QUALITY METRICS SUMMARY"
-echo "=============================================================================="
-printf "%-10s %-10s %-10s %-10s %-10s %-15s\n" "scene" "iteration" "psnr" "ssim" "lpips" "num_gaussians"
-echo "------------------------------------------------------------------------------"
+echo "========================================================================"
+printf "%-10s %-10s %-10s %-10s %-15s\n" "scene" "iteration" "psnr" "ssim" "num_gaussians"
+echo "------------------------------------------------------------------------"
 
 # Collect and format results for each scene
 total_psnr=0
 total_ssim=0
-total_lpips=0
 total_gaussians=0
 valid_scenes=0
 
@@ -80,31 +79,28 @@ do
     if [ -f "$csv_file" ]; then
         # Get the last line of metrics (final iteration)
         final_metrics=$(tail -n 1 "$csv_file")
-        
-        # Parse CSV values
-        IFS=',' read -r iteration psnr ssim lpips time_per_image num_gaussians <<< "$final_metrics"
-        
+
+        # Parse CSV values (format: iteration,psnr,ssim,time_per_image,num_gaussians)
+        IFS=',' read -r iteration psnr ssim time_per_image num_gaussians <<< "$final_metrics"
+
         # Format the numbers
         psnr_fmt=$(format_number $psnr 4)
         ssim_fmt=$(format_number $ssim 6)
-        lpips_fmt=$(format_number $lpips 6)
         gaussians_fmt=$(format_with_commas $num_gaussians)
-        
+
         # Print formatted row
-        printf "%-10s %-10s %-10s %-10s %-10s %-15s\n" \
+        printf "%-10s %-10s %-10s %-10s %-15s\n" \
             "$SCENE" \
             "$iteration" \
             "$psnr_fmt" \
             "$ssim_fmt" \
-            "$lpips_fmt" \
             "$gaussians_fmt"
-        
-        echo "------------------------------------------------------------------------------"
-        
+
+        echo "------------------------------------------------------------------------"
+
         # Accumulate for mean calculation
         total_psnr=$(echo "$total_psnr + $psnr" | bc -l)
         total_ssim=$(echo "$total_ssim + $ssim" | bc -l)
-        total_lpips=$(echo "$total_lpips + $lpips" | bc -l)
         total_gaussians=$((total_gaussians + num_gaussians))
         valid_scenes=$((valid_scenes + 1))
     fi
@@ -114,25 +110,22 @@ done
 if [ $valid_scenes -gt 0 ]; then
     mean_psnr=$(echo "$total_psnr / $valid_scenes" | bc -l)
     mean_ssim=$(echo "$total_ssim / $valid_scenes" | bc -l)
-    mean_lpips=$(echo "$total_lpips / $valid_scenes" | bc -l)
     mean_gaussians=$((total_gaussians / valid_scenes))
-    
+
     mean_psnr_fmt=$(format_number $mean_psnr 4)
     mean_ssim_fmt=$(format_number $mean_ssim 6)
-    mean_lpips_fmt=$(format_number $mean_lpips 6)
     mean_gaussians_fmt=$(format_with_commas $mean_gaussians)
-    
-    echo "=============================================================================="
-    printf "%-10s %-10s %-10s %-10s %-10s %-15s\n" \
+
+    echo "========================================================================"
+    printf "%-10s %-10s %-10s %-10s %-15s\n" \
         "mean" \
         "30000" \
         "$mean_psnr_fmt" \
         "$mean_ssim_fmt" \
-        "$mean_lpips_fmt" \
         "$mean_gaussians_fmt"
 fi
 
-echo "=============================================================================="
+echo "========================================================================"
 
 
 # Add two blank lines at the end

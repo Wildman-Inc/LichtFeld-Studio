@@ -1,3 +1,8 @@
+/*
+ * Legacy file kept for merge compatibility.
+ * Implementation moved to src/rendering/rasterizer/gsplat_fwd/SphericalHarmonics.cpp
+ */
+#if 0
 #include <ATen/TensorUtils.h>
 #include <ATen/core/Tensor.h>
 #include <tuple>
@@ -74,3 +79,4 @@ namespace gsplat {
     }
 
 } // namespace gsplat
+#endif

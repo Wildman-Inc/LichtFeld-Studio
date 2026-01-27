@@ -2,7 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 #include <gtest/gtest.h>
 #include <iostream>
 #include <torch/torch.h>
@@ -158,10 +158,10 @@ TEST_F(BugVerificationTest, Bug2_Clone_Independence) {
     std::cout << std::endl;
 
     // Check if they share memory
-    std::cout << "Original raw_ptr: " << original.raw_ptr() << std::endl;
-    std::cout << "Clone raw_ptr:    " << cloned.raw_ptr() << std::endl;
+    std::cout << "Original raw_ptr: " << original.data_ptr() << std::endl;
+    std::cout << "Clone raw_ptr:    " << cloned.data_ptr() << std::endl;
 
-    if (original.raw_ptr() == cloned.raw_ptr()) {
+    if (original.data_ptr() == cloned.data_ptr()) {
         std::cout << "✗ ERROR: Clone shares same memory pointer!" << std::endl;
     }
 

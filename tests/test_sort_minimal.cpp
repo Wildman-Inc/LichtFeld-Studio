@@ -2,7 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <iostream>
@@ -251,9 +251,9 @@ TEST_F(MinimalSortDebugTest, Step7_CheckIndicesValidity) {
     std::cout << "Device: " << lfs::core::device_name(idx_cpu.device()) << std::endl;
     std::cout << "Valid: " << idx_cpu.is_valid() << std::endl;
     std::cout << "Numel: " << idx_cpu.numel() << std::endl;
-    std::cout << "Raw ptr: " << idx_cpu.raw_ptr() << std::endl;
+    std::cout << "Raw ptr: " << idx_cpu.data_ptr() << std::endl;
 
-    if (idx_cpu.raw_ptr() == nullptr) {
+    if (idx_cpu.data_ptr() == nullptr) {
         std::cout << "✗ ERROR: Raw pointer is null!" << std::endl;
         FAIL();
     }

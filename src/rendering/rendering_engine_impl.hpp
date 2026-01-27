@@ -7,53 +7,17 @@
 #include "axes_renderer.hpp"
 #include "bbox_renderer.hpp"
 #include "camera_frustum_renderer.hpp"
+#include "ellipsoid_renderer.hpp"
 #include "grid_renderer.hpp"
+#include "pivot_renderer.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering_pipeline.hpp"
 #include "screen_renderer.hpp"
 #include "shader_manager.hpp"
 #include "split_view_renderer.hpp"
-#include "translation_gizmo.hpp"
 #include "viewport_gizmo.hpp"
 
-namespace gs::rendering {
-
-    // Adapter to bridge public interface with internal implementation
-    class GizmoInteractionAdapter : public GizmoInteraction {
-        TranslationGizmo* gizmo_;
-
-    public:
-        explicit GizmoInteractionAdapter(TranslationGizmo* gizmo) : gizmo_(gizmo) {}
-
-        GizmoElement pick(const glm::vec2& mouse_pos, const glm::mat4& view,
-                          const glm::mat4& projection, const glm::vec3& position) override {
-            auto elem = gizmo_->pick(mouse_pos, view, projection, position);
-            return static_cast<GizmoElement>(elem);
-        }
-
-        glm::vec3 startDrag(GizmoElement element, const glm::vec2& mouse_pos,
-                            const glm::mat4& view, const glm::mat4& projection,
-                            const glm::vec3& position) override {
-            return gizmo_->startDrag(static_cast<TranslationGizmo::Element>(element),
-                                     mouse_pos, view, projection, position);
-        }
-
-        glm::vec3 updateDrag(const glm::vec2& mouse_pos, const glm::mat4& view,
-                             const glm::mat4& projection) override {
-            return gizmo_->updateDrag(mouse_pos, view, projection);
-        }
-
-        void endDrag() override { gizmo_->endDrag(); }
-        bool isDragging() const override { return gizmo_->isDragging(); }
-
-        void setHovered(GizmoElement element) override {
-            gizmo_->setHoveredElement(static_cast<TranslationGizmo::Element>(element));
-        }
-
-        GizmoElement getHovered() const override {
-            return static_cast<GizmoElement>(gizmo_->getHoveredElement());
-        }
-    };
+namespace lfs::rendering {
 
     class RenderingEngineImpl : public RenderingEngine {
     public:
@@ -65,7 +29,11 @@ namespace gs::rendering {
         bool isInitialized() const override;
 
         Result<RenderResult> renderGaussians(
-            const SplatData& splat_data,
+            const lfs::core::SplatData& splat_data,
+            const RenderRequest& request) override;
+
+        Result<RenderResult> renderPointCloud(
+            const lfs::core::PointCloud& point_cloud,
             const RenderRequest& request) override;
 
         Result<RenderResult> renderSplitView(
@@ -87,52 +55,76 @@ namespace gs::rendering {
             const glm::vec3& color,
             float line_width) override;
 
+        Result<void> renderEllipsoid(
+            const Ellipsoid& ellipsoid,
+            const ViewportData& viewport,
+            const glm::vec3& color,
+            float line_width) override;
+
         Result<void> renderCoordinateAxes(
             const ViewportData& viewport,
             float size,
-            const std::array<bool, 3>& visible) override;
+            const std::array<bool, 3>& visible,
+            bool equirectangular = false) override;
+
+        Result<void> renderPivot(
+            const ViewportData& viewport,
+            const glm::vec3& pivot_position,
+            float size = 50.0f,
+            float opacity = 1.0f) override;
 
         Result<void> renderViewportGizmo(
             const glm::mat3& camera_rotation,
             const glm::vec2& viewport_pos,
             const glm::vec2& viewport_size) override;
 
+        int hitTestViewportGizmo(
+            const glm::vec2& click_pos,
+            const glm::vec2& viewport_pos,
+            const glm::vec2& viewport_size) const override;
+
+        void setViewportGizmoHover(int axis) override;
+
         Result<void> renderTranslationGizmo(
             const glm::vec3& position,
             const ViewportData& viewport,
             float scale) override;
 
+        std::shared_ptr<GizmoInteraction> getGizmoInteraction() override;
+
         Result<void> renderCameraFrustums(
-            const std::vector<std::shared_ptr<const Camera>>& cameras,
+            const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
             const ViewportData& viewport,
             float scale,
             const glm::vec3& train_color,
             const glm::vec3& eval_color,
-            const glm::mat4& world_transform) override;
+            const glm::mat4& scene_transform = glm::mat4(1.0f),
+            bool equirectangular_view = false) override;
 
         Result<void> renderCameraFrustumsWithHighlight(
-            const std::vector<std::shared_ptr<const Camera>>& cameras,
+            const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
             const ViewportData& viewport,
             float scale,
             const glm::vec3& train_color,
             const glm::vec3& eval_color,
             int highlight_index,
-            const glm::mat4& world_transform) override;
+            const glm::mat4& scene_transform = glm::mat4(1.0f),
+            bool equirectangular_view = false) override;
 
         Result<int> pickCameraFrustum(
-            const std::vector<std::shared_ptr<const Camera>>& cameras,
+            const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
             const glm::vec2& mouse_pos,
             const glm::vec2& viewport_pos,
             const glm::vec2& viewport_size,
             const ViewportData& viewport,
             float scale,
-            const glm::mat4& world_transform) override;
+            const glm::mat4& scene_transform = glm::mat4(1.0f)) override;
 
-        std::shared_ptr<GizmoInteraction> getGizmoInteraction() override;
+        void clearFrustumCache() override;
 
         // Pipeline compatibility
         RenderingPipelineResult renderWithPipeline(
-            const SplatData& model,
+            const lfs::core::SplatData& model,
             const RenderingPipelineRequest& request) override;
 
         // Factory methods
@@ -154,16 +146,14 @@ namespace gs::rendering {
         // Overlay renderers
         RenderInfiniteGrid grid_renderer_;
         RenderBoundingBox bbox_renderer_;
+        EllipsoidRenderer ellipsoid_renderer_;
         RenderCoordinateAxes axes_renderer_;
         ViewportGizmo viewport_gizmo_;
-        TranslationGizmo translation_gizmo_;
         CameraFrustumRenderer camera_frustum_renderer_;
-
-        // Gizmo interaction adapter
-        std::shared_ptr<GizmoInteractionAdapter> gizmo_interaction_;
+        RenderPivotPoint pivot_renderer_;
 
         // Shaders
         ManagedShader quad_shader_;
     };
 
-} // namespace gs::rendering
+} // namespace lfs::rendering

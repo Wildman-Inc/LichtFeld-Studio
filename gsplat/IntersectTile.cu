@@ -1,43 +1,8 @@
-#include <ATen/Dispatch.h>
-#include <ATen/core/Tensor.h>
-
-// Common.h includes stream/guard headers with HIP compatibility
-#include "Common.h"
-
-#if USE_HIP
-#include <hip/hip_cooperative_groups.h>
-#else
-#include <cooperative_groups.h>
-#endif
-
-// for CUB_WRAPPER
-#if USE_HIP
-#include <c10/hip/HIPCachingAllocator.h>
-#include <hipcub/hipcub.hpp>
-namespace cub = hipcub;
-#else
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <cub/cub.cuh>
-#endif
-
-#include "Intersect.h"
-#include "Utils.cuh"
-
-namespace gsplat {
-
-    namespace cg = cooperative_groups;
-
-    // Evaluate spherical harmonics bases at unit direction for high orders using
-    // approach described by Efficient Spherical Harmonic Evaluation, Peter-Pike
-    // Sloan, JCGT 2013 See https://jcgt.org/published/0002/02/06/ for reference
-    // implementation
-
-    template <typename scalar_t>
-    __global__ void intersect_tile_kernel(
-        // if the data is [C, N, ...] or [nnz, ...] (packed)
-        const bool packed,
-        // parallelize over C * N, only used if packed is False
-        const uint32_t C,
+/*
+ * Legacy file kept for merge compatibility.
+ * Implementation moved to src/rendering/rasterizer/gsplat_fwd/IntersectTile.cu
+ */
+#if 0
         const uint32_t N,
         // parallelize over nnz, only used if packed is True
         const uint32_t nnz,
@@ -354,3 +319,4 @@ namespace gsplat {
     }
 
 } // namespace gsplat
+#endif

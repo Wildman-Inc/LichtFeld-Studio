@@ -4,45 +4,41 @@
 
 #pragma once
 
-#include "istrategy.hpp"
-#include "optimizers/scheduler.hpp"
+#include "core/parameters.hpp"
+#include "core/splat_data.hpp"
+#include "optimizer/adam_optimizer.hpp"
+#include "optimizer/scheduler.hpp"
+#include <functional>
 #include <memory>
-#include <torch/torch.h>
+#include <vector>
 
-namespace gs::training {
-    void initialize_gaussians(gs::SplatData& splat_data);
+namespace lfs::training {
 
-    std::unique_ptr<torch::optim::Optimizer> create_optimizer(
-        gs::SplatData& splat_data,
-        const gs::param::OptimizationParameters& params);
+    // Initialize Gaussians (move to GPU, pre-allocate capacity, etc.)
+    void initialize_gaussians(lfs::core::SplatData& splat_data, int max_cap = 0);
 
+    // Create optimizer for splat data
+    std::unique_ptr<AdamOptimizer> create_optimizer(
+        lfs::core::SplatData& splat_data,
+        const lfs::core::param::OptimizationParameters& params);
+
+    // Create exponential LR scheduler
     std::unique_ptr<ExponentialLR> create_scheduler(
-        const gs::param::OptimizationParameters& params,
-        torch::optim::Optimizer* optimizer,
-        int param_group_index = -1);
+        const lfs::core::param::OptimizationParameters& params,
+        AdamOptimizer& optimizer);
 
-    // Unified scheduler creation with optional warmup
-    std::unique_ptr<WarmupExponentialLR> create_warmup_scheduler(
-        const gs::param::OptimizationParameters& params,
-        torch::optim::Optimizer* optimizer,
-        int param_group_index = -1,
-        int warmup_steps = 0,
-        float warmup_start_factor = 1.0f);
+    // Function types for parameter and optimizer state updates
+    using ParamUpdateFn = std::function<lfs::core::Tensor(const int, const lfs::core::Tensor&)>;
+    using OptimizerUpdateFn = std::function<void(
+        AdamParamState& state,
+        const lfs::core::Tensor& new_param)>;
 
-    // Helper to compute decay gamma
-    inline double compute_lr_decay_gamma(float final_lr_fraction, size_t iterations) {
-        return std::pow(final_lr_fraction, 1.0 / iterations);
-    }
-
-    // Use explicit type alias to help MSVC
-    using ParamUpdateFn = std::function<torch::Tensor(const int, const torch::Tensor)>;
-    using OptimizerUpdateFn = std::function<std::unique_ptr<torch::optim::OptimizerParamState>(
-        torch::optim::OptimizerParamState&, const torch::Tensor)>;
-
+    // Update parameter with optimizer state synchronization
     void update_param_with_optimizer(
         const ParamUpdateFn& param_fn,
         const OptimizerUpdateFn& optimizer_fn,
-        std::unique_ptr<torch::optim::Optimizer>& optimizer,
-        gs::SplatData& splat_data,
+        std::unique_ptr<AdamOptimizer>& optimizer,
+        lfs::core::SplatData& splat_data,
         std::vector<size_t> param_idxs = {0, 1, 2, 3, 4, 5});
-} // namespace gs::training
+
+} // namespace lfs::training

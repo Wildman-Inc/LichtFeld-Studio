@@ -1,7 +1,7 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <random>
@@ -276,7 +276,7 @@ TEST_F(TensorBasicTest, Clone) {
     compare_tensors(original_custom, original_torch, 1e-6f, 1e-7f, "Clone_Original");
 
     // Check different memory
-    EXPECT_NE(original_custom.raw_ptr(), cloned_custom.raw_ptr());
+    EXPECT_NE(original_custom.data_ptr(), cloned_custom.data_ptr());
     EXPECT_NE(original_torch.data_ptr(), cloned_torch.data_ptr());
 
     EXPECT_TRUE(cloned_custom.owns_memory());
@@ -333,7 +333,7 @@ TEST_F(TensorBasicTest, CopyFrom) {
     compare_tensors(tensor1_custom, tensor1_torch, 1e-6f, 1e-7f, "CopyFrom_Source");
 
     // But different memory
-    EXPECT_NE(tensor1_custom.raw_ptr(), tensor2_custom.raw_ptr());
+    EXPECT_NE(tensor1_custom.data_ptr(), tensor2_custom.data_ptr());
     EXPECT_NE(tensor1_torch.data_ptr(), tensor2_torch.data_ptr());
 }
 
@@ -410,27 +410,27 @@ TEST_F(TensorBasicTest, NormalFillOperation) {
 
 TEST_F(TensorBasicTest, MoveConstructor) {
     auto tensor1 = Tensor::ones({2, 2}, Device::CUDA);
-    void* original_ptr = tensor1.raw_ptr();
+    void* original_ptr = tensor1.data_ptr();
 
     Tensor tensor2(std::move(tensor1));
 
-    EXPECT_EQ(tensor2.raw_ptr(), original_ptr);
-    EXPECT_EQ(tensor1.raw_ptr(), nullptr); // tensor1 should be cleared
+    EXPECT_EQ(tensor2.data_ptr(), original_ptr);
+    EXPECT_EQ(tensor1.data_ptr(), nullptr); // tensor1 should be cleared
     EXPECT_TRUE(tensor2.is_valid());
     EXPECT_FALSE(tensor1.is_valid());
 }
 
 TEST_F(TensorBasicTest, MoveAssignment) {
     auto tensor1 = Tensor::ones({2, 2}, Device::CUDA);
-    void* original_ptr = tensor1.raw_ptr();
+    void* original_ptr = tensor1.data_ptr();
 
     auto tensor2 = Tensor::zeros({2, 2}, Device::CUDA);
-    void* tensor2_original = tensor2.raw_ptr();
+    void* tensor2_original = tensor2.data_ptr();
 
     tensor2 = std::move(tensor1);
 
-    EXPECT_EQ(tensor2.raw_ptr(), original_ptr);
-    EXPECT_EQ(tensor1.raw_ptr(), nullptr);
+    EXPECT_EQ(tensor2.data_ptr(), original_ptr);
+    EXPECT_EQ(tensor1.data_ptr(), nullptr);
     EXPECT_TRUE(tensor2.is_valid());
     EXPECT_FALSE(tensor1.is_valid());
 }

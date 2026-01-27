@@ -7,22 +7,17 @@
 #include "../dataset.hpp"
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
+#include "core/tensor.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <torch/script.h>
 #include <vector>
 
-class splatData;
-
-namespace gs::training {
-    // SSIM window creation
-    torch::Tensor gaussian(const int window_size, const float sigma);
-
-    torch::Tensor create_window(const int window_size, const int channel);
+namespace lfs::training {
 
     // Peak Signal-to-Noise Ratio
     class PSNR {
@@ -30,47 +25,27 @@ namespace gs::training {
         explicit PSNR(const float data_range = 1.0f) : data_range_(data_range) {
         }
 
-        float compute(const torch::Tensor& pred, const torch::Tensor& target) const;
+        float compute(const lfs::core::Tensor& pred, const lfs::core::Tensor& target) const;
 
     private:
         const float data_range_;
     };
 
-    // Structural Similarity Index
+    // Structural Similarity Index (using LibTorch-free kernels)
     class SSIM {
     public:
-        SSIM(const int window_size = 11, const int channel = 3);
+        SSIM(bool apply_valid_padding = true);
 
-        float compute(const torch::Tensor& pred, const torch::Tensor& target);
-
-    private:
-        const int window_size_;
-        const int channel_;
-        torch::Tensor window_;
-        static constexpr float C1 = 0.01f * 0.01f;
-        static constexpr float C2 = 0.03f * 0.03f;
-    };
-
-    class LPIPS {
-    public:
-        explicit LPIPS(const std::string& model_path = "");
-
-        float compute(const torch::Tensor& pred, const torch::Tensor& target);
-
-        bool is_loaded() const { return model_loaded_; }
+        float compute(const lfs::core::Tensor& pred, const lfs::core::Tensor& target);
 
     private:
-        torch::jit::script::Module model_;
-        bool model_loaded_ = false;
-
-        void load_model(const std::string& model_path);
+        bool apply_valid_padding_;
     };
 
-    // Evaluation result structure
+    // Evaluation result structure (no LPIPS)
     struct EvalMetrics {
         float psnr;
         float ssim;
-        float lpips;
         float elapsed_time;
         int num_gaussians;
         int iteration;
@@ -80,14 +55,13 @@ namespace gs::training {
             ss << std::fixed << std::setprecision(4);
             ss << "PSNR: " << psnr
                << ", SSIM: " << ssim
-               << ", LPIPS: " << lpips
                << ", Time: " << elapsed_time << "s/image"
                << ", #GS: " << num_gaussians;
             return ss.str();
         }
 
         static std::string to_csv_header() {
-            return "iteration,psnr,ssim,lpips,time_per_image,num_gaussians";
+            return "iteration,psnr,ssim,time_per_image,num_gaussians";
         }
 
         [[nodiscard]] std::string to_csv_row() const {
@@ -96,7 +70,6 @@ namespace gs::training {
                << std::fixed << std::setprecision(6)
                << psnr << ","
                << ssim << ","
-               << lpips << ","
                << elapsed_time << ","
                << num_gaussians;
             return ss.str();
@@ -122,7 +95,7 @@ namespace gs::training {
     // Main evaluator class that handles all metrics computation and visualization
     class MetricsEvaluator {
     public:
-        explicit MetricsEvaluator(const param::TrainingParameters& params);
+        explicit MetricsEvaluator(const lfs::core::param::TrainingParameters& params);
 
         // Check if evaluation is enabled
         bool is_enabled() const { return _params.optimization.enable_eval; }
@@ -132,9 +105,9 @@ namespace gs::training {
 
         // Main evaluation method
         EvalMetrics evaluate(const int iteration,
-                             const SplatData& splatData,
+                             const lfs::core::SplatData& splatData,
                              std::shared_ptr<CameraDataset> val_dataset,
-                             torch::Tensor& background);
+                             lfs::core::Tensor& background);
 
         // Save final report
         void save_report() const {
@@ -150,22 +123,17 @@ namespace gs::training {
 
     private:
         // Configuration
-        const param::TrainingParameters _params;
+        const lfs::core::param::TrainingParameters _params;
 
         // Metrics
         std::unique_ptr<PSNR> _psnr_metric;
         std::unique_ptr<SSIM> _ssim_metric;
-        std::unique_ptr<LPIPS> _lpips_metric;
         std::unique_ptr<MetricsReporter> _reporter;
 
         // Helper functions
-        torch::Tensor apply_depth_colormap(const torch::Tensor& depth_normalized) const;
-
-        bool has_rgb() const;
-
-        bool has_depth() const;
+        lfs::core::Tensor apply_depth_colormap(const lfs::core::Tensor& depth_normalized) const;
 
         // Create dataloader from dataset
         auto make_dataloader(std::shared_ptr<CameraDataset> dataset, const int workers = 1) const;
     };
-} // namespace gs::training
+} // namespace lfs::training

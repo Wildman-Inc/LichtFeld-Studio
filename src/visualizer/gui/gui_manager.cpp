@@ -2,135 +2,301 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+// glad must be included before OpenGL headers
+// clang-format off
+#include <glad/glad.h>
+// clang-format on
+
 #include "gui/gui_manager.hpp"
+#include "command/command_history.hpp"
+#include "core/cuda_version.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
+#include "core/sogs.hpp"
+#include "core/splat_data_export.hpp"
+#include "gui/dpi_scale.hpp"
+#include "gui/html_viewer_export.hpp"
+#include "gui/localization_manager.hpp"
 #include "gui/panels/main_panel.hpp"
 #include "gui/panels/scene_panel.hpp"
 #include "gui/panels/tools_panel.hpp"
 #include "gui/panels/training_panel.hpp"
+#include "gui/string_keys.hpp"
 #include "gui/ui_widgets.hpp"
-#include "gui/utils/file_dialogs.hpp"
+#include "gui/utils/windows_utils.hpp"
 #include "gui/windows/file_browser.hpp"
-#include "gui/windows/project_changed_dialog_box.hpp"
+#include "io/exporter.hpp"
+#include "io/loader.hpp"
 
+#include "input/input_controller.hpp"
 #include "internal/resource_paths.hpp"
-#include "visualizer_impl.hpp"
+#include "tools/align_tool.hpp"
 
+#include "core/data_loading_service.hpp"
+#include "core/events.hpp"
+#include "core/parameters.hpp"
+#include "core/services.hpp"
+#include "rendering/rendering.hpp"
+#include "rendering/rendering_manager.hpp"
+#include "scene/scene.hpp"
+#include "scene/scene_manager.hpp"
+#include "theme/theme.hpp"
+#include "tools/brush_tool.hpp"
+#include "tools/selection_tool.hpp"
+#include "training/training_state.hpp"
+#include "visualizer_impl.hpp"
+#include <cuda_runtime.h>
+
+#include "git_version.h"
 #include <GLFW/glfw3.h>
+#include <algorithm>
+#include <cfloat>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <format>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_internal.h>
+#include <unordered_set>
+#include <ImGuizmo.h>
 
-namespace gs::gui {
+namespace lfs::vis::gui {
 
-    GuiManager::GuiManager(visualizer::VisualizerImpl* viewer)
+    // Import commonly used types
+    using ToolType = lfs::vis::ToolType;
+    using ExportFormat = lfs::core::ExportFormat;
+
+    constexpr float GIZMO_AXIS_LIMIT = 0.0001f;
+    constexpr float MIN_GIZMO_SCALE = 0.001f;
+
+    namespace {
+        inline glm::mat3 extractRotation(const glm::mat4& m) {
+            return glm::mat3(glm::normalize(glm::vec3(m[0])), glm::normalize(glm::vec3(m[1])),
+                             glm::normalize(glm::vec3(m[2])));
+        }
+
+        inline glm::vec3 extractScale(const glm::mat4& m) {
+            return glm::vec3(glm::length(glm::vec3(m[0])), glm::length(glm::vec3(m[1])),
+                             glm::length(glm::vec3(m[2])));
+        }
+    } // namespace
+
+    // Returns display name for dataset type
+    [[nodiscard]] const char* getDatasetTypeName(const std::filesystem::path& path) {
+        switch (lfs::io::Loader::getDatasetType(path)) {
+        case lfs::io::DatasetType::COLMAP: return "COLMAP";
+        case lfs::io::DatasetType::Transforms: return "NeRF/Blender";
+        default: return "Dataset";
+        }
+    }
+
+    // Truncate SH to target degree. shN has (d+1)²-1 coefficients for degree d.
+    void truncateSHDegree(lfs::core::SplatData& splat, const int target_degree) {
+        if (target_degree >= splat.get_max_sh_degree())
+            return;
+
+        if (target_degree == 0) {
+            splat.shN() = lfs::core::Tensor{};
+        } else {
+            const size_t keep_coeffs = static_cast<size_t>((target_degree + 1) * (target_degree + 1) - 1);
+            auto& shN = splat.shN();
+            if (shN.is_valid() && shN.ndim() >= 2 && shN.shape()[1] > keep_coeffs) {
+                if (shN.ndim() == 3) {
+                    shN = shN.slice(1, 0, static_cast<int64_t>(keep_coeffs)).contiguous();
+                } else {
+                    constexpr size_t CHANNELS = 3;
+                    shN = shN.slice(1, 0, static_cast<int64_t>(keep_coeffs * CHANNELS)).contiguous();
+                }
+            }
+        }
+        splat.set_max_sh_degree(target_degree);
+        splat.set_active_sh_degree(target_degree);
+    }
+
+    GuiManager::GuiManager(VisualizerImpl* viewer)
         : viewer_(viewer) {
 
         // Create components
         file_browser_ = std::make_unique<FileBrowser>();
-        project_changed_dialog_box_ = std::make_unique<ProjectChangedDialogBox>();
         scene_panel_ = std::make_unique<ScenePanel>(viewer->trainer_manager_);
-        save_project_browser_ = std::make_unique<SaveProjectBrowser>();
         menu_bar_ = std::make_unique<MenuBar>();
+        export_dialog_ = std::make_unique<ExportDialog>();
+        notification_popup_ = std::make_unique<NotificationPopup>();
+        save_directory_popup_ = std::make_unique<SaveDirectoryPopup>();
+        resume_checkpoint_popup_ = std::make_unique<ResumeCheckpointPopup>();
+        exit_confirmation_popup_ = std::make_unique<ExitConfirmationPopup>();
+        disk_space_error_dialog_ = std::make_unique<DiskSpaceErrorDialog>();
 
         // Initialize window states
         window_states_["file_browser"] = false;
         window_states_["scene_panel"] = true;
-        window_states_["project_changed_dialog_box"] = false;
-        window_states_["save_project_browser_before_exit"] = false;
-        window_states_["show_save_browser"] = false;
         window_states_["system_console"] = false;
         window_states_["training_tab"] = false;
+        window_states_["export_dialog"] = false;
 
         // Initialize speed overlay state
         speed_overlay_visible_ = false;
         speed_overlay_duration_ = std::chrono::milliseconds(3000); // 3 seconds
 
-        // Initialize notification popup state
-        notification_visible_ = false;
-        notification_is_error_ = false;
-        notification_duration_ = std::chrono::milliseconds(3000); // 3 seconds default
-
         // Initialize focus state
         viewport_has_focus_ = false;
 
         setupEventHandlers();
+        checkCudaVersionAndNotify();
+    }
+
+    void GuiManager::checkCudaVersionAndNotify() {
+        using namespace lfs::core;
+        const auto info = check_cuda_version();
+        if (!info.query_failed && !info.supported) {
+            constexpr int MIN_MAJOR = MIN_CUDA_VERSION / 1000;
+            constexpr int MIN_MINOR = (MIN_CUDA_VERSION % 1000) / 10;
+            events::state::CudaVersionUnsupported{
+                .major = info.major,
+                .minor = info.minor,
+                .min_major = MIN_MAJOR,
+                .min_minor = MIN_MINOR}
+                .emit();
+        }
     }
 
     GuiManager::~GuiManager() {
-        // Cleanup handled automatically
+        // Cancel and wait for export thread if running
+        if (export_state_.active.load()) {
+            cancelExport();
+            if (export_state_.thread && export_state_.thread->joinable()) {
+                export_state_.thread->join();
+            }
+        }
+        export_state_.thread.reset();
     }
 
     void GuiManager::initMenuBar() {
         menu_bar_->setOnImportDataset([this]() {
-            OpenDatasetFolderDialog([this](const std::string& path) {
-                std::filesystem::path dataset_path(path);
-                if (std::filesystem::is_directory(dataset_path)) {
-                    events::cmd::LoadFile{.path = dataset_path, .is_dataset = true}.emit();
-                    LOG_INFO("Loading dataset: {}", dataset_path.string());
-                }
-                // hide the file browser
-                events::cmd::ShowWindow{.window_name = "file_browser", .show = false}.emit();
-            });
-        });
-
-        menu_bar_->setOnOpenProject([this]() {
-            OpenProjectFileDialog([this](const std::string& path) {
-                std::filesystem::path project_path(path);
-                events::cmd::LoadProject{.path = project_path}.emit();
-                LOG_INFO("Loading project file: {}", project_path.string());
-                // hide the file browser
-                events::cmd::ShowWindow{.window_name = "file_browser", .show = false}.emit();
-            });
-        });
-
-        menu_bar_->setOnImportPLY([this]() {
-            OpenPlyFileDialog([this](const std::string& path) {
-                std::filesystem::path ply_path(path);
-                events::cmd::LoadFile{.path = ply_path}.emit();
-                LOG_INFO("Loading PLY file: {}", ply_path.string());
-                // hide the file browser
-                events::cmd::ShowWindow{.window_name = "file_browser", .show = false}.emit();
-            });
-        });
-
-        menu_bar_->setOnSaveProjectAs([this]() {
-            window_states_["show_save_browser"] = true;
-        });
-
-        menu_bar_->setOnSaveProject([this]() {
-            if (viewer_->project_) {
-                events::cmd::SaveProject{viewer_->project_->getProjectOutputFolder().string()}.emit();
+            const auto path = OpenDatasetFolderDialogNative();
+            if (!path.empty() && std::filesystem::is_directory(path)) {
+                save_directory_popup_->show(path);
             }
         });
 
-        menu_bar_->setOnExportConfig([this]() {
-            ExportConfigFileDialog([](const std::string& path) {
-                events::cmd::ExportConfig{.path = path}.emit();
-                LOG_INFO("Exporting config to: {}", path);
-            });
+        menu_bar_->setOnImportPLY([this]() {
+            const auto path = OpenPlyFileDialogNative();
+            if (!path.empty()) {
+                lfs::core::events::cmd::LoadFile{.path = path, .is_dataset = false}.emit();
+            }
         });
 
-        menu_bar_->setOnImportConfig([this]() {
-            ImportConfigFileDialog([](const std::string& path) {
-                events::cmd::ImportConfig{.path = path}.emit();
-                LOG_INFO("Importing config from: {}", path);
-            });
-#ifndef WIN32
-            // On Linux, also show the file browser
-            // Set default path to parameter directory for config imports
-            auto param_dir = std::filesystem::absolute("parameter");
-            file_browser_->setCurrentPath(param_dir);
-            window_states_["file_browser"] = true;
-#endif
+        menu_bar_->setOnImportCheckpoint([this]() {
+            const auto path = OpenCheckpointFileDialog();
+            if (!path.empty()) {
+                resume_checkpoint_popup_->show(path);
+            }
+        });
+
+        menu_bar_->setOnImportConfig([]() {
+            const auto path = OpenJsonFileDialog();
+            if (!path.empty()) {
+                lfs::core::events::cmd::LoadConfigFile{.path = path}.emit();
+            }
+        });
+
+        menu_bar_->setOnExport([this]() {
+            window_states_["export_dialog"] = true;
+        });
+
+        menu_bar_->setOnExportConfig([]() {
+            const auto* const param_manager = services().paramsOrNull();
+            if (!param_manager)
+                return;
+
+            const auto path = SaveJsonFileDialog("training_config");
+            if (path.empty())
+                return;
+
+            lfs::core::param::TrainingParameters params;
+            params.dataset = param_manager->getDatasetConfig();
+            params.optimization = param_manager->getActiveParams();
+
+            if (const auto result = lfs::core::param::save_training_parameters_to_json(params, path); !result) {
+                LOG_ERROR("Failed to export config: {}", result.error());
+            }
+        });
+
+        // Export dialog: when user clicks Export, show native file dialog and perform export
+        export_dialog_->setOnBrowse([this](ExportFormat format,
+                                           const std::string& default_name,
+                                           const std::vector<std::string>& node_names,
+                                           int sh_degree) {
+            if (isExporting())
+                return;
+
+            // Show native file dialog based on format
+            std::filesystem::path path;
+            switch (format) {
+            case ExportFormat::PLY:
+                path = SavePlyFileDialog(default_name);
+                break;
+            case ExportFormat::SOG:
+                path = SaveSogFileDialog(default_name);
+                break;
+            case ExportFormat::SPZ:
+                path = SaveSpzFileDialog(default_name);
+                break;
+            case ExportFormat::HTML_VIEWER:
+                path = SaveHtmlFileDialog(default_name);
+                break;
+            }
+
+            if (path.empty())
+                return;
+
+            // Perform the export
+            auto* const scene_manager = viewer_->getSceneManager();
+            if (!scene_manager || node_names.empty())
+                return;
+
+            // Collect splats with transforms for selected nodes
+            const auto& scene = scene_manager->getScene();
+            std::vector<std::pair<const lfs::core::SplatData*, glm::mat4>> splats;
+            for (const auto& name : node_names) {
+                const auto* node = scene.getNode(name);
+                if (node && node->type == NodeType::SPLAT && node->model) {
+                    splats.emplace_back(node->model.get(), scene.getWorldTransform(node->id));
+                }
+            }
+
+            if (splats.empty())
+                return;
+
+            // Merge selected splats
+            auto merged = Scene::mergeSplatsWithTransforms(splats);
+            if (!merged)
+                return;
+
+            // Truncate SH data if needed
+            if (sh_degree < merged->get_max_sh_degree()) {
+                truncateSHDegree(*merged, sh_degree);
+            }
+
+            // Start async export
+            startAsyncExport(format, path, std::move(merged));
         });
 
         menu_bar_->setOnExit([this]() {
-            glfwSetWindowShouldClose(viewer_->getWindow(), true);
+            requestExitConfirmation();
+        });
+
+        menu_bar_->setOnNewProject([this]() {
+            lfs::core::events::cmd::ClearScene{}.emit();
+        });
+
+        menu_bar_->setCanClearCheck([this]() {
+            auto* trainer_mgr = viewer_->getTrainerManager();
+            if (!trainer_mgr)
+                return true;
+            return trainer_mgr->canPerform(TrainingAction::ClearScene);
         });
     }
 
@@ -148,70 +314,228 @@ namespace gs::gui {
         ImGui_ImplGlfw_InitForOpenGL(viewer_->getWindow(), true);
         ImGui_ImplOpenGL3_Init("#version 430");
 
+        // Initialize localization system
+        auto& loc = lichtfeld::LocalizationManager::getInstance();
+        const std::string locale_path = lfs::core::path_to_utf8(lfs::core::getLocalesDir());
+        if (!loc.initialize(locale_path)) {
+            LOG_WARN("Failed to initialize localization system, using default strings");
+        } else {
+            LOG_INFO("Localization initialized with language: {}", loc.getCurrentLanguageName());
+        }
+
         float xscale, yscale;
         glfwGetWindowContentScale(viewer_->getWindow(), &xscale, &yscale);
 
-        // some clamping / safety net for weird DPI values
-        xscale = std::clamp(xscale, 1.0f, 2.0f);
+        // Clamping / safety net for weird DPI values
+        // Support up to 4.0x scale for high-DPI displays (e.g., 6K monitors)
+        xscale = std::clamp(xscale, 1.0f, 4.0f);
+
+        // Store DPI scale for use by UI components
+        setDpiScale(xscale);
 
         // Set application icon - use the resource path helper
         try {
-            const auto icon_path = gs::visualizer::getAssetPath("lichtfeld-icon.png");
-            const auto [data, width, height, channels] = load_image_with_alpha(icon_path);
+            const auto icon_path = lfs::vis::getAssetPath("lichtfeld-icon.png");
+            const auto [data, width, height, channels] = lfs::core::load_image_with_alpha(icon_path);
 
             GLFWimage image{width, height, data};
             glfwSetWindowIcon(viewer_->getWindow(), 1, &image);
-            free_image(data);
+            lfs::core::free_image(data);
         } catch (const std::exception& e) {
             LOG_WARN("Could not load application icon: {}", e.what());
         }
 
-        // Load fonts - use the resource path helper
-        try {
-            auto font_path = gs::visualizer::getAssetPath("JetBrainsMono-Regular.ttf");
-            io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 14.0f * xscale);
-        } catch (const std::exception& e) {
-            // If font loading fails, just use the default font
-            LOG_WARN("Could not load custom font: {}", e.what());
-            LOG_DEBUG("Using default ImGui font");
-        }
-
+        // Apply theme first to get font settings
         applyDefaultStyle();
 
-        // Configure file browser callback
-        setFileSelectedCallback([this](const std::filesystem::path& path, bool is_dataset) {
-            if (path.extension() == gs::management::Project::EXTENSION) {
-                events::cmd::LoadProject{.path = path}.emit();
-            } else {
-                events::cmd::LoadFile{.path = path, .is_dataset = is_dataset}.emit();
-            }
+        // Load fonts
+        const auto& t = theme();
+        try {
+            const auto regular_path = lfs::vis::getAssetPath("fonts/" + t.fonts.regular_path);
+            const auto bold_path = lfs::vis::getAssetPath("fonts/" + t.fonts.bold_path);
+            const auto japanese_path = lfs::vis::getAssetPath("fonts/NotoSansJP-Regular.ttf");
+            const auto korean_path = lfs::vis::getAssetPath("fonts/NotoSansKR-Regular.ttf");
 
-            window_states_["file_browser"] = false;
+            // Helper to check if font file is valid
+            const auto is_font_valid = [](const std::filesystem::path& path) -> bool {
+                constexpr size_t MIN_FONT_FILE_SIZE = 100;
+                return std::filesystem::exists(path) && std::filesystem::file_size(path) >= MIN_FONT_FILE_SIZE;
+            };
+
+            // Load font with optional CJK glyph merging (Japanese + Korean)
+            const auto load_font_with_cjk =
+                [&](const std::filesystem::path& path, const float size) -> ImFont* {
+                if (!is_font_valid(path)) {
+                    LOG_WARN("Font file invalid: {}", lfs::core::path_to_utf8(path));
+                    return nullptr;
+                }
+
+                // Load base font (Latin characters)
+                const std::string path_utf8 = lfs::core::path_to_utf8(path);
+                ImFont* font = io.Fonts->AddFontFromFileTTF(path_utf8.c_str(), size);
+                if (!font)
+                    return nullptr;
+
+                // Merge Japanese + Chinese glyphs if available (NotoSansJP contains both)
+                if (is_font_valid(japanese_path)) {
+                    ImFontConfig config;
+                    config.MergeMode = true;
+                    const std::string japanese_path_utf8 = lfs::core::path_to_utf8(japanese_path);
+                    io.Fonts->AddFontFromFileTTF(japanese_path_utf8.c_str(), size, &config,
+                                                 io.Fonts->GetGlyphRangesJapanese());
+                    // Chinese glyphs are also in NotoSansJP, just need to load the ranges
+                    io.Fonts->AddFontFromFileTTF(japanese_path_utf8.c_str(), size, &config,
+                                                 io.Fonts->GetGlyphRangesChineseFull());
+                }
+
+                // Merge Korean glyphs if available
+                if (is_font_valid(korean_path)) {
+                    ImFontConfig config;
+                    config.MergeMode = true;
+                    const std::string korean_path_utf8 = lfs::core::path_to_utf8(korean_path);
+                    io.Fonts->AddFontFromFileTTF(korean_path_utf8.c_str(), size, &config,
+                                                 io.Fonts->GetGlyphRangesKorean());
+                }
+
+                return font;
+            };
+
+            font_regular_ = load_font_with_cjk(regular_path, t.fonts.base_size * xscale);
+            font_bold_ = load_font_with_cjk(bold_path, t.fonts.base_size * xscale);
+            font_heading_ = load_font_with_cjk(bold_path, t.fonts.heading_size * xscale);
+            font_small_ = load_font_with_cjk(regular_path, t.fonts.small_size * xscale);
+            font_section_ = load_font_with_cjk(bold_path, t.fonts.section_size * xscale);
+
+            const bool all_loaded = font_regular_ && font_bold_ && font_heading_ && font_small_ && font_section_;
+            if (!all_loaded) {
+                LOG_WARN("Some fonts failed to load, using fallback");
+                ImFont* const fallback = font_regular_ ? font_regular_ : io.Fonts->AddFontDefault();
+                if (!font_regular_)
+                    font_regular_ = fallback;
+                if (!font_bold_)
+                    font_bold_ = fallback;
+                if (!font_heading_)
+                    font_heading_ = fallback;
+                if (!font_small_)
+                    font_small_ = fallback;
+                if (!font_section_)
+                    font_section_ = fallback;
+            } else {
+                LOG_INFO("Loaded fonts: {} and {}", t.fonts.regular_path, t.fonts.bold_path);
+                if (is_font_valid(japanese_path)) {
+                    LOG_INFO("Japanese + Chinese font support enabled");
+                }
+                if (is_font_valid(korean_path)) {
+                    LOG_INFO("Korean font support enabled");
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Font loading failed: {}", e.what());
+            ImFont* const fallback = io.Fonts->AddFontDefault();
+            font_regular_ = font_bold_ = font_heading_ = font_small_ = font_section_ = fallback;
+        }
+
+        save_directory_popup_->setOnConfirm([this](const DatasetLoadParams& load_params) {
+            if (const auto result = services().params().ensureLoaded(); !result) {
+                LOG_ERROR("Failed to load parameter files: {}", result.error());
+                return;
+            }
+            services().params().resetToDefaults();
+            auto params = services().params().createForDataset(load_params.dataset_path, load_params.output_path);
+            if (load_params.init_path) {
+                params.init_path = lfs::core::path_to_utf8(*load_params.init_path);
+            }
+            viewer_->setParameters(params);
+            lfs::core::events::cmd::LoadFile{.path = load_params.dataset_path, .is_dataset = true}.emit();
         });
 
-        handleProjectChangedDialogCallback([this](bool save) {
-            if (save) {
-                window_states_["save_project_browser_before_exit"] = true;
+        resume_checkpoint_popup_->setOnConfirm([](const CheckpointLoadParams& params) {
+            lfs::core::events::cmd::LoadCheckpointForTraining{
+                .checkpoint_path = params.checkpoint_path,
+                .dataset_path = params.dataset_path,
+                .output_path = params.output_path}
+                .emit();
+        });
+
+        lfs::core::events::cmd::ShowResumeCheckpointPopup::when([this](const auto& e) {
+            resume_checkpoint_popup_->show(e.checkpoint_path);
+        });
+
+        setFileSelectedCallback([this](const std::filesystem::path& path, const bool is_dataset) {
+            window_states_["file_browser"] = false;
+            if (is_dataset) {
+                save_directory_popup_->show(path);
             } else {
-                force_exit_ = true;
-                glfwSetWindowShouldClose(viewer_->getWindow(), true);
-                LOG_INFO("Exiting LichtFeldStudio gracefully without saving");
+                lfs::core::events::cmd::LoadFile{.path = path, .is_dataset = false}.emit();
             }
-            window_states_["project_changed_dialog_box"] = false;
         });
 
         scene_panel_->setOnDatasetLoad([this](const std::filesystem::path& path) {
             if (path.empty()) {
                 window_states_["file_browser"] = true;
             } else {
-                events::cmd::LoadFile{.path = path, .is_dataset = true}.emit();
+                save_directory_popup_->show(path);
             }
         });
 
         initMenuBar();
+        menu_bar_->setFonts({font_regular_, font_bold_, font_heading_, font_small_, font_section_});
+
+        // Load startup overlay textures
+        const auto loadOverlayTexture = [](const std::filesystem::path& path, unsigned int& tex, int& w, int& h) {
+            try {
+                const auto [data, width, height, channels] = lfs::core::load_image_with_alpha(path);
+                glGenTextures(1, &tex);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+                             channels == 4 ? GL_RGBA : GL_RGB, GL_UNSIGNED_BYTE, data);
+                lfs::core::free_image(data);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                w = width;
+                h = height;
+            } catch (const std::exception& e) {
+                LOG_WARN("Failed to load overlay texture {}: {}", lfs::core::path_to_utf8(path), e.what());
+            }
+        };
+        loadOverlayTexture(lfs::vis::getAssetPath("lichtfeld-splash-logo.png"),
+                           startup_logo_light_texture_, startup_logo_width_, startup_logo_height_);
+        loadOverlayTexture(lfs::vis::getAssetPath("lichtfeld-splash-logo-dark.png"),
+                           startup_logo_dark_texture_, startup_logo_width_, startup_logo_height_);
+        loadOverlayTexture(lfs::vis::getAssetPath("core11-logo.png"),
+                           startup_core11_light_texture_, startup_core11_width_, startup_core11_height_);
+        loadOverlayTexture(lfs::vis::getAssetPath("core11-logo-dark.png"),
+                           startup_core11_dark_texture_, startup_core11_width_, startup_core11_height_);
+
+        if (!drag_drop_.init(viewer_->getWindow())) {
+            LOG_WARN("Native drag-drop initialization failed, falling back to GLFW");
+        }
+        drag_drop_.setFileDropCallback([this](const std::vector<std::string>& paths) {
+            LOG_INFO("Files dropped via native drag-drop: {} file(s)", paths.size());
+            if (auto* const ic = viewer_->getInputController()) {
+                ic->handleFileDrop(paths);
+            } else {
+                LOG_ERROR("InputController not available for file drop handling");
+            }
+        });
     }
 
     void GuiManager::shutdown() {
+        drag_drop_.shutdown();
+        panels::ShutdownGizmoToolbar(gizmo_toolbar_state_);
+
+        if (startup_logo_light_texture_)
+            glDeleteTextures(1, &startup_logo_light_texture_);
+        if (startup_logo_dark_texture_)
+            glDeleteTextures(1, &startup_logo_dark_texture_);
+        if (startup_core11_light_texture_)
+            glDeleteTextures(1, &startup_core11_light_texture_);
+        if (startup_core11_dark_texture_)
+            glDeleteTextures(1, &startup_core11_dark_texture_);
+
         if (ImGui::GetCurrentContext()) {
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplGlfw_Shutdown();
@@ -220,19 +544,51 @@ namespace gs::gui {
     }
 
     void GuiManager::render() {
+        drag_drop_.pollEvents();
+        drag_drop_hovering_ = drag_drop_.isDragHovering();
+
         // Start frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
 
-        // CRITICAL: Check mouse state BEFORE ImGui::NewFrame()
-        // This is important because ImGui updates WantCaptureMouse during NewFrame()
+        // Check mouse state before ImGui::NewFrame() updates WantCaptureMouse
         ImVec2 mouse_pos = ImGui::GetMousePos();
         bool mouse_in_viewport = isPositionInViewport(mouse_pos.x, mouse_pos.y);
 
         ImGui::NewFrame();
 
-        if (menu_bar_) {
+        // Check for async import completion (must happen on main thread)
+        checkAsyncImportCompletion();
+
+        // Hot-reload themes (check once per second)
+        {
+            static auto last_check = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_check > std::chrono::seconds(1)) {
+                checkThemeFileChanges();
+                last_check = now;
+            }
+        }
+
+        // Initialize ImGuizmo for this frame
+        ImGuizmo::BeginFrame();
+
+        if (menu_bar_ && !ui_hidden_) {
+            // Lazily connect input bindings (input controller may not be ready during init)
+            if (!menu_bar_input_bindings_set_) {
+                if (auto* input_controller = viewer_->getInputController()) {
+                    menu_bar_->setInputBindings(&input_controller->getBindings());
+                    menu_bar_input_bindings_set_ = true;
+                }
+            }
             menu_bar_->render();
+        }
+
+        // Override ImGui's mouse capture for gizmo interaction
+        // If ImGuizmo is being used or hovered, let it handle the mouse
+        if (ImGuizmo::IsOver() || ImGuizmo::IsUsing()) {
+            ImGui::GetIO().WantCaptureMouse = false;
+            ImGui::GetIO().WantCaptureKeyboard = false;
         }
 
         // Override ImGui's mouse capture for right/middle buttons when in viewport
@@ -244,7 +600,7 @@ namespace gs::gui {
             }
         }
 
-        // CRITICAL FIX: In point cloud mode, always disable ImGui mouse capture in viewport
+        // In point cloud mode, disable ImGui mouse capture in viewport
         auto* rendering_manager = viewer_->getRenderingManager();
         if (rendering_manager) {
             const auto& settings = rendering_manager->getSettings();
@@ -284,198 +640,277 @@ namespace gs::gui {
         ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode;
         ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
 
-        // Set up default layout on first run
-        static bool first_time = true;
-        if (first_time) {
-            first_time = false;
-            ImGui::DockBuilderRemoveNode(dockspace_id);
-            ImGui::DockBuilderAddNode(dockspace_id, dockspace_flags | ImGuiDockNodeFlags_DockSpace);
-            ImGui::DockBuilderSetNodeSize(dockspace_id, main_viewport->WorkSize);
-
-            ImGuiID dock_id_left = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.25f, nullptr, &dockspace_id);
-            ImGuiID dock_id_right = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Right, 0.2f, nullptr, &dockspace_id);
-
-            // Dock windows
-            ImGui::DockBuilderDockWindow("Rendering", dock_id_left);
-            ImGui::DockBuilderDockWindow("Scene", dock_id_right);
-            ImGui::DockBuilderDockWindow("Training", dock_id_left);
-
-            ImGui::DockBuilderFinish(dockspace_id);
-        }
-
         ImGui::End();
+
+        // Update editor context state for this frame
+        auto& editor_ctx = viewer_->getEditorContext();
+        editor_ctx.update(viewer_->getSceneManager(), viewer_->getTrainerManager());
 
         // Create context for this frame
         UIContext ctx{
             .viewer = viewer_,
             .file_browser = file_browser_.get(),
-            .window_states = &window_states_};
+            .window_states = &window_states_,
+            .editor = &editor_ctx,
+            .fonts = {font_regular_, font_bold_, font_heading_, font_small_, font_section_}};
 
-        // Draw docked panels
-        if (show_main_panel_) {
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.5f, 0.5f, 0.5f, 0.8f));
-            if (ImGui::Begin("Rendering", nullptr)) {
-                // Draw contents without the manual sizing/positioning
-                widgets::DrawModeStatusWithContentSwitch(ctx);
-                ImGui::Separator();
-                panels::DrawRenderingSettings(ctx);
-                ImGui::Separator();
-                panels::DrawToolsPanel(ctx);
-                panels::DrawSystemConsoleButton(ctx);
+        // Right panel
+        if (show_main_panel_ && !ui_hidden_) {
+            const auto* const vp = ImGui::GetMainViewport();
+            const float panel_h = vp->WorkSize.y - STATUS_BAR_HEIGHT;
+            const float min_w = vp->WorkSize.x * RIGHT_PANEL_MIN_RATIO;
+            const float max_w = vp->WorkSize.x * RIGHT_PANEL_MAX_RATIO;
+
+            // on windows, when window is minimized, WorkSize can be zero
+            if (min_w != 0 || max_w != 0)
+                right_panel_width_ = std::clamp(right_panel_width_, min_w, max_w);
+
+            const float panel_x = vp->WorkPos.x + vp->WorkSize.x - right_panel_width_;
+            ImGui::SetNextWindowPos({panel_x, vp->WorkPos.y}, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({right_panel_width_, panel_h}, ImGuiCond_Always);
+
+            constexpr ImGuiWindowFlags PANEL_FLAGS =
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking |
+                ImGuiWindowFlags_NoTitleBar;
+
+            const auto& t = theme();
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, withAlpha(t.palette.surface, 0.95f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {8.0f, 8.0f});
+
+            // Left edge resize handle
+            constexpr float EDGE_GRAB_W = 8.0f;
+            const auto& io = ImGui::GetIO();
+            hovering_panel_edge_ = io.MousePos.x >= panel_x - EDGE_GRAB_W &&
+                                   io.MousePos.x <= panel_x + EDGE_GRAB_W &&
+                                   io.MousePos.y >= vp->WorkPos.y &&
+                                   io.MousePos.y <= vp->WorkPos.y + panel_h;
+
+            if (hovering_panel_edge_ && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                resizing_panel_ = true;
+            if (resizing_panel_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                resizing_panel_ = false;
+            if (resizing_panel_) {
+                right_panel_width_ = std::clamp(right_panel_width_ - io.MouseDelta.x, min_w, max_w);
+                updateViewportRegion();
+            }
+            if (hovering_panel_edge_ || resizing_panel_)
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+
+            if (ImGui::Begin("##RightPanel", nullptr, PANEL_FLAGS)) {
+                const float avail_h = ImGui::GetContentRegionAvail().y;
+                const float scale = getDpiScale();
+                const float SPLITTER_H = 6.0f * scale, MIN_H = 80.0f * scale;
+
+                // Scene panel
+                const float scene_h = std::max(MIN_H, avail_h * scene_panel_ratio_ - SPLITTER_H * 0.5f);
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, {0, 0, 0, 0});
+                if (ImGui::BeginChild("##ScenePanel", {0, scene_h}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground)) {
+                    widgets::SectionHeader(LOC(lichtfeld::Strings::Window::SCENE), ctx.fonts);
+                    scene_panel_->renderContent(&ctx);
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                // Splitter
+                ImGui::PushStyleColor(ImGuiCol_Button, withAlpha(t.palette.border, 0.4f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, withAlpha(t.palette.info, 0.6f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, withAlpha(t.palette.info, 0.8f));
+                ImGui::Button("##Splitter", {-1, SPLITTER_H});
+                if (ImGui::IsItemActive())
+                    scene_panel_ratio_ = std::clamp(scene_panel_ratio_ + ImGui::GetIO().MouseDelta.y / avail_h, 0.15f, 0.85f);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                ImGui::PopStyleColor(3);
+
+                // Rendering content helper
+                const auto draw_rendering = [&ctx] {
+                    panels::DrawRenderingSettings(ctx);
+                    ImGui::Separator();
+                    panels::DrawSelectionGroups(ctx);
+                    ImGui::Separator();
+                    panels::DrawToolsPanel(ctx);
+                    panels::DrawSystemConsoleButton(ctx);
+                };
+
+                // Rendering panel
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, {0, 0, 0, 0});
+                if (viewer_->getTrainer()) {
+                    if (ImGui::BeginTabBar("##BottomTabs")) {
+                        if (ImGui::BeginTabItem(LOC(lichtfeld::Strings::Window::RENDERING))) {
+                            if (ImGui::BeginChild("##RenderingPanel", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground)) {
+                                draw_rendering();
+                            }
+                            ImGui::EndChild();
+                            ImGui::EndTabItem();
+                        }
+                        const ImGuiTabItemFlags flags = focus_training_panel_
+                                                            ? ImGuiTabItemFlags_SetSelected
+                                                            : ImGuiTabItemFlags_None;
+                        if (focus_training_panel_)
+                            focus_training_panel_ = false;
+                        if (ImGui::BeginTabItem(LOC(lichtfeld::Strings::Window::TRAINING), nullptr, flags)) {
+                            panels::DrawTrainingControls(ctx);
+                            if (ImGui::BeginChild("##TrainingPanel", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground)) {
+                                panels::DrawTrainingParams(ctx);
+                                panels::DrawTrainingStatus(ctx);
+                                ImGui::Separator();
+                                panels::DrawProgressInfo(ctx);
+                            }
+                            ImGui::EndChild();
+                            ImGui::EndTabItem();
+                        }
+                        ImGui::EndTabBar();
+                    }
+                } else {
+                    widgets::SectionHeader(LOC(lichtfeld::Strings::Window::RENDERING), ctx.fonts);
+                    if (ImGui::BeginChild("##RenderingPanel", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground)) {
+                        draw_rendering();
+                    }
+                    ImGui::EndChild();
+                }
+                ImGui::PopStyleColor();
             }
             ImGui::End();
-
-            if (viewer_->getTrainer() && !window_states_["training_tab"]) {
-                ImGui::SetWindowFocus("Rendering");
-                window_states_["training_tab"] = true;
-            }
-
-            if (!viewer_->getTrainer()) {
-                window_states_["training_tab"] = false;
-            }
-
-            if (window_states_["training_tab"]) {
-                if (ImGui::Begin("Training", nullptr)) {
-                    panels::DrawTrainingControls(ctx);
-                    ImGui::Separator();
-                    panels::DrawProgressInfo(ctx);
-                }
-                ImGui::End();
-            }
-
+            ImGui::PopStyleVar();
             ImGui::PopStyleColor();
+        } else {
+            hovering_panel_edge_ = false;
+            resizing_panel_ = false;
         }
 
-        // Draw Scene panel
-        if (window_states_["scene_panel"]) {
-            scene_panel_->render(&window_states_["scene_panel"]);
-        }
-
-        // Render floating windows (these remain movable)
+        // Render floating windows
         if (window_states_["file_browser"]) {
             file_browser_->render(&window_states_["file_browser"]);
         }
 
-        if (window_states_["project_changed_dialog_box"]) {
-            project_changed_dialog_box_->render(&window_states_["project_changed_dialog_box"]);
+        // Export dialog
+        if (window_states_["export_dialog"]) {
+            export_dialog_->render(&window_states_["export_dialog"], viewer_->getSceneManager());
         }
 
-        // 3DGUT auto-enabled warning notification
-        if (viewer_->hasGutAutoEnabledWarning()) {
-            showNotificationPopup("Camera distortion detected!\n3DGUT rasterizer has been automatically enabled.", false, 4000);
-            viewer_->clearGutAutoEnabledWarning();
-        }
+        // Utility toolbar (always visible)
+        const bool is_fullscreen = viewer_->getWindowManager() && viewer_->getWindowManager()->isFullscreen();
+        panels::DrawUtilityToolbar(gizmo_toolbar_state_, viewport_pos_, viewport_size_, ui_hidden_, is_fullscreen,
+                                   viewer_->getRenderingManager(), &viewer_->getViewport());
 
-        if (window_states_["save_project_browser_before_exit"]) {
-#ifdef WIN32
-            bool was_project_saved = save_project_browser_->SaveProjectFileDialog(&window_states_["save_project_browser_before_exit"]);
-#else
-            bool was_project_saved = save_project_browser_->render(&window_states_["save_project_browser_before_exit"]);
-#endif
-            if (was_project_saved) {
-                force_exit_ = true;
-                glfwSetWindowShouldClose(viewer_->getWindow(), true);
-                LOG_INFO("Exiting LichtFeldStudio gracefully after project save");
+        // Gizmo toolbar (only when node selected and UI visible)
+        auto* const scene_manager = ctx.viewer->getSceneManager();
+        if (scene_manager && scene_manager->hasSelectedNode() && !ui_hidden_) {
+            panels::DrawGizmoToolbar(ctx, gizmo_toolbar_state_, viewport_pos_, viewport_size_);
+
+            // Get current tool from EditorContext (single source of truth)
+            const auto current_tool = ctx.editor->getActiveTool();
+            const bool is_transform_tool = (current_tool == ToolType::Translate ||
+                                            current_tool == ToolType::Rotate ||
+                                            current_tool == ToolType::Scale);
+            show_node_gizmo_ = is_transform_tool;
+            if (is_transform_tool) {
+                node_gizmo_operation_ = gizmo_toolbar_state_.current_operation;
             }
-        }
 
-        // Update cross-platform file dialogs (for Linux/other platforms)
-#ifndef WIN32
-        RenderExportConfigDialog();
+            auto* brush_tool = ctx.viewer->getBrushTool();
+            auto* align_tool = ctx.viewer->getAlignTool();
+            auto* selection_tool = ctx.viewer->getSelectionTool();
+            const bool is_brush_mode = (current_tool == ToolType::Brush);
+            const bool is_align_mode = (current_tool == ToolType::Align);
+            const bool is_selection_mode = (current_tool == ToolType::Selection);
 
-        // Handle file browser callbacks for config import
-        if (window_states_["file_browser"]) {
-            auto import_cb = GetImportConfigCallback();
-            if (import_cb) {
-                // Set file browser callback to handle config import
-                file_browser_->setOnFileSelected([import_cb](const std::filesystem::path& path, bool is_dataset) {
-                    // Only handle .json files for config import
-                    if (!is_dataset && path.extension() == ".json") {
-                        import_cb(path.string());
-                        ClearPendingCallbacks();
+            // Materialize deletions when switching away from selection tool
+            const bool was_selection_mode = (previous_tool_ == ToolType::Selection);
+            if (was_selection_mode && current_tool != previous_tool_) {
+                if (auto* sm = ctx.viewer->getSceneManager()) {
+                    sm->applyDeleted();
+                }
+            }
+
+            previous_tool_ = current_tool;
+
+            if (brush_tool)
+                brush_tool->setEnabled(is_brush_mode);
+            if (align_tool)
+                align_tool->setEnabled(is_align_mode);
+            if (selection_tool)
+                selection_tool->setEnabled(is_selection_mode);
+
+            // Update selection mode and auto-toggle ring rendering
+            if (is_selection_mode) {
+                if (auto* rm = ctx.viewer->getRenderingManager()) {
+                    lfs::rendering::SelectionMode mode = lfs::rendering::SelectionMode::Centers;
+                    switch (gizmo_toolbar_state_.selection_mode) {
+                    case panels::SelectionSubMode::Centers: mode = lfs::rendering::SelectionMode::Centers; break;
+                    case panels::SelectionSubMode::Rectangle: mode = lfs::rendering::SelectionMode::Rectangle; break;
+                    case panels::SelectionSubMode::Polygon: mode = lfs::rendering::SelectionMode::Polygon; break;
+                    case panels::SelectionSubMode::Lasso: mode = lfs::rendering::SelectionMode::Lasso; break;
+                    case panels::SelectionSubMode::Rings: mode = lfs::rendering::SelectionMode::Rings; break;
                     }
-                });
-            }
-        }
-#endif
+                    rm->setSelectionMode(mode);
 
-        if (window_states_["show_save_browser"]) {
-#ifdef WIN32
-            save_project_browser_->SaveProjectFileDialog(&window_states_["show_save_browser"]);
-#else
-            save_project_browser_->render(&window_states_["show_save_browser"]);
-#endif
-        }
+                    // Reset selection state when switching modes
+                    if (gizmo_toolbar_state_.selection_mode != previous_selection_mode_) {
+                        if (selection_tool)
+                            selection_tool->onSelectionModeChanged();
 
-        if (menu_bar_ && viewer_) {
-            auto project = viewer_->getProject();
-            menu_bar_->setIsProjectTemp(project ? project->getIsTempProject() : false);
-        }
+                        // Auto-enable rings when switching to Rings sub-mode
+                        if (gizmo_toolbar_state_.selection_mode == panels::SelectionSubMode::Rings) {
+                            auto settings = rm->getSettings();
+                            settings.show_rings = true;
+                            settings.show_center_markers = false;
+                            rm->updateSettings(settings);
+                        }
 
-        // Render speed overlay if visible
-        renderSpeedOverlay();
-
-        // Render notification popup if visible
-        renderNotificationPopup();
-
-        // Render split view indicator if enabled
-        if (rendering_manager) {
-            auto split_info = rendering_manager->getSplitViewInfo();
-            if (split_info.enabled) {
-                // Create a small overlay showing what is being compared
-                const ImGuiViewport* viewport = ImGui::GetMainViewport();
-
-                // Position at top center
-                ImVec2 overlay_pos(
-                    viewport->WorkPos.x + (viewport->WorkSize.x - 400.0f) * 0.5f,
-                    viewport->WorkPos.y + 10.0f);
-
-                ImGui::SetNextWindowPos(overlay_pos, ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(400.0f, 40.0f), ImGuiCond_Always);
-
-                ImGuiWindowFlags overlay_flags =
-                    ImGuiWindowFlags_NoTitleBar |
-                    ImGuiWindowFlags_NoResize |
-                    ImGuiWindowFlags_NoMove |
-                    ImGuiWindowFlags_NoScrollbar |
-                    ImGuiWindowFlags_NoCollapse |
-                    ImGuiWindowFlags_NoSavedSettings |
-                    ImGuiWindowFlags_NoInputs |
-                    ImGuiWindowFlags_NoFocusOnAppearing;
-
-                ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.8f));
-                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 0.0f, 0.5f));
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f);
-
-                if (ImGui::Begin("##SplitViewIndicator", nullptr, overlay_flags)) {
-                    ImGui::SetCursorPos(ImVec2(10, 10));
-
-                    // Draw the split view info - check mode
-                    const auto& settings = rendering_manager->getSettings();
-                    if (settings.split_view_mode == visualizer::SplitViewMode::GTComparison) {
-                        // GT comparison mode
-                        int cam_id = rendering_manager->getCurrentCameraId();
-                        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
-                                           "GT Comparison - Camera %d", cam_id);
-                        ImGui::SameLine();
-                        ImGui::TextDisabled(" (G: toggle, V: cycle modes, arrows: change camera)");
-                    } else {
-                        // PLY comparison mode
-                        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
-                                           "Split View: %s | %s",
-                                           split_info.left_name.c_str(),
-                                           split_info.right_name.c_str());
-                        ImGui::SameLine();
-                        ImGui::TextDisabled(" (T: cycle, V: exit)");
+                        previous_selection_mode_ = gizmo_toolbar_state_.selection_mode;
                     }
                 }
-                ImGui::End();
+            }
 
-                ImGui::PopStyleVar(2);
-                ImGui::PopStyleColor(2);
+        } else {
+            show_node_gizmo_ = false;
+            auto* brush_tool = ctx.viewer->getBrushTool();
+            auto* align_tool = ctx.viewer->getAlignTool();
+            if (brush_tool)
+                brush_tool->setEnabled(false);
+            if (align_tool)
+                align_tool->setEnabled(false);
+        }
+
+        auto* brush_tool = ctx.viewer->getBrushTool();
+        if (brush_tool && brush_tool->isEnabled() && !ui_hidden_) {
+            brush_tool->renderUI(ctx, nullptr);
+        }
+
+        auto* selection_tool = ctx.viewer->getSelectionTool();
+        if (selection_tool && selection_tool->isEnabled() && !ui_hidden_) {
+            selection_tool->renderUI(ctx, nullptr);
+
+            // Mini-toolbar for gizmo operation when crop box is selected
+            if (selection_tool->isCropBoxSelected()) {
+                renderCropGizmoMiniToolbar(ctx);
             }
         }
+
+        auto* align_tool = ctx.viewer->getAlignTool();
+        if (align_tool && align_tool->isEnabled() && !ui_hidden_) {
+            align_tool->renderUI(ctx, nullptr);
+        }
+
+        // Node selection rectangle
+        if (auto* const ic = ctx.viewer->getInputController();
+            !ui_hidden_ && ic && ic->isNodeRectDragging()) {
+            const auto start = ic->getNodeRectStart();
+            const auto end = ic->getNodeRectEnd();
+            const auto& t = theme();
+            auto* const draw_list = ImGui::GetForegroundDrawList();
+            draw_list->AddRectFilled({start.x, start.y}, {end.x, end.y}, toU32WithAlpha(t.palette.warning, 0.15f));
+            draw_list->AddRect({start.x, start.y}, {end.x, end.y}, toU32WithAlpha(t.palette.warning, 0.85f), 0.0f, 0, 2.0f);
+        }
+
+        // Node gizmo first: parent transforms must update before children read them
+        renderNodeTransformGizmo(ctx);
+        renderCropBoxGizmo(ctx);
+        renderEllipsoidGizmo(ctx);
+
+        updateCropFlash();
 
         // Get the viewport region for 3D rendering
         updateViewportRegion();
@@ -483,66 +918,174 @@ namespace gs::gui {
         // Update viewport focus based on mouse position
         updateViewportFocus();
 
-        // Render viewport gizmo BEFORE focus indicator - always render regardless of focus
-        if (show_viewport_gizmo_ && viewport_size_.x > 0 && viewport_size_.y > 0) {
-            if (rendering_manager) {
-                auto* engine = rendering_manager->getRenderingEngine();
-                if (engine) {
-                    const auto& viewport = viewer_->getViewport();
-                    glm::mat3 camera_rotation = viewport.getRotationMatrix();
+        // Draw vignette effect on viewport
+        if (viewport_size_.x > 0 && viewport_size_.y > 0) {
+            widgets::DrawViewportVignette(viewport_pos_, viewport_size_);
+        }
 
-                    engine->renderViewportGizmo(
-                        camera_rotation,
-                        glm::vec2(viewport_pos_.x, viewport_pos_.y),
-                        glm::vec2(viewport_size_.x, viewport_size_.y));
+        // Mask viewport corners with background for rounded effect
+        if (!ui_hidden_ && viewport_size_.x > 0 && viewport_size_.y > 0) {
+            const auto& t = theme();
+            const float r = t.viewport.corner_radius;
+            if (r > 0.0f) {
+                auto* const dl = ImGui::GetBackgroundDrawList();
+                const ImU32 bg = toU32(t.palette.background);
+                const float x1 = viewport_pos_.x, y1 = viewport_pos_.y;
+                const float x2 = x1 + viewport_size_.x, y2 = y1 + viewport_size_.y;
+
+                // Draw corner wedge: corner -> edge -> arc -> corner
+                constexpr int CORNER_ARC_SEGMENTS = 12;
+                const auto maskCorner = [&](const ImVec2 corner, const ImVec2 edge,
+                                            const ImVec2 center, const float a0, const float a1) {
+                    dl->PathLineTo(corner);
+                    dl->PathLineTo(edge);
+                    dl->PathArcTo(center, r, a0, a1, CORNER_ARC_SEGMENTS);
+                    dl->PathLineTo(corner);
+                    dl->PathFillConvex(bg);
+                };
+                maskCorner({x1, y1}, {x1, y1 + r}, {x1 + r, y1 + r}, IM_PI, IM_PI * 1.5f);
+                maskCorner({x2, y1}, {x2 - r, y1}, {x2 - r, y1 + r}, IM_PI * 1.5f, IM_PI * 2.0f);
+                maskCorner({x1, y2}, {x1 + r, y2}, {x1 + r, y2 - r}, IM_PI * 0.5f, IM_PI);
+                maskCorner({x2, y2}, {x2, y2 - r}, {x2 - r, y2 - r}, 0.0f, IM_PI * 0.5f);
+
+                if (t.viewport.border_size > 0.0f) {
+                    dl->AddRect({x1, y1}, {x2, y2}, t.viewport_border_u32(), r,
+                                ImDrawFlags_RoundCornersAll, t.viewport.border_size);
                 }
             }
         }
 
-        // Draw viewport focus indicator AFTER gizmo
-        // DISABLE in point cloud mode
-        bool draw_focus = viewport_has_focus_ && viewport_size_.x > 0 && viewport_size_.y > 0;
-        if (rendering_manager) {
-            const auto& settings = rendering_manager->getSettings();
-            if (settings.point_cloud_mode) {
-                draw_focus = false;
+        // Render status bar at bottom of viewport
+        if (!ui_hidden_) {
+            renderStatusBar(ctx);
+        }
+
+        // Render viewport gizmo and handle drag-to-orbit
+        if (show_viewport_gizmo_ && !ui_hidden_ && viewport_size_.x > 0 && viewport_size_.y > 0) {
+            if (rendering_manager) {
+                if (auto* const engine = rendering_manager->getRenderingEngine()) {
+                    auto& viewport = viewer_->getViewport();
+                    const glm::vec2 vp_pos(viewport_pos_.x, viewport_pos_.y);
+                    const glm::vec2 vp_size(viewport_size_.x, viewport_size_.y);
+
+                    // Gizmo bounds (lower-right corner)
+                    const float gizmo_x = vp_pos.x + vp_size.x - VIEWPORT_GIZMO_SIZE - VIEWPORT_GIZMO_MARGIN_X;
+                    const float gizmo_y = vp_pos.y + vp_size.y - VIEWPORT_GIZMO_SIZE - VIEWPORT_GIZMO_MARGIN_Y;
+
+                    const ImVec2 mouse = ImGui::GetMousePos();
+                    const bool mouse_in_gizmo = mouse.x >= gizmo_x && mouse.x <= gizmo_x + VIEWPORT_GIZMO_SIZE &&
+                                                mouse.y >= gizmo_y && mouse.y <= gizmo_y + VIEWPORT_GIZMO_SIZE;
+
+                    const int hovered_axis = engine->hitTestViewportGizmo(glm::vec2(mouse.x, mouse.y), vp_pos, vp_size);
+                    engine->setViewportGizmoHover(hovered_axis);
+
+                    if (!ImGui::GetIO().WantCaptureMouse) {
+                        const glm::vec2 capture_mouse_pos(mouse.x, mouse.y);
+                        const float time = static_cast<float>(ImGui::GetTime());
+
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && mouse_in_gizmo) {
+                            if (hovered_axis >= 0 && hovered_axis <= 5) {
+                                // Snap to axis view
+                                const int axis = hovered_axis % 3;
+                                const bool negative = hovered_axis >= 3;
+                                const glm::mat3 rotation = engine->getAxisViewRotation(axis, negative);
+                                const float dist = glm::length(viewport.camera.pivot - viewport.camera.t);
+
+                                viewport.camera.pivot = glm::vec3(0.0f);
+                                viewport.camera.R = rotation;
+                                viewport.camera.t = -rotation[2] * dist;
+
+                                const auto& settings = rendering_manager->getSettings();
+                                lfs::core::events::ui::GridSettingsChanged{
+                                    .enabled = settings.show_grid,
+                                    .plane = axis,
+                                    .opacity = settings.grid_opacity}
+                                    .emit();
+
+                                rendering_manager->markDirty();
+                            } else {
+                                // Drag to orbit
+                                viewport_gizmo_dragging_ = true;
+                                viewport.camera.startRotateAroundCenter(capture_mouse_pos, time);
+                                if (GLFWwindow* const window = glfwGetCurrentContext()) {
+                                    glfwGetCursorPos(window, &gizmo_drag_start_cursor_.x, &gizmo_drag_start_cursor_.y);
+                                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                                }
+                            }
+                        }
+
+                        if (viewport_gizmo_dragging_) {
+                            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                                viewport.camera.updateRotateAroundCenter(capture_mouse_pos, time);
+                                rendering_manager->markDirty();
+                            } else {
+                                viewport.camera.endRotateAroundCenter();
+                                viewport_gizmo_dragging_ = false;
+
+                                // Release cursor, restore position
+                                if (GLFWwindow* const window = glfwGetCurrentContext()) {
+                                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                                    glfwSetCursorPos(window, gizmo_drag_start_cursor_.x, gizmo_drag_start_cursor_.y);
+                                }
+                            }
+                        }
+                    }
+
+                    if (auto result = engine->renderViewportGizmo(viewport.getRotationMatrix(), vp_pos, vp_size); !result) {
+                        LOG_WARN("Failed to render viewport gizmo: {}", result.error());
+                    }
+
+                    // Drag feedback overlay
+                    if (viewport_gizmo_dragging_) {
+                        const float center_x = gizmo_x + VIEWPORT_GIZMO_SIZE * 0.5f;
+                        const float center_y = gizmo_y + VIEWPORT_GIZMO_SIZE * 0.5f;
+                        constexpr float OVERLAY_RADIUS = VIEWPORT_GIZMO_SIZE * 0.46f; // Match gizmo content + 2px
+                        ImGui::GetBackgroundDrawList()->AddCircleFilled(
+                            ImVec2(center_x, center_y), OVERLAY_RADIUS,
+                            toU32WithAlpha(theme().overlay.text_dim, 0.2f), 32);
+                    }
+                }
             }
         }
 
-        if (draw_focus) {
-            ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+        // Render export progress overlay (blocking overlay on top of everything)
+        renderExportOverlay();
 
-            // The viewport_pos_ is already relative to the window, so we just need to add the window position
-            const ImGuiViewport* main_vp = ImGui::GetMainViewport();
-            ImVec2 screen_pos = ImVec2(
-                main_vp->WorkPos.x + viewport_pos_.x,
-                main_vp->WorkPos.y + viewport_pos_.y);
+        // Render import progress overlay
+        renderImportOverlay();
 
-            // Animated glow
-            float time = static_cast<float>(ImGui::GetTime());
-            float pulse = (sin(time * 3.0f) + 1.0f) * 0.5f;
+        // Render empty state welcome screen when no content loaded
+        renderEmptyStateOverlay();
 
-            // Outer glow
-            draw_list->AddRect(
-                screen_pos,
-                ImVec2(screen_pos.x + viewport_size_.x, screen_pos.y + viewport_size_.y),
-                IM_COL32(51, 153, 255, 127 + (int)(pulse * 76)), // Blue with pulsing alpha
-                0.0f, 0, 3.0f);
+        renderDragDropOverlay();
+        renderStartupOverlay();
 
-            // Inner highlight
-            draw_list->AddRect(
-                ImVec2(screen_pos.x + 1, screen_pos.y + 1),
-                ImVec2(screen_pos.x + viewport_size_.x - 1, screen_pos.y + viewport_size_.y - 1),
-                IM_COL32(102, 204, 255, 76 + (int)(pulse * 50)),
-                0.0f, 0, 1.0f);
+        if (save_directory_popup_) {
+            save_directory_popup_->render(viewport_pos_, viewport_size_);
+        }
+        if (resume_checkpoint_popup_) {
+            resume_checkpoint_popup_->render(viewport_pos_, viewport_size_);
         }
 
-        // Render dataset error popup if needed
-        renderDatasetErrorPopup();
+        if (disk_space_error_dialog_)
+            disk_space_error_dialog_->render();
+
+        if (notification_popup_ && !disk_space_error_dialog_->isOpen())
+            notification_popup_->render(viewport_pos_, viewport_size_);
+
+        if (exit_confirmation_popup_)
+            exit_confirmation_popup_->render();
 
         // End frame
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // Clean up GL state after ImGui rendering (ImGui can leave VAO/shader bindings corrupted)
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        // Clear any errors ImGui might have generated
+        while (glGetError() != GL_NO_ERROR) {}
 
         // Update and Render additional Platform Windows (for multi-viewport)
         if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
@@ -550,73 +1093,29 @@ namespace gs::gui {
             ImGui::UpdatePlatformWindows();
             ImGui::RenderPlatformWindowsDefault();
             glfwMakeContextCurrent(backup_current_context);
+
+            // Clean up GL state after multi-viewport rendering too
+            glBindVertexArray(0);
+            glUseProgram(0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            while (glGetError() != GL_NO_ERROR) {}
         }
     }
 
     void GuiManager::updateViewportRegion() {
-        const ImGuiViewport* main_viewport = ImGui::GetMainViewport();
-
-        // Start with full window
-        float left = 0;
-        float top = 0;
-        float right = main_viewport->WorkSize.x;
-        float bottom = main_viewport->WorkSize.y;
-
-        // Find our docked windows and calculate the remaining space
-        ImGuiWindow* settings_window = ImGui::FindWindowByName("Rendering Settings");
-        ImGuiWindow* scene_window = ImGui::FindWindowByName("Scene");
-
-        if (settings_window && settings_window->DockNode && settings_window->Active) {
-            // Settings panel is on the left
-            float panel_right = settings_window->Pos.x + settings_window->Size.x - main_viewport->WorkPos.x;
-            left = std::max(left, panel_right);
-        }
-
-        if (scene_window && scene_window->DockNode && scene_window->Active) {
-            // Scene panel is on the right
-            float panel_left = scene_window->Pos.x - main_viewport->WorkPos.x;
-            right = std::min(right, panel_left);
-        }
-
-        // Store relative to window
-        viewport_pos_ = ImVec2(left, top);
-        viewport_size_ = ImVec2(right - left, bottom - top);
+        constexpr float PANEL_GAP = 2.0f;
+        const auto* const vp = ImGui::GetMainViewport();
+        const float w = (show_main_panel_ && !ui_hidden_)
+                            ? vp->WorkSize.x - right_panel_width_ - PANEL_GAP
+                            : vp->WorkSize.x;
+        const float h = ui_hidden_ ? vp->WorkSize.y : vp->WorkSize.y - STATUS_BAR_HEIGHT;
+        viewport_pos_ = {vp->WorkPos.x, vp->WorkPos.y};
+        viewport_size_ = {w, h};
     }
 
     void GuiManager::updateViewportFocus() {
-        // Check if mouse is in viewport area
-        ImVec2 mouse_pos = ImGui::GetMousePos();
-        const ImGuiViewport* main_viewport = ImGui::GetMainViewport();
-
-        // Convert mouse position to window-relative coordinates
-        float mouse_x = mouse_pos.x - main_viewport->WorkPos.x;
-        float mouse_y = mouse_pos.y - main_viewport->WorkPos.y;
-
-        // Check if mouse is within viewport bounds
-        bool mouse_in_viewport = (mouse_x >= viewport_pos_.x &&
-                                  mouse_x < viewport_pos_.x + viewport_size_.x &&
-                                  mouse_y >= viewport_pos_.y &&
-                                  mouse_y < viewport_pos_.y + viewport_size_.y);
-
-        // Check if ImGui wants input
-        bool imgui_wants_input = ImGui::GetIO().WantCaptureMouse ||
-                                 ImGui::GetIO().WantCaptureKeyboard ||
-                                 ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
-
-        // Special handling for clicks - if clicking in viewport, it gets focus immediately
-        bool mouse_clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-                             ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
-                             ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
-
-        if (mouse_clicked && mouse_in_viewport && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
-            // Clicking in viewport gives it focus immediately
-            viewport_has_focus_ = true;
-            // Tell ImGui we don't want this mouse event
-            ImGui::GetIO().WantCaptureMouse = false;
-        } else {
-            // Normal focus rules: viewport has focus when mouse is over it and ImGui doesn't want input
-            viewport_has_focus_ = mouse_in_viewport && !imgui_wants_input;
-        }
+        // Viewport has focus unless actively using a GUI widget
+        viewport_has_focus_ = !ImGui::IsAnyItemActive();
     }
 
     ImVec2 GuiManager::getViewportPos() const {
@@ -653,271 +1152,885 @@ namespace gs::gui {
                 rel_y < viewport_pos_.y + viewport_size_.y);
     }
 
-    void GuiManager::renderSpeedOverlay() {
-        // Check if overlay should be hidden
-        if (speed_overlay_visible_) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - speed_overlay_start_time_ >= speed_overlay_duration_) {
-                speed_overlay_visible_ = false;
-            }
-        } else {
+    bool GuiManager::isPositionInViewportGizmo(const double x, const double y) const {
+        if (!show_viewport_gizmo_ || ui_hidden_)
+            return false;
+
+        const float gizmo_x = viewport_pos_.x + viewport_size_.x - VIEWPORT_GIZMO_SIZE - VIEWPORT_GIZMO_MARGIN_X;
+        const float gizmo_y = viewport_pos_.y + viewport_size_.y - VIEWPORT_GIZMO_SIZE - VIEWPORT_GIZMO_MARGIN_Y;
+
+        return x >= gizmo_x && x <= gizmo_x + VIEWPORT_GIZMO_SIZE &&
+               y >= gizmo_y && y <= gizmo_y + VIEWPORT_GIZMO_SIZE;
+    }
+
+    void GuiManager::renderStatusBar(const UIContext& ctx) {
+        auto* const rm = ctx.viewer->getRenderingManager();
+        auto* const sm = ctx.viewer->getSceneManager();
+        if (!rm)
             return;
-        }
 
-        // Get viewport for positioning
-        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        constexpr float PADDING = 8.0f, SPACING = 20.0f, FADE_DURATION_MS = 500.0f;
+        const auto& t = theme();
+        const auto* const vp = ImGui::GetMainViewport();
+        const ImVec2 pos{vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y - STATUS_BAR_HEIGHT};
+        const ImVec2 size{vp->WorkSize.x, STATUS_BAR_HEIGHT};
+        const auto now = std::chrono::steady_clock::now();
 
-        // Position overlay in the center-top of the viewport
-        const float overlay_width = 300.0f;
-        const float overlay_height = 80.0f;
-        const float padding = 20.0f;
+        // Fade alpha helper
+        const auto fade_alpha = [&](auto start_time) {
+            const auto remaining = speed_overlay_duration_ -
+                                   std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
+            return (remaining.count() < FADE_DURATION_MS) ? remaining.count() / FADE_DURATION_MS : 1.0f;
+        };
 
-        ImVec2 overlay_pos(
-            viewport->WorkPos.x + (viewport->WorkSize.x - overlay_width) * 0.5f,
-            viewport->WorkPos.y + padding);
+        // Update overlay timers
+        if (speed_overlay_visible_ && now - speed_overlay_start_time_ >= speed_overlay_duration_)
+            speed_overlay_visible_ = false;
+        if (zoom_speed_overlay_visible_ && now - zoom_speed_overlay_start_time_ >= speed_overlay_duration_)
+            zoom_speed_overlay_visible_ = false;
 
-        // Create overlay window
-        ImGui::SetNextWindowPos(overlay_pos, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(overlay_width, overlay_height), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(size, ImGuiCond_Always);
 
-        // Window flags to make it non-interactive and styled nicely
-        ImGuiWindowFlags overlay_flags =
-            ImGuiWindowFlags_NoTitleBar |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse |
-            ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoInputs |
-            ImGuiWindowFlags_NoFocusOnAppearing |
-            ImGuiWindowFlags_NoBringToFrontOnFocus;
+        constexpr ImGuiWindowFlags FLAGS =
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoFocusOnAppearing;
 
-        // Apply semi-transparent background
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.7f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 0.3f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, withAlpha(t.palette.background, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_Border, withAlpha(t.palette.border, 0.6f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {PADDING, 3.0f});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {6.0f, 0.0f});
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
 
-        if (ImGui::Begin("##SpeedOverlay", nullptr, overlay_flags)) {
-            // Calculate fade effect based on remaining time
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - speed_overlay_start_time_);
-            auto remaining = speed_overlay_duration_ - elapsed;
+        if (ImGui::Begin("##StatusBar", nullptr, FLAGS)) {
+            // Use regular font as base for status bar
+            if (ctx.fonts.regular)
+                ImGui::PushFont(ctx.fonts.regular);
 
-            float fade_alpha = 1.0f;
-            if (remaining < std::chrono::milliseconds(500)) {
-                // Fade out in the last 500ms
-                fade_alpha = static_cast<float>(remaining.count()) / 500.0f;
+            ImGui::GetWindowDrawList()->AddLine(pos, {pos.x + size.x, pos.y},
+                                                toU32(withAlpha(t.palette.surface_bright, 0.4f)), 1.0f);
+
+            // Mode (bold)
+            const char* mode = "Empty";
+            ImVec4 color = t.palette.text_dim;
+            TrainerManager* trainer_mgr = nullptr;
+            bool show_training_progress = false;
+            char mode_buf[64] = {};
+
+            if (sm) {
+                switch (sm->getContentType()) {
+                case SceneManager::ContentType::SplatFiles:
+                    mode = "Viewer";
+                    color = t.palette.info;
+                    break;
+                case SceneManager::ContentType::Dataset:
+                    trainer_mgr = sm->getTrainerManager();
+                    if (trainer_mgr && trainer_mgr->hasTrainer()) {
+                        const auto state = trainer_mgr->getState();
+                        const int current_iter = trainer_mgr->getCurrentIteration();
+                        const char* base_mode = "Dataset";
+                        switch (state) {
+                        case TrainerManager::State::Running:
+                            base_mode = "Training";
+                            color = t.palette.warning;
+                            show_training_progress = true;
+                            break;
+                        case TrainerManager::State::Paused:
+                            base_mode = "Paused";
+                            color = t.palette.text_dim;
+                            show_training_progress = true;
+                            break;
+                        case TrainerManager::State::Ready:
+                            base_mode = (current_iter > 0) ? "Resume" : "Ready";
+                            color = t.palette.success;
+                            break;
+                        case TrainerManager::State::Finished: {
+                            const auto reason = trainer_mgr->getStateMachine().getFinishReason();
+                            if (reason == FinishReason::Completed) {
+                                base_mode = "Complete";
+                                color = t.palette.success;
+                                show_training_progress = true;
+                            } else {
+                                base_mode = "Error";
+                                color = t.palette.error;
+                            }
+                            break;
+                        }
+                        default: break;
+                        }
+                        // Add strategy and method info
+                        const char* strategy = trainer_mgr->getStrategyType();
+                        const bool gut = trainer_mgr->isGutEnabled();
+                        snprintf(mode_buf, sizeof(mode_buf), "%s (%s/%s)",
+                                 base_mode,
+                                 strcmp(strategy, "mcmc") == 0 ? "MCMC" : "Default",
+                                 gut ? "GUT" : "3DGS");
+                        mode = mode_buf;
+                    } else {
+                        mode = "Dataset";
+                    }
+                    break;
+                default: break;
+                }
+            }
+            if (ctx.fonts.bold)
+                ImGui::PushFont(ctx.fonts.bold);
+            ImGui::TextColored(color, "%s", mode);
+            if (ctx.fonts.bold)
+                ImGui::PopFont();
+
+            // Training progress display
+            if (show_training_progress && trainer_mgr) {
+                constexpr float SECTION_GAP = 12.0f;
+                constexpr float LABEL_GAP = 6.0f;
+                constexpr float SEP_GAP = 20.0f;
+                constexpr float BAR_WIDTH = 120.0f;
+                constexpr float BAR_HEIGHT = 12.0f;
+                constexpr float BAR_ROUNDING = 2.0f;
+
+                const int current_iter = trainer_mgr->getCurrentIteration();
+                const int total_iter = trainer_mgr->getTotalIterations();
+                const float progress = total_iter > 0
+                                           ? static_cast<float>(current_iter) / static_cast<float>(total_iter)
+                                           : 0.0f;
+
+                ImDrawList* const draw_list = ImGui::GetWindowDrawList();
+                ImFont* const font = ctx.fonts.bold ? ctx.fonts.bold : ImGui::GetFont();
+                const float font_size = font->FontSize;
+                const float y_text = pos.y + (STATUS_BAR_HEIGHT - font_size) * 0.5f;
+                const float y_bar = pos.y + (STATUS_BAR_HEIGHT - BAR_HEIGHT) * 0.5f;
+                const ImU32 col_text = toU32(t.palette.text);
+                const ImU32 col_dim = toU32(t.palette.text_dim);
+                const ImU32 col_bar_bg = toU32(withAlpha(t.palette.surface_bright, 0.5f));
+                const ImU32 col_bar_fill = toU32(t.palette.primary);
+
+                // Helper: draw label and advance cursor
+                const auto draw_label = [&](float& x, const char* label) {
+                    draw_list->AddText(font, font_size, {x, y_text}, col_dim, label);
+                    x += font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, label).x + LABEL_GAP;
+                };
+
+                // Helper: draw value and advance cursor
+                const auto draw_value = [&](float& x, const char* value) {
+                    draw_list->AddText(font, font_size, {x, y_text}, col_text, value);
+                    x += font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, value).x;
+                };
+
+                // Helper: draw separator and advance cursor
+                const auto draw_sep = [&](float& x) {
+                    draw_list->AddText(font, font_size, {x, y_text}, col_dim, "|");
+                    x += SEP_GAP;
+                };
+
+                // Helper: format count with K/M suffix
+                const auto fmt_count = [](const int n, char* buf, const size_t size) {
+                    if (n >= 1'000'000)
+                        snprintf(buf, size, "%.2fM", n / 1e6);
+                    else if (n >= 1'000)
+                        snprintf(buf, size, "%.0fK", n / 1e3);
+                    else
+                        snprintf(buf, size, "%d", n);
+                };
+
+                // Helper: format time as h:mm:ss or m:ss
+                const auto fmt_time = [](const float secs, char* buf, const size_t size) {
+                    if (secs < 0.0f) {
+                        snprintf(buf, size, "--:--");
+                        return;
+                    }
+                    const int total = static_cast<int>(secs);
+                    const int h = total / 3600, m = (total % 3600) / 60, s = total % 60;
+                    if (h > 0)
+                        snprintf(buf, size, "%d:%02d:%02d", h, m, s);
+                    else
+                        snprintf(buf, size, "%d:%02d", m, s);
+                };
+
+                ImGui::SameLine(0.0f, SPACING);
+                ImGui::TextColored(t.palette.text_dim, "|");
+                ImGui::SameLine(0.0f, SPACING);
+
+                float x = ImGui::GetCursorScreenPos().x;
+
+                // Progress bar
+                draw_list->AddRectFilled({x, y_bar}, {x + BAR_WIDTH, y_bar + BAR_HEIGHT},
+                                         col_bar_bg, BAR_ROUNDING);
+                if (progress > 0.0f) {
+                    draw_list->AddRectFilled({x, y_bar}, {x + BAR_WIDTH * progress, y_bar + BAR_HEIGHT},
+                                             col_bar_fill, BAR_ROUNDING);
+                }
+                char pct_buf[8];
+                snprintf(pct_buf, sizeof(pct_buf), "%.0f%%", progress * 100.0f);
+                const ImVec2 pct_size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, pct_buf);
+                draw_list->AddText(font, font_size,
+                                   {x + (BAR_WIDTH - pct_size.x) * 0.5f, y_bar + (BAR_HEIGHT - pct_size.y) * 0.5f},
+                                   col_text, pct_buf);
+                x += BAR_WIDTH + SECTION_GAP;
+
+                // Step
+                char iter_buf[32];
+                snprintf(iter_buf, sizeof(iter_buf), "%d/%d", current_iter, total_iter);
+                draw_label(x, "Step");
+                draw_value(x, iter_buf);
+                x += SECTION_GAP;
+                draw_sep(x);
+
+                // Loss
+                char loss_buf[16];
+                snprintf(loss_buf, sizeof(loss_buf), "%.4f", trainer_mgr->getCurrentLoss());
+                draw_label(x, "Loss");
+                draw_value(x, loss_buf);
+                x += SECTION_GAP;
+                draw_sep(x);
+
+                // Gaussians
+                char cur_buf[16], max_buf[16], gauss_buf[32];
+                fmt_count(trainer_mgr->getNumSplats(), cur_buf, sizeof(cur_buf));
+                fmt_count(trainer_mgr->getMaxGaussians(), max_buf, sizeof(max_buf));
+                snprintf(gauss_buf, sizeof(gauss_buf), "%s/%s", cur_buf, max_buf);
+                draw_label(x, "Gaussians");
+                draw_value(x, gauss_buf);
+                x += SECTION_GAP;
+                draw_sep(x);
+
+                // Time
+                char elapsed_buf[16], eta_buf[16];
+                fmt_time(trainer_mgr->getElapsedSeconds(), elapsed_buf, sizeof(elapsed_buf));
+                fmt_time(trainer_mgr->getEstimatedRemainingSeconds(), eta_buf, sizeof(eta_buf));
+                draw_value(x, elapsed_buf);
+                x += LABEL_GAP;
+                draw_label(x, "ETA");
+                draw_value(x, eta_buf);
+
+                ImGui::SameLine();
+                ImGui::Dummy({x - ImGui::GetCursorScreenPos().x + SECTION_GAP, STATUS_BAR_HEIGHT});
             }
 
-            // Center the text
-            ImVec2 window_size = ImGui::GetWindowSize();
+            // Splat count (visible / total) - skip during training
+            if (sm && !show_training_progress) {
+                size_t total = 0, visible = 0;
+                for (const auto* n : sm->getScene().getNodes()) {
+                    if (n->type == NodeType::SPLAT) {
+                        total += n->gaussian_count;
+                        if (n->visible.get())
+                            visible += n->gaussian_count;
+                    }
+                }
+                if (total > 0) {
+                    ImGui::SameLine(0.0f, SPACING);
+                    ImGui::TextColored(t.palette.text_dim, "|");
+                    ImGui::SameLine();
+                    const auto fmt = [](const size_t n) -> std::string {
+                        if (n >= 1'000'000)
+                            return std::format("{:.2f}M", n / 1e6);
+                        if (n >= 1'000)
+                            return std::format("{:.1f}K", n / 1e3);
+                        return std::to_string(n);
+                    };
+                    if (ctx.fonts.bold)
+                        ImGui::PushFont(ctx.fonts.bold);
+                    if (visible == total)
+                        ImGui::Text(LOC(lichtfeld::Strings::Progress::GAUSSIANS_COUNT), fmt(total).c_str());
+                    else
+                        ImGui::Text("%s / %s", fmt(visible).c_str(), fmt(total).c_str());
+                    if (ctx.fonts.bold)
+                        ImGui::PopFont();
+                }
+            }
 
-            // Speed text
-            std::string speed_text = std::format("WASD Speed: {:.2f}", current_speed_);
-            ImVec2 speed_text_size = ImGui::CalcTextSize(speed_text.c_str());
-            ImGui::SetCursorPos(ImVec2(
-                (window_size.x - speed_text_size.x) * 0.5f,
-                window_size.y * 0.3f));
+            // Split view / GT comparison
+            if (const auto info = rm->getSplitViewInfo(); info.enabled) {
+                ImGui::SameLine(0.0f, SPACING);
+                ImGui::TextColored(t.palette.text_dim, "|");
+                ImGui::SameLine();
+                if (rm->getSettings().split_view_mode == SplitViewMode::GTComparison) {
+                    const int cam_id = rm->getCurrentCameraId();
+                    auto* sm_trainer_mgr = sm ? sm->getTrainerManager() : nullptr;
+                    auto cam = sm_trainer_mgr ? sm_trainer_mgr->getCamById(cam_id) : nullptr;
 
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, fade_alpha));
-            ImGui::Text("%s", speed_text.c_str());
-            ImGui::PopStyleColor();
+                    if (cam) {
+                        // Image filename and extension
+                        const auto& path = cam->image_path();
+                        const std::string filename = lfs::core::path_to_utf8(path.filename());
+                        std::string ext = path.extension().string();
+                        if (!ext.empty() && ext[0] == '.')
+                            ext = ext.substr(1);
+                        for (auto& c : ext)
+                            c = static_cast<char>(std::toupper(c));
 
-            // Max speed text
-            std::string max_text = std::format("Max: {:.3f}", max_speed_);
-            ImVec2 max_text_size = ImGui::CalcTextSize(max_text.c_str());
-            ImGui::SetCursorPos(ImVec2(
-                (window_size.x - max_text_size.x) * 0.5f,
-                window_size.y * 0.6f));
+                        // Infer channels from extension
+                        const char* channels = "RGB";
+                        if (ext == "PNG" || ext == "WEBP" || ext == "TIFF" || ext == "TIF" || ext == "EXR")
+                            channels = "RGBA";
 
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.8f, fade_alpha * 0.8f));
-            ImGui::Text("%s", max_text.c_str());
-            ImGui::PopStyleColor();
+                        ImGui::TextColored(t.palette.info, "%s", filename.c_str());
+                        ImGui::SameLine(0.0f, SPACING);
+                        ImGui::TextColored(t.palette.text_dim, "|");
+                        ImGui::SameLine(0.0f, SPACING);
+
+                        // Dimensions and channels
+                        ImGui::TextColored(t.palette.text_dim, "%dx%d %s",
+                                           cam->image_width(), cam->image_height(), channels);
+                        ImGui::SameLine(0.0f, SPACING);
+
+                        // Format
+                        ImGui::TextColored(t.palette.text_dim, "%s", ext.c_str());
+
+                        // Mask indicator
+                        if (cam->has_mask()) {
+                            ImGui::SameLine(0.0f, SPACING);
+                            ImGui::TextColored(t.palette.success, "MASK");
+                        }
+
+                        // Camera model (always show)
+                        ImGui::SameLine(0.0f, SPACING);
+                        const auto model_type = cam->camera_model_type();
+                        const char* model = "PINHOLE";
+                        switch (model_type) {
+                        case lfs::core::CameraModelType::FISHEYE: model = "FISHEYE"; break;
+                        case lfs::core::CameraModelType::ORTHO: model = "ORTHO"; break;
+                        case lfs::core::CameraModelType::EQUIRECTANGULAR: model = "EQUIRECT"; break;
+                        case lfs::core::CameraModelType::THIN_PRISM_FISHEYE: model = "THIN_PRISM"; break;
+                        default: break;
+                        }
+                        const bool is_pinhole = (model_type == lfs::core::CameraModelType::PINHOLE);
+                        ImGui::TextColored(is_pinhole ? t.palette.text_dim : t.palette.warning, "%s", model);
+                    } else {
+                        ImGui::TextColored(t.palette.warning, "GT Compare");
+                        ImGui::SameLine(0.0f, 4.0f);
+                        ImGui::TextColored(t.palette.text_dim, "Cam %d", cam_id);
+                    }
+                } else {
+                    ImGui::TextColored(t.palette.warning, "Split:");
+                    ImGui::SameLine(0.0f, 4.0f);
+                    ImGui::Text("%s | %s", info.left_name.c_str(), info.right_name.c_str());
+                }
+            }
+
+            // WASD speed
+            if (speed_overlay_visible_) {
+                const float a = fade_alpha(speed_overlay_start_time_);
+                ImGui::SameLine(0.0f, SPACING);
+                ImGui::TextColored(withAlpha(t.palette.text_dim, a), "|");
+                ImGui::SameLine();
+                ImGui::TextColored(withAlpha(t.palette.info, a), "WASD: %.0f", current_speed_);
+            }
+
+            // Zoom speed
+            if (zoom_speed_overlay_visible_) {
+                const float a = fade_alpha(zoom_speed_overlay_start_time_);
+                ImGui::SameLine(0.0f, SPACING);
+                ImGui::TextColored(withAlpha(t.palette.text_dim, a), "|");
+                ImGui::SameLine();
+                ImGui::TextColored(withAlpha(t.palette.info, a), "Zoom: %.0f", zoom_speed_ * 10.0f);
+            }
+
+            // GPU Memory and FPS (right-aligned)
+            constexpr float GPU_MEM_WARN_PCT = 50.0f;
+            constexpr float GPU_MEM_CRIT_PCT = 75.0f;
+            constexpr float FPS_GOOD = 30.0f;
+            constexpr float FPS_WARN = 15.0f;
+            constexpr float BYTES_TO_GB = 1e-9f;
+
+            ImFont* const font = ctx.fonts.bold ? ctx.fonts.bold : ImGui::GetFont();
+
+            size_t free_mem = 0, total_mem = 0;
+            cudaMemGetInfo(&free_mem, &total_mem);
+            const float used_gb = static_cast<float>(total_mem - free_mem) * BYTES_TO_GB;
+            const float total_gb = static_cast<float>(total_mem) * BYTES_TO_GB;
+            const float pct_used = (used_gb / total_gb) * 100.0f;
+
+            const ImVec4 mem_color = pct_used < GPU_MEM_WARN_PCT   ? t.palette.success
+                                     : pct_used < GPU_MEM_CRIT_PCT ? t.palette.warning
+                                                                   : t.palette.error;
+
+            char mem_buf[32];
+            snprintf(mem_buf, sizeof(mem_buf), "%.1f/%.1fGB", used_gb, total_gb);
+
+            const float fps = rm->getAverageFPS();
+            const ImVec4 fps_color = fps >= FPS_GOOD   ? t.palette.success
+                                     : fps >= FPS_WARN ? t.palette.warning
+                                                       : t.palette.error;
+            char fps_buf[16];
+            snprintf(fps_buf, sizeof(fps_buf), "%.0f", fps);
+
+            const float mem_val_w = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, mem_buf).x;
+            const float mem_label_w = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, "GPU ").x;
+            const float fps_w = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, fps_buf).x;
+            const float fps_label_w = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, " FPS").x;
+            const float version_label_w = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, GIT_COMMIT_HASH_SHORT).x;
+
+            ImGui::SameLine(size.x - (version_label_w + SPACING + mem_label_w + mem_val_w + SPACING + fps_w + fps_label_w) - PADDING * 2);
+
+            ImGui::TextColored(t.palette.text_dim, "GPU ");
+            ImGui::SameLine(0.0f, 0.0f);
+            if (ctx.fonts.bold)
+                ImGui::PushFont(ctx.fonts.bold);
+            ImGui::TextColored(mem_color, "%s", mem_buf);
+            if (ctx.fonts.bold)
+                ImGui::PopFont();
+
+            ImGui::SameLine(0.0f, SPACING);
+
+            if (ctx.fonts.bold)
+                ImGui::PushFont(ctx.fonts.bold);
+            ImGui::TextColored(fps_color, "%s", fps_buf);
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::TextColored(t.palette.text_dim, " %s", LOC(lichtfeld::Strings::Status::FPS));
+            if (ctx.fonts.bold)
+                ImGui::PopFont();
+
+            ImGui::SameLine(0.0f, SPACING);
+
+            ImGui::TextColored(t.palette.text_dim, GIT_COMMIT_HASH_SHORT);
+
+            if (ctx.fonts.regular)
+                ImGui::PopFont();
         }
         ImGui::End();
 
-        ImGui::PopStyleVar(2);
+        ImGui::PopStyleVar(4);
         ImGui::PopStyleColor(2);
     }
 
-    void GuiManager::showSpeedOverlay(float current_speed, float max_speed) {
+    void GuiManager::showSpeedOverlay(const float current_speed, float /*max_speed*/) {
         current_speed_ = current_speed;
-        max_speed_ = max_speed;
         speed_overlay_visible_ = true;
         speed_overlay_start_time_ = std::chrono::steady_clock::now();
     }
 
-    void GuiManager::renderNotificationPopup() {
-        // Check if notification should be hidden
-        if (notification_visible_) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - notification_start_time_ >= notification_duration_) {
-                notification_visible_ = false;
-            }
-        } else {
+    void GuiManager::showZoomSpeedOverlay(const float zoom_speed, float /*max_zoom_speed*/) {
+        zoom_speed_ = zoom_speed;
+        zoom_speed_overlay_visible_ = true;
+        zoom_speed_overlay_start_time_ = std::chrono::steady_clock::now();
+    }
+
+    void GuiManager::triggerCropFlash() {
+        crop_flash_active_ = true;
+        crop_flash_start_ = std::chrono::steady_clock::now();
+    }
+
+    void GuiManager::updateCropFlash() {
+        if (!crop_flash_active_)
+            return;
+
+        auto* const sm = viewer_->getSceneManager();
+        auto* const rm = viewer_->getRenderingManager();
+        if (!sm || !rm)
+            return;
+
+        constexpr int DURATION_MS = 400;
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - crop_flash_start_)
+                                    .count();
+
+        const NodeId cropbox_id = sm->getSelectedNodeCropBoxId();
+        if (cropbox_id == NULL_NODE) {
+            crop_flash_active_ = false;
             return;
         }
 
-        // Get viewport for positioning
-        const ImGuiViewport* viewport = ImGui::GetMainViewport();
-
-        // Position popup in the center of the screen
-        const float popup_width = 450.0f;
-        const float popup_height = 120.0f;
-
-        ImVec2 popup_pos(
-            viewport->WorkPos.x + (viewport->WorkSize.x - popup_width) * 0.5f,
-            viewport->WorkPos.y + (viewport->WorkSize.y - popup_height) * 0.5f);
-
-        ImGui::SetNextWindowPos(popup_pos, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(popup_width, popup_height), ImGuiCond_Always);
-
-        // Calculate fade effect based on time remaining
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - notification_start_time_).count();
-        float fade_alpha = 1.0f;
-        if (elapsed > notification_duration_.count() - 500) {
-            float fade_time = notification_duration_.count() - elapsed;
-            fade_alpha = fade_time / 500.0f;
+        auto* node = sm->getScene().getMutableNode(sm->getScene().getNodeById(cropbox_id)->name);
+        if (!node || !node->cropbox) {
+            crop_flash_active_ = false;
+            return;
         }
 
-        // Style the popup
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f, 20.0f));
-
-        ImVec4 bg_color = notification_is_error_
-            ? ImVec4(0.15f, 0.05f, 0.05f, 0.95f * fade_alpha)  // Dark red for errors
-            : ImVec4(0.05f, 0.15f, 0.05f, 0.95f * fade_alpha); // Dark green for success
-
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, bg_color);
-        ImGui::PushStyleColor(ImGuiCol_Border, notification_is_error_
-            ? ImVec4(0.8f, 0.2f, 0.2f, fade_alpha)   // Red border for errors
-            : ImVec4(0.2f, 0.8f, 0.2f, fade_alpha)); // Green border for success
-
-        ImGuiWindowFlags window_flags =
-            ImGuiWindowFlags_NoTitleBar |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoDocking;
-
-        if (ImGui::Begin("##NotificationPopup", nullptr, window_flags)) {
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 12.0f));
-
-            // Title
-            ImVec4 title_color = notification_is_error_
-                ? ImVec4(1.0f, 0.4f, 0.4f, fade_alpha)  // Light red for errors
-                : ImVec4(0.4f, 1.0f, 0.4f, fade_alpha); // Light green for success
-
-            ImGui::PushStyleColor(ImGuiCol_Text, title_color);
-            const char* title = notification_is_error_ ? "Error" : "Success";
-            ImVec2 title_size = ImGui::CalcTextSize(title);
-            ImGui::SetCursorPosX((popup_width - title_size.x) * 0.5f);
-            ImGui::Text("%s", title);
-            ImGui::PopStyleColor();
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            // Message (word-wrapped)
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.95f, 0.95f, fade_alpha));
-            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + popup_width - 40.0f);
-            ImGui::TextWrapped("%s", notification_message_.c_str());
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
-
-            ImGui::PopStyleVar();
+        if (elapsed_ms >= DURATION_MS) {
+            crop_flash_active_ = false;
+            node->cropbox->flash_intensity = 0.0f;
+        } else {
+            node->cropbox->flash_intensity = 1.0f - static_cast<float>(elapsed_ms) / DURATION_MS;
         }
-        ImGui::End();
-
-        ImGui::PopStyleVar(2);
-        ImGui::PopStyleColor(2);
+        sm->getScene().invalidateCache();
+        rm->markDirty();
     }
 
-    void GuiManager::showNotificationPopup(const std::string& message, bool is_error, int duration_ms) {
-        notification_message_ = message;
-        notification_is_error_ = is_error;
-        notification_visible_ = true;
-        notification_start_time_ = std::chrono::steady_clock::now();
-        notification_duration_ = std::chrono::milliseconds(duration_ms);
-    }
+    void GuiManager::deactivateAllTools() {
+        if (auto* const t = viewer_->getSelectionTool())
+            t->setEnabled(false);
+        if (auto* const t = viewer_->getBrushTool())
+            t->setEnabled(false);
+        if (auto* const t = viewer_->getAlignTool())
+            t->setEnabled(false);
 
-    void GuiManager::renderDatasetErrorPopup() {
-        if (dataset_error_popup_pending_) {
-            ImGui::OpenPopup("Dataset load error");
-            dataset_error_popup_pending_ = false;
+        if (auto* const sm = viewer_->getSceneManager()) {
+            sm->applyDeleted();
         }
 
-        bool open = true;
-        if (ImGui::BeginPopupModal("Dataset load error", &open,
-                                   ImGuiWindowFlags_AlwaysAutoResize |
-                                       ImGuiWindowFlags_NoSavedSettings)) {
-
-            ImGui::TextWrapped("%s", dataset_error_message_.c_str());
-            ImGui::Separator();
-
-            if (ImGui::Button("OK", ImVec2(120.0f, 0.0f))) {
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::SetItemDefaultFocus();
-
-            ImGui::SameLine();
-
-            if (ImGui::Button("Copy details", ImVec2(120.0f, 0.0f))) {
-                ImGui::SetClipboardText(dataset_error_message_.c_str());
-            }
-
-            ImGui::EndPopup();
-        }
+        auto& editor = viewer_->getEditorContext();
+        editor.setActiveTool(ToolType::None);
+        gizmo_toolbar_state_.current_operation = ImGuizmo::TRANSLATE;
     }
-
-    void GuiManager::showDatasetErrorPopup(const std::string& message) {
-        dataset_error_message_ = message;
-        dataset_error_popup_pending_ = true;
-    }
-
 
     void GuiManager::setupEventHandlers() {
-        using namespace events;
+        using namespace lfs::core::events;
 
-        // Handle window visibility
+        ui::FileDropReceived::when([this](const auto&) {
+            show_startup_overlay_ = false;
+        });
+
         cmd::ShowWindow::when([this](const auto& e) {
             showWindow(e.window_name, e.show);
         });
+
+        cmd::ShowDatasetLoadPopup::when([this](const auto& e) {
+            std::filesystem::path output_dir = e.dataset_path;
+            if (std::filesystem::is_regular_file(output_dir)) {
+                output_dir = output_dir.parent_path();
+            }
+            if (save_directory_popup_) {
+                save_directory_popup_->show(output_dir);
+            }
+        });
+
+        ui::NodeSelected::when([this](const auto&) {
+            if (auto* const t = viewer_->getSelectionTool())
+                t->setEnabled(false);
+            if (auto* const t = viewer_->getBrushTool())
+                t->setEnabled(false);
+            if (auto* const t = viewer_->getAlignTool())
+                t->setEnabled(false);
+            if (auto* const sm = viewer_->getSceneManager())
+                sm->syncCropBoxToRenderSettings();
+        });
+        ui::NodeDeselected::when([this](const auto&) {
+            if (auto* const t = viewer_->getSelectionTool())
+                t->setEnabled(false);
+            if (auto* const t = viewer_->getBrushTool())
+                t->setEnabled(false);
+            if (auto* const t = viewer_->getAlignTool())
+                t->setEnabled(false);
+        });
+        state::PLYRemoved::when([this](const auto&) { deactivateAllTools(); });
+        state::SceneCleared::when([this](const auto&) { deactivateAllTools(); });
 
         // Handle speed change events
         ui::SpeedChanged::when([this](const auto& e) {
             showSpeedOverlay(e.current_speed, e.max_speed);
         });
 
-        // Handle dataset load completion for GUI feedback
-        state::DatasetLoadCompleted::when([this](const auto& e) {
-            if (!e.success) {
-                std::string message;
-                if (e.error.has_value()) {
-                    message = e.error.value();
-                } else {
-                    message = "Dataset loading failed. Unsupported dataset format or invalid dataset path.";
-                }
-                showDatasetErrorPopup(message);
+        ui::ZoomSpeedChanged::when([this](const auto& e) {
+            showZoomSpeedOverlay(e.zoom_speed, e.max_zoom_speed);
+        });
+
+        lfs::core::events::tools::SetToolbarTool::when([this](const auto& e) {
+            auto& editor = viewer_->getEditorContext();
+            editor.setActiveTool(static_cast<ToolType>(e.tool_mode));
+        });
+
+        cmd::ApplyCropBox::when([this](const auto&) {
+            auto* const sm = viewer_->getSceneManager();
+            if (!sm)
+                return;
+
+            // Check if a cropbox node is selected
+            const NodeId cropbox_id = sm->getSelectedNodeCropBoxId();
+            if (cropbox_id == NULL_NODE)
+                return;
+
+            const auto* cropbox_node = sm->getScene().getNodeById(cropbox_id);
+            if (!cropbox_node || !cropbox_node->cropbox)
+                return;
+
+            const glm::mat4 world_transform = sm->getScene().getWorldTransform(cropbox_id);
+
+            lfs::geometry::BoundingBox crop_box;
+            crop_box.setBounds(cropbox_node->cropbox->min, cropbox_node->cropbox->max);
+            crop_box.setworld2BBox(glm::inverse(world_transform));
+            cmd::CropPLY{.crop_box = crop_box, .inverse = cropbox_node->cropbox->inverse}.emit();
+            triggerCropFlash();
+        });
+
+        cmd::ApplyEllipsoid::when([this](const auto&) {
+            auto* const sm = viewer_->getSceneManager();
+            if (!sm)
+                return;
+
+            const NodeId ellipsoid_id = sm->getSelectedNodeEllipsoidId();
+            if (ellipsoid_id == NULL_NODE)
+                return;
+
+            const auto* ellipsoid_node = sm->getScene().getNodeById(ellipsoid_id);
+            if (!ellipsoid_node || !ellipsoid_node->ellipsoid)
+                return;
+
+            const glm::mat4 world_transform = sm->getScene().getWorldTransform(ellipsoid_id);
+            const glm::vec3 radii = ellipsoid_node->ellipsoid->radii;
+            const bool inverse = ellipsoid_node->ellipsoid->inverse;
+
+            cmd::CropPLYEllipsoid{
+                .world_transform = world_transform,
+                .radii = radii,
+                .inverse = inverse}
+                .emit();
+            triggerCropFlash();
+        });
+
+        // Handle Ctrl+T to toggle crop inverse mode
+        cmd::ToggleCropInverse::when([this](const auto&) {
+            auto* const sm = viewer_->getSceneManager();
+            if (!sm)
+                return;
+
+            // Check if a cropbox node is selected
+            const NodeId cropbox_id = sm->getSelectedNodeCropBoxId();
+            if (cropbox_id == NULL_NODE)
+                return;
+
+            auto* node = sm->getScene().getMutableNode(sm->getScene().getNodeById(cropbox_id)->name);
+            if (!node || !node->cropbox)
+                return;
+
+            // Capture state before toggle
+            const command::CropBoxState old_state{
+                .min = node->cropbox->min,
+                .max = node->cropbox->max,
+                .local_transform = node->local_transform.get(),
+                .inverse = node->cropbox->inverse};
+
+            // Toggle crop inverse
+            node->cropbox->inverse = !node->cropbox->inverse;
+            sm->getScene().invalidateCache();
+
+            // Capture state after toggle
+            const command::CropBoxState new_state{
+                .min = node->cropbox->min,
+                .max = node->cropbox->max,
+                .local_transform = node->local_transform.get(),
+                .inverse = node->cropbox->inverse};
+
+            auto cmd = std::make_unique<command::CropBoxCommand>(
+                sm, node->name, old_state, new_state);
+            viewer_->getCommandHistory().execute(std::move(cmd));
+        });
+
+        // Cycle: normal -> center markers -> rings -> normal
+        cmd::CycleSelectionVisualization::when([this](const auto&) {
+            if (viewer_->getEditorContext().getActiveTool() != ToolType::Selection)
+                return;
+            auto* const rm = viewer_->getRenderingManager();
+            if (!rm)
+                return;
+
+            auto settings = rm->getSettings();
+            const bool centers = settings.show_center_markers;
+            const bool rings = settings.show_rings;
+
+            settings.show_center_markers = !centers && !rings;
+            settings.show_rings = centers && !rings;
+            rm->updateSettings(settings);
+        });
+
+        ui::FocusTrainingPanel::when([this](const auto&) {
+            focus_training_panel_ = true;
+        });
+
+        ui::ToggleUI::when([this](const auto&) {
+            ui_hidden_ = !ui_hidden_;
+        });
+
+        ui::ToggleFullscreen::when([this](const auto&) {
+            if (auto* wm = viewer_->getWindowManager()) {
+                wm->toggleFullscreen();
             }
         });
 
+        state::DiskSpaceSaveFailed::when([this](const auto& e) {
+            if (!e.is_disk_space_error) {
+                if (notification_popup_) {
+                    const std::string title = e.is_checkpoint ? "Checkpoint Save Failed" : "Export Failed";
+                    const std::string msg = e.is_checkpoint
+                                                ? std::format("Failed to save checkpoint at iteration {}:\n\n{}", e.iteration, e.error)
+                                                : std::format("Failed to export:\n\n{}", e.error);
+                    notification_popup_->show(NotificationPopup::Type::FAILURE, title, msg);
+                }
+                return;
+            }
+
+            if (!disk_space_error_dialog_)
+                return;
+
+            const DiskSpaceErrorDialog::ErrorInfo info{
+                .path = e.path,
+                .error_message = e.error,
+                .required_bytes = e.required_bytes,
+                .available_bytes = e.available_bytes,
+                .iteration = e.iteration,
+                .is_checkpoint = e.is_checkpoint};
+
+            if (e.is_checkpoint) {
+                auto on_retry = [this, iteration = e.iteration]() {
+                    if (auto* tm = viewer_->getTrainerManager()) {
+                        if (tm->isFinished() || !tm->isTrainingActive()) {
+                            if (auto* trainer = tm->getTrainer()) {
+                                LOG_INFO("Retrying save at iteration {}", iteration);
+                                trainer->save_final_ply_and_checkpoint(iteration);
+                            }
+                        } else {
+                            tm->requestSaveCheckpoint();
+                        }
+                    }
+                };
+
+                auto on_change_location = [this, iteration = e.iteration](const std::filesystem::path& new_path) {
+                    if (auto* tm = viewer_->getTrainerManager()) {
+                        if (auto* trainer = tm->getTrainer()) {
+                            auto params = trainer->getParams();
+                            params.dataset.output_path = new_path;
+                            trainer->setParams(params);
+                            LOG_INFO("Output path changed to: {}", lfs::core::path_to_utf8(new_path));
+
+                            if (tm->isFinished() || !tm->isTrainingActive()) {
+                                trainer->save_final_ply_and_checkpoint(iteration);
+                            } else {
+                                tm->requestSaveCheckpoint();
+                            }
+                        }
+                    }
+                };
+
+                auto on_cancel = []() {
+                    LOG_WARN("Checkpoint save cancelled by user");
+                };
+
+                disk_space_error_dialog_->show(info, on_retry, on_change_location, on_cancel);
+            } else {
+                auto on_retry = []() {};
+
+                auto on_change_location = [](const std::filesystem::path& new_path) {
+                    LOG_INFO("Re-export manually using File > Export to: {}", lfs::core::path_to_utf8(new_path));
+                };
+
+                auto on_cancel = []() {
+                    LOG_INFO("Export cancelled by user");
+                };
+
+                disk_space_error_dialog_->show(info, on_retry, on_change_location, on_cancel);
+            }
+        });
+
+        // Async dataset import
+        cmd::LoadFile::when([this](const auto& cmd) {
+            if (!cmd.is_dataset) {
+                return;
+            }
+            const auto* const data_loader = viewer_->getDataLoader();
+            if (!data_loader) {
+                LOG_ERROR("No data loader service");
+                return;
+            }
+            startAsyncImport(cmd.path, data_loader->getParameters());
+        });
+
+        // Fallback sync import progress handlers
+        state::DatasetLoadStarted::when([this](const auto& e) {
+            if (import_state_.active.load()) {
+                return;
+            }
+            const std::lock_guard lock(import_state_.mutex);
+            import_state_.active.store(true);
+            import_state_.progress.store(0.0f);
+            import_state_.path = e.path;
+            import_state_.stage = "Initializing...";
+            import_state_.error.clear();
+            import_state_.num_images = 0;
+            import_state_.num_points = 0;
+            import_state_.success = false;
+            import_state_.dataset_type = getDatasetTypeName(e.path);
+        });
+
+        state::DatasetLoadProgress::when([this](const auto& e) {
+            import_state_.progress.store(e.progress / 100.0f);
+            const std::lock_guard lock(import_state_.mutex);
+            import_state_.stage = e.step;
+        });
+
+        state::DatasetLoadCompleted::when([this](const auto& e) {
+            if (import_state_.show_completion.load()) {
+                return;
+            }
+            {
+                const std::lock_guard lock(import_state_.mutex);
+                import_state_.success = e.success;
+                import_state_.num_images = e.num_images;
+                import_state_.num_points = e.num_points;
+                import_state_.completion_time = std::chrono::steady_clock::now();
+                import_state_.error = e.error.value_or("");
+                import_state_.stage = e.success ? "Complete" : "Failed";
+                import_state_.progress.store(1.0f);
+            }
+            import_state_.active.store(false);
+            import_state_.show_completion.store(true);
+
+            // Focus training panel on successful dataset load
+            if (e.success) {
+                focus_training_panel_ = true;
+            }
+        });
+
+        // Focus training panel when trainer is ready (dataset or checkpoint loaded)
+        internal::TrainerReady::when([this](const auto&) {
+            focus_training_panel_ = true;
+        });
+    }
+
+    void GuiManager::setSelectionSubMode(panels::SelectionSubMode mode) {
+        if (viewer_->getEditorContext().getActiveTool() == ToolType::Selection) {
+            gizmo_toolbar_state_.selection_mode = mode;
+        }
+    }
+
+    panels::ToolType GuiManager::getCurrentToolMode() const {
+        return viewer_->getEditorContext().getActiveTool();
+    }
+
+    bool GuiManager::isCapturingInput() const {
+        return menu_bar_ && menu_bar_->isCapturingInput();
+    }
+
+    bool GuiManager::isModalWindowOpen() const {
+        // Check exit confirmation popup
+        if (exit_confirmation_popup_ && exit_confirmation_popup_->isOpen())
+            return true;
+
+        // Check save directory popup
+        if (save_directory_popup_ && save_directory_popup_->isOpen())
+            return true;
+
+        // Check export dialog
+        if (window_states_.contains("export_dialog") && window_states_.at("export_dialog"))
+            return true;
+
+        // Check menu bar dialog windows
+        if (!menu_bar_)
+            return false;
+
+        return menu_bar_->isInputSettingsOpen() ||
+               menu_bar_->isAboutWindowOpen() ||
+               menu_bar_->isGettingStartedWindowOpen() ||
+               menu_bar_->isDebugWindowOpen();
+    }
+
+    void GuiManager::captureKey(int key, int mods) {
+        if (menu_bar_) {
+            menu_bar_->captureKey(key, mods);
+        }
+    }
+
+    void GuiManager::captureMouseButton(int button, int mods) {
+        if (menu_bar_) {
+            menu_bar_->captureMouseButton(button, mods);
+        }
     }
 
     void GuiManager::applyDefaultStyle() {
-        ImGuiStyle& style = ImGui::GetStyle();
-        style.WindowTitleAlign = ImVec2(0.5f, 0.5f);
-        style.WindowPadding = ImVec2(6.0f, 6.0f);
-        style.WindowRounding = 6.0f;
-        style.WindowBorderSize = 0.0f;
-        style.FrameRounding = 2.0f;
-
-        ImGui::StyleColorsLight();
+        // Initialize theme system using saved preference
+        const bool is_dark = loadThemePreference();
+        setTheme(is_dark ? darkTheme() : lightTheme());
     }
 
     void GuiManager::showWindow(const std::string& name, bool show) {
@@ -929,11 +2042,19 @@ namespace gs::gui {
     }
 
     bool GuiManager::wantsInput() const {
+        // Block all input while exporting
+        if (export_state_.active.load()) {
+            return true;
+        }
         ImGuiIO& io = ImGui::GetIO();
         return io.WantCaptureMouse || io.WantCaptureKeyboard;
     }
 
     bool GuiManager::isAnyWindowActive() const {
+        // Block all interaction while exporting
+        if (export_state_.active.load()) {
+            return true;
+        }
         return ImGui::IsAnyItemActive() ||
                ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) ||
                ImGui::GetIO().WantCaptureMouse ||
@@ -946,9 +2067,1684 @@ namespace gs::gui {
         }
     }
 
-    void GuiManager::handleProjectChangedDialogCallback(std::function<void(bool)> callback) {
-        if (project_changed_dialog_box_) {
-            project_changed_dialog_box_->setOnDialogClose(callback);
+    void GuiManager::renderCropBoxGizmo(const UIContext& ctx) {
+        auto* const render_manager = ctx.viewer->getRenderingManager();
+        auto* const scene_manager = ctx.viewer->getSceneManager();
+        if (!render_manager || !scene_manager)
+            return;
+
+        const auto& settings = render_manager->getSettings();
+        if (!settings.show_crop_box)
+            return;
+
+        NodeId cropbox_id = NULL_NODE;
+        const SceneNode* cropbox_node = nullptr;
+
+        if (scene_manager->getSelectedNodeType() == NodeType::CROPBOX) {
+            cropbox_id = scene_manager->getSelectedNodeCropBoxId();
+        }
+
+        if (cropbox_id == NULL_NODE)
+            return;
+
+        cropbox_node = scene_manager->getScene().getNodeById(cropbox_id);
+        if (!cropbox_node || !cropbox_node->visible || !cropbox_node->cropbox)
+            return;
+        if (!scene_manager->getScene().isNodeEffectivelyVisible(cropbox_id))
+            return;
+
+        // Camera setup
+        auto& viewport = ctx.viewer->getViewport();
+        const glm::mat4 view = viewport.getViewMatrix();
+        const glm::ivec2 vp_size(static_cast<int>(viewport_size_.x), static_cast<int>(viewport_size_.y));
+        const glm::mat4 projection = lfs::rendering::createProjectionMatrix(
+            vp_size, settings.fov, settings.orthographic, settings.ortho_scale);
+
+        // Get cropbox state from scene graph
+        const glm::vec3 cropbox_min = cropbox_node->cropbox->min;
+        const glm::vec3 cropbox_max = cropbox_node->cropbox->max;
+        const glm::mat4 world_transform = scene_manager->getScene().getWorldTransform(cropbox_id);
+
+        // Decompose world transform
+        const glm::vec3 local_size = cropbox_max - cropbox_min;
+        const glm::vec3 world_scale = gizmo_ops::extractScale(world_transform);
+        const glm::mat3 rotation = gizmo_ops::extractRotation(world_transform);
+        const glm::vec3 translation = gizmo_ops::extractTranslation(world_transform);
+
+        // Settings
+        const bool use_world_space = (gizmo_toolbar_state_.transform_space == panels::TransformSpace::World);
+        const ImGuizmo::OPERATION gizmo_op = gizmo_toolbar_state_.current_operation;
+
+        // Compute pivot based on pivot mode
+        const glm::vec3 local_pivot = gizmo_ops::computeLocalPivot(
+            scene_manager->getScene(), cropbox_id,
+            gizmo_toolbar_state_.pivot_mode, GizmoTargetType::CropBox);
+        const glm::vec3 pivot_world = translation + rotation * (local_pivot * world_scale);
+
+        // Build gizmo matrix from frozen context during manipulation, live state otherwise
+        const bool gizmo_local_aligned = (gizmo_op == ImGuizmo::SCALE) || !use_world_space;
+        glm::mat4 gizmo_matrix;
+        if (cropbox_gizmo_active_ && gizmo_context_.isActive()) {
+            const auto& target = gizmo_context_.targets[0];
+            const glm::vec3 original_size = target.bounds_max - target.bounds_min;
+            const glm::vec3 current_size = original_size * gizmo_context_.cumulative_scale;
+            const glm::mat3 current_rotation = gizmo_context_.cumulative_rotation * target.rotation;
+            const glm::vec3 current_pivot = gizmo_context_.pivot_world + gizmo_context_.cumulative_translation;
+
+            gizmo_matrix = gizmo_ops::computeGizmoMatrix(
+                current_pivot, current_rotation, current_size * world_scale,
+                gizmo_context_.use_world_space, gizmo_op == ImGuizmo::SCALE);
+        } else {
+            const glm::vec3 scaled_size = local_size * world_scale;
+            gizmo_matrix = glm::translate(glm::mat4(1.0f), pivot_world);
+            if (gizmo_local_aligned) {
+                gizmo_matrix = gizmo_matrix * glm::mat4(rotation);
+            }
+            gizmo_matrix = glm::scale(gizmo_matrix, scaled_size);
+        }
+
+        // ImGuizmo setup
+        ImGuizmo::SetOrthographic(settings.orthographic);
+        ImGuizmo::SetRect(viewport_pos_.x, viewport_pos_.y, viewport_size_.x, viewport_size_.y);
+        ImGuizmo::SetAxisLimit(GIZMO_AXIS_LIMIT);
+        ImGuizmo::SetPlaneLimit(GIZMO_AXIS_LIMIT);
+
+        // Use BOUNDS mode for resize handles when Scale is active
+        static const float local_bounds[6] = {-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f};
+        const bool use_bounds = (gizmo_op == ImGuizmo::SCALE);
+        const ImGuizmo::OPERATION effective_op = use_bounds ? ImGuizmo::BOUNDS : gizmo_op;
+        const float* bounds_ptr = use_bounds ? local_bounds : nullptr;
+
+        {
+            static bool s_hovered_axis = false;
+            const bool is_using = ImGuizmo::IsUsing();
+            if (!is_using) {
+                s_hovered_axis = ImGuizmo::IsOver(ImGuizmo::TRANSLATE_X) ||
+                                 ImGuizmo::IsOver(ImGuizmo::TRANSLATE_Y) ||
+                                 ImGuizmo::IsOver(ImGuizmo::TRANSLATE_Z) ||
+                                 ImGuizmo::IsOver(ImGuizmo::BOUNDS);
+                ImGuizmo::SetAxisMask(false, false, false);
+            } else {
+                ImGuizmo::SetAxisMask(s_hovered_axis, s_hovered_axis, s_hovered_axis);
+            }
+        }
+
+        // Clip to viewport
+        ImDrawList* overlay_drawlist = isModalWindowOpen() ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+        const ImVec2 clip_min(viewport_pos_.x, viewport_pos_.y);
+        const ImVec2 clip_max(clip_min.x + viewport_size_.x, clip_min.y + viewport_size_.y);
+        overlay_drawlist->PushClipRect(clip_min, clip_max, true);
+        ImGuizmo::SetDrawlist(overlay_drawlist);
+
+        glm::mat4 delta_matrix;
+        const ImGuizmo::MODE gizmo_mode = gizmo_local_aligned ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
+
+        const bool gizmo_changed = ImGuizmo::Manipulate(
+            glm::value_ptr(view), glm::value_ptr(projection),
+            effective_op, gizmo_mode, glm::value_ptr(gizmo_matrix),
+            glm::value_ptr(delta_matrix), nullptr, bounds_ptr);
+
+        const bool is_using = ImGuizmo::IsUsing();
+
+        // Capture state when manipulation starts - freeze context for entire drag
+        if (is_using && !cropbox_gizmo_active_) {
+            cropbox_gizmo_active_ = true;
+            cropbox_node_name_ = cropbox_node->name;
+            cropbox_state_before_drag_ = command::CropBoxState{
+                .min = cropbox_node->cropbox->min,
+                .max = cropbox_node->cropbox->max,
+                .local_transform = cropbox_node->local_transform.get(),
+                .inverse = cropbox_node->cropbox->inverse};
+
+            // Capture gizmo context with frozen pivot and original state
+            gizmo_context_ = gizmo_ops::captureCropBox(
+                scene_manager->getScene(),
+                cropbox_node->name,
+                pivot_world,
+                local_pivot,
+                gizmo_toolbar_state_.transform_space,
+                gizmo_toolbar_state_.pivot_mode,
+                gizmo_op);
+        }
+
+        if (gizmo_changed && gizmo_context_.isActive()) {
+            auto& scene = scene_manager->getScene();
+
+            if (gizmo_op == ImGuizmo::ROTATE) {
+                const glm::mat3 delta_rot = gizmo_ops::extractRotation(delta_matrix);
+                gizmo_ops::applyRotation(gizmo_context_, scene, delta_rot);
+            } else if (gizmo_op == ImGuizmo::SCALE) {
+                // Extract new size from gizmo matrix
+                float mat_trans[3], mat_rot[3], mat_scale[3];
+                ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(gizmo_matrix), mat_trans, mat_rot, mat_scale);
+                const glm::vec3 new_size = glm::max(
+                    glm::vec3(mat_scale[0], mat_scale[1], mat_scale[2]) / world_scale,
+                    glm::vec3(MIN_GIZMO_SCALE));
+                gizmo_ops::applyBoundsScale(gizmo_context_, scene, new_size);
+
+                // Update position to match gizmo center
+                const glm::vec3 new_pivot_world(mat_trans[0], mat_trans[1], mat_trans[2]);
+                gizmo_ops::applyTranslation(gizmo_context_, scene, new_pivot_world);
+            } else {
+                // TRANSLATE
+                const glm::vec3 new_pivot_world(gizmo_matrix[3]);
+                gizmo_ops::applyTranslation(gizmo_context_, scene, new_pivot_world);
+            }
+
+            render_manager->markDirty();
+        }
+
+        // Create undo command when manipulation ends
+        if (!is_using && cropbox_gizmo_active_) {
+            cropbox_gizmo_active_ = false;
+            gizmo_context_.reset();
+
+            if (cropbox_state_before_drag_.has_value()) {
+                auto* node = scene_manager->getScene().getMutableNode(cropbox_node_name_);
+                if (node && node->cropbox) {
+                    const command::CropBoxState new_state{
+                        .min = node->cropbox->min,
+                        .max = node->cropbox->max,
+                        .local_transform = node->local_transform.get(),
+                        .inverse = node->cropbox->inverse};
+
+                    auto cmd = std::make_unique<command::CropBoxCommand>(
+                        scene_manager, cropbox_node_name_, *cropbox_state_before_drag_, new_state);
+                    viewer_->getCommandHistory().execute(std::move(cmd));
+
+                    using namespace lfs::core::events;
+                    ui::CropBoxChanged{
+                        .min_bounds = node->cropbox->min,
+                        .max_bounds = node->cropbox->max,
+                        .enabled = settings.use_crop_box}
+                        .emit();
+                }
+                cropbox_state_before_drag_.reset();
+            }
+        }
+
+        // Sync state for wireframe rendering
+        if (cropbox_gizmo_active_) {
+            render_manager->setCropboxGizmoState(
+                true, cropbox_node->cropbox->min, cropbox_node->cropbox->max,
+                scene_manager->getScene().getWorldTransform(cropbox_id));
+        } else {
+            render_manager->setCropboxGizmoActive(false);
+        }
+
+        overlay_drawlist->PopClipRect();
+    }
+
+    void GuiManager::renderCropGizmoMiniToolbar(const UIContext&) {
+        constexpr float MARGIN_X = 10.0f;
+        constexpr float MARGIN_BOTTOM = 100.0f;
+        constexpr int BUTTON_COUNT = 3;
+        constexpr ImGuiWindowFlags WINDOW_FLAGS =
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+
+        const auto& t = theme();
+        const float scale = getDpiScale();
+        const float btn_size = t.sizes.toolbar_button_size * scale;
+        const float spacing = t.sizes.toolbar_spacing * scale;
+        const float padding = t.sizes.toolbar_padding * scale;
+        const float toolbar_width = BUTTON_COUNT * btn_size + (BUTTON_COUNT - 1) * spacing + 2.0f * padding;
+        const float toolbar_height = btn_size + 2.0f * padding;
+        const float toolbar_x = viewport_pos_.x + MARGIN_X * scale;
+        const float toolbar_y = viewport_pos_.y + viewport_size_.y - MARGIN_BOTTOM * scale;
+
+        widgets::DrawWindowShadow({toolbar_x, toolbar_y}, {toolbar_width, toolbar_height}, t.sizes.window_rounding);
+        ImGui::SetNextWindowPos({toolbar_x, toolbar_y});
+        ImGui::SetNextWindowSize({toolbar_width, toolbar_height});
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, t.sizes.window_rounding);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {padding, padding});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {spacing, 0.0f});
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {0.0f, 0.0f});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, t.subtoolbar_background());
+
+        if (ImGui::Begin("##CropGizmoMiniToolbar", nullptr, WINDOW_FLAGS)) {
+            const ImVec2 btn_sz(btn_size, btn_size);
+            const auto& state = gizmo_toolbar_state_;
+
+            const auto button = [&](const char* id, const unsigned int tex, const ImGuizmo::OPERATION op,
+                                    const char* fallback, const char* tip) {
+                if (widgets::IconButton(id, tex, btn_sz, state.current_operation == op, fallback)) {
+                    gizmo_toolbar_state_.current_operation = op;
+                }
+                if (ImGui::IsItemHovered()) {
+                    widgets::SetThemedTooltip("%s", tip);
+                }
+            };
+
+            button("##mini_t", state.translation_texture, ImGuizmo::TRANSLATE, "T", "Translate (T)");
+            ImGui::SameLine();
+            button("##mini_r", state.rotation_texture, ImGuizmo::ROTATE, "R", "Rotate (R)");
+            ImGui::SameLine();
+            button("##mini_s", state.scaling_texture, ImGuizmo::SCALE, "S", "Scale (S)");
+        }
+        ImGui::End();
+
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(4);
+    }
+
+    void GuiManager::renderEllipsoidGizmo(const UIContext& ctx) {
+        auto* const render_manager = ctx.viewer->getRenderingManager();
+        auto* const scene_manager = ctx.viewer->getSceneManager();
+        if (!render_manager || !scene_manager)
+            return;
+
+        const auto& settings = render_manager->getSettings();
+        if (!settings.show_ellipsoid)
+            return;
+
+        NodeId ellipsoid_id = NULL_NODE;
+        const SceneNode* ellipsoid_node = nullptr;
+
+        if (scene_manager->getSelectedNodeType() == NodeType::ELLIPSOID) {
+            ellipsoid_id = scene_manager->getSelectedNodeEllipsoidId();
+        }
+
+        if (ellipsoid_id == NULL_NODE)
+            return;
+
+        ellipsoid_node = scene_manager->getScene().getNodeById(ellipsoid_id);
+        if (!ellipsoid_node || !ellipsoid_node->visible || !ellipsoid_node->ellipsoid)
+            return;
+        if (!scene_manager->getScene().isNodeEffectivelyVisible(ellipsoid_id))
+            return;
+
+        // Camera setup
+        auto& viewport = ctx.viewer->getViewport();
+        const glm::mat4 view = viewport.getViewMatrix();
+        const glm::ivec2 vp_size(static_cast<int>(viewport_size_.x), static_cast<int>(viewport_size_.y));
+        const glm::mat4 projection = lfs::rendering::createProjectionMatrix(
+            vp_size, settings.fov, settings.orthographic, settings.ortho_scale);
+
+        const glm::vec3 radii = ellipsoid_node->ellipsoid->radii;
+        const glm::mat4 world_transform = scene_manager->getScene().getWorldTransform(ellipsoid_id);
+
+        // Decompose world transform
+        const glm::vec3 world_scale = gizmo_ops::extractScale(world_transform);
+        const glm::mat3 rotation = gizmo_ops::extractRotation(world_transform);
+        const glm::vec3 translation = gizmo_ops::extractTranslation(world_transform);
+
+        // Settings
+        const bool use_world_space = (gizmo_toolbar_state_.transform_space == panels::TransformSpace::World);
+        const ImGuizmo::OPERATION gizmo_op = gizmo_toolbar_state_.current_operation;
+
+        // Ellipsoid pivot is always at center (origin in local space)
+        const glm::vec3 local_pivot(0.0f);
+        const glm::vec3 pivot_world = translation;
+
+        // Build gizmo matrix from frozen context during manipulation, live state otherwise
+        const bool gizmo_local_aligned = (gizmo_op == ImGuizmo::SCALE) || !use_world_space;
+        glm::mat4 gizmo_matrix;
+        if (ellipsoid_gizmo_active_ && gizmo_context_.isActive()) {
+            const auto& target = gizmo_context_.targets[0];
+            const glm::vec3 current_radii = target.radii * gizmo_context_.cumulative_scale;
+            const glm::mat3 current_rotation = gizmo_context_.cumulative_rotation * target.rotation;
+            const glm::vec3 current_pivot = gizmo_context_.pivot_world + gizmo_context_.cumulative_translation;
+
+            gizmo_matrix = gizmo_ops::computeGizmoMatrix(
+                current_pivot, current_rotation, current_radii * world_scale,
+                gizmo_context_.use_world_space, gizmo_op == ImGuizmo::SCALE);
+        } else {
+            const glm::vec3 scaled_radii = radii * world_scale;
+            gizmo_matrix = glm::translate(glm::mat4(1.0f), pivot_world);
+            if (gizmo_local_aligned) {
+                gizmo_matrix = gizmo_matrix * glm::mat4(rotation);
+            }
+            gizmo_matrix = glm::scale(gizmo_matrix, scaled_radii);
+        }
+
+        // ImGuizmo setup
+        ImGuizmo::SetOrthographic(settings.orthographic);
+        ImGuizmo::SetRect(viewport_pos_.x, viewport_pos_.y, viewport_size_.x, viewport_size_.y);
+        ImGuizmo::SetAxisLimit(GIZMO_AXIS_LIMIT);
+        ImGuizmo::SetPlaneLimit(GIZMO_AXIS_LIMIT);
+
+        // Use BOUNDS mode for resize handles when Scale is active
+        // Ellipsoid uses unit sphere bounds (-1 to 1) since radii are in the scale component
+        static const float local_bounds[6] = {-1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
+        const bool use_bounds = (gizmo_op == ImGuizmo::SCALE);
+        const ImGuizmo::OPERATION effective_op = use_bounds ? ImGuizmo::BOUNDS : gizmo_op;
+        const float* bounds_ptr = use_bounds ? local_bounds : nullptr;
+
+        {
+            static bool s_hovered_axis = false;
+            const bool is_using = ImGuizmo::IsUsing();
+            if (!is_using) {
+                s_hovered_axis = ImGuizmo::IsOver(ImGuizmo::TRANSLATE_X) ||
+                                 ImGuizmo::IsOver(ImGuizmo::TRANSLATE_Y) ||
+                                 ImGuizmo::IsOver(ImGuizmo::TRANSLATE_Z) ||
+                                 ImGuizmo::IsOver(ImGuizmo::BOUNDS);
+                ImGuizmo::SetAxisMask(false, false, false);
+            } else {
+                ImGuizmo::SetAxisMask(s_hovered_axis, s_hovered_axis, s_hovered_axis);
+            }
+        }
+
+        // Clip to viewport
+        ImDrawList* overlay_drawlist = isModalWindowOpen() ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+        const ImVec2 clip_min(viewport_pos_.x, viewport_pos_.y);
+        const ImVec2 clip_max(clip_min.x + viewport_size_.x, clip_min.y + viewport_size_.y);
+        overlay_drawlist->PushClipRect(clip_min, clip_max, true);
+        ImGuizmo::SetDrawlist(overlay_drawlist);
+
+        glm::mat4 delta_matrix;
+        const ImGuizmo::MODE gizmo_mode = gizmo_local_aligned ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
+
+        const bool gizmo_changed = ImGuizmo::Manipulate(
+            glm::value_ptr(view), glm::value_ptr(projection),
+            effective_op, gizmo_mode, glm::value_ptr(gizmo_matrix),
+            glm::value_ptr(delta_matrix), nullptr, bounds_ptr);
+
+        const bool is_using = ImGuizmo::IsUsing();
+
+        // Capture state when manipulation starts - freeze context for entire drag
+        if (is_using && !ellipsoid_gizmo_active_) {
+            ellipsoid_gizmo_active_ = true;
+            ellipsoid_node_name_ = ellipsoid_node->name;
+            ellipsoid_state_before_drag_ = command::EllipsoidState{
+                .radii = ellipsoid_node->ellipsoid->radii,
+                .local_transform = ellipsoid_node->local_transform.get(),
+                .inverse = ellipsoid_node->ellipsoid->inverse};
+
+            // Capture gizmo context with frozen pivot and original state
+            gizmo_context_ = gizmo_ops::captureEllipsoid(
+                scene_manager->getScene(),
+                ellipsoid_node->name,
+                pivot_world,
+                local_pivot,
+                gizmo_toolbar_state_.transform_space,
+                gizmo_toolbar_state_.pivot_mode,
+                gizmo_op);
+        }
+
+        if (gizmo_changed && gizmo_context_.isActive()) {
+            auto& scene = scene_manager->getScene();
+
+            if (gizmo_op == ImGuizmo::ROTATE) {
+                const glm::mat3 delta_rot = gizmo_ops::extractRotation(delta_matrix);
+                gizmo_ops::applyRotation(gizmo_context_, scene, delta_rot);
+            } else if (gizmo_op == ImGuizmo::SCALE) {
+                // Extract new radii from gizmo matrix
+                float mat_trans[3], mat_rot[3], mat_scale[3];
+                ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(gizmo_matrix), mat_trans, mat_rot, mat_scale);
+                const glm::vec3 new_radii = glm::max(
+                    glm::vec3(mat_scale[0], mat_scale[1], mat_scale[2]) / world_scale,
+                    glm::vec3(MIN_GIZMO_SCALE));
+                gizmo_ops::applyBoundsScale(gizmo_context_, scene, new_radii);
+
+                // Update position to match gizmo center
+                const glm::vec3 new_pivot_world(mat_trans[0], mat_trans[1], mat_trans[2]);
+                gizmo_ops::applyTranslation(gizmo_context_, scene, new_pivot_world);
+            } else {
+                // TRANSLATE
+                const glm::vec3 new_pivot_world(gizmo_matrix[3]);
+                gizmo_ops::applyTranslation(gizmo_context_, scene, new_pivot_world);
+            }
+
+            render_manager->markDirty();
+        }
+
+        // Create undo command when manipulation ends
+        if (!is_using && ellipsoid_gizmo_active_) {
+            ellipsoid_gizmo_active_ = false;
+            gizmo_context_.reset();
+
+            if (ellipsoid_state_before_drag_.has_value()) {
+                auto* node = scene_manager->getScene().getMutableNode(ellipsoid_node_name_);
+                if (node && node->ellipsoid) {
+                    const command::EllipsoidState new_state{
+                        .radii = node->ellipsoid->radii,
+                        .local_transform = node->local_transform.get(),
+                        .inverse = node->ellipsoid->inverse};
+
+                    auto cmd = std::make_unique<command::EllipsoidCommand>(
+                        scene_manager, ellipsoid_node_name_, *ellipsoid_state_before_drag_, new_state);
+                    viewer_->getCommandHistory().execute(std::move(cmd));
+
+                    using namespace lfs::core::events;
+                    ui::EllipsoidChanged{
+                        .radii = node->ellipsoid->radii,
+                        .enabled = settings.use_ellipsoid}
+                        .emit();
+                }
+                ellipsoid_state_before_drag_.reset();
+            }
+        }
+
+        // Sync gizmo state with current manipulation values for wireframe rendering
+        if (ellipsoid_gizmo_active_) {
+            const glm::mat4 current_world_transform = scene_manager->getScene().getWorldTransform(ellipsoid_id);
+            render_manager->setEllipsoidGizmoState(true, ellipsoid_node->ellipsoid->radii,
+                                                   current_world_transform);
+        } else {
+            render_manager->setEllipsoidGizmoActive(false);
+        }
+
+        overlay_drawlist->PopClipRect();
+    }
+
+    void GuiManager::renderNodeTransformGizmo(const UIContext& ctx) {
+        if (!show_node_gizmo_)
+            return;
+
+        auto* scene_manager = ctx.viewer->getSceneManager();
+        if (!scene_manager || !scene_manager->hasSelectedNode())
+            return;
+
+        const auto selected_type = scene_manager->getSelectedNodeType();
+        if (selected_type == NodeType::CROPBOX || selected_type == NodeType::ELLIPSOID)
+            return;
+
+        // Check visibility of at least one selected node
+        const auto& scene = scene_manager->getScene();
+        const auto selected_names = scene_manager->getSelectedNodeNames();
+        bool any_visible = false;
+        for (const auto& name : selected_names) {
+            if (const auto* node = scene.getNode(name)) {
+                if (scene.isNodeEffectivelyVisible(node->id)) {
+                    any_visible = true;
+                    break;
+                }
+            }
+        }
+        if (!any_visible)
+            return;
+
+        auto* render_manager = ctx.viewer->getRenderingManager();
+        if (!render_manager)
+            return;
+
+        const auto& settings = render_manager->getSettings();
+        const bool is_multi_selection = (selected_names.size() > 1);
+
+        // Camera matrices
+        auto& viewport = ctx.viewer->getViewport();
+        const glm::mat4 view = viewport.getViewMatrix();
+        const glm::ivec2 vp_size(static_cast<int>(viewport_size_.x), static_cast<int>(viewport_size_.y));
+        const glm::mat4 projection = lfs::rendering::createProjectionMatrix(
+            vp_size, settings.fov, settings.orthographic, settings.ortho_scale);
+
+        const bool use_world_space =
+            (gizmo_toolbar_state_.transform_space == panels::TransformSpace::World) || is_multi_selection;
+
+        const glm::vec3 local_pivot = (gizmo_toolbar_state_.pivot_mode == panels::PivotMode::Origin)
+                                          ? glm::vec3(0.0f)
+                                          : scene_manager->getSelectionCenter();
+
+        const glm::vec3 gizmo_position = node_gizmo_active_
+                                             ? gizmo_pivot_
+                                             : (is_multi_selection
+                                                    ? scene_manager->getSelectionWorldCenter()
+                                                    : glm::vec3(scene_manager->getSelectedNodeWorldTransform() *
+                                                                glm::vec4(local_pivot, 1.0f)));
+
+        glm::mat4 gizmo_matrix(1.0f);
+        gizmo_matrix[3] = glm::vec4(gizmo_position, 1.0f);
+
+        if (!is_multi_selection && !use_world_space) {
+            const glm::mat3 rotation_scale(scene_manager->getSelectedNodeWorldTransform());
+            gizmo_matrix[0] = glm::vec4(rotation_scale[0], 0.0f);
+            gizmo_matrix[1] = glm::vec4(rotation_scale[1], 0.0f);
+            gizmo_matrix[2] = glm::vec4(rotation_scale[2], 0.0f);
+        }
+
+        ImGuizmo::SetOrthographic(settings.orthographic);
+        ImGuizmo::SetRect(viewport_pos_.x, viewport_pos_.y, viewport_size_.x, viewport_size_.y);
+        ImGuizmo::SetAxisLimit(GIZMO_AXIS_LIMIT);
+        ImGuizmo::SetPlaneLimit(GIZMO_AXIS_LIMIT);
+
+        static bool s_node_hovered_axis = false;
+        const bool is_using = ImGuizmo::IsUsing();
+
+        if (!is_using) {
+            s_node_hovered_axis = ImGuizmo::IsOver(ImGuizmo::TRANSLATE_X) ||
+                                  ImGuizmo::IsOver(ImGuizmo::TRANSLATE_Y) ||
+                                  ImGuizmo::IsOver(ImGuizmo::TRANSLATE_Z);
+            ImGuizmo::SetAxisMask(false, false, false);
+        } else {
+            ImGuizmo::SetAxisMask(s_node_hovered_axis, s_node_hovered_axis, s_node_hovered_axis);
+        }
+
+        // Use background drawlist when modal is open to render below dialogs
+        ImDrawList* overlay_drawlist = isModalWindowOpen() ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+        const ImVec2 clip_min(viewport_pos_.x, viewport_pos_.y);
+        const ImVec2 clip_max(clip_min.x + viewport_size_.x, clip_min.y + viewport_size_.y);
+        overlay_drawlist->PushClipRect(clip_min, clip_max, true);
+        ImGuizmo::SetDrawlist(overlay_drawlist);
+
+        const ImGuizmo::MODE gizmo_mode = use_world_space ? ImGuizmo::WORLD : ImGuizmo::LOCAL;
+
+        glm::mat4 delta_matrix;
+        const bool gizmo_changed = ImGuizmo::Manipulate(
+            glm::value_ptr(view), glm::value_ptr(projection),
+            node_gizmo_operation_, gizmo_mode,
+            glm::value_ptr(gizmo_matrix), glm::value_ptr(delta_matrix), nullptr);
+
+        if (node_gizmo_operation_ == ImGuizmo::ROTATE) {
+            const glm::vec4 clip_pos = projection * view * glm::vec4(gizmo_position, 1.0f);
+            if (clip_pos.w > 0.0f) {
+                const glm::vec2 ndc(clip_pos.x / clip_pos.w, clip_pos.y / clip_pos.w);
+                const ImVec2 screen_pos(viewport_pos_.x + (ndc.x * 0.5f + 0.5f) * viewport_size_.x,
+                                        viewport_pos_.y + (-ndc.y * 0.5f + 0.5f) * viewport_size_.y);
+                constexpr float PIVOT_RADIUS = 4.0f;
+                constexpr ImU32 PIVOT_COLOR = IM_COL32(255, 255, 255, 200);
+                constexpr ImU32 PIVOT_OUTLINE = IM_COL32(0, 0, 0, 200);
+                overlay_drawlist->AddCircleFilled(screen_pos, PIVOT_RADIUS + 1.0f, PIVOT_OUTLINE);
+                overlay_drawlist->AddCircleFilled(screen_pos, PIVOT_RADIUS, PIVOT_COLOR);
+            }
+        }
+
+        // Capture state for undo when drag starts
+        if (is_using && !node_gizmo_active_) {
+            node_gizmo_active_ = true;
+            gizmo_pivot_ = gizmo_position;
+            gizmo_cumulative_rotation_ = glm::mat3(1.0f);
+            gizmo_cumulative_scale_ = glm::vec3(1.0f);
+
+            // Filter out nodes whose ancestors are also selected
+            std::unordered_set<NodeId> selected_ids;
+            for (const auto& name : selected_names) {
+                if (const auto* node = scene.getNode(name)) {
+                    selected_ids.insert(node->id);
+                }
+            }
+
+            node_gizmo_node_names_.clear();
+            for (const auto& name : selected_names) {
+                const auto* node = scene.getNode(name);
+                if (!node)
+                    continue;
+
+                bool ancestor_selected = false;
+                for (NodeId check_id = node->parent_id; check_id != NULL_NODE;) {
+                    if (selected_ids.count(check_id)) {
+                        ancestor_selected = true;
+                        break;
+                    }
+                    const auto* parent = scene.getNodeById(check_id);
+                    check_id = parent ? parent->parent_id : NULL_NODE;
+                }
+
+                if (!ancestor_selected) {
+                    node_gizmo_node_names_.push_back(name);
+                }
+            }
+
+            node_transforms_before_drag_.clear();
+            node_original_world_positions_.clear();
+            node_parent_world_inverses_.clear();
+            node_original_rotations_.clear();
+            node_original_scales_.clear();
+
+            for (const auto& name : node_gizmo_node_names_) {
+                const auto* node = scene.getNode(name);
+                if (!node)
+                    continue;
+
+                const glm::mat4 world_t = scene.getWorldTransform(node->id);
+                const glm::mat4 local_t = node->local_transform.get();
+                node_transforms_before_drag_.push_back(local_t);
+                node_original_rotations_.push_back(extractRotation(local_t));
+                node_original_scales_.push_back(extractScale(local_t));
+
+                glm::mat4 parent_world(1.0f);
+                if (node->parent_id != NULL_NODE) {
+                    parent_world = scene.getWorldTransform(node->parent_id);
+                }
+
+                node_original_world_positions_.emplace_back(world_t[3]);
+                node_parent_world_inverses_.push_back(glm::inverse(parent_world));
+            }
+        }
+
+        if (gizmo_changed && is_using) {
+            if (is_multi_selection) {
+                if (node_gizmo_operation_ == ImGuizmo::TRANSLATE) {
+                    const glm::vec3 new_gizmo_pos(gizmo_matrix[3]);
+                    const glm::vec3 delta = new_gizmo_pos - gizmo_pivot_;
+
+                    for (size_t i = 0; i < node_gizmo_node_names_.size(); ++i) {
+                        const glm::mat4& original_local = node_transforms_before_drag_[i];
+                        const glm::vec3& original_world_pos = node_original_world_positions_[i];
+                        const glm::mat4& parent_inv = node_parent_world_inverses_[i];
+
+                        const glm::vec3 new_world_pos = original_world_pos + delta;
+                        const glm::vec3 new_local_pos = glm::vec3(parent_inv * glm::vec4(new_world_pos, 1.0f));
+
+                        glm::mat4 new_transform = original_local;
+                        new_transform[3] = glm::vec4(new_local_pos, 1.0f);
+                        scene_manager->setNodeTransform(node_gizmo_node_names_[i], new_transform);
+                    }
+                } else if (node_gizmo_operation_ == ImGuizmo::ROTATE) {
+                    const glm::mat3 delta_rot = extractRotation(delta_matrix);
+                    gizmo_cumulative_rotation_ = delta_rot * gizmo_cumulative_rotation_;
+
+                    for (size_t i = 0; i < node_gizmo_node_names_.size(); ++i) {
+                        const glm::vec3& original_world_pos = node_original_world_positions_[i];
+                        const glm::mat4& parent_inv = node_parent_world_inverses_[i];
+                        const glm::mat3& original_rot = node_original_rotations_[i];
+                        const glm::vec3& original_scale = node_original_scales_[i];
+
+                        const glm::vec3 offset = original_world_pos - gizmo_pivot_;
+                        const glm::vec3 rotated_offset = gizmo_cumulative_rotation_ * offset;
+                        const glm::vec3 new_world_pos = gizmo_pivot_ + rotated_offset;
+                        const glm::vec3 new_local_pos = glm::vec3(parent_inv * glm::vec4(new_world_pos, 1.0f));
+
+                        const glm::mat3 parent_rot = extractRotation(glm::inverse(parent_inv));
+                        const glm::mat3 parent_rot_inv = glm::transpose(parent_rot);
+                        const glm::mat3 local_delta_rot = parent_rot_inv * gizmo_cumulative_rotation_ * parent_rot;
+                        const glm::mat3 new_rot = local_delta_rot * original_rot;
+
+                        glm::mat4 new_transform(1.0f);
+                        new_transform[0] = glm::vec4(new_rot[0] * original_scale.x, 0.0f);
+                        new_transform[1] = glm::vec4(new_rot[1] * original_scale.y, 0.0f);
+                        new_transform[2] = glm::vec4(new_rot[2] * original_scale.z, 0.0f);
+                        new_transform[3] = glm::vec4(new_local_pos, 1.0f);
+                        scene_manager->setNodeTransform(node_gizmo_node_names_[i], new_transform);
+                    }
+                } else if (node_gizmo_operation_ == ImGuizmo::SCALE) {
+                    gizmo_cumulative_scale_ *= extractScale(delta_matrix);
+
+                    const glm::mat3 world_scale(gizmo_cumulative_scale_.x, 0.0f, 0.0f,
+                                                0.0f, gizmo_cumulative_scale_.y, 0.0f,
+                                                0.0f, 0.0f, gizmo_cumulative_scale_.z);
+
+                    for (size_t i = 0; i < node_gizmo_node_names_.size(); ++i) {
+                        const glm::vec3& original_world_pos = node_original_world_positions_[i];
+                        const glm::mat4& parent_inv = node_parent_world_inverses_[i];
+                        const glm::mat3& original_rot = node_original_rotations_[i];
+                        const glm::vec3& original_scale = node_original_scales_[i];
+
+                        const glm::vec3 offset = original_world_pos - gizmo_pivot_;
+                        const glm::vec3 new_world_pos = gizmo_pivot_ + offset * gizmo_cumulative_scale_;
+                        const glm::vec3 new_local_pos = glm::vec3(parent_inv * glm::vec4(new_world_pos, 1.0f));
+
+                        const glm::mat3 parent_rot_inv = extractRotation(parent_inv);
+                        const glm::mat3 parent_rot = glm::transpose(parent_rot_inv);
+                        const glm::mat3 local_scale = parent_rot_inv * world_scale * parent_rot;
+
+                        const glm::mat3 original_rs(original_rot[0] * original_scale.x,
+                                                    original_rot[1] * original_scale.y,
+                                                    original_rot[2] * original_scale.z);
+                        const glm::mat3 new_rs = local_scale * original_rs;
+
+                        const glm::mat4 new_transform(glm::vec4(new_rs[0], 0.0f),
+                                                      glm::vec4(new_rs[1], 0.0f),
+                                                      glm::vec4(new_rs[2], 0.0f),
+                                                      glm::vec4(new_local_pos, 1.0f));
+                        scene_manager->setNodeTransform(node_gizmo_node_names_[i], new_transform);
+                    }
+                }
+            } else {
+                // Single selection
+                const glm::mat4 node_transform = scene_manager->getSelectedNodeTransform();
+                const glm::vec3 new_gizmo_pos_world = glm::vec3(gizmo_matrix[3]);
+
+                // Convert world position to parent space
+                const auto& sm_scene = scene_manager->getScene();
+                const auto* node = sm_scene.getNode(*selected_names.begin());
+                const glm::mat4 parent_world_inv = (node && node->parent_id != NULL_NODE)
+                                                       ? glm::inverse(sm_scene.getWorldTransform(node->parent_id))
+                                                       : glm::mat4(1.0f);
+                const glm::vec3 new_gizmo_pos = glm::vec3(parent_world_inv * glm::vec4(new_gizmo_pos_world, 1.0f));
+
+                glm::mat4 new_transform;
+                if (use_world_space) {
+                    const glm::mat3 old_rs(node_transform);
+                    const glm::mat3 delta_rs(delta_matrix);
+                    const glm::mat3 parent_rot_inv = extractRotation(parent_world_inv);
+                    const glm::mat3 parent_rot = glm::transpose(parent_rot_inv);
+                    const glm::mat3 local_delta = parent_rot_inv * delta_rs * parent_rot;
+                    const glm::mat3 new_rs = local_delta * old_rs;
+                    new_transform = glm::mat4(new_rs);
+                    new_transform[3] = glm::vec4(new_gizmo_pos - new_rs * local_pivot, 1.0f);
+                } else {
+                    const glm::mat3 new_rs(gizmo_matrix);
+                    new_transform = gizmo_matrix;
+                    new_transform[3] = glm::vec4(new_gizmo_pos - new_rs * local_pivot, 1.0f);
+                }
+                scene_manager->setSelectedNodeTransform(new_transform);
+            }
+        }
+
+        // Create undo command when drag ends
+        if (!is_using && node_gizmo_active_) {
+            node_gizmo_active_ = false;
+            // Clear child cropbox/ellipsoid gizmo state
+            if (render_manager) {
+                render_manager->setCropboxGizmoActive(false);
+                render_manager->setEllipsoidGizmoActive(false);
+            }
+
+            const size_t count = node_gizmo_node_names_.size();
+            std::vector<glm::mat4> final_transforms;
+            final_transforms.reserve(count);
+            for (const auto& name : node_gizmo_node_names_) {
+                final_transforms.push_back(scene_manager->getNodeTransform(name));
+            }
+
+            bool any_changed = false;
+            for (size_t i = 0; i < count; ++i) {
+                if (node_transforms_before_drag_[i] != final_transforms[i]) {
+                    any_changed = true;
+                    break;
+                }
+            }
+
+            if (any_changed) {
+                if (count == 1) {
+                    auto cmd = std::make_unique<command::TransformCommand>(
+                        node_gizmo_node_names_[0],
+                        node_transforms_before_drag_[0], final_transforms[0]);
+                    services().commands().execute(std::move(cmd));
+                } else {
+                    auto cmd = std::make_unique<command::MultiTransformCommand>(
+                        node_gizmo_node_names_,
+                        node_transforms_before_drag_, std::move(final_transforms));
+                    services().commands().execute(std::move(cmd));
+                }
+            }
+        }
+
+        // Sync child cropbox/ellipsoid state when parent splat is being transformed
+        if (node_gizmo_active_ && render_manager) {
+            for (const auto& name : selected_names) {
+                const auto* node = scene.getNode(name);
+                if (!node || node->type != NodeType::SPLAT)
+                    continue;
+
+                // Find cropbox child
+                const NodeId cropbox_id = scene.getCropBoxForSplat(node->id);
+                if (cropbox_id != NULL_NODE) {
+                    const auto* cropbox_node = scene.getNodeById(cropbox_id);
+                    if (cropbox_node && cropbox_node->cropbox) {
+                        const glm::mat4 cropbox_world = scene.getWorldTransform(cropbox_id);
+                        render_manager->setCropboxGizmoState(true, cropbox_node->cropbox->min,
+                                                             cropbox_node->cropbox->max, cropbox_world);
+                    }
+                }
+
+                // Find ellipsoid child
+                const NodeId ellipsoid_id = scene.getEllipsoidForSplat(node->id);
+                if (ellipsoid_id != NULL_NODE) {
+                    const auto* ellipsoid_node = scene.getNodeById(ellipsoid_id);
+                    if (ellipsoid_node && ellipsoid_node->ellipsoid) {
+                        const glm::mat4 ellipsoid_world = scene.getWorldTransform(ellipsoid_id);
+                        render_manager->setEllipsoidGizmoState(true, ellipsoid_node->ellipsoid->radii,
+                                                               ellipsoid_world);
+                    }
+                }
+            }
+        }
+
+        overlay_drawlist->PopClipRect();
+    }
+
+    void GuiManager::startAsyncExport(ExportFormat format,
+                                      const std::filesystem::path& path,
+                                      std::unique_ptr<lfs::core::SplatData> data) {
+        if (!data) {
+            LOG_ERROR("No splat data to export");
+            return;
+        }
+
+        export_state_.active.store(true);
+        export_state_.cancel_requested.store(false);
+        export_state_.progress.store(0.0f);
+        {
+            const std::lock_guard lock(export_state_.mutex);
+            export_state_.format = format;
+            export_state_.stage = "Starting";
+            export_state_.error.clear();
+        }
+
+        auto splat_data = std::make_shared<lfs::core::SplatData>(std::move(*data));
+        LOG_INFO("Export started: {} (format: {})", lfs::core::path_to_utf8(path), static_cast<int>(format));
+
+        export_state_.thread = std::make_unique<std::jthread>(
+            [this, format, path, splat_data](std::stop_token stop_token) {
+                auto update_progress = [this, &stop_token](float progress, const std::string& stage) -> bool {
+                    export_state_.progress.store(progress);
+                    {
+                        const std::lock_guard lock(export_state_.mutex);
+                        export_state_.stage = stage;
+                    }
+                    if (stop_token.stop_requested() || export_state_.cancel_requested.load()) {
+                        LOG_INFO("Export cancelled");
+                        return false;
+                    }
+                    return true;
+                };
+
+                bool success = false;
+                std::string error_msg;
+
+                switch (format) {
+                case ExportFormat::PLY: {
+                    update_progress(0.1f, "Writing PLY");
+                    const lfs::io::PlySaveOptions options{
+                        .output_path = path,
+                        .binary = true,
+                        .async = false};
+                    if (auto result = lfs::io::save_ply(*splat_data, options); result) {
+                        success = true;
+                        update_progress(1.0f, "Complete");
+                    } else {
+                        error_msg = result.error().message;
+                        // Check if this is a disk space error
+                        if (result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
+                            // Emit event for disk space error dialog
+                            lfs::core::events::state::DiskSpaceSaveFailed{
+                                .iteration = 0,
+                                .path = path,
+                                .error = result.error().message,
+                                .required_bytes = result.error().required_bytes,
+                                .available_bytes = result.error().available_bytes,
+                                .is_disk_space_error = true,
+                                .is_checkpoint = false}
+                                .emit();
+                        }
+                    }
+                    break;
+                }
+                case ExportFormat::SOG: {
+                    const lfs::core::SogWriteOptions options{
+                        .iterations = 10,
+                        .output_path = path,
+                        .progress_callback = update_progress};
+                    if (auto result = lfs::core::write_sog(*splat_data, options); result) {
+                        success = true;
+                    } else {
+                        error_msg = result.error();
+                    }
+                    break;
+                }
+                case ExportFormat::SPZ: {
+                    update_progress(0.1f, "Writing SPZ");
+                    const lfs::io::SpzSaveOptions options{.output_path = path};
+                    if (auto result = lfs::io::save_spz(*splat_data, options); result) {
+                        success = true;
+                        update_progress(1.0f, "Complete");
+                    } else {
+                        error_msg = result.error().message;
+                    }
+                    break;
+                }
+                case ExportFormat::HTML_VIEWER: {
+                    const HtmlViewerExportOptions options{
+                        .output_path = path,
+                        .progress_callback = [&update_progress](float p, const std::string& s) {
+                            update_progress(p, s);
+                        }};
+                    if (auto result = export_html_viewer(*splat_data, options); result) {
+                        success = true;
+                    } else {
+                        error_msg = result.error();
+                    }
+                    break;
+                }
+                }
+
+                if (success) {
+                    LOG_INFO("Export completed: {}", lfs::core::path_to_utf8(path));
+                    const std::lock_guard lock(export_state_.mutex);
+                    export_state_.stage = "Complete";
+                } else {
+                    LOG_ERROR("Export failed: {}", error_msg);
+                    const std::lock_guard lock(export_state_.mutex);
+                    export_state_.error = error_msg;
+                    export_state_.stage = "Failed";
+                }
+
+                export_state_.active.store(false);
+            });
+    }
+
+    void GuiManager::cancelExport() {
+        if (!export_state_.active.load())
+            return;
+
+        LOG_INFO("Cancelling export");
+        export_state_.cancel_requested.store(true);
+        if (export_state_.thread && export_state_.thread->joinable()) {
+            export_state_.thread->request_stop();
         }
     }
-} // namespace gs::gui
+
+    void GuiManager::startAsyncImport(const std::filesystem::path& path,
+                                      const lfs::core::param::TrainingParameters& params) {
+        if (import_state_.active.load()) {
+            LOG_WARN("Import already in progress");
+            return;
+        }
+
+        import_state_.active.store(true);
+        import_state_.load_complete.store(false);
+        import_state_.show_completion.store(false);
+        import_state_.progress.store(0.0f);
+        {
+            const std::lock_guard lock(import_state_.mutex);
+            import_state_.path = path;
+            import_state_.stage = "Initializing...";
+            import_state_.error.clear();
+            import_state_.num_images = 0;
+            import_state_.num_points = 0;
+            import_state_.success = false;
+            import_state_.load_result.reset();
+            import_state_.params = params;
+            import_state_.dataset_type = getDatasetTypeName(path);
+        }
+
+        LOG_INFO("Async import: {}", lfs::core::path_to_utf8(path));
+
+        import_state_.thread = std::make_unique<std::jthread>(
+            [this, path](const std::stop_token stop_token) {
+                lfs::core::param::TrainingParameters local_params;
+                {
+                    const std::lock_guard lock(import_state_.mutex);
+                    local_params = import_state_.params;
+                }
+
+                const lfs::io::LoadOptions load_options{
+                    .resize_factor = local_params.dataset.resize_factor,
+                    .max_width = local_params.dataset.max_width,
+                    .images_folder = local_params.dataset.images,
+                    .validate_only = false,
+                    .progress = [this, &stop_token](const float pct, const std::string& msg) {
+                        if (stop_token.stop_requested())
+                            return;
+                        import_state_.progress.store(pct / 100.0f);
+                        const std::lock_guard lock(import_state_.mutex);
+                        import_state_.stage = msg;
+                    }};
+
+                auto loader = lfs::io::Loader::create();
+                auto result = loader->load(path, load_options);
+
+                if (stop_token.stop_requested()) {
+                    import_state_.active.store(false);
+                    return;
+                }
+
+                const std::lock_guard lock(import_state_.mutex);
+                if (result) {
+                    import_state_.load_result = std::move(*result);
+                    import_state_.success = true;
+                    import_state_.stage = "Applying...";
+                    std::visit([this](const auto& data) {
+                        using T = std::decay_t<decltype(data)>;
+                        if constexpr (std::is_same_v<T, std::shared_ptr<lfs::core::SplatData>>) {
+                            import_state_.num_points = data->size();
+                            import_state_.num_images = 0;
+                        } else if constexpr (std::is_same_v<T, lfs::io::LoadedScene>) {
+                            import_state_.num_images = data.cameras ? data.cameras->size() : 0;
+                            import_state_.num_points = data.point_cloud ? data.point_cloud->size() : 0;
+                        }
+                    },
+                               import_state_.load_result->data);
+                } else {
+                    import_state_.success = false;
+                    import_state_.error = result.error().format();
+                    import_state_.stage = "Failed";
+                    LOG_ERROR("Import failed: {}", import_state_.error);
+                }
+                import_state_.progress.store(1.0f);
+                import_state_.load_complete.store(true);
+            });
+    }
+
+    void GuiManager::checkAsyncImportCompletion() {
+        if (!import_state_.load_complete.load()) {
+            return;
+        }
+        import_state_.load_complete.store(false);
+
+        bool success;
+        {
+            const std::lock_guard lock(import_state_.mutex);
+            success = import_state_.success;
+        }
+
+        if (success) {
+            applyLoadedDataToScene();
+        } else {
+            import_state_.active.store(false);
+            import_state_.show_completion.store(true);
+            const std::lock_guard lock(import_state_.mutex);
+            import_state_.completion_time = std::chrono::steady_clock::now();
+        }
+
+        if (import_state_.thread && import_state_.thread->joinable()) {
+            import_state_.thread->join();
+            import_state_.thread.reset();
+        }
+    }
+
+    void GuiManager::applyLoadedDataToScene() {
+        auto* const scene_manager = viewer_->getSceneManager();
+        if (!scene_manager) {
+            LOG_ERROR("No scene manager");
+            import_state_.active.store(false);
+            return;
+        }
+
+        std::optional<lfs::io::LoadResult> load_result;
+        lfs::core::param::TrainingParameters params;
+        std::filesystem::path path;
+        {
+            const std::lock_guard lock(import_state_.mutex);
+            load_result = std::move(import_state_.load_result);
+            params = import_state_.params;
+            path = import_state_.path;
+            import_state_.load_result.reset();
+        }
+
+        if (!load_result) {
+            LOG_ERROR("No load result");
+            import_state_.active.store(false);
+            return;
+        }
+
+        const auto result = scene_manager->applyLoadedDataset(path, params, std::move(*load_result));
+
+        {
+            const std::lock_guard lock(import_state_.mutex);
+            import_state_.completion_time = std::chrono::steady_clock::now();
+            import_state_.success = result.has_value();
+            import_state_.stage = result ? "Complete" : "Failed";
+            if (!result) {
+                import_state_.error = result.error();
+            }
+        }
+
+        import_state_.active.store(false);
+        import_state_.show_completion.store(true);
+
+        lfs::core::events::state::DatasetLoadCompleted{
+            .path = path,
+            .success = import_state_.success,
+            .error = import_state_.success ? std::nullopt : std::optional<std::string>(import_state_.error),
+            .num_images = import_state_.num_images,
+            .num_points = import_state_.num_points}
+            .emit();
+    }
+
+    void GuiManager::renderExportOverlay() {
+        if (!export_state_.active.load()) {
+            if (export_state_.thread && export_state_.thread->joinable()) {
+                export_state_.thread->join();
+                export_state_.thread.reset();
+            }
+            return;
+        }
+
+        const float scale = getDpiScale();
+        const float OVERLAY_WIDTH = 350.0f * scale;
+        const float OVERLAY_HEIGHT = 100.0f * scale;
+        const float BUTTON_WIDTH = 100.0f * scale;
+        const float BUTTON_HEIGHT = 30.0f * scale;
+        const float PROGRESS_BAR_HEIGHT = 20.0f * scale;
+
+        // Center in 3D viewport, not the main window
+        const ImVec2 overlay_pos(
+            viewport_pos_.x + (viewport_size_.x - OVERLAY_WIDTH) * 0.5f,
+            viewport_pos_.y + (viewport_size_.y - OVERLAY_HEIGHT) * 0.5f);
+
+        ImGui::SetNextWindowPos(overlay_pos, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(OVERLAY_WIDTH, 0), ImGuiCond_Always);
+
+        constexpr ImGuiWindowFlags FLAGS = ImGuiWindowFlags_NoTitleBar |
+                                           ImGuiWindowFlags_NoResize |
+                                           ImGuiWindowFlags_NoMove |
+                                           ImGuiWindowFlags_NoScrollbar |
+                                           ImGuiWindowFlags_NoCollapse |
+                                           ImGuiWindowFlags_AlwaysAutoResize;
+
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.1f, 0.1f, 0.1f, 0.95f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20 * scale, 15 * scale));
+
+        if (ImGui::Begin("##ExportProgress", nullptr, FLAGS)) {
+            ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]);
+            {
+                const std::lock_guard lock(export_state_.mutex);
+                const char* format_name = "file";
+                switch (export_state_.format) {
+                case ExportFormat::PLY: format_name = "PLY"; break;
+                case ExportFormat::SOG: format_name = "SOG"; break;
+                case ExportFormat::SPZ: format_name = "SPZ"; break;
+                case ExportFormat::HTML_VIEWER: format_name = "HTML"; break;
+                }
+                ImGui::Text(LOC(lichtfeld::Strings::Progress::EXPORTING), format_name);
+            }
+            ImGui::PopFont();
+
+            ImGui::Spacing();
+
+            const float progress = export_state_.progress.load();
+            ImGui::ProgressBar(progress, ImVec2(-1, PROGRESS_BAR_HEIGHT), "");
+
+            ImGui::Text("%.0f%%", progress * 100.0f);
+            ImGui::SameLine();
+
+            {
+                const std::lock_guard lock(export_state_.mutex);
+                ImGui::TextUnformatted(export_state_.stage.c_str());
+            }
+
+            ImGui::Spacing();
+
+            ImGui::SetCursorPosX((OVERLAY_WIDTH - BUTTON_WIDTH) * 0.5f - ImGui::GetStyle().WindowPadding.x);
+            if (ImGui::Button(LOC(lichtfeld::Strings::Common::CANCEL), ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
+                cancelExport();
+            }
+
+            ImGui::End();
+        }
+
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+
+        // Dim viewport background during export
+        ImDrawList* const draw_list = ImGui::GetBackgroundDrawList();
+        draw_list->AddRectFilled(
+            viewport_pos_,
+            ImVec2(viewport_pos_.x + viewport_size_.x,
+                   viewport_pos_.y + viewport_size_.y),
+            IM_COL32(0, 0, 0, 100));
+    }
+
+    void GuiManager::renderImportOverlay() {
+        const bool is_active = import_state_.active.load();
+        const bool show_completion = import_state_.show_completion.load();
+
+        // Auto-hide completion after 2 seconds
+        if (show_completion && !is_active) {
+            std::chrono::steady_clock::time_point completion_time;
+            {
+                const std::lock_guard lock(import_state_.mutex);
+                completion_time = import_state_.completion_time;
+            }
+            if (std::chrono::steady_clock::now() - completion_time > std::chrono::seconds(2)) {
+                import_state_.show_completion.store(false);
+                return;
+            }
+        }
+
+        if (!is_active && !show_completion) {
+            return;
+        }
+
+        const float scale = getDpiScale();
+        const float overlay_width = 400.0f * scale;
+        const float progress_bar_height = 20.0f * scale;
+        const float btn_width = 80.0f * scale;
+        const float btn_height = 28.0f * scale;
+
+        const ImVec2 overlay_pos(
+            viewport_pos_.x + (viewport_size_.x - overlay_width) * 0.5f,
+            viewport_pos_.y + viewport_size_.y * 0.4f);
+
+        ImGui::SetNextWindowPos(overlay_pos, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(overlay_width, 0), ImGuiCond_Always);
+
+        constexpr ImGuiWindowFlags OVERLAY_FLAGS = ImGuiWindowFlags_NoTitleBar |
+                                                   ImGuiWindowFlags_NoResize |
+                                                   ImGuiWindowFlags_NoMove |
+                                                   ImGuiWindowFlags_NoScrollbar |
+                                                   ImGuiWindowFlags_NoCollapse |
+                                                   ImGuiWindowFlags_AlwaysAutoResize;
+
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.1f, 0.1f, 0.1f, 0.95f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f * scale, 15.0f * scale));
+
+        if (ImGui::Begin("##ImportProgress", nullptr, OVERLAY_FLAGS)) {
+            std::string dataset_type, stage, path_str, error;
+            size_t num_images = 0, num_points = 0;
+            bool success = false;
+            {
+                const std::lock_guard lock(import_state_.mutex);
+                dataset_type = import_state_.dataset_type;
+                stage = import_state_.stage;
+                path_str = lfs::core::path_to_utf8(import_state_.path.filename());
+                num_images = import_state_.num_images;
+                num_points = import_state_.num_points;
+                success = import_state_.success;
+                error = import_state_.error;
+            }
+
+            // Title
+            ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]);
+            if (show_completion && !is_active) {
+                constexpr ImVec4 GREEN(0.4f, 0.9f, 0.4f, 1.0f);
+                constexpr ImVec4 RED(1.0f, 0.4f, 0.4f, 1.0f);
+                ImGui::TextColored(success ? GREEN : RED,
+                                   success ? LOC(lichtfeld::Strings::Progress::IMPORT_COMPLETE_TITLE)
+                                           : LOC(lichtfeld::Strings::Progress::IMPORT_FAILED_TITLE));
+            } else {
+                const char* type = dataset_type.empty() ? "dataset" : dataset_type.c_str();
+                ImGui::Text(LOC(lichtfeld::Strings::Progress::IMPORTING), type);
+            }
+            ImGui::PopFont();
+
+            ImGui::Spacing();
+            if (!path_str.empty()) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Path: %s", path_str.c_str());
+            }
+            ImGui::Spacing();
+
+            const float progress = import_state_.progress.load();
+            ImGui::ProgressBar(progress, ImVec2(-1, progress_bar_height), "");
+
+            if (is_active) {
+                ImGui::Text("%.0f%%", progress * 100.0f);
+                ImGui::SameLine();
+                ImGui::TextUnformatted(stage.c_str());
+            }
+
+            if (show_completion && (num_images > 0 || num_points > 0)) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.5f, 0.8f, 0.5f, 1.0f),
+                                   "%zu images, %zu points", num_images, num_points);
+            }
+
+            if (!error.empty()) {
+                ImGui::Spacing();
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + overlay_width - ImGui::GetStyle().WindowPadding.x * 2.0f);
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", error.c_str());
+                ImGui::PopTextWrapPos();
+            }
+
+            if (show_completion && !is_active) {
+                ImGui::Spacing();
+                ImGui::SetCursorPosX((overlay_width - btn_width) * 0.5f - ImGui::GetStyle().WindowPadding.x);
+                if (ImGui::Button(LOC(lichtfeld::Strings::Common::OK), ImVec2(btn_width, btn_height))) {
+                    import_state_.show_completion.store(false);
+                }
+            }
+            ImGui::End();
+        }
+
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+
+        if (is_active) {
+            ImGui::GetBackgroundDrawList()->AddRectFilled(
+                viewport_pos_,
+                ImVec2(viewport_pos_.x + viewport_size_.x, viewport_pos_.y + viewport_size_.y),
+                IM_COL32(0, 0, 0, 100));
+        }
+    }
+
+    void GuiManager::renderEmptyStateOverlay() {
+        const auto* const scene_manager = viewer_->getSceneManager();
+        if (!scene_manager || !scene_manager->isEmpty() || drag_drop_hovering_)
+            return;
+        if (viewport_size_.x < 200.0f || viewport_size_.y < 200.0f)
+            return;
+
+        static constexpr float ZONE_PADDING = 120.0f;
+        static constexpr float DASH_LENGTH = 12.0f;
+        static constexpr float GAP_LENGTH = 8.0f;
+        static constexpr float BORDER_THICKNESS = 2.0f;
+        static constexpr float ICON_SIZE = 48.0f;
+        static constexpr float ANIM_SPEED = 30.0f;
+        const auto& t = theme();
+        const ImU32 border_color = t.overlay_border_u32();
+        const ImU32 icon_color = t.overlay_icon_u32();
+        const ImU32 title_color = t.overlay_text_u32();
+        const ImU32 subtitle_color = t.overlay_hint_u32();
+        const ImU32 hint_color = toU32WithAlpha(t.overlay.text_dim, 0.5f);
+
+        ImDrawList* const draw_list = ImGui::GetBackgroundDrawList();
+        const float center_x = viewport_pos_.x + viewport_size_.x * 0.5f;
+        const float center_y = viewport_pos_.y + viewport_size_.y * 0.5f;
+        const ImVec2 zone_min(viewport_pos_.x + ZONE_PADDING, viewport_pos_.y + ZONE_PADDING);
+        const ImVec2 zone_max(viewport_pos_.x + viewport_size_.x - ZONE_PADDING,
+                              viewport_pos_.y + viewport_size_.y - ZONE_PADDING);
+
+        const float time = static_cast<float>(ImGui::GetTime());
+        const float dash_offset = std::fmod(time * ANIM_SPEED, DASH_LENGTH + GAP_LENGTH);
+
+        // Dashed border
+        const auto drawDashedLine = [&](const ImVec2& start, const ImVec2& end) {
+            const float dx = end.x - start.x;
+            const float dy = end.y - start.y;
+            const float length = std::sqrt(dx * dx + dy * dy);
+            const float nx = dx / length;
+            const float ny = dy / length;
+            for (float pos = -dash_offset; pos < length; pos += DASH_LENGTH + GAP_LENGTH) {
+                const float d0 = std::max(0.0f, pos);
+                const float d1 = std::min(length, pos + DASH_LENGTH);
+                if (d1 > d0) {
+                    draw_list->AddLine(ImVec2(start.x + nx * d0, start.y + ny * d0),
+                                       ImVec2(start.x + nx * d1, start.y + ny * d1),
+                                       border_color, BORDER_THICKNESS);
+                }
+            }
+        };
+        drawDashedLine(zone_min, {zone_max.x, zone_min.y});
+        drawDashedLine({zone_max.x, zone_min.y}, zone_max);
+        drawDashedLine(zone_max, {zone_min.x, zone_max.y});
+        drawDashedLine({zone_min.x, zone_max.y}, zone_min);
+
+        const float icon_y = center_y - 50.0f;
+        draw_list->AddRect({center_x - ICON_SIZE * 0.5f, icon_y - ICON_SIZE * 0.3f},
+                           {center_x + ICON_SIZE * 0.5f, icon_y + ICON_SIZE * 0.4f},
+                           icon_color, 4.0f, 0, 2.0f);
+        draw_list->AddLine({center_x - ICON_SIZE * 0.5f, icon_y - ICON_SIZE * 0.3f},
+                           {center_x - ICON_SIZE * 0.2f, icon_y - ICON_SIZE * 0.5f}, icon_color, 2.0f);
+        draw_list->AddLine({center_x - ICON_SIZE * 0.2f, icon_y - ICON_SIZE * 0.5f},
+                           {center_x + ICON_SIZE * 0.1f, icon_y - ICON_SIZE * 0.5f}, icon_color, 2.0f);
+        draw_list->AddLine({center_x + ICON_SIZE * 0.1f, icon_y - ICON_SIZE * 0.5f},
+                           {center_x + ICON_SIZE * 0.2f, icon_y - ICON_SIZE * 0.3f}, icon_color, 2.0f);
+
+        // Text
+        const auto calcTextSize = [this](const char* text, ImFont* font) {
+            if (font)
+                ImGui::PushFont(font);
+            const ImVec2 size = ImGui::CalcTextSize(text);
+            if (font)
+                ImGui::PopFont();
+            return size;
+        };
+
+        const char* title = LOC(lichtfeld::Strings::Startup::DROP_FILES_TITLE);
+        const char* subtitle = LOC(lichtfeld::Strings::Startup::DROP_FILES_SUBTITLE);
+        const char* hint = LOC(lichtfeld::Strings::Startup::DROP_FILES_HINT);
+
+        const ImVec2 title_size = calcTextSize(title, font_heading_);
+        const ImVec2 subtitle_size = calcTextSize(subtitle, font_bold_);
+        const ImVec2 hint_size = calcTextSize(hint, font_heading_);
+
+        if (font_heading_)
+            ImGui::PushFont(font_heading_);
+        draw_list->AddText({center_x - title_size.x * 0.5f, center_y + 10.0f}, title_color, title);
+        if (font_heading_)
+            ImGui::PopFont();
+
+        if (font_bold_)
+            ImGui::PushFont(font_bold_);
+        draw_list->AddText({center_x - subtitle_size.x * 0.5f, center_y + 40.0f}, subtitle_color, subtitle);
+        if (font_bold_)
+            ImGui::PopFont();
+
+        if (font_heading_)
+            ImGui::PushFont(font_heading_);
+        draw_list->AddText({center_x - hint_size.x * 0.5f, center_y + 70.0f}, hint_color, hint);
+        if (font_heading_)
+            ImGui::PopFont();
+    }
+
+    void GuiManager::renderDragDropOverlay() {
+        if (!drag_drop_hovering_)
+            return;
+
+        static constexpr float INSET = 30.0f;
+        static constexpr float CORNER_RADIUS = 16.0f;
+        static constexpr float GLOW_MAX = 8.0f;
+        static constexpr float PULSE_SPEED = 3.0f;
+        static constexpr float BOUNCE_SPEED = 4.0f;
+        static constexpr float BOUNCE_AMOUNT = 5.0f;
+        const auto& t = theme();
+        const ImU32 overlay_color = toU32WithAlpha(t.palette.primary_dim, 0.7f);
+        const ImU32 fill_color = toU32WithAlpha(t.palette.primary, 0.23f);
+        const ImU32 icon_color = t.overlay_text_u32();
+        const ImU32 title_color = t.overlay_text_u32();
+        const ImU32 subtitle_color = t.overlay_hint_u32();
+
+        const ImGuiViewport* const vp = ImGui::GetMainViewport();
+        ImDrawList* const draw_list = ImGui::GetForegroundDrawList();
+        const ImVec2 win_max(vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y);
+        const ImVec2 zone_min(vp->WorkPos.x + INSET, vp->WorkPos.y + INSET);
+        const ImVec2 zone_max(win_max.x - INSET, win_max.y - INSET);
+        const float center_x = vp->WorkPos.x + vp->WorkSize.x * 0.5f;
+        const float center_y = vp->WorkPos.y + vp->WorkSize.y * 0.5f;
+
+        const float time = static_cast<float>(ImGui::GetTime());
+        const float pulse = 0.5f + 0.5f * std::sin(time * PULSE_SPEED);
+
+        draw_list->AddRectFilled(vp->WorkPos, win_max, overlay_color);
+
+        const ImU32 glow_color = toU32WithAlpha(t.palette.primary, 0.16f * pulse);
+        for (float i = GLOW_MAX; i > 0.0f; i -= 2.0f) {
+            draw_list->AddRect({zone_min.x - i, zone_min.y - i}, {zone_max.x + i, zone_max.y + i},
+                               glow_color, CORNER_RADIUS + i, 0, 2.0f);
+        }
+
+        const float border_alpha = 0.7f + 0.3f * pulse;
+        draw_list->AddRect(zone_min, zone_max, toU32WithAlpha(t.palette.primary, border_alpha), CORNER_RADIUS, 0, 3.0f);
+        draw_list->AddRectFilled(zone_min, zone_max, fill_color, CORNER_RADIUS);
+
+        const float arrow_y = center_y - 60.0f + BOUNCE_AMOUNT * std::sin(time * BOUNCE_SPEED);
+        draw_list->AddTriangleFilled({center_x, arrow_y + 25.0f}, {center_x - 20.0f, arrow_y},
+                                     {center_x + 20.0f, arrow_y}, icon_color);
+        draw_list->AddRectFilled({center_x - 8.0f, arrow_y - 25.0f}, {center_x + 8.0f, arrow_y}, icon_color, 2.0f);
+
+        // Text
+        const auto calcTextSize = [this](const char* text, ImFont* font) {
+            if (font)
+                ImGui::PushFont(font);
+            const ImVec2 size = ImGui::CalcTextSize(text);
+            if (font)
+                ImGui::PopFont();
+            return size;
+        };
+
+        const char* title = LOC(lichtfeld::Strings::Startup::DROP_TO_IMPORT);
+        const char* subtitle = LOC(lichtfeld::Strings::Startup::DROP_TO_IMPORT_SUBTITLE);
+
+        const ImVec2 title_size = calcTextSize(title, font_heading_);
+        const ImVec2 subtitle_size = calcTextSize(subtitle, font_small_);
+
+        if (font_heading_)
+            ImGui::PushFont(font_heading_);
+        draw_list->AddText({center_x - title_size.x * 0.5f, center_y + 5.0f}, title_color, title);
+        if (font_heading_)
+            ImGui::PopFont();
+
+        if (font_small_)
+            ImGui::PushFont(font_small_);
+        draw_list->AddText({center_x - subtitle_size.x * 0.5f, center_y + 35.0f}, subtitle_color, subtitle);
+        if (font_small_)
+            ImGui::PopFont();
+    }
+
+    void GuiManager::renderStartupOverlay() {
+        if (!show_startup_overlay_)
+            return;
+
+        static constexpr float MIN_VIEWPORT_SIZE = 100.0f;
+        if (viewport_size_.x < MIN_VIEWPORT_SIZE || viewport_size_.y < MIN_VIEWPORT_SIZE)
+            return;
+
+        // Layout constants
+        static constexpr float MAIN_LOGO_SCALE = 1.3f;
+        static constexpr float CORE11_LOGO_SCALE = 0.5f;
+        static constexpr float CORNER_RADIUS = 12.0f;
+        static constexpr float PADDING_X = 40.0f;
+        static constexpr float PADDING_Y = 28.0f;
+        static constexpr float GAP_LOGO_TEXT = 20.0f;
+        static constexpr float GAP_TEXT_CORE11 = 10.0f;
+        static constexpr float GAP_CORE11_HINT = 16.0f;
+        static constexpr float GAP_LANG_HINT = 12.0f;
+        static constexpr float LANG_COMBO_WIDTH = 140.0f;
+
+        const auto& t = theme();
+        const bool is_dark_theme = (t.name == "Dark");
+        const unsigned int logo_texture = is_dark_theme ? startup_logo_light_texture_ : startup_logo_dark_texture_;
+        const unsigned int core11_texture = is_dark_theme ? startup_core11_light_texture_ : startup_core11_dark_texture_;
+
+        const float main_logo_w = static_cast<float>(startup_logo_width_) * MAIN_LOGO_SCALE;
+        const float main_logo_h = static_cast<float>(startup_logo_height_) * MAIN_LOGO_SCALE;
+        const float core11_w = static_cast<float>(startup_core11_width_) * CORE11_LOGO_SCALE;
+        const float core11_h = static_cast<float>(startup_core11_height_) * CORE11_LOGO_SCALE;
+
+        // Text sizes (use localized strings)
+        const char* supported_text = LOC(lichtfeld::Strings::Startup::SUPPORTED_BY);
+        const char* click_hint = LOC(lichtfeld::Strings::Startup::CLICK_TO_CONTINUE);
+        if (font_small_)
+            ImGui::PushFont(font_small_);
+        const ImVec2 supported_size = ImGui::CalcTextSize(supported_text);
+        const ImVec2 hint_size = ImGui::CalcTextSize(click_hint);
+        const ImVec2 lang_label_size = ImGui::CalcTextSize(LOC(lichtfeld::Strings::Preferences::LANGUAGE));
+        if (font_small_)
+            ImGui::PopFont();
+
+        // Overlay dimensions (include language selector height)
+        const float lang_row_height = ImGui::GetFrameHeight() + 4.0f;
+        const float content_width = std::max({main_logo_w, core11_w, supported_size.x, hint_size.x, LANG_COMBO_WIDTH + lang_label_size.x + 8.0f});
+        const float content_height = main_logo_h + GAP_LOGO_TEXT + supported_size.y + GAP_TEXT_CORE11 +
+                                     core11_h + GAP_CORE11_HINT + lang_row_height + GAP_LANG_HINT + hint_size.y;
+        const float overlay_width = content_width + PADDING_X * 2.0f;
+        const float overlay_height = content_height + PADDING_Y * 2.0f;
+
+        // Center in viewport
+        const float center_x = viewport_pos_.x + viewport_size_.x * 0.5f;
+        const float center_y = viewport_pos_.y + viewport_size_.y * 0.5f;
+        const ImVec2 overlay_pos(center_x - overlay_width * 0.5f, center_y - overlay_height * 0.5f);
+
+        // Style the overlay window
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, CORNER_RADIUS);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {PADDING_X, PADDING_Y});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, t.palette.surface);
+        ImGui::PushStyleColor(ImGuiCol_Border, t.palette.border);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, t.palette.background);
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, lighten(t.palette.background, 0.05f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, lighten(t.palette.background, 0.08f));
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, t.palette.surface);
+        ImGui::PushStyleColor(ImGuiCol_Header, t.palette.primary);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, lighten(t.palette.primary, 0.1f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, t.palette.primary);
+
+        ImGui::SetNextWindowPos(overlay_pos);
+        ImGui::SetNextWindowSize({overlay_width, overlay_height});
+
+        if (ImGui::Begin("##StartupOverlay", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                             ImGuiWindowFlags_NoCollapse)) {
+
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+            const ImVec2 window_pos = ImGui::GetWindowPos();
+            const float window_center_x = window_pos.x + overlay_width * 0.5f;
+            float y = window_pos.y + PADDING_Y;
+
+            // Main logo
+            if (logo_texture && startup_logo_width_ > 0) {
+                const float x = window_center_x - main_logo_w * 0.5f;
+                draw_list->AddImage(static_cast<ImTextureID>(logo_texture),
+                                    {x, y}, {x + main_logo_w, y + main_logo_h});
+                y += main_logo_h + GAP_LOGO_TEXT;
+            }
+
+            // Supported by text
+            if (font_small_)
+                ImGui::PushFont(font_small_);
+            draw_list->AddText({window_center_x - supported_size.x * 0.5f, y},
+                               toU32WithAlpha(t.palette.text_dim, 0.85f), supported_text);
+            y += supported_size.y + GAP_TEXT_CORE11;
+
+            // Core11 logo
+            if (core11_texture && startup_core11_width_ > 0) {
+                const float x = window_center_x - core11_w * 0.5f;
+                draw_list->AddImage(static_cast<ImTextureID>(core11_texture),
+                                    {x, y}, {x + core11_w, y + core11_h});
+                y += core11_h + GAP_CORE11_HINT;
+            }
+
+            // Language selector - center the row in content area
+            const float lang_total_width = lang_label_size.x + 8.0f + LANG_COMBO_WIDTH;
+            const float content_area_width = overlay_width - 2.0f * PADDING_X;
+            const float lang_indent = (content_area_width - lang_total_width) * 0.5f;
+            ImGui::SetCursorPosY(y - window_pos.y);
+            ImGui::SetCursorPosX(lang_indent);
+            ImGui::TextColored(t.palette.text_dim, "%s", LOC(lichtfeld::Strings::Preferences::LANGUAGE));
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::SetNextItemWidth(LANG_COMBO_WIDTH);
+
+            auto& loc = lichtfeld::LocalizationManager::getInstance();
+            const auto& current_lang = loc.getCurrentLanguage();
+            const auto available_langs = loc.getAvailableLanguages();
+            const auto lang_names = loc.getAvailableLanguageNames();
+
+            // Find current language name for preview
+            std::string current_name = current_lang;
+            for (size_t i = 0; i < available_langs.size(); ++i) {
+                if (available_langs[i] == current_lang) {
+                    current_name = lang_names[i];
+                    break;
+                }
+            }
+
+            if (ImGui::BeginCombo("##LangCombo", current_name.c_str())) {
+                for (size_t i = 0; i < available_langs.size(); ++i) {
+                    const bool is_selected = (available_langs[i] == current_lang);
+                    if (ImGui::Selectable(lang_names[i].c_str(), is_selected)) {
+                        loc.setLanguage(available_langs[i]);
+                    }
+                    if (is_selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            y += lang_row_height + GAP_LANG_HINT;
+
+            // Dismiss hint
+            draw_list->AddText({window_center_x - hint_size.x * 0.5f, y},
+                               toU32WithAlpha(t.palette.text_dim, 0.5f), click_hint);
+            if (font_small_)
+                ImGui::PopFont();
+        }
+        ImGui::End();
+        ImGui::PopStyleColor(9);
+        ImGui::PopStyleVar(5);
+
+        // Dismiss on user interaction (but not when interacting with language combo or modals)
+        const auto& io = ImGui::GetIO();
+        const bool modal_open = (save_directory_popup_ && save_directory_popup_->isOpen()) ||
+                                (exit_confirmation_popup_ && exit_confirmation_popup_->isOpen());
+        const bool mouse_action = ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+                                  ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+                                  ImGui::IsMouseClicked(ImGuiMouseButton_Middle) ||
+                                  std::abs(io.MouseWheel) > 0.0f || std::abs(io.MouseWheelH) > 0.0f;
+        const bool key_action = io.InputQueueCharacters.Size > 0 ||
+                                ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+                                ImGui::IsKeyPressed(ImGuiKey_Space) ||
+                                ImGui::IsKeyPressed(ImGuiKey_Enter);
+
+        // Don't dismiss if interacting with language combo or any popup/modal
+        const bool any_popup_open = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+        const bool any_item_active = ImGui::IsAnyItemActive();
+        if (!any_popup_open && !any_item_active && !modal_open && !drag_drop_hovering_ && (mouse_action || key_action)) {
+            show_startup_overlay_ = false;
+        }
+    }
+
+    void GuiManager::requestExitConfirmation() {
+        if (!exit_confirmation_popup_)
+            return;
+        exit_confirmation_popup_->show([this]() {
+            force_exit_ = true;
+            glfwSetWindowShouldClose(viewer_->getWindow(), true);
+        });
+    }
+
+    bool GuiManager::isExitConfirmationPending() const {
+        return exit_confirmation_popup_ && exit_confirmation_popup_->isOpen();
+    }
+
+} // namespace lfs::vis::gui

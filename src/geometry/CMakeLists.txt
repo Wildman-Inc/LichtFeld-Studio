@@ -1,29 +1,35 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
-#
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Geometry module
+# geometry module - LibTorch-free geometry library
+
 set(GEOMETRY_SOURCES
-    bounding_box.cpp
     euclidean_transform.cpp
+    bounding_box.cpp
 )
 
-add_library(gs_geometry STATIC ${GEOMETRY_SOURCES})
+add_library(lfs_geometry STATIC ${GEOMETRY_SOURCES})
 
-target_include_directories(gs_geometry
+target_include_directories(lfs_geometry
     PUBLIC
-        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_BINARY_DIR}/include
 )
 
-target_link_libraries(gs_geometry
+target_link_libraries(lfs_geometry
     PUBLIC
-        gs_core  # Depends on core
         glm::glm
 )
 
-set_target_properties(gs_geometry PROPERTIES
+set_target_properties(lfs_geometry PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
     DEBUG_POSTFIX d
 )
+
+message(STATUS "╔════════════════════════════════════════════════════════════════╗")
+message(STATUS "║  geometry - LibTorch-free Geometry Module                 ║")
+message(STATUS "╚════════════════════════════════════════════════════════════════╝")
+message(STATUS "  • Namespace: lfs::geometry")
+message(STATUS "  • Contains: EuclideanTransform, BoundingBox")

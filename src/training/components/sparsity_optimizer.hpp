@@ -1,19 +1,29 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
- *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
 
-#include "core/splat_data.hpp"
+#include "core/tensor.hpp"
 #include <expected>
 #include <memory>
 #include <string>
-#include <torch/torch.h>
 
-namespace gs::training {
+namespace lfs::training {
 
     /**
-     * @brief Interface for sparsity optimization methods
+     * @brief Context for manual sparsity loss forward/backward (LibTorch-free)
+     */
+    struct SparsityLossContext {
+        const float* opacities_ptr;   // Pointer to opacity values (raw, before sigmoid)
+        const float* opa_sigmoid_ptr; // Pointer to sigmoid(opacities)
+        const float* z_ptr;           // Pointer to ADMM auxiliary variable
+        const float* u_ptr;           // Pointer to ADMM dual variable
+        size_t n;                     // Number of elements
+        float rho;                    // ADMM penalty parameter
+    };
+
+    /**
+     * @brief Interface for sparsity optimization methods (LibTorch-free)
      *
      * Provides a clean abstraction for different sparsity-inducing techniques
      * that can be applied during Gaussian Splatting training.
@@ -24,31 +34,46 @@ namespace gs::training {
 
         /**
          * @brief Initialize the optimizer with initial opacities
-         * @param opacities Initial opacity values from the model
+         * @param opacities Initial opacity values from the model [N, 1]
          * @return Error string if initialization fails
          */
-        virtual std::expected<void, std::string> initialize(const torch::Tensor& opacities) = 0;
+        virtual std::expected<void, std::string> initialize(const lfs::core::Tensor& opacities) = 0;
 
         /**
-         * @brief Compute the sparsity regularization loss
-         * @param opacities Current opacity values from the model
-         * @return Loss tensor or error string
+         * @brief MANUAL FORWARD: Compute sparsity loss without autograd
+         * @param opacities Current opacity values from the model [N, 1]
+         * @return (loss_tensor_gpu, context) or error string - NO CPU SYNC
          */
-        virtual std::expected<torch::Tensor, std::string> compute_loss(const torch::Tensor& opacities) const = 0;
+        virtual std::expected<std::pair<lfs::core::Tensor, SparsityLossContext>, std::string>
+        compute_loss_forward(const lfs::core::Tensor& opacities) = 0;
+
+        /**
+         * @brief MANUAL BACKWARD: Compute gradients manually
+         * @param ctx Context from forward pass
+         * @param grad_loss Gradient of total loss w.r.t. sparsity loss (usually 1.0)
+         * @param grad_opacities [N, 1] - Output gradient buffer to write to
+         * @return Error string if backward fails
+         * @note Gradients are written directly to grad_opacities (accumulated)
+         */
+        virtual std::expected<void, std::string>
+        compute_loss_backward(const SparsityLossContext& ctx,
+                              float grad_loss,
+                              lfs::core::Tensor& grad_opacities) = 0;
 
         /**
          * @brief Update internal state (called periodically during training)
-         * @param opacities Current opacity values from the model
+         * @param opacities Current opacity values from the model [N, 1]
          * @return Error string if update fails
          */
-        virtual std::expected<void, std::string> update_state(const torch::Tensor& opacities) = 0;
+        virtual std::expected<void, std::string> update_state(const lfs::core::Tensor& opacities) = 0;
 
         /**
          * @brief Get mask indicating which Gaussians to prune
-         * @param opacities Current opacity values from the model
-         * @return Boolean mask tensor or error string
+         * @param opacities Current opacity values from the model [N, 1]
+         * @return Boolean mask tensor [N] or error string
          */
-        virtual std::expected<torch::Tensor, std::string> get_prune_mask(const torch::Tensor& opacities) const = 0;
+        virtual std::expected<lfs::core::Tensor, std::string>
+        get_prune_mask(const lfs::core::Tensor& opacities) = 0;
 
         /**
          * @brief Check if we should update state at this iteration
@@ -68,7 +93,7 @@ namespace gs::training {
         /**
          * @brief Get the number of Gaussians that will be pruned
          */
-        virtual int get_num_to_prune(const torch::Tensor& opacities) const = 0;
+        virtual int get_num_to_prune(const lfs::core::Tensor& opacities) = 0;
 
         /**
          * @brief Check if the optimizer has been initialized
@@ -77,7 +102,7 @@ namespace gs::training {
     };
 
     /**
-     * @brief ADMM-based sparsity optimizer
+     * @brief ADMM-based sparsity optimizer (LibTorch-free)
      *
      * Implements Alternating Direction Method of Multipliers (ADMM) for
      * inducing sparsity in Gaussian opacity values during training.
@@ -94,10 +119,20 @@ namespace gs::training {
 
         explicit ADMMSparsityOptimizer(const Config& config);
 
-        std::expected<void, std::string> initialize(const torch::Tensor& opacities) override;
-        std::expected<torch::Tensor, std::string> compute_loss(const torch::Tensor& opacities) const override;
-        std::expected<void, std::string> update_state(const torch::Tensor& opacities) override;
-        std::expected<torch::Tensor, std::string> get_prune_mask(const torch::Tensor& opacities) const override;
+        std::expected<void, std::string> initialize(const lfs::core::Tensor& opacities) override;
+
+        std::expected<std::pair<lfs::core::Tensor, SparsityLossContext>, std::string>
+        compute_loss_forward(const lfs::core::Tensor& opacities) override;
+
+        std::expected<void, std::string>
+        compute_loss_backward(const SparsityLossContext& ctx,
+                              float grad_loss,
+                              lfs::core::Tensor& grad_opacities) override;
+
+        std::expected<void, std::string> update_state(const lfs::core::Tensor& opacities) override;
+
+        std::expected<lfs::core::Tensor, std::string>
+        get_prune_mask(const lfs::core::Tensor& opacities) override;
 
         bool should_update(int iter) const override {
             int relative_iter = iter - config_.start_iteration;
@@ -116,26 +151,28 @@ namespace gs::training {
             return iter == (config_.start_iteration + config_.sparsify_steps);
         }
 
-        int get_num_to_prune(const torch::Tensor& opacities) const override;
+        int get_num_to_prune(const lfs::core::Tensor& opacities) override;
 
         bool is_initialized() const override { return initialized_; }
 
     private:
         /**
          * @brief Apply soft thresholding to enforce sparsity
-         * @param z Input tensor
-         * @return Thresholded tensor
+         * @param z Input tensor [N, 1]
+         * @return Thresholded tensor [N, 1]
          */
-        torch::Tensor prune_z(const torch::Tensor& z) const;
+        lfs::core::Tensor prune_z(const lfs::core::Tensor& z);
 
         Config config_;
-        torch::Tensor u_; // Dual variable (Lagrange multiplier)
-        torch::Tensor z_; // Auxiliary variable for sparsity
+        lfs::core::Tensor u_;           // Dual variable (Lagrange multiplier) [N, 1]
+        lfs::core::Tensor z_;           // Auxiliary variable for sparsity [N, 1]
+        lfs::core::Tensor opa_sigmoid_; // Cached sigmoid(opacities) [N, 1]
+
         bool initialized_ = false;
     };
 
     /**
-     * @brief Factory for creating sparsity optimizers
+     * @brief Factory for creating sparsity optimizers (LibTorch-free)
      */
     class SparsityOptimizerFactory {
     public:
@@ -144,4 +181,4 @@ namespace gs::training {
             const ADMMSparsityOptimizer::Config& config);
     };
 
-} // namespace gs::training
+} // namespace lfs::training

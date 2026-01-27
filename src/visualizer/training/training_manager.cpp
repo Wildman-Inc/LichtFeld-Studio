@@ -3,16 +3,76 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "training/training_manager.hpp"
+#include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/parameter_manager.hpp"
+#include "core/services.hpp"
+#include "scene/scene.hpp"
 #include "training/training_setup.hpp"
-#include <c10/cuda/CUDACachingAllocator.h>
+#include <cstring>
+#include <cuda_runtime.h>
 #include <stdexcept>
 
-namespace gs {
+namespace lfs::vis {
+
+    using namespace lfs::core::events;
 
     TrainerManager::TrainerManager() {
         setupEventHandlers();
+        setupStateMachineCallbacks();
         LOG_DEBUG("TrainerManager created");
+    }
+
+    void TrainerManager::setupStateMachineCallbacks() {
+        state_machine_.setCleanupCallback([this](const TrainingResources& resources) {
+            cleanupTrainingResources(resources);
+        });
+
+        state_machine_.setStateChangeCallback([this](TrainingState old_state, TrainingState new_state) {
+            // Emit events on state changes
+            if (new_state == TrainingState::Idle) {
+                loss_buffer_.clear();
+                last_error_.clear();
+            }
+        });
+    }
+
+    void TrainerManager::cleanupTrainingResources(const TrainingResources& /*resources*/) {
+        LOG_DEBUG("Cleaning up training resources");
+
+        if (training_thread_ && training_thread_->joinable()) {
+            training_thread_->request_stop();
+            auto timeout = std::chrono::milliseconds(500);
+            {
+                std::unique_lock<std::mutex> lock(completion_mutex_);
+                if (completion_cv_.wait_for(lock, timeout, [this] { return training_complete_; })) {
+                    lock.unlock();
+                    training_thread_->join();
+                } else {
+                    lock.unlock();
+                    LOG_WARN("Thread didn't respond to stop request, detaching");
+                    training_thread_->detach();
+                }
+            }
+            training_thread_.reset();
+        }
+
+        if (trainer_) {
+            trainer_->shutdown();
+            trainer_.reset();
+        }
+    }
+
+    void TrainerManager::updateResourceTracking() {
+        TrainingResources resources;
+        resources.has_trainer = trainer_ != nullptr;
+        resources.has_training_thread = training_thread_ != nullptr && training_thread_->joinable();
+        resources.has_scene_data = scene_ != nullptr;
+        resources.has_gpu_tensors = trainer_ && trainer_->isInitialized();
+        if (scene_) {
+            resources.training_node_name = scene_->getTrainingModelNodeName();
+        }
+        state_machine_.setResources(resources);
     }
 
     TrainerManager::~TrainerManager() {
@@ -24,45 +84,48 @@ namespace gs {
         }
     }
 
-    void TrainerManager::setTrainer(std::unique_ptr<gs::training::Trainer> trainer) {
+    void TrainerManager::setTrainer(std::unique_ptr<lfs::training::Trainer> trainer) {
         LOG_TIMER_TRACE("TrainerManager::setTrainer");
 
-        // Clear any existing trainer first
         clearTrainer();
 
         if (trainer) {
-            LOG_DEBUG("Setting new trainer");
+            const auto& params = trainer->getParams();
+            pending_opt_params_ = params.optimization;
+            pending_dataset_params_ = params.dataset;
+
             trainer_ = std::move(trainer);
-            trainer_->setProject(project_);
+            updateResourceTracking();
 
-            if (project_) {
-                trainer_->load_cameras_info();
-
-                // Auto-enable 3DGUT if cameras have distortion parameters
-                auto opt_params = project_->getOptimizationParams();
-                if (!opt_params.gut) {
-                    bool has_distortion = false;
-                    auto cameras = trainer_->getCamList();
-                    for (const auto& cam : cameras) {
-                        if (cam->radial_distortion().numel() > 0 || cam->tangential_distortion().numel() > 0) {
-                            has_distortion = true;
-                            break;
-                        }
-                    }
-                    if (has_distortion) {
-                        opt_params.gut = true;
-                        project_->setOptimizationParams(opt_params);
-                        LOG_WARN("Detected camera distortion parameters - automatically enabling 3DGUT rasterizer");
-                        events::state::GutAutoEnabled{}.emit();
-                    }
-                }
+            if (!state_machine_.transitionTo(TrainingState::Ready)) {
+                LOG_WARN("Failed to transition to Ready");
             }
 
-            setState(State::Ready);
+            internal::TrainerReady{}.emit();
+            LOG_DEBUG("Trainer ready");
+        }
+    }
 
-            // Trainer is ready
-            events::internal::TrainerReady{}.emit();
-            LOG_INFO("Trainer ready for training");
+    void TrainerManager::setTrainerFromCheckpoint(std::unique_ptr<lfs::training::Trainer> trainer, int checkpoint_iteration) {
+        LOG_TIMER_TRACE("TrainerManager::setTrainerFromCheckpoint");
+
+        clearTrainer();
+
+        if (trainer) {
+            const auto& params = trainer->getParams();
+            pending_opt_params_ = params.optimization;
+            pending_dataset_params_ = params.dataset;
+
+            trainer_ = std::move(trainer);
+            updateResourceTracking();
+            // Checkpoint load goes to Paused
+
+            if (!state_machine_.transitionTo(TrainingState::Paused)) {
+                LOG_WARN("Failed to transition to Paused");
+            }
+
+            state::TrainingPaused{.iteration = checkpoint_iteration}.emit();
+            LOG_DEBUG("Trainer paused from checkpoint (iteration {})", checkpoint_iteration);
         }
     }
 
@@ -73,75 +136,40 @@ namespace gs {
     void TrainerManager::clearTrainer() {
         LOG_DEBUG("Clearing trainer");
 
-        events::cmd::StopTraining{}.emit();
         // Stop any ongoing training first
-        if (isTrainingActive()) {
-            LOG_INFO("Stopping active training before clearing trainer");
+        const auto state = getState();
+        if (state == TrainingState::Running || state == TrainingState::Paused) {
+            LOG_INFO("Stopping active training before clearing");
+            // If paused, resume first so thread can process stop request
+            if (state == TrainingState::Paused && trainer_) {
+                trainer_->request_resume();
+            }
             stopTraining();
+            waitForCompletion();
+        } else if (state == TrainingState::Stopping) {
+            // Already stopping, just wait for completion
+            LOG_INFO("Waiting for training to finish stopping");
             waitForCompletion();
         }
 
-        // Additional safety: ensure thread is properly stopped even if not "active"
-        if (training_thread_ && training_thread_->joinable()) {
-            LOG_WARN("Force stopping training thread that wasn't marked as active");
-            training_thread_->request_stop();
-
-            // Try to wait for completion with a short timeout
-            auto timeout = std::chrono::milliseconds(500);
-            {
-                std::unique_lock<std::mutex> lock(completion_mutex_);
-                if (completion_cv_.wait_for(lock, timeout, [this] { return training_complete_; })) {
-                    lock.unlock();
-                    LOG_DEBUG("Thread completed gracefully, joining...");
-                    training_thread_->join();
-                } else {
-                    lock.unlock();
-                    LOG_WARN("Thread didn't respond to stop request within timeout, detaching...");
-                    training_thread_->detach();
-                }
-            }
-            training_thread_.reset();
-        }
-
-        // Now safe to clear the trainer
+        // Destroy trainer - destructor handles cleanup
         trainer_.reset();
-        last_error_.clear();
-        setState(State::Idle);
 
-        // Reset loss buffer
-        loss_buffer_.clear();
+        // Transition to Idle
+        updateResourceTracking();
+
+        if (!state_machine_.transitionTo(TrainingState::Idle)) {
+            LOG_WARN("Failed to transition to Idle");
+        }
+
         LOG_INFO("Trainer cleared");
-    }
-
-    std::expected<bool, std::string> TrainerManager::initializeTrainerFromProject() {
-        if (!trainer_) {
-            return std::unexpected("No trainer available");
-        }
-
-        if (!project_) {
-            return std::unexpected("No project available");
-        }
-
-        // Create training parameters from project
-        param::TrainingParameters params;
-        params.dataset = project_->getProjectData().data_set_info;
-        params.optimization = project_->getOptimizationParams();
-        params.dataset.output_path = project_->getProjectOutputFolder();
-
-        // Initialize trainer
-        auto init_result = trainer_->initialize(params);
-        if (!init_result) {
-            return std::unexpected(init_result.error());
-        }
-
-        return true;
     }
 
     bool TrainerManager::startTraining() {
         LOG_TIMER("TrainerManager::startTraining");
 
         if (!canStart()) {
-            LOG_WARN("Cannot start training in current state: {}", static_cast<int>(state_.load()));
+            LOG_WARN("Cannot start: {}", getActionBlockedReason(TrainingAction::Start));
             return false;
         }
 
@@ -150,31 +178,76 @@ namespace gs {
             return false;
         }
 
-        // ALWAYS reinitialize trainer to pick up any parameter changes from the project
-        // This ensures that any UI changes are applied
-        LOG_INFO("Initializing trainer with current project parameters");
-        auto init_result = initializeTrainerFromProject();
-        if (!init_result) {
-            LOG_ERROR("Failed to initialize trainer: {}", init_result.error());
-            last_error_ = init_result.error();
-            setState(State::Error);
-            return false;
+        applyPendingParams();
+
+        if (trainer_->isInitialized()) {
+            LOG_DEBUG("Resuming from iteration {}", trainer_->get_current_iteration());
+        } else {
+            const auto& params = trainer_->getParams();
+
+            if (scene_) {
+                if (auto result = lfs::training::initializeTrainingModel(params, *scene_); !result) {
+                    LOG_ERROR("Failed to initialize model: {}", result.error());
+                    last_error_ = result.error();
+
+                    std::string error_msg = result.error();
+                    if (auto pos = error_msg.find("CUDA out of memory"); pos != std::string::npos) {
+                        error_msg = error_msg.substr(pos);
+                    }
+                    state::TrainingCompleted{
+                        .iteration = 0,
+                        .final_loss = 0.0f,
+                        .elapsed_seconds = 0.0f,
+                        .success = false,
+                        .error = error_msg}
+                        .emit();
+
+                    if (!state_machine_.transitionToFinished(FinishReason::Error)) {
+                        LOG_WARN("Failed to transition to Finished(Error)");
+                    }
+                    return false;
+                }
+            }
+
+            if (auto result = trainer_->initialize(params); !result) {
+                LOG_ERROR("Failed to initialize trainer: {}", result.error());
+                last_error_ = result.error();
+
+                std::string error_msg = result.error();
+                if (auto pos = error_msg.find("CUDA out of memory"); pos != std::string::npos) {
+                    error_msg = error_msg.substr(pos);
+                }
+                state::TrainingCompleted{
+                    .iteration = 0,
+                    .final_loss = 0.0f,
+                    .elapsed_seconds = 0.0f,
+                    .success = false,
+                    .error = error_msg}
+                    .emit();
+
+                if (!state_machine_.transitionToFinished(FinishReason::Error)) {
+                    LOG_WARN("Failed to transition to Finished(Error)");
+                }
+                return false;
+            }
         }
 
-        // Reset completion state
         {
             std::lock_guard<std::mutex> lock(completion_mutex_);
             training_complete_ = false;
         }
 
-        setState(State::Running);
+        updateResourceTracking();
 
-        // Emit training started event
-        events::state::TrainingStarted{
-            .total_iterations = getTotalIterations()}
-            .emit();
+        if (!state_machine_.transitionTo(TrainingState::Running)) {
+            LOG_WARN("Failed to transition to Running");
+        }
 
-        // Start training thread
+        training_start_time_ = std::chrono::steady_clock::now();
+        accumulated_training_time_ = std::chrono::steady_clock::duration{0};
+
+        state::TrainingStarted{.total_iterations = getTotalIterations()}.emit();
+
         training_thread_ = std::make_unique<std::jthread>(
             [this](std::stop_token stop_token) {
                 trainingThreadFunc(stop_token);
@@ -186,63 +259,97 @@ namespace gs {
 
     void TrainerManager::pauseTraining() {
         if (!canPause()) {
-            LOG_TRACE("Cannot pause training in current state");
+            LOG_TRACE("Cannot pause: {}", getActionBlockedReason(TrainingAction::Pause));
             return;
         }
 
         if (trainer_) {
             trainer_->request_pause();
-            setState(State::Paused);
+            accumulated_training_time_ += std::chrono::steady_clock::now() - training_start_time_;
 
-            events::state::TrainingPaused{
-                .iteration = getCurrentIteration()}
-                .emit();
+            if (!state_machine_.transitionTo(TrainingState::Paused)) {
+                LOG_WARN("Failed to transition to Paused");
+            }
 
+            state::TrainingPaused{.iteration = getCurrentIteration()}.emit();
             LOG_INFO("Training paused at iteration {}", getCurrentIteration());
         }
     }
 
     void TrainerManager::resumeTraining() {
         if (!canResume()) {
-            LOG_TRACE("Cannot resume training in current state");
+            LOG_TRACE("Cannot resume: {}", getActionBlockedReason(TrainingAction::Resume));
             return;
         }
+        if (!trainer_)
+            return;
+
+        const int iter = getCurrentIteration();
+        const bool need_thread = !training_thread_ || !training_thread_->joinable();
+
+        if (need_thread) {
+            // Checkpoint resume: no thread exists yet
+            training_complete_ = false;
+            accumulated_training_time_ = std::chrono::steady_clock::duration{0};
+            training_thread_ = std::make_unique<std::jthread>(
+                [this](std::stop_token st) { trainingThreadFunc(st); });
+        } else {
+            trainer_->request_resume();
+        }
+
+        training_start_time_ = std::chrono::steady_clock::now();
+        updateResourceTracking();
+
+        if (!state_machine_.transitionTo(TrainingState::Running)) {
+            LOG_WARN("Failed to transition to Running");
+        }
+
+        state::TrainingResumed{.iteration = iter}.emit();
+        LOG_INFO("Training resumed at iteration {}", iter);
+    }
+
+    void TrainerManager::pauseTrainingTemporary() {
+        if (!isRunning())
+            return;
+
+        if (trainer_) {
+            trainer_->request_pause();
+            LOG_TRACE("Training temporarily paused at iteration {}", getCurrentIteration());
+        }
+    }
+
+    void TrainerManager::resumeTrainingTemporary() {
+        if (!isRunning())
+            return;
 
         if (trainer_) {
             trainer_->request_resume();
-            setState(State::Running);
-
-            events::state::TrainingResumed{
-                .iteration = getCurrentIteration()}
-                .emit();
-
-            LOG_INFO("Training resumed from iteration {}", getCurrentIteration());
+            LOG_TRACE("Training resumed from temporary pause at iteration {}", getCurrentIteration());
         }
     }
 
     void TrainerManager::stopTraining() {
-        if (!isTrainingActive()) {
-            LOG_TRACE("Training not active, nothing to stop");
+        if (!canStop()) {
+            LOG_TRACE("Cannot stop: {}", getActionBlockedReason(TrainingAction::Stop));
             return;
         }
 
         LOG_DEBUG("Requesting training stop");
-        setState(State::Stopping);
+        updateResourceTracking();
+
+        if (!state_machine_.transitionTo(TrainingState::Stopping)) {
+            LOG_WARN("Failed to transition to Stopping");
+        }
 
         if (trainer_) {
             trainer_->request_stop();
         }
 
         if (training_thread_ && training_thread_->joinable()) {
-            LOG_DEBUG("Requesting training thread to stop...");
             training_thread_->request_stop();
         }
 
-        events::state::TrainingStopped{
-            .iteration = getCurrentIteration(),
-            .user_requested = true}
-            .emit();
-
+        state::TrainingStopped{.iteration = getCurrentIteration(), .user_requested = true}.emit();
         LOG_INFO("Training stop requested at iteration {}", getCurrentIteration());
     }
 
@@ -270,42 +377,28 @@ namespace gs {
         }
 
         if (trainer_->isInitialized()) {
-            LOG_DEBUG("Clearing GPU memory from previous training");
-
-            // Save params before destroying
-            auto params = trainer_->getParams();
-
-            // Destroy the trainer to release all tensors
+            LOG_DEBUG("Releasing GPU memory");
             trainer_.reset();
-
-            // Force PyTorch to release cached memory back to system
-            c10::cuda::CUDACachingAllocator::emptyCache();
             cudaDeviceSynchronize();
 
-            LOG_DEBUG("GPU memory cache cleared");
+            if (!scene_) {
+                LOG_ERROR("Cannot reset: no scene");
 
-            // Recreate trainer
-            auto setup_result = gs::training::setupTraining(params);
-            if (setup_result) {
-                trainer_ = std::move(setup_result->trainer);
-                trainer_->setProject(project_);
-                if (project_) {
-                    trainer_->load_cameras_info();
+                if (!state_machine_.transitionToFinished(FinishReason::Error)) {
+                    LOG_WARN("Failed to transition to Finished(Error)");
                 }
-            } else {
-                LOG_ERROR("Failed to recreate trainer after reset: {}", setup_result.error());
-                setState(State::Error);
                 return false;
             }
+            trainer_ = std::make_unique<lfs::training::Trainer>(*scene_);
         }
 
-        // Clear loss buffer
         loss_buffer_.clear();
 
-        // Set to Ready state
-        setState(State::Ready);
+        if (!state_machine_.transitionTo(TrainingState::Ready)) {
+            LOG_WARN("Failed to transition to Ready");
+        }
 
-        LOG_INFO("Training reset complete - GPU memory freed, ready to start with current parameters");
+        LOG_DEBUG("Training reset complete");
         return true;
     }
 
@@ -336,19 +429,73 @@ namespace gs {
     int TrainerManager::getTotalIterations() const {
         if (!trainer_)
             return 0;
-        return trainer_->getParams().optimization.iterations;
+        return static_cast<int>(trainer_->getParams().optimization.iterations);
     }
 
     int TrainerManager::getNumSplats() const {
         if (!trainer_)
             return 0;
-        return static_cast<int>(trainer_->get_strategy().get_model().size());
+        // Strategy may not be created yet if using Scene-based constructor
+        // In that case, try to get size from scene
+        if (scene_) {
+            const auto* model = scene_->getTrainingModel();
+            if (model) {
+                return static_cast<int>(model->size());
+            }
+        }
+        // Fall back to strategy if trainer is initialized
+        if (trainer_->isInitialized()) {
+            return static_cast<int>(trainer_->get_strategy().get_model().size());
+        }
+        return 0;
+    }
+
+    int TrainerManager::getMaxGaussians() const {
+        if (!trainer_)
+            return 0;
+        return trainer_->getParams().optimization.max_cap;
+    }
+
+    const char* TrainerManager::getStrategyType() const {
+        if (!trainer_ || !trainer_->isInitialized())
+            return "unknown";
+        return trainer_->get_strategy().strategy_type();
+    }
+
+    bool TrainerManager::isGutEnabled() const {
+        if (!trainer_)
+            return false;
+        return trainer_->getParams().optimization.gut;
+    }
+
+    float TrainerManager::getElapsedSeconds() const {
+        const auto state = getState();
+        if (state == TrainingState::Running) {
+            const auto current = std::chrono::steady_clock::now() - training_start_time_;
+            return std::chrono::duration<float>(accumulated_training_time_ + current).count();
+        }
+        if (state == TrainingState::Paused || state == TrainingState::Finished) {
+            return std::chrono::duration<float>(accumulated_training_time_).count();
+        }
+        return 0.0f;
+    }
+
+    float TrainerManager::getEstimatedRemainingSeconds() const {
+        const float elapsed = getElapsedSeconds();
+        const int current_iter = getCurrentIteration();
+        const int total_iter = getTotalIterations();
+
+        if (current_iter <= 0 || elapsed <= 0.0f || total_iter <= current_iter)
+            return 0.0f;
+
+        const float secs_per_iter = elapsed / static_cast<float>(current_iter);
+        return secs_per_iter * static_cast<float>(total_iter - current_iter);
     }
 
     void TrainerManager::updateLoss(float loss) {
         std::lock_guard<std::mutex> lock(loss_buffer_mutex_);
         loss_buffer_.push_back(loss);
-        while (loss_buffer_.size() > static_cast<size_t>(max_loss_points_)) {
+        while (loss_buffer_.size() > static_cast<size_t>(MAX_LOSS_POINTS)) {
             loss_buffer_.pop_front();
         }
         LOG_TRACE("Loss updated: {:.6f} (buffer size: {})", loss, loss_buffer_.size());
@@ -385,89 +532,117 @@ namespace gs {
         LOG_INFO("Training thread finished");
     }
 
-    void TrainerManager::setState(State new_state) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-
-        State old_state = state_.load();
-        state_ = new_state;
-
-        const char* state_str = "";
-        switch (new_state) {
-        case State::Idle: state_str = "Idle"; break;
-        case State::Ready: state_str = "Ready"; break;
-        case State::Running: state_str = "Running"; break;
-        case State::Paused: state_str = "Paused"; break;
-        case State::Stopping: state_str = "Stopping"; break;
-        case State::Completed: state_str = "Completed"; break;
-        case State::Error: state_str = "Error"; break;
-        }
-
-        LOG_DEBUG("Training state changed from {} to {}",
-                  static_cast<int>(old_state), state_str);
-    }
-
-    void TrainerManager::handleTrainingComplete(bool success, const std::string& error) {
+    void TrainerManager::handleTrainingComplete(const bool success, const std::string& error) {
         if (!error.empty()) {
             last_error_ = error;
             LOG_ERROR("Training error: {}", error);
         }
 
-        setState(success ? State::Completed : State::Error);
+        const float elapsed = getElapsedSeconds();
+        const int final_iter = getCurrentIteration();
+        const float final_loss = getCurrentLoss();
+        const bool user_stopped = (getState() == TrainingState::Stopping);
 
-        int final_iteration = getCurrentIteration();
-        float final_loss = getCurrentLoss();
+        updateResourceTracking();
+        if (!user_stopped) {
+            if (!state_machine_.transitionTo(TrainingState::Stopping)) {
+                LOG_WARN("Failed to transition to Stopping");
+            }
+        }
 
-        LOG_INFO("Training finished - Success: {}, Final iteration: {}, Final loss: {:.6f}",
-                 success, final_iteration, final_loss);
+        const FinishReason reason = !success       ? FinishReason::Error
+                                    : user_stopped ? FinishReason::UserStopped
+                                                   : FinishReason::Completed;
 
-        events::state::TrainingCompleted{
-            .iteration = final_iteration,
-            .final_loss = final_loss,
-            .success = success,
-            .error = error.empty() ? std::nullopt : std::optional(error)}
-            .emit();
+        if (!state_machine_.transitionToFinished(reason)) {
+            LOG_WARN("Failed to transition to Finished");
+        }
 
-        // Notify completion
+        LOG_INFO("Training finished: iter={}, loss={:.6f}, time={:.1f}s",
+                 final_iter, final_loss, elapsed);
+
+        // Skip popup for user-stopped (user knows they stopped it)
+        if (!user_stopped) {
+            state::TrainingCompleted{
+                .iteration = final_iter,
+                .final_loss = final_loss,
+                .elapsed_seconds = elapsed,
+                .success = success,
+                .error = error.empty() ? std::nullopt : std::optional(error)}
+                .emit();
+        }
+
         {
-            std::lock_guard<std::mutex> lock(completion_mutex_);
+            std::lock_guard lock(completion_mutex_);
             training_complete_ = true;
         }
         completion_cv_.notify_all();
     }
 
     void TrainerManager::setupEventHandlers() {
-        using namespace events;
+        using namespace lfs::core::events;
 
-        // Listen for training progress events - only update loss buffer
+        // Training control commands
+        cmd::StartTraining::when([this](const auto&) {
+            startTraining();
+        });
+
+        cmd::PauseTraining::when([this](const auto&) {
+            pauseTraining();
+        });
+
+        cmd::ResumeTraining::when([this](const auto&) {
+            resumeTraining();
+        });
+
+        cmd::StopTraining::when([this](const auto&) {
+            stopTraining();
+        });
+
+        cmd::SaveCheckpoint::when([this](const auto&) {
+            requestSaveCheckpoint();
+        });
+
+        // Listen for training progress events - update loss buffer
         state::TrainingProgress::when([this](const auto& event) {
             updateLoss(event.loss);
         });
     }
 
-    std::shared_ptr<const Camera> TrainerManager::getCamById(int camId) const {
-        if (trainer_) {
-            LOG_TRACE("Retrieving camera with ID: {}", camId);
-            return trainer_->getCamById(camId);
+    std::shared_ptr<const lfs::core::Camera> TrainerManager::getCamById(int camId) const {
+        // Get camera from Scene (Scene owns all training data)
+        if (scene_) {
+            return scene_->getCameraByUid(camId);
         }
-        LOG_ERROR("getCamById called but trainer is not initialized");
+        LOG_ERROR("getCamById called but scene is not set");
         return nullptr;
     }
 
-    std::vector<std::shared_ptr<const Camera>> TrainerManager::getCamList() const {
-        if (trainer_) {
-            auto cams = trainer_->getCamList();
-            LOG_TRACE("Retrieved {} cameras from trainer", cams.size());
-            return cams;
+    std::vector<std::shared_ptr<const lfs::core::Camera>> TrainerManager::getCamList() const {
+        // Get cameras from Scene (Scene owns all training data)
+        if (scene_) {
+            return scene_->getAllCameras();
         }
-        LOG_ERROR("getCamList called but trainer is not initialized");
+        LOG_ERROR("getCamList called but scene is not set");
         return {};
     }
 
-    void TrainerManager::setProject(std::shared_ptr<gs::management::Project> project) {
-        project_ = project;
-        if (trainer_) {
-            trainer_->setProject(project);
+    void TrainerManager::applyPendingParams() {
+        if (!trainer_)
+            return;
+
+        auto params = trainer_->getParams();
+        params.dataset = pending_dataset_params_;
+
+        // Use ParameterManager in GUI mode, fallback to pending_opt_params_ for headless
+        if (auto* const param_mgr = services().paramsOrNull()) {
+            params.optimization = param_mgr->getActiveParams();
+            LOG_DEBUG("Applied params: strategy={}, iter={}, max_cap={}",
+                      params.optimization.strategy, params.optimization.iterations, params.optimization.max_cap);
+        } else {
+            params.optimization = pending_opt_params_;
         }
+        trainer_->setParams(params);
     }
 
-} // namespace gs
+} // namespace lfs::vis

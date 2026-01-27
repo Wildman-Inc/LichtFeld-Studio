@@ -2,8 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 // Memory pool is now an internal implementation detail of tensor library
-// #include "core/memory_pool.hpp"
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 #include <chrono>
 #include <gtest/gtest.h>
 #include <iomanip>

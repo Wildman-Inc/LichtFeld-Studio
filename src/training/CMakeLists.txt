@@ -2,163 +2,145 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Collect all training sources
-set(TRAINING_HOST_SOURCES
-        trainer.cpp
-        training_setup.cpp
+# Add fastlfs backend
+add_subdirectory(rasterization/fastgs)
 
-        # Rasterization
-        rasterization/rasterizer.cpp
-        rasterization/fast_rasterizer.cpp
-        rasterization/rasterizer_autograd.cpp
-        rasterization/fast_rasterizer_autograd.cpp
+# Add LibTorch-free gsplat backend
+add_subdirectory(rasterization/gsplat)
 
-        # Strategies
-        strategies/strategy_utils.cpp
-        strategies/default_strategy.cpp
-        strategies/mcmc.cpp
-
-        # Optimizers
-        optimizers/scheduler.cpp
-        optimizers/fused_adam.cpp
-
-        # Metrics
-        metrics/metrics.cpp
-
-        # Components
-        components/bilateral_grid.cpp
-        components/poseopt.cpp
-        components/sparsity_optimizer.cpp
+# LibTorch-free CUDA kernels
+set(LFS_TRAINING_KERNEL_SOURCES
+    kernels/ssim.cu
+    kernels/l1_loss.cu
+    kernels/ssim_reduction.cu
+    kernels/regularization.cu
+    kernels/bilateral_grid_forward.cu
+    kernels/bilateral_grid_backward.cu
+    kernels/bilateral_grid_tv.cu
+    kernels/mcmc_kernels.cu
+    kernels/densification_kernels.cu
+    kernels/grad_alpha.cu
+    components/sparsity_optimizer_kernels.cu
 )
 
-# CUDA kernel sources
-set(TRAINING_KERNEL_SOURCES
-        kernels/bilateral_grid_forward.cu
-        kernels/bilateral_grid_backward.cu
-        kernels/bilateral_grid_tv.cu
-        kernels/ssim.cu
-        kernels/regularization.cu
-)
-
-# Create training kernels library based on GPU backend
+# Create CUDA/HIP kernels library
 if(USE_HIP)
-    # Use lfs_hip_add_library from HIPUtils.cmake for Windows-compatible HIP support
     set(HIP_HIPCC_FLAGS "${HIP_HIPCC_FLAGS} -std=c++20")
-    lfs_hip_add_library(gs_training_kernels STATIC ${TRAINING_KERNEL_SOURCES})
+    lfs_hip_add_library(lfs_training_kernels STATIC ${LFS_TRAINING_KERNEL_SOURCES})
 else()
-    add_library(gs_training_kernels STATIC ${TRAINING_KERNEL_SOURCES})
+    add_library(lfs_training_kernels STATIC ${LFS_TRAINING_KERNEL_SOURCES})
 endif()
 
-if(USE_CUDA)
-    set_target_properties(gs_training_kernels PROPERTIES
-            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-            CUDA_SEPARABLE_COMPILATION ON
-            POSITION_INDEPENDENT_CODE ON
-            CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    )
-elseif(USE_HIP)
-    set_target_properties(gs_training_kernels PROPERTIES
-            POSITION_INDEPENDENT_CODE ON
+target_include_directories(lfs_training_kernels
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(lfs_training_kernels
+    PUBLIC
+    lfs_tensor       # For lfs::core::Tensor
+    ${GPU_RUNTIME_LIBRARY}
+)
+
+# PTX-only builds require separable compilation OFF
+if(LFS_DEFER_DEVICE_SYMBOLS)
+    set(_sep_comp OFF)
+else()
+    set(_sep_comp ON)
+endif()
+
+set_target_properties(lfs_training_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ${_sep_comp}
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+)
+
+if(USE_HIP)
+    set_target_properties(lfs_training_kernels PROPERTIES
+        HIP_ARCHITECTURES "${HIP_ARCHITECTURES}"
+        POSITION_INDEPENDENT_CODE ON
     )
 endif()
 
-target_include_directories(gs_training_kernels
-        PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/kernels
-        PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_BINARY_DIR}/include
-        ${CMAKE_SOURCE_DIR}/gsplat
-        ${CMAKE_CURRENT_SOURCE_DIR}/fastgs
-        ${GPU_INCLUDE_DIRS}
+# CUDA compiler options for lfs_training_kernels
+target_compile_options(lfs_training_kernels PRIVATE
+    # CUDA device code + MSVC host compiler flags (Windows only)
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+    # CUDA device code for non-Windows
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo --extended-lambda --expt-relaxed-constexpr>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v>
+
+    # HIP compile options
+    $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Debug>:-O0 -g>>
+    $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Release>:-O3 -ffast-math>>
 )
 
-target_link_libraries(gs_training_kernels
-        PUBLIC
-        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
-        ${GPU_RAND_LIBRARY}      # CUDA::curand or hipRAND
-        ${GPU_BLAS_LIBRARY}      # CUDA::cublas or hipBLAS
-        ${TORCH_LIBRARIES}
-        glm::glm
-        spdlog::spdlog
+if(MSVC)
+    target_compile_definitions(lfs_training_kernels PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
+    )
+endif()
+# Optimizer sources
+set(TRAINING_NEW_SOURCES
+    optimizer/adam_optimizer.cpp
+    optimizer/scheduler.cpp
+    losses/regularization.cpp
+    losses/photometric_loss.cpp
+    strategies/strategy_utils.cpp
+    strategies/adc.cpp
+    strategies/mcmc.cpp
+    rasterization/fast_rasterizer.cpp
+    rasterization/gsplat_rasterizer.cpp
+    components/bilateral_grid.cpp
+    components/sparsity_optimizer.cpp
+    metrics/metrics.cpp
+    checkpoint.cpp
+    trainer.cpp
+    training_setup.cpp
 )
 
-target_compile_options(gs_training_kernels PRIVATE
-        # CUDA device code + MSVC host compiler flags (Windows only)
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo -Xcompiler=/Od -Xcompiler=/Z7>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --ptxas-options=-v -Xcompiler=/O2 -Xcompiler=/DNDEBUG>
+# lfs_training - Training module with optimizer
+add_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
 
-        # CUDA device code for non-Windows
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --ptxas-options=-v>
-
-        # HIP compile options
-        $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Debug>:-O0 -g>>
-        $<$<COMPILE_LANGUAGE:HIP>:$<$<CONFIG:Release>:-O3 -ffast-math>>
+target_include_directories(lfs_training
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/external>  # For indicators.hpp (used in progress.hpp)
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src                   # For old training components (TODO: port)
+        ${CMAKE_SOURCE_DIR}/src/training          # For old training components (TODO: port)
+        ${CMAKE_SOURCE_DIR}/src/training/fastgs  # For adam_api.h (old)
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/rasterization/include  # For rasterization_api.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/optimizer/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization  # For gsplat headers
 )
 
-# Create training host library
-add_library(gs_training STATIC ${TRAINING_HOST_SOURCES})
-
-target_include_directories(gs_training
-        PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_BINARY_DIR}/include
-        ${CMAKE_SOURCE_DIR}/gsplat
-        ${CMAKE_CURRENT_SOURCE_DIR}/fastgs
-        ${GPU_INCLUDE_DIRS}
-        ${OPENGL_INCLUDE_DIRS}
+# Link dependencies
+target_link_libraries(lfs_training
+    PUBLIC
+        lfs_core                # Depends on new core module (SplatData, Tensor)
+        lfs_training_kernels    # LibTorch-free SSIM kernels
+        fastlfs_backend         # For adam_step_raw CUDA kernel (LibTorch-free)
+        gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
 )
 
-target_link_libraries(gs_training
-        PUBLIC
-        gs_core
-        gs_training_kernels
-        gs_kernels
-        gs_loader
-        gsplat_backend
-        fastgs_backend
-        ${TORCH_LIBRARIES}
-        TBB::tbb
-        nlohmann_json::nlohmann_json
-        glm::glm
-        Threads::Threads
-        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
-        spdlog::spdlog
-        PRIVATE
-        ${OPENGL_LIBRARIES}
+# Set C++ standard
+set_target_properties(lfs_training PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
 )
 
-# Compiler options
-if (MSVC)
-    target_compile_options(gs_training PRIVATE
-            $<$<CONFIG:Debug>:/Od /Z7>
-            $<$<CONFIG:Release>:/O2 /DNDEBUG>)
-else ()
-    target_compile_options(gs_training PRIVATE
-            $<$<CONFIG:Debug>:-O0 -g -fno-omit-frame-pointer -DDEBUG>
-            $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native>)
-endif ()
-
-# AVX2 support
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-
-    if (COMPILER_SUPPORTS_AVX2)
-        target_compile_options(gs_training PRIVATE
-                $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mfma>
-        )
-        target_compile_definitions(gs_training PRIVATE HAS_AVX2_SUPPORT)
-    endif ()
-endif ()
-
-# Set properties
-set_target_properties(gs_training PROPERTIES
-        CXX_STANDARD 23
-        CXX_STANDARD_REQUIRED ON
-        DEBUG_POSTFIX d
-)
+message(STATUS "╔════════════════════════════════════════════════════════════════╗")
+message(STATUS "║  lfs_training - Training Module with Optimizer & Losses       ║")
+message(STATUS "╚════════════════════════════════════════════════════════════════╝")
+message(STATUS "  • Contains: AdamOptimizer, LR Schedulers, Losses (LibTorch-free API)")
+message(STATUS "  • Namespace: lfs::training")
+message(STATUS "  • Uses: CUDA kernels from gs_training_kernels, fastgs_backend")

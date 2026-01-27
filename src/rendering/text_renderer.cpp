@@ -4,12 +4,13 @@
 
 #include "text_renderer.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "gl_state_guard.hpp"
 #include <format>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     TextRenderer::TextRenderer(unsigned int width, unsigned int height)
         : screenWidth(width),
@@ -29,9 +30,9 @@ namespace gs::rendering {
         }
     }
 
-    Result<void> TextRenderer::LoadFont(const std::string& fontPath, unsigned int fontSize) {
+    Result<void> TextRenderer::LoadFont(const std::filesystem::path& fontPath, unsigned int fontSize) {
         LOG_TIMER("TextRenderer::LoadFont");
-        LOG_INFO("Loading font: {} at size {}", fontPath, fontSize);
+        LOG_INFO("Loading font: {} at size {}", fontPath.string(), fontSize);
 
         // Clear existing characters
         for (auto& pair : characters) {
@@ -54,10 +55,12 @@ namespace gs::rendering {
             }
         } ft_guard{ft};
 
+        // Convert path to UTF-8 for FreeType which uses fopen internally
+        const std::string fontPath_utf8 = lfs::core::path_to_utf8(fontPath);
         FT_Face face;
-        if (FT_New_Face(ft, fontPath.c_str(), 0, &face)) {
-            LOG_ERROR("Failed to load font from: {}", fontPath);
-            return std::unexpected(std::format("Failed to load font from: {}", fontPath));
+        if (FT_New_Face(ft, fontPath_utf8.c_str(), 0, &face)) {
+            LOG_ERROR("Failed to load font from: {}", fontPath.string());
+            return std::unexpected(std::format("Failed to load font from: {}", fontPath.string()));
         }
 
         // RAII wrapper for FreeType face
@@ -269,4 +272,16 @@ namespace gs::rendering {
         return {};
     }
 
-} // namespace gs::rendering
+    glm::vec2 TextRenderer::getCharacterSize(const char c, const float scale) const {
+        if (const auto it = characters.find(c); it != characters.end())
+            return glm::vec2(it->second.size) * scale;
+        return glm::vec2(0.0f);
+    }
+
+    glm::vec2 TextRenderer::getCharacterBearing(const char c, const float scale) const {
+        if (const auto it = characters.find(c); it != characters.end())
+            return glm::vec2(it->second.bearing) * scale;
+        return glm::vec2(0.0f);
+    }
+
+} // namespace lfs::rendering

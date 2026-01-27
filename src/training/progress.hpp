@@ -4,13 +4,13 @@
 
 #pragma once
 
-#include "external/indicators.hpp"
+#include "indicators.hpp"
 #include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 
-namespace gs::training {
+namespace lfs::training {
     class TrainingProgress {
         std::unique_ptr<indicators::ProgressBar> progress_bar_;
         std::chrono::steady_clock::time_point start_time_;
@@ -128,4 +128,4 @@ namespace gs::training {
             complete();
         }
     };
-}; // namespace gs::training
+} // namespace lfs::training

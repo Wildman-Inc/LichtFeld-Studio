@@ -6,7 +6,7 @@
 #include "framebuffer.hpp"
 #include <memory>
 
-namespace gs::rendering {
+namespace lfs::rendering {
     enum class FrameBufferMode {
         CPU,
         CUDA_INTEROP
@@ -18,27 +18,36 @@ namespace gs::rendering {
         static constexpr bool available = EnableInterop;
     };
 
-    // Get the preferred mode based on compile-time configuration
+    // Runtime interop disable flag (set before RenderingEngine creation)
+    inline bool& isInteropDisabled() {
+        static bool disabled = false;
+        return disabled;
+    }
+
+    inline void disableInterop() { isInteropDisabled() = true; }
+
     inline FrameBufferMode getPreferredFrameBufferMode() {
-        // This will be set by CMake through a constexpr or config header
-        constexpr bool cuda_interop_available =
+        if (isInteropDisabled()) {
+            return FrameBufferMode::CPU;
+        }
+
+        constexpr bool CUDA_INTEROP_AVAILABLE =
 #ifdef CUDA_GL_INTEROP_ENABLED
             true;
 #else
             false;
 #endif
 
-        if constexpr (cuda_interop_available) {
+        if constexpr (CUDA_INTEROP_AVAILABLE) {
             return FrameBufferMode::CUDA_INTEROP;
         }
         return FrameBufferMode::CPU;
     }
 
-    // Check if interop is available at compile time
     inline bool isInteropAvailable() {
         return getPreferredFrameBufferMode() == FrameBufferMode::CUDA_INTEROP;
     }
 
     // Create a framebuffer with the specified mode
     std::shared_ptr<FrameBuffer> createFrameBuffer(FrameBufferMode preferred = FrameBufferMode::CPU);
-} // namespace gs::rendering
+} // namespace lfs::rendering

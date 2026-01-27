@@ -4,84 +4,80 @@
 
 #pragma once
 
+#include "core/splat_data.hpp"
+#include "core/tensor.hpp"
 #include "istrategy.hpp"
+#include "optimizer/adam_optimizer.hpp"
+#include "optimizer/scheduler.hpp"
 #include <memory>
-#include <torch/torch.h>
 
-namespace gs::training {
+namespace lfs::training {
+
+    /// MCMC-based optimization strategy. SplatData owned by Scene.
     class MCMC : public IStrategy {
     public:
         MCMC() = delete;
+        /// SplatData must be owned by Scene
+        explicit MCMC(lfs::core::SplatData& splat_data);
 
-        MCMC(gs::SplatData&& splat_data);
-
+        // Reference member prevents copy/move
         MCMC(const MCMC&) = delete;
-
         MCMC& operator=(const MCMC&) = delete;
-
-        MCMC(MCMC&&) = default;
-
-        MCMC& operator=(MCMC&&) = default;
+        MCMC(MCMC&&) = delete;
+        MCMC& operator=(MCMC&&) = delete;
 
         // IStrategy interface implementation
-        void initialize(const gs::param::OptimizationParameters& optimParams) override;
-
+        void initialize(const lfs::core::param::OptimizationParameters& optimParams) override;
         void post_backward(int iter, RenderOutput& render_output) override;
-
         bool is_refining(int iter) const override;
-
         void step(int iter) override;
 
-        gs::SplatData& get_model() override { return _splat_data; }
-        const gs::SplatData& get_model() const override { return _splat_data; }
+        lfs::core::SplatData& get_model() override { return *_splat_data; }
+        const lfs::core::SplatData& get_model() const override { return *_splat_data; }
 
-        void remove_gaussians(const torch::Tensor& mask) override;
+        void remove_gaussians(const lfs::core::Tensor& mask) override;
+
+        // IStrategy interface - optimizer access
+        AdamOptimizer& get_optimizer() override { return *_optimizer; }
+        const AdamOptimizer& get_optimizer() const override { return *_optimizer; }
+        ExponentialLR* get_scheduler() { return _scheduler.get(); }
+        const ExponentialLR* get_scheduler() const { return _scheduler.get(); }
+
+        // Serialization for checkpoints
+        void serialize(std::ostream& os) const override;
+        void deserialize(std::istream& is) override;
+        const char* strategy_type() const override { return "mcmc"; }
+
+        // Reserve optimizer capacity for future growth (e.g., after checkpoint load)
+        void reserve_optimizer_capacity(size_t capacity) override;
+
+        // Exposed for testing (compare with legacy implementation)
+        int add_new_gs_test() { return add_new_gs(); }
+        int add_new_gs_with_indices_test(const lfs::core::Tensor& sampled_idxs);
+        int relocate_gs_test() { return relocate_gs(); }
 
     private:
-        // Simple ExponentialLR implementation since C++ API is different
-        class ExponentialLR {
-        public:
-            ExponentialLR(torch::optim::Optimizer& optimizer, double gamma, int param_group_index = -1)
-                : optimizer_(optimizer),
-                  gamma_(gamma),
-                  param_group_index_(param_group_index) {
-            }
-
-            void step();
-
-        private:
-            torch::optim::Optimizer& optimizer_;
-            double gamma_;
-            int param_group_index_;
-        };
-
         // Helper functions
-        torch::Tensor multinomial_sample(const torch::Tensor& weights, int n, bool replacement = true);
-
+        lfs::core::Tensor multinomial_sample(const lfs::core::Tensor& weights, int n, bool replacement = true);
         int relocate_gs();
-
         int add_new_gs();
-
         void inject_noise();
-
-        void update_optimizer_for_relocate(torch::optim::Optimizer* optimizer,
-                                           const torch::Tensor& sampled_indices,
-                                           const torch::Tensor& dead_indices,
-                                           int param_position);
+        void update_optimizer_for_relocate(const lfs::core::Tensor& sampled_indices,
+                                           const lfs::core::Tensor& dead_indices,
+                                           ParamType param_type);
 
         // Member variables
-        std::unique_ptr<torch::optim::Optimizer> _optimizer;
+        std::unique_ptr<AdamOptimizer> _optimizer;
         std::unique_ptr<ExponentialLR> _scheduler;
-        gs::SplatData _splat_data;
-        std::unique_ptr<const gs::param::OptimizationParameters> _params;
+        lfs::core::SplatData* _splat_data = nullptr; // Scene-owned
+        std::unique_ptr<const lfs::core::param::OptimizationParameters> _params;
 
         // MCMC specific parameters
-        const float _noise_lr = 5e5;
+        const float _noise_lr = 5e5f;
 
         // State variables
-        torch::Tensor _binoms;
-
-        // SelectiveAdam support
-        torch::Tensor _last_visibility_mask;
+        lfs::core::Tensor _binoms;       // [n_max, n_max] binomial coefficients
+        lfs::core::Tensor _noise_buffer; // Reusable buffer for noise injection
     };
-} // namespace gs::training
+
+} // namespace lfs::training

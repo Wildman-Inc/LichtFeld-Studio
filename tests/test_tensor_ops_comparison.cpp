@@ -8,7 +8,7 @@
 #include <torch/torch.h>
 #include <vector>
 
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 
 namespace {
 
@@ -1031,9 +1031,9 @@ TEST_F(TensorBugHuntingTest, DiagnosticCompareSliceIsView) {
 
     // GS
     auto gs_data = lfs::core::Tensor::randn({5, 3}, lfs::core::Device::CUDA);
-    void* gs_orig_ptr = gs_data.raw_ptr();
+    void* gs_orig_ptr = gs_data.data_ptr();
     auto gs_slice = gs_data.slice(0, 0, 1);
-    void* gs_slice_ptr = gs_slice.raw_ptr();
+    void* gs_slice_ptr = gs_slice.data_ptr();
 
     bool gs_is_view = (gs_slice_ptr == gs_orig_ptr);
     std::cout << "GS: slice is " << (gs_is_view ? "VIEW" : "COPY") << std::endl;
@@ -1055,9 +1055,9 @@ TEST_F(TensorBugHuntingTest, DiagnosticCompareCloneIsCopy) {
 
     // GS
     auto gs_data = lfs::core::Tensor::randn({5, 3}, lfs::core::Device::CUDA);
-    void* gs_orig_ptr = gs_data.raw_ptr();
+    void* gs_orig_ptr = gs_data.data_ptr();
     auto gs_clone = gs_data.clone();
-    void* gs_clone_ptr = gs_clone.raw_ptr();
+    void* gs_clone_ptr = gs_clone.data_ptr();
 
     bool gs_is_copy = (gs_clone_ptr != gs_orig_ptr);
     std::cout << "GS: clone is " << (gs_is_copy ? "COPY" : "VIEW") << std::endl;
@@ -1079,9 +1079,9 @@ TEST_F(TensorBugHuntingTest, DiagnosticCompareSqueezeIsView) {
 
     // GS
     auto gs_data = lfs::core::Tensor::randn({1, 5}, lfs::core::Device::CUDA);
-    void* gs_orig_ptr = gs_data.raw_ptr();
+    void* gs_orig_ptr = gs_data.data_ptr();
     auto gs_squeezed = gs_data.squeeze(0);
-    void* gs_squeeze_ptr = gs_squeezed.raw_ptr();
+    void* gs_squeeze_ptr = gs_squeezed.data_ptr();
 
     bool gs_is_view = (gs_squeeze_ptr == gs_orig_ptr);
     std::cout << "GS: squeeze is " << (gs_is_view ? "VIEW" : "COPY") << std::endl;
@@ -1103,9 +1103,9 @@ TEST_F(TensorBugHuntingTest, DiagnosticCompareReshapeIsView) {
 
     // GS
     auto gs_data = lfs::core::Tensor::randn({6}, lfs::core::Device::CUDA);
-    void* gs_orig_ptr = gs_data.raw_ptr();
+    void* gs_orig_ptr = gs_data.data_ptr();
     auto gs_reshaped = gs_data.reshape({2, 3});
-    void* gs_reshape_ptr = gs_reshaped.raw_ptr();
+    void* gs_reshape_ptr = gs_reshaped.data_ptr();
 
     bool gs_is_view = (gs_reshape_ptr == gs_orig_ptr);
     std::cout << "GS: reshape is " << (gs_is_view ? "VIEW" : "COPY") << std::endl;
@@ -1132,13 +1132,13 @@ TEST_F(TensorBugHuntingTest, DiagnosticCompareSliceSqueezeClone) {
 
     // GS
     auto gs_data = lfs::core::Tensor::randn({5, 3}, lfs::core::Device::CUDA);
-    void* gs_orig_ptr = gs_data.raw_ptr();
+    void* gs_orig_ptr = gs_data.data_ptr();
 
     auto gs_sliced = gs_data.slice(0, 0, 1);
     auto gs_squeezed = gs_sliced.squeeze(0);
     auto gs_cloned = gs_squeezed.clone();
 
-    void* gs_clone_ptr = gs_cloned.raw_ptr();
+    void* gs_clone_ptr = gs_cloned.data_ptr();
     bool gs_clone_independent = (gs_clone_ptr != gs_orig_ptr);
 
     std::cout << "GS: final result is "

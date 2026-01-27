@@ -4,33 +4,35 @@
 
 #include "window_manager.hpp"
 #include "core/events.hpp"
+#include "core/logger.hpp"
 // clang-format off
-// CRITICAL: GLAD must be included before GLFW to avoid OpenGL header conflicts
+// GLAD must be included before GLFW
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 // clang-format on
 #include <iostream>
-#include <print>
 
-namespace gs {
+namespace lfs::vis {
 
     void* WindowManager::callback_handler_ = nullptr;
 
     static void window_focus_callback(GLFWwindow*, int focused) {
         if (!focused) {
-            events::internal::WindowFocusLost{}.emit();
-            std::println("[WindowManager] Window lost focus");
+            lfs::core::events::internal::WindowFocusLost{}.emit();
+            LOG_DEBUG("Window lost focus");
         } else {
-            std::println("[WindowManager] Window gained focus");
+            LOG_DEBUG("Window gained focus");
         }
     }
 
-    WindowManager::WindowManager(const std::string& title, int width, int height)
+    WindowManager::WindowManager(const std::string& title, const int width, const int height,
+                                 const int monitor_x, const int monitor_y,
+                                 const int monitor_width, const int monitor_height)
         : title_(title),
           window_size_(width, height),
-          framebuffer_size_(width, height) {
-
-        setVSync(true);
+          framebuffer_size_(width, height),
+          monitor_pos_(monitor_x, monitor_y),
+          monitor_size_(monitor_width, monitor_height) {
     }
 
     WindowManager::~WindowManager() {
@@ -66,6 +68,13 @@ namespace gs {
             return false;
         }
 
+        // Position window on specified monitor (if provided)
+        if (monitor_size_.x > 0 && monitor_size_.y > 0) {
+            const int xpos = monitor_pos_.x + (monitor_size_.x - window_size_.x) / 2;
+            const int ypos = monitor_pos_.y + (monitor_size_.y - window_size_.y) / 2;
+            glfwSetWindowPos(window_, xpos, ypos);
+        }
+
         glfwMakeContextCurrent(window_);
 
         if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
@@ -77,7 +86,7 @@ namespace gs {
         // Set window focus callback
         glfwSetWindowFocusCallback(window_, window_focus_callback);
 
-        // Enable vsync by default
+        // Enable VSync for smooth frame delivery and reduced GPU load
         glfwSwapInterval(1);
 
         // Set up OpenGL state
@@ -88,7 +97,20 @@ namespace gs {
         glBlendEquation(GL_FUNC_ADD);
         glEnable(GL_PROGRAM_POINT_SIZE);
 
+        // Clear to dark background immediately
+        glClearColor(0.11f, 0.11f, 0.14f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glfwSwapBuffers(window_);
+        glfwPollEvents();
+
         return true;
+    }
+
+    void WindowManager::showWindow() {
+        if (window_) {
+            glfwShowWindow(window_);
+            glfwFocusWindow(window_);
+        }
     }
 
     void WindowManager::updateWindowSize() {
@@ -108,17 +130,16 @@ namespace gs {
         glfwPollEvents();
     }
 
+    void WindowManager::waitEvents(double timeout_seconds) {
+        glfwWaitEventsTimeout(timeout_seconds);
+    }
+
     bool WindowManager::shouldClose() const {
         return glfwWindowShouldClose(window_);
     }
 
     void WindowManager::cancelClose() {
         glfwSetWindowShouldClose(window_, false);
-    }
-
-    void WindowManager::setVSync(bool enabled) {
-        glfwSwapInterval(enabled ? 1 : 0);
-        vsync_enabled_ = enabled;
     }
 
     void WindowManager::requestRedraw() {
@@ -136,4 +157,43 @@ namespace gs {
         return result;
     }
 
-} // namespace gs
+    void WindowManager::toggleFullscreen() {
+        if (!window_)
+            return;
+
+        if (is_fullscreen_) {
+            glfwSetWindowMonitor(window_, nullptr,
+                                 windowed_pos_.x, windowed_pos_.y,
+                                 windowed_size_.x, windowed_size_.y,
+                                 GLFW_DONT_CARE);
+            is_fullscreen_ = false;
+        } else {
+            glfwGetWindowPos(window_, &windowed_pos_.x, &windowed_pos_.y);
+            glfwGetWindowSize(window_, &windowed_size_.x, &windowed_size_.y);
+
+            GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+            int monitor_count = 0;
+            GLFWmonitor** const monitors = glfwGetMonitors(&monitor_count);
+            const int cx = windowed_pos_.x + windowed_size_.x / 2;
+            const int cy = windowed_pos_.y + windowed_size_.y / 2;
+
+            for (int i = 0; i < monitor_count; ++i) {
+                int mx = 0, my = 0;
+                glfwGetMonitorPos(monitors[i], &mx, &my);
+                const auto* const mode = glfwGetVideoMode(monitors[i]);
+                if (cx >= mx && cx < mx + mode->width && cy >= my && cy < my + mode->height) {
+                    monitor = monitors[i];
+                    break;
+                }
+            }
+
+            const auto* const mode = glfwGetVideoMode(monitor);
+            glfwSetWindowMonitor(window_, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+            is_fullscreen_ = true;
+        }
+
+        updateWindowSize();
+        requestRedraw();
+    }
+
+} // namespace lfs::vis

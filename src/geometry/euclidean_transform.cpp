@@ -4,7 +4,7 @@
 
 #include "geometry/euclidean_transform.hpp"
 
-namespace gs {
+namespace lfs {
     namespace geometry {
         EuclideanTransform::EuclideanTransform()
             : m_rotation(glm::identity<glm::quat>()),
@@ -136,4 +136,4 @@ namespace gs {
         }
 
     } // namespace geometry
-} // namespace gs
+} // namespace lfs

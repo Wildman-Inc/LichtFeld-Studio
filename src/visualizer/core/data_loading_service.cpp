@@ -4,11 +4,14 @@
 
 #include "core/data_loading_service.hpp"
 #include "core/logger.hpp"
+#include "core/parameter_manager.hpp"
+#include "core/path_utils.hpp"
+#include "core/services.hpp"
 #include "scene/scene_manager.hpp"
 #include <algorithm>
 #include <stdexcept>
 
-namespace gs::visualizer {
+namespace lfs::vis {
 
     DataLoadingService::DataLoadingService(SceneManager* scene_manager)
         : scene_manager_(scene_manager) {
@@ -18,40 +21,46 @@ namespace gs::visualizer {
     DataLoadingService::~DataLoadingService() = default;
 
     void DataLoadingService::setupEventHandlers() {
-        using namespace events;
+        using namespace lfs::core::events;
 
         // Listen for file load commands
         cmd::LoadFile::when([this](const auto& cmd) {
             handleLoadFileCommand(cmd.is_dataset, cmd.path);
         });
+
+        // Listen for checkpoint load for training commands
+        cmd::LoadCheckpointForTraining::when([this](const auto& cmd) {
+            handleLoadCheckpointForTrainingCommand(cmd.checkpoint_path, cmd.dataset_path, cmd.output_path);
+        });
     }
 
-    void DataLoadingService::handleLoadFileCommand(bool is_dataset, const std::filesystem::path& path) {
+    void DataLoadingService::handleLoadFileCommand(const bool is_dataset, const std::filesystem::path& path) {
         if (is_dataset) {
-            // Prevent GUI crash on unsupported dataset formats
-            try {
-                loadDataset(path);
-            } catch (const std::exception& e) {
-                events::state::DatasetLoadCompleted{
-                    .path = path,
-                    .success = false,
-                    .error = std::string(e.what()),
-                    .num_images = 0,
-                    .num_points = 0}
-                    .emit();
-            }
+            return; // Handled async by GuiManager
+        }
 
-        } else {
-            scene_manager_->changeContentType(SceneManager::ContentType::SplatFiles);
-            // Determine file type and load appropriately
-            if (isSOGFile(path) || isPLYFile(path)) {
-                std::string ply_name = path.stem().string();
-                scene_manager_->addSplatFile(path, ply_name);
-                scene_manager_->getProject()->addPly(true, path, -1, ply_name);
-            } else {
-                // Let scene manager determine the type
-                scene_manager_->addSplatFile(path);
-            }
+        // Checkpoint files get special handling - redirect to training resume flow
+        if (isCheckpointFile(path)) {
+            handleLoadCheckpointForTrainingCommand(path, {}, {});
+            return;
+        }
+
+        if (scene_manager_->getContentType() == SceneManager::ContentType::Dataset) {
+            scene_manager_->clear();
+        }
+        scene_manager_->changeContentType(SceneManager::ContentType::SplatFiles);
+
+        const std::string name = lfs::core::path_to_utf8(path.stem());
+        scene_manager_->addSplatFile(path, name);
+    }
+
+    void DataLoadingService::handleLoadCheckpointForTrainingCommand(
+        const std::filesystem::path& checkpoint_path,
+        const std::filesystem::path& dataset_path,
+        const std::filesystem::path& output_path) {
+        LOG_INFO("Loading checkpoint for training: {}", lfs::core::path_to_utf8(checkpoint_path));
+        if (auto result = loadCheckpointForTraining(checkpoint_path, dataset_path, output_path); !result) {
+            LOG_ERROR("Failed to load checkpoint for training: {}", result.error());
         }
     }
 
@@ -98,23 +107,29 @@ namespace gs::visualizer {
         return ext == ".ply";
     }
 
+    bool DataLoadingService::isCheckpointFile(const std::filesystem::path& path) const {
+        auto ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        return ext == ".resume";
+    }
+
     std::expected<void, std::string> DataLoadingService::loadPLY(const std::filesystem::path& path) {
         LOG_TIMER("LoadPLY");
 
         try {
-            LOG_INFO("Loading PLY file: {}", path.string());
+            LOG_INFO("Loading PLY file: {}", lfs::core::path_to_utf8(path));
 
             // Load through scene manager
             scene_manager_->loadSplatFile(path);
 
             LOG_INFO("Successfully loaded PLY: {} (from: {})",
-                     path.filename().string(),
-                     path.parent_path().string());
+                     lfs::core::path_to_utf8(path.filename()),
+                     lfs::core::path_to_utf8(path.parent_path()));
 
             return {};
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load PLY: {}", e.what());
-            LOG_ERROR("{} (Path: {})", error_msg, path.string());
+            LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
             throw std::runtime_error(error_msg);
         }
     }
@@ -123,19 +138,19 @@ namespace gs::visualizer {
         LOG_TIMER("LoadSOG");
 
         try {
-            LOG_INFO("Loading SOG file: {}", path.string());
+            LOG_INFO("Loading SOG file: {}", lfs::core::path_to_utf8(path));
 
             // Load through scene manager
             scene_manager_->loadSplatFile(path);
 
             LOG_INFO("Successfully loaded SOG: {} (from: {})",
-                     path.filename().string(),
-                     path.parent_path().string());
+                     lfs::core::path_to_utf8(path.filename()),
+                     lfs::core::path_to_utf8(path.parent_path()));
 
             return {};
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load SOG: {}", e.what());
-            LOG_ERROR("{} (Path: {})", error_msg, path.string());
+            LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
             throw std::runtime_error(error_msg);
         }
     }
@@ -151,15 +166,15 @@ namespace gs::visualizer {
                 return loadPLY(path);
             } else {
                 // Let the scene manager figure it out with the generic loader
-                LOG_INFO("Loading splat file: {}", path.string());
+                LOG_INFO("Loading splat file: {}", lfs::core::path_to_utf8(path));
                 scene_manager_->loadSplatFile(path);
 
-                LOG_INFO("Successfully loaded splat file: {}", path.filename().string());
+                LOG_INFO("Successfully loaded splat file: {}", lfs::core::path_to_utf8(path.filename()));
                 return {};
             }
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load splat file: {}", e.what());
-            LOG_ERROR("{} (Path: {})", error_msg, path.string());
+            LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
             throw std::runtime_error(error_msg);
         }
     }
@@ -168,10 +183,10 @@ namespace gs::visualizer {
         LOG_TIMER_TRACE("AddPLYToScene");
 
         try {
-            LOG_DEBUG("Adding PLY to scene: {}", path.string());
+            LOG_DEBUG("Adding PLY to scene: {}", lfs::core::path_to_utf8(path));
 
             // Extract name from path
-            std::string name = path.stem().string();
+            std::string name = lfs::core::path_to_utf8(path.stem());
             LOG_TRACE("Extracted PLY name: {}", name);
 
             // Add through scene manager
@@ -181,7 +196,7 @@ namespace gs::visualizer {
 
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to add PLY: {}", e.what());
-            LOG_ERROR("{} (Path: {})", error_msg, path.string());
+            LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
             throw std::runtime_error(error_msg);
         }
     }
@@ -190,10 +205,10 @@ namespace gs::visualizer {
         LOG_TIMER_TRACE("AddSOGToScene");
 
         try {
-            LOG_DEBUG("Adding SOG to scene: {}", path.string());
+            LOG_DEBUG("Adding SOG to scene: {}", lfs::core::path_to_utf8(path));
 
             // Extract name from path
-            std::string name = path.stem().string();
+            std::string name = lfs::core::path_to_utf8(path.stem());
             LOG_TRACE("Extracted SOG name: {}", name);
 
             // Add through scene manager
@@ -203,7 +218,7 @@ namespace gs::visualizer {
 
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to add SOG: {}", e.what());
-            LOG_ERROR("{} (Path: {})", error_msg, path.string());
+            LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
             throw std::runtime_error(error_msg);
         }
     }
@@ -215,7 +230,7 @@ namespace gs::visualizer {
             addPLYToScene(path);
         } else {
             // Generic add
-            std::string name = path.stem().string();
+            std::string name = lfs::core::path_to_utf8(path.stem());
             scene_manager_->addSplatFile(path, name);
         }
     }
@@ -223,25 +238,19 @@ namespace gs::visualizer {
     std::expected<void, std::string> DataLoadingService::loadDataset(const std::filesystem::path& path) {
         LOG_TIMER("LoadDataset");
 
-        try {
-            LOG_INFO("Loading dataset from: {}", path.string());
+        LOG_INFO("Loading dataset from: {}", lfs::core::path_to_utf8(path));
 
-            // Validate parameters
-            if (params_.dataset.data_path.empty() && path.empty()) {
-                LOG_ERROR("No dataset path specified");
-                throw std::runtime_error("No dataset path specified");
-            }
-
-            // Load through scene manager
-            LOG_DEBUG("Passing dataset to scene manager with parameters");
-            scene_manager_->loadDataset(path, params_);
-
-            return {};
-        } catch (const std::exception& e) {
-            std::string error_msg = std::format("Failed to load dataset: {}", e.what());
-            LOG_ERROR("{} (Path: {})", error_msg, path.string());
-            throw std::runtime_error(error_msg);
+        // Validate parameters
+        if (params_.dataset.data_path.empty() && path.empty()) {
+            LOG_ERROR("No dataset path specified");
+            return std::unexpected("No dataset path specified");
         }
+
+        // Load through scene manager (it emits DatasetLoadCompleted event on success/failure)
+        LOG_DEBUG("Passing dataset to scene manager with parameters");
+        scene_manager_->loadDataset(path, params_);
+
+        return {};
     }
 
     void DataLoadingService::clearScene() {
@@ -255,4 +264,27 @@ namespace gs::visualizer {
         }
     }
 
-} // namespace gs::visualizer
+    std::expected<void, std::string> DataLoadingService::loadCheckpointForTraining(
+        const std::filesystem::path& checkpoint_path,
+        const std::filesystem::path& dataset_path,
+        const std::filesystem::path& output_path) {
+        LOG_TIMER("LoadCheckpointForTraining");
+        try {
+            // Override dataset/output paths if provided by user
+            lfs::core::param::TrainingParameters params;
+            if (!dataset_path.empty()) {
+                params.dataset.data_path = dataset_path;
+            }
+            if (!output_path.empty()) {
+                params.dataset.output_path = output_path;
+            }
+            scene_manager_->loadCheckpointForTraining(checkpoint_path, params);
+            return {};
+        } catch (const std::exception& e) {
+            const std::string error = std::format("Checkpoint load failed: {}", e.what());
+            LOG_ERROR("{}", error);
+            return std::unexpected(error);
+        }
+    }
+
+} // namespace lfs::vis

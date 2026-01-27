@@ -10,7 +10,7 @@
 #include "cuda_gl_interop.hpp"
 #endif
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     std::shared_ptr<FrameBuffer> createFrameBuffer(FrameBufferMode preferred) {
         if (preferred == FrameBufferMode::CUDA_INTEROP && isInteropAvailable()) {
@@ -32,4 +32,4 @@ namespace gs::rendering {
         LOG_DEBUG("Creating standard CPU framebuffer");
         return std::make_shared<FrameBuffer>();
     }
-} // namespace gs::rendering
+} // namespace lfs::rendering

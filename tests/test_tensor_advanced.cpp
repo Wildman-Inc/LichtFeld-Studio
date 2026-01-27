@@ -1,7 +1,8 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core_new/tensor.hpp"
+#include "core/logger.hpp"
+#include "core/tensor.hpp"
 #include <chrono>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -149,12 +150,11 @@ TEST_F(TensorAdvancedTest, Concatenate) {
 
     compare_tensors(concatenated_custom, concatenated_torch, 1e-6f, 1e-7f, "Concatenate");
 
-    // Test mismatched shapes (should fail)
+    // Test mismatched shapes (should throw)
     std::vector<Tensor> mismatched;
     mismatched.push_back(Tensor::zeros({2, 3}, Device::CUDA));
     mismatched.push_back(Tensor::zeros({2, 4}, Device::CUDA));
-    auto invalid = Tensor::cat(std::move(mismatched), 0);
-    EXPECT_FALSE(invalid.is_valid());
+    EXPECT_THROW(Tensor::cat(std::move(mismatched), 0), std::invalid_argument);
 }
 
 // ============= Memory Info Tests =============
@@ -183,8 +183,8 @@ TEST_F(TensorAdvancedTest, ErrorHandlingShapeMismatch) {
     auto t1_custom = Tensor::ones({3, 4}, Device::CUDA);
     auto t2_custom = Tensor::ones({4, 3}, Device::CUDA);
 
-    auto result = t1_custom.add(t2_custom);
-    EXPECT_FALSE(result.is_valid()) << "Shape mismatch should produce invalid tensor";
+    // Incompatible shapes should throw an exception
+    EXPECT_THROW(t1_custom.add(t2_custom), std::runtime_error);
 }
 
 TEST_F(TensorAdvancedTest, ErrorHandlingInvalidReshape) {

@@ -4,14 +4,23 @@
 
 #pragma once
 
+#include "config.h"
+#include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
+#include "core/tensor.hpp"
 #include "gl_resources.hpp"
 #include "shader_manager.hpp"
 #include <glm/glm.hpp>
+#include <memory>
 #include <span>
-#include <torch/torch.h>
+#include <vector>
 
-namespace gs::rendering {
+#ifdef CUDA_GL_INTEROP_ENABLED
+#include "cuda_gl_interop.hpp"
+#include <optional>
+#endif
+
+namespace lfs::rendering {
 
     class PointCloudRenderer {
     public:
@@ -20,20 +29,41 @@ namespace gs::rendering {
 
         Result<void> initialize();
 
-        // Render point cloud - now returns Result
-        Result<void> render(const SplatData& splat_data,
+        Result<void> render(const lfs::core::SplatData& splat_data,
                             const glm::mat4& view,
                             const glm::mat4& projection,
                             float voxel_size,
-                            const glm::vec3& background_color);
+                            const glm::vec3& background_color,
+                            const std::vector<glm::mat4>& model_transforms = {},
+                            const std::shared_ptr<lfs::core::Tensor>& transform_indices = nullptr,
+                            bool equirectangular = false);
+
+        Result<void> render(const lfs::core::PointCloud& point_cloud,
+                            const glm::mat4& view,
+                            const glm::mat4& projection,
+                            float voxel_size,
+                            const glm::vec3& background_color,
+                            const std::vector<glm::mat4>& model_transforms = {},
+                            const std::shared_ptr<lfs::core::Tensor>& transform_indices = nullptr,
+                            bool equirectangular = false);
 
         // Check if initialized
         bool isInitialized() const { return initialized_; }
 
     private:
         Result<void> createCubeGeometry();
-        Result<void> uploadPointData(std::span<const float> positions, std::span<const float> colors);
-        static torch::Tensor extractRGBFromSH(const torch::Tensor& shs);
+        static Tensor extractRGBFromSH(const Tensor& shs);
+
+        // Core rendering implementation (shared by both overloads)
+        Result<void> renderInternal(const Tensor& positions,
+                                    const Tensor& colors,
+                                    const glm::mat4& view,
+                                    const glm::mat4& projection,
+                                    float voxel_size,
+                                    const glm::vec3& background_color,
+                                    const std::vector<glm::mat4>& model_transforms,
+                                    const std::shared_ptr<lfs::core::Tensor>& transform_indices,
+                                    bool equirectangular);
 
         // OpenGL resources using RAII
         VAO cube_vao_;
@@ -54,6 +84,15 @@ namespace gs::rendering {
         // State
         bool initialized_ = false;
         size_t current_point_count_ = 0;
+
+        // Cached buffer to avoid per-frame allocation
+        Tensor interleaved_cache_;
+
+#ifdef CUDA_GL_INTEROP_ENABLED
+        std::optional<CudaGLInteropBuffer> interop_buffer_;
+        size_t interop_buffer_size_ = 0;
+        bool use_interop_ = true;
+#endif
 
         // Cube vertices
         static constexpr float cube_vertices_[] = {
@@ -84,4 +123,4 @@ namespace gs::rendering {
             0, 4, 5, 5, 1, 0};
     };
 
-} // namespace gs::rendering
+} // namespace lfs::rendering

@@ -4,7 +4,10 @@
 
 #pragma once
 
-#include "trainer.hpp"
+#include "core/camera.hpp"
+#include "core/parameters.hpp"
+#include "training/trainer.hpp"
+#include "training_state.hpp"
 #include <atomic>
 #include <deque>
 #include <memory>
@@ -12,24 +15,17 @@
 #include <stop_token>
 #include <thread>
 
-namespace gs {
+namespace lfs::vis {
 
     // Forward declarations
-    namespace visualizer {
-        class VisualizerImpl;
-    }
+    class VisualizerImpl;
+    class Scene;
 
     class TrainerManager {
     public:
-        enum class State {
-            Idle,      // No trainer loaded
-            Ready,     // Trainer loaded, ready to start
-            Running,   // Training in progress
-            Paused,    // Training paused
-            Stopping,  // Stop requested, waiting for thread
-            Completed, // Training finished successfully
-            Error      // Training encountered an error
-        };
+        // Legacy State enum for backwards compatibility
+        // Use TrainingState from training_state.hpp for new code
+        using State = TrainingState;
 
         TrainerManager();
         ~TrainerManager();
@@ -43,12 +39,16 @@ namespace gs {
         TrainerManager& operator=(TrainerManager&&) = default;
 
         // Setup and teardown
-        void setTrainer(std::unique_ptr<gs::training::Trainer> trainer);
+        void setTrainer(std::unique_ptr<lfs::training::Trainer> trainer);
+        void setTrainerFromCheckpoint(std::unique_ptr<lfs::training::Trainer> trainer, int checkpoint_iteration);
         void clearTrainer();
         bool hasTrainer() const;
 
         // Link to viewer for notifications
-        void setViewer(visualizer::VisualizerImpl* viewer) { viewer_ = viewer; }
+        void setViewer(VisualizerImpl* viewer) { viewer_ = viewer; }
+
+        // Link to scene for data access (Scene-based trainer mode)
+        void setScene(Scene* scene) { scene_ = scene; }
 
         // Training control
         bool startTraining();
@@ -58,36 +58,49 @@ namespace gs {
         void requestSaveCheckpoint();
         bool resetTraining();
 
-        // State queries
-        State getState() const { return state_.load(); }
-        bool isRunning() const { return state_ == State::Running; }
-        bool isPaused() const { return state_ == State::Paused; }
-        bool isTrainingActive() const {
-            auto s = state_.load();
-            return s == State::Running || s == State::Paused;
+        // Temporary pause (for camera movement - doesn't change UI state)
+        void pauseTrainingTemporary();
+        void resumeTrainingTemporary();
+
+        // State machine access
+        [[nodiscard]] const TrainingStateMachine& getStateMachine() const { return state_machine_; }
+        [[nodiscard]] bool canPerform(TrainingAction action) const { return state_machine_.canPerform(action); }
+        [[nodiscard]] std::string_view getActionBlockedReason(TrainingAction action) const {
+            return state_machine_.getActionBlockedReason(action);
         }
-        bool canStart() const { return state_ == State::Ready; }
-        bool canPause() const { return state_ == State::Running; }
-        bool canResume() const { return state_ == State::Paused; }
-        bool canStop() const { return isTrainingActive(); }
-        bool canReset() const {
-            auto s = state_.load();
-            return s == State::Paused || s == State::Completed || s == State::Ready;
-        }
+
+        // State queries (delegate to state machine)
+        [[nodiscard]] TrainingState getState() const { return state_machine_.getState(); }
+        [[nodiscard]] bool isRunning() const { return state_machine_.isInState(TrainingState::Running); }
+        [[nodiscard]] bool isPaused() const { return state_machine_.isInState(TrainingState::Paused); }
+        [[nodiscard]] bool isFinished() const { return state_machine_.isInState(TrainingState::Finished); }
+        [[nodiscard]] bool isTrainingActive() const { return state_machine_.isActive(); }
+        [[nodiscard]] bool canStart() const { return canPerform(TrainingAction::Start); }
+        [[nodiscard]] bool canPause() const { return canPerform(TrainingAction::Pause); }
+        [[nodiscard]] bool canResume() const { return canPerform(TrainingAction::Resume); }
+        [[nodiscard]] bool canStop() const { return canPerform(TrainingAction::Stop); }
+        [[nodiscard]] bool canReset() const { return canPerform(TrainingAction::Reset); }
 
         // Progress information - directly query trainer
         int getCurrentIteration() const;
         float getCurrentLoss() const;
         int getTotalIterations() const;
         int getNumSplats() const;
+        int getMaxGaussians() const;
+        const char* getStrategyType() const;
+        bool isGutEnabled() const;
+
+        // Time tracking
+        float getElapsedSeconds() const;
+        float getEstimatedRemainingSeconds() const;
 
         // Loss buffer management (this needs to be stored)
         std::deque<float> getLossBuffer() const;
         void updateLoss(float loss);
 
         // Access to trainer (for rendering, etc.)
-        gs::training::Trainer* getTrainer() { return trainer_.get(); }
-        const gs::training::Trainer* getTrainer() const { return trainer_.get(); }
+        lfs::training::Trainer* getTrainer() { return trainer_.get(); }
+        const lfs::training::Trainer* getTrainer() const { return trainer_.get(); }
 
         // Wait for training to complete (blocking)
         void waitForCompletion();
@@ -96,32 +109,37 @@ namespace gs {
         const std::string& getLastError() const { return last_error_; }
 
         // Camera access
-        std::shared_ptr<const Camera> getCamById(int camId) const;
-        std::vector<std::shared_ptr<const Camera>> getCamList() const;
+        std::shared_ptr<const lfs::core::Camera> getCamById(int camId) const;
+        std::vector<std::shared_ptr<const lfs::core::Camera>> getCamList() const;
 
-        void setProject(std::shared_ptr<gs::management::Project> project);
-
-        std::shared_ptr<gs::management::Project> getProject() const { return project_; }
+        // Pending parameters (editable in Ready state, applied on start)
+        lfs::core::param::OptimizationParameters& getEditableOptParams() { return pending_opt_params_; }
+        const lfs::core::param::OptimizationParameters& getEditableOptParams() const { return pending_opt_params_; }
+        lfs::core::param::DatasetConfig& getEditableDatasetParams() { return pending_dataset_params_; }
+        const lfs::core::param::DatasetConfig& getEditableDatasetParams() const { return pending_dataset_params_; }
+        void applyPendingParams();
 
     private:
-        // Helper method to avoid duplicated initialization logic
-        std::expected<bool, std::string> initializeTrainerFromProject();
-
         // Training thread function
         void trainingThreadFunc(std::stop_token stop_token);
 
         // State management
-        void setState(State new_state);
         void handleTrainingComplete(bool success, const std::string& error = "");
         void setupEventHandlers();
+        void setupStateMachineCallbacks();
+
+        // Resource cleanup (called by state machine)
+        void cleanupTrainingResources(const TrainingResources& resources);
+        void updateResourceTracking();
 
         // Member variables
-        std::unique_ptr<gs::training::Trainer> trainer_;
+        std::unique_ptr<lfs::training::Trainer> trainer_;
         std::unique_ptr<std::jthread> training_thread_;
-        visualizer::VisualizerImpl* viewer_ = nullptr;
+        VisualizerImpl* viewer_ = nullptr;
+        Scene* scene_ = nullptr;
 
-        // State tracking
-        std::atomic<State> state_{State::Idle};
+        // State machine (single source of truth for state)
+        TrainingStateMachine state_machine_;
         std::string last_error_;
         mutable std::mutex state_mutex_;
 
@@ -130,13 +148,17 @@ namespace gs {
         std::mutex completion_mutex_;
         bool training_complete_ = false;
 
-        // Loss buffer (the only metric we need to store)
-        int max_loss_points_ = 200;
+        // Loss buffer
+        static constexpr int MAX_LOSS_POINTS = 200;
         std::deque<float> loss_buffer_;
         mutable std::mutex loss_buffer_mutex_;
 
-        // project
-        std::shared_ptr<gs::management::Project> project_ = nullptr;
+        // Training time tracking
+        std::chrono::steady_clock::time_point training_start_time_;
+        std::chrono::steady_clock::duration accumulated_training_time_{0};
+
+        lfs::core::param::OptimizationParameters pending_opt_params_;
+        lfs::core::param::DatasetConfig pending_dataset_params_;
     };
 
-} // namespace gs
+} // namespace lfs::vis

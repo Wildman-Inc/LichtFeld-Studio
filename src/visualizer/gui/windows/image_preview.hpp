@@ -17,7 +17,24 @@
 // Forward declarations
 struct GLFWwindow;
 
-namespace gs::gui {
+namespace lfs::vis::gui {
+
+    struct ExifData {
+        std::string camera_make;
+        std::string camera_model;
+        std::string software;
+        std::string date_time;
+        std::string exposure_time;
+        std::string f_number;
+        std::string iso;
+        std::string focal_length;
+        std::string focal_length_35mm;
+        std::string lens_model;
+        int orientation = 1;
+        bool valid = false;
+    };
+
+    ExifData parseExifData(const std::filesystem::path& path);
 
     /**
      * @brief RAII wrapper for raw image data
@@ -33,7 +50,7 @@ namespace gs::gui {
 
         ~ImageData() {
             if (data_) {
-                ::free_image(data_);
+                lfs::core::free_image(data_);
             }
         }
 
@@ -51,7 +68,7 @@ namespace gs::gui {
         ImageData& operator=(ImageData&& other) noexcept {
             if (this != &other) {
                 if (data_) {
-                    ::free_image(data_);
+                    lfs::core::free_image(data_);
                 }
                 data_ = std::exchange(other.data_, nullptr);
                 width_ = std::exchange(other.width_, 0);
@@ -153,7 +170,12 @@ namespace gs::gui {
 
         void open(const std::vector<std::filesystem::path>& image_paths, size_t initial_index);
         void open(const std::filesystem::path& image_path);
+        // Open with mask overlay support - overlay_paths are optional corresponding masks or images
+        void openWithOverlay(const std::vector<std::filesystem::path>& image_paths,
+                             const std::vector<std::filesystem::path>& overlay_paths,
+                             size_t initial_index);
         void render(bool* p_open);
+        void setShowOverlay(bool show) { show_overlay_ = show; }
         bool isOpen() const { return is_open_; }
         void close();
         void nextImage();
@@ -192,7 +214,6 @@ namespace gs::gui {
         std::unique_ptr<ImageData> loadImageData(const std::filesystem::path& path);
         std::unique_ptr<ImageTexture> createTexture(ImageData&& data, const std::filesystem::path& path);
         bool loadImage(const std::filesystem::path& path);
-        bool loadMask(const std::filesystem::path& image_path);
         void preloadAdjacentImages();
         void checkPreloadedImages();
         std::pair<float, float> calculateDisplaySize(int window_width, int window_height) const;
@@ -200,10 +221,13 @@ namespace gs::gui {
         // State
         bool is_open_ = false;
         std::vector<std::filesystem::path> image_paths_;
+        std::vector<std::filesystem::path> overlay_paths_; // Optional overlay images (masks)
         size_t current_index_ = 0;
+        bool show_overlay_ = false; // Whether to show overlay on top of current image
 
-        // Current image texture
         std::unique_ptr<ImageTexture> current_texture_;
+        std::unique_ptr<ImageTexture> previous_texture_;
+        std::unique_ptr<ImageTexture> overlay_texture_; // Overlay texture (mask)
 
         // Thread-safe preload results
         mutable std::mutex preload_mutex_;
@@ -219,19 +243,24 @@ namespace gs::gui {
         std::string load_error_;
         std::atomic<bool> preload_in_progress_{false};
 
+        // Overlay helpers
+        void loadCurrentOverlay();
+        [[nodiscard]] bool hasValidOverlay() const;
+
         // UI state
         float zoom_ = 1.0f;
         float pan_x_ = 0.0f;
         float pan_y_ = 0.0f;
         bool fit_to_window_ = true;
-        bool show_mask_overlay_ = false;
-        float mask_opacity_ = 0.5f;
+        bool show_info_panel_ = true;
+        bool focus_on_next_frame_ = false;
 
-        // Mask texture
-        std::unique_ptr<ImageTexture> mask_texture_;
+        // EXIF data cache
+        ExifData current_exif_;
+        size_t exif_cache_index_ = SIZE_MAX;
 
         // OpenGL limits
         GLint max_texture_size_ = 4096;
     };
 
-} // namespace gs::gui
+} // namespace lfs::vis::gui

@@ -4,12 +4,14 @@
 
 #pragma once
 
+#include "command/command_history.hpp"
+#include "core/editor_context.hpp"
 #include "core/main_loop.hpp"
+#include "core/parameter_manager.hpp"
 #include "core/parameters.hpp"
 #include "gui/gui_manager.hpp"
 #include "input/input_controller.hpp"
 #include "internal/viewport.hpp"
-#include "project/project.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
@@ -23,16 +25,18 @@
 // Forward declaration for GLFW
 struct GLFWwindow;
 
-namespace gs {
+namespace lfs::vis {
     class SceneManager;
-} // namespace gs
+} // namespace lfs::vis
 
-namespace gs::visualizer {
+namespace lfs::vis {
     class DataLoadingService;
 
     namespace tools {
-        class TranslationGizmoTool;
-    }
+        class BrushTool;
+        class AlignTool;
+        class SelectionTool;
+    } // namespace tools
 
     class VisualizerImpl : public Visualizer {
     public:
@@ -40,29 +44,26 @@ namespace gs::visualizer {
         ~VisualizerImpl() override;
 
         void run() override;
-        void setParameters(const param::TrainingParameters& params) override;
+        void setParameters(const lfs::core::param::TrainingParameters& params) override;
         std::expected<void, std::string> loadPLY(const std::filesystem::path& path) override;
+        std::expected<void, std::string> addSplatFile(const std::filesystem::path& path) override;
         std::expected<void, std::string> loadDataset(const std::filesystem::path& path) override;
+        std::expected<void, std::string> loadCheckpointForTraining(const std::filesystem::path& path) override;
+        void consolidateModels() override;
         void clearScene() override;
 
-        // open project file and attach it to viewer
-        bool openProject(const std::filesystem::path& path) override;
-        bool closeProject(const std::filesystem::path& path = {}) override;
-        std::shared_ptr<gs::management::Project> getProject() override;
-        void attachProject(std::shared_ptr<gs::management::Project> _project) override;
-        // load project content to viewer
-        bool LoadProject();
-        void LoadProjectPlys();
-
         // Getters for GUI (delegating to state manager)
-        gs::training::Trainer* getTrainer() const { return trainer_manager_->getTrainer(); }
+        lfs::training::Trainer* getTrainer() const { return trainer_manager_->getTrainer(); }
 
         // Component access
         TrainerManager* getTrainerManager() { return trainer_manager_.get(); }
         SceneManager* getSceneManager() { return scene_manager_.get(); }
         ::GLFWwindow* getWindow() const { return window_manager_->getWindow(); }
+        WindowManager* getWindowManager() { return window_manager_.get(); }
         RenderingManager* getRenderingManager() { return rendering_manager_.get(); }
+        gui::GuiManager* getGuiManager() { return gui_manager_.get(); }
         const Viewport& getViewport() const { return viewport_; }
+        Viewport& getViewport() { return viewport_; }
 
         // FPS monitoring
         [[nodiscard]] float getCurrentFPS() const {
@@ -73,39 +74,58 @@ namespace gs::visualizer {
             return rendering_manager_ ? rendering_manager_->getAverageFPS() : 0.0f;
         }
 
-        // VSync control
-        void setVSync(bool enabled) {
-            if (window_manager_) {
-                window_manager_->setVSync(enabled);
-            }
-        }
-
-        [[nodiscard]] bool getVSyncEnabled() const {
-            return window_manager_ ? window_manager_->getVSync() : true;
-        }
-
         // Antialiasing state
         bool isAntiAliasingEnabled() const {
             return rendering_manager_ ? rendering_manager_->getSettings().antialiasing : false;
         }
 
-        tools::TranslationGizmoTool* getTranslationGizmoTool() {
-            return translation_gizmo_tool_.get();
+        tools::BrushTool* getBrushTool() {
+            return brush_tool_.get();
         }
 
-        const tools::TranslationGizmoTool* getTranslationGizmoTool() const {
-            return translation_gizmo_tool_.get();
+        const tools::BrushTool* getBrushTool() const {
+            return brush_tool_.get();
         }
 
-        bool hasGutAutoEnabledWarning() const {
-            return gut_auto_enabled_warning_;
+        tools::AlignTool* getAlignTool() {
+            return align_tool_.get();
         }
 
-        void clearGutAutoEnabledWarning() {
-            gut_auto_enabled_warning_ = false;
+        const tools::AlignTool* getAlignTool() const {
+            return align_tool_.get();
         }
 
-        std::shared_ptr<TrainerManager> trainer_manager_;
+        tools::SelectionTool* getSelectionTool() {
+            return selection_tool_.get();
+        }
+
+        const tools::SelectionTool* getSelectionTool() const {
+            return selection_tool_.get();
+        }
+
+        InputController* getInputController() {
+            return input_controller_.get();
+        }
+
+        DataLoadingService* getDataLoader() {
+            return data_loader_.get();
+        }
+
+        EditorContext& getEditorContext() { return editor_context_; }
+        const EditorContext& getEditorContext() const { return editor_context_; }
+
+        // Undo/Redo
+        command::CommandHistory& getCommandHistory() { return command_history_; }
+        void undo();
+        void redo();
+
+        // Selection operations
+        void deleteSelectedGaussians();
+        void invertSelection();
+        void deselectAll();
+        void selectAll();
+        void copySelection();
+        void pasteSelection();
 
         // GUI manager
         std::unique_ptr<gui::GuiManager> gui_manager_;
@@ -125,12 +145,10 @@ namespace gs::visualizer {
         // Event system
         void setupEventHandlers();
         void setupComponentConnections();
-        void handleLoadProjectCommand(const events::cmd::LoadProject& cmd);
-        void handleTrainingCompleted(const events::state::TrainingCompleted& event);
-        void handleLoadFileCommand(const events::cmd::LoadFile& cmd);
-        void handleSaveProject(const events::cmd::SaveProject& cmd);
-        void handleExportConfig(const events::cmd::ExportConfig& cmd);
-        void handleImportConfig(const events::cmd::ImportConfig& cmd);
+        void handleTrainingCompleted(const lfs::core::events::state::TrainingCompleted& event);
+        void handleLoadFileCommand(const lfs::core::events::cmd::LoadFile& cmd);
+        void handleLoadConfigFile(const std::filesystem::path& path);
+        void handleSwitchToLatestCheckpoint();
 
         // Tool initialization
         void initializeTools();
@@ -144,24 +162,28 @@ namespace gs::visualizer {
         std::unique_ptr<InputController> input_controller_;
         std::unique_ptr<RenderingManager> rendering_manager_;
         std::unique_ptr<SceneManager> scene_manager_;
+        std::shared_ptr<TrainerManager> trainer_manager_;
         std::unique_ptr<DataLoadingService> data_loader_;
+        std::unique_ptr<ParameterManager> parameter_manager_;
         std::unique_ptr<MainLoop> main_loop_;
 
         // Tools
-        std::shared_ptr<tools::TranslationGizmoTool> translation_gizmo_tool_;
+        std::shared_ptr<tools::BrushTool> brush_tool_;
+        std::shared_ptr<tools::AlignTool> align_tool_;
+        std::shared_ptr<tools::SelectionTool> selection_tool_;
         std::unique_ptr<ToolContext> tool_context_;
+
+        // Undo/Redo history
+        command::CommandHistory command_history_;
+
+        // Centralized editor state
+        EditorContext editor_context_;
 
         // State tracking
         bool window_initialized_ = false;
         bool gui_initialized_ = false;
-        bool tools_initialized_ = false; // Added this member!
-
-        // Gut auto-enable warning tracking
-        bool gut_auto_enabled_warning_ = false;
-
-        // Project
-        std::shared_ptr<gs::management::Project> project_ = nullptr;
-        void updateProjectOnModules();
+        bool tools_initialized_ = false;
+        bool pending_auto_train_ = false;
     };
 
-} // namespace gs::visualizer
+} // namespace lfs::vis

@@ -2,12 +2,14 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-add_library(gs_visualizer STATIC
+add_library(lfs_visualizer STATIC
         # Core
         visualizer.cpp
         visualizer_impl.cpp
         core/main_loop.cpp
         core/data_loading_service.cpp
+        core/editor_context.cpp
+        core/parameter_manager.cpp
 
         # Window management
         window/window_manager.cpp
@@ -16,19 +18,31 @@ add_library(gs_visualizer STATIC
         rendering/rendering_manager.cpp
         rendering/framerate_controller.cpp
 
+        # Theme system
+        theme/theme.cpp
+
         # GUI system
         gui/gui_manager.cpp
+        gui/gizmo_transform.cpp
+        gui/html_viewer_export.cpp
         gui/ui_widgets.cpp
+        gui/localization_manager.cpp
         gui/panels/main_panel.cpp
         gui/panels/training_panel.cpp
         gui/panels/crop_box_panel.cpp
+        gui/panels/ellipsoid_panel.cpp
+        gui/panels/transform_panel.cpp
+        gui/panels/gizmo_toolbar.cpp
         gui/panels/scene_panel.cpp
         gui/panels/tools_panel.cpp
-        gui/panels/world_transform_panel.cpp
         gui/windows/file_browser.cpp
-        gui/windows/project_changed_dialog_box.cpp
         gui/windows/image_preview.cpp
-        gui/windows/save_project_browser.cpp
+        gui/windows/export_dialog.cpp
+        gui/windows/notification_popup.cpp
+        gui/windows/save_directory_popup.cpp
+        gui/windows/resume_checkpoint_popup.cpp
+        gui/windows/exit_confirmation_popup.cpp
+        gui/windows/disk_space_error_dialog.cpp
 
         # Scene management
         scene/scene.cpp
@@ -36,56 +50,71 @@ add_library(gs_visualizer STATIC
 
         # Input handling
         input/input_controller.cpp
+        input/input_bindings.cpp
 
         # Training integration
+        training/training_state.cpp
         training/training_manager.cpp
 
         # Tools
-        tools/translation_gizmo_tool.cpp
+        tools/brush_tool.cpp
+        tools/align_tool.cpp
+        tools/selection_tool.cpp
+
+        # Command system (undo/redo)
+        command/command_history.cpp
+        command/commands/cropbox_command.cpp
+        command/commands/ellipsoid_command.cpp
+        command/commands/crop_command.cpp
+        command/commands/selection_command.cpp
+        command/commands/saturation_command.cpp
+        command/commands/mirror_command.cpp
+        command/commands/transform_command.cpp
         gui/panels/menu_bar.cpp
         gui/panels/menu_bar.hpp
         gui/utils/windows_utils.cpp
-        gui/utils/file_dialogs.cpp
+        gui/utils/drag_drop_native.cpp
 )
 
 # Set include directories
-target_include_directories(gs_visualizer
+target_include_directories(lfs_visualizer
         PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/external/httplib
         ${OPENGL_INCLUDE_DIRS}
 )
 
 # Link dependencies
-target_link_libraries(gs_visualizer
+target_link_libraries(lfs_visualizer
         PRIVATE
-        gs_core            # Use modular core library
-        gs_geometry        # If needed for geometry operations
-        gs_project         # For project management
-        gs_kernels         # Use modular kernels library
-        gs_loader
-        gs_rendering
-        gs_training
-        ${TORCH_LIBRARIES}
+        lfs_core           # Use modular core library (LibTorch-free)
+        lfs_geometry       # LibTorch-free geometry module
+        lfs_io
+        lfs_rendering
+        lfs_training
         glad::glad
         glfw
         imgui::imgui
+        imguizmo::imguizmo # 3D manipulation gizmo
         glm::glm
         TBB::tbb
         spdlog::spdlog
         nlohmann_json::nlohmann_json
-        ${GPU_RUNTIME_LIBRARY}   # CUDA::cudart or hip::device
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ${GPU_RUNTIME_LIBRARY}
         ${OPENGL_LIBRARIES}
 )
 
 # Set C++ standard
-target_compile_features(gs_visualizer PUBLIC cxx_std_23)
+target_compile_features(lfs_visualizer PUBLIC cxx_std_23)
 
 # Compiler options
-target_compile_options(gs_visualizer PRIVATE
+target_compile_options(lfs_visualizer PRIVATE
         $<$<CXX_COMPILER_FRONTEND_VARIANT:GNU>:-Wall -Wextra -Wpedantic>
         $<$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>:/W4>
         $<$<AND:$<CONFIG:Debug>,$<CXX_COMPILER_ID:GNU,Clang>>:-O0 -g>
@@ -126,12 +155,29 @@ foreach (GUI_ASSET_FILE ${GUI_ASSET_FILES})
     endif ()
 endforeach ()
 
+# Copy icon files
+file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon")
+file(GLOB ICON_FILES "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/icon/*.png")
+foreach (ICON_FILE ${ICON_FILES})
+    get_filename_component(ICON_NAME ${ICON_FILE} NAME)
+    configure_file(${ICON_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon/${ICON_NAME}" COPYONLY)
+endforeach ()
+
+# Copy locale files
+file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/locales")
+file(GLOB LOCALE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/gui/resources/locales/*.json")
+foreach (LOCALE_FILE ${LOCALE_FILES})
+    get_filename_component(LOCALE_NAME ${LOCALE_FILE} NAME)
+    configure_file(${LOCALE_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/locales/${LOCALE_NAME}" COPYONLY)
+endforeach ()
+
 # Compile definitions
-target_compile_definitions(gs_visualizer PRIVATE
+target_compile_definitions(lfs_visualizer PRIVATE
         $<$<BOOL:${CUDA_GL_INTEROP_ENABLED}>:CUDA_GL_INTEROP_ENABLED>
         PROJECT_ROOT_PATH="${PROJECT_SOURCE_DIR}"
         VISUALIZER_SHADER_PATH="${VISUALIZER_BUILD_RESOURCE_DIR}/shaders"
         VISUALIZER_ASSET_PATH="${VISUALIZER_BUILD_RESOURCE_DIR}/assets"
+        VISUALIZER_LOCALE_PATH="${VISUALIZER_BUILD_RESOURCE_DIR}/locales"
         VISUALIZER_SOURCE_SHADER_PATH="${VISUALIZER_SOURCE_RESOURCE_DIR}/shaders"
         VISUALIZER_SOURCE_ASSET_PATH="${VISUALIZER_SOURCE_RESOURCE_DIR}/assets"
         $<$<CONFIG:Debug>:DEBUG_BUILD>
@@ -140,12 +186,15 @@ target_compile_definitions(gs_visualizer PRIVATE
 
 # Platform-specific settings
 if (WIN32)
-    target_compile_definitions(gs_visualizer PRIVATE
+    target_compile_definitions(lfs_visualizer PRIVATE
             NOMINMAX
             _USE_MATH_DEFINES
     )
+    target_link_libraries(lfs_visualizer PRIVATE
+            Ole32       # OLE drag-drop (IDropTarget)
+    )
 elseif (UNIX AND NOT APPLE)
-    target_link_libraries(gs_visualizer PRIVATE
+    target_link_libraries(lfs_visualizer PRIVATE
             GL
             GLU
             X11
@@ -153,7 +202,7 @@ elseif (UNIX AND NOT APPLE)
 endif ()
 
 # Export only the public header
-install(FILES ${CMAKE_SOURCE_DIR}/include/visualizer/visualizer.hpp
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/include/visualizer/visualizer.hpp
         DESTINATION include/visualizer
 )
 
@@ -164,6 +213,13 @@ install(DIRECTORY ${VISUALIZER_SOURCE_RESOURCE_DIR}/
         PATTERN "*.vert"
         PATTERN "*.frag"
         PATTERN "*.ttf"
+)
+
+# Install locale files
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/gui/resources/locales/
+        DESTINATION share/LichtFeld-Studio/locales
+        FILES_MATCHING
+        PATTERN "*.json"
 )
 
 # Add custom target for resource files (makes them show up in IDEs)

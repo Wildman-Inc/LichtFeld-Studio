@@ -10,7 +10,7 @@
 #include <glm/glm.hpp>
 #include <vector>
 
-namespace gs::rendering {
+namespace lfs::rendering {
     class RenderCoordinateAxes : public ICoordinateAxes {
     public:
         RenderCoordinateAxes();
@@ -33,8 +33,7 @@ namespace gs::rendering {
         void setAxisVisible(int axis, bool visible) override; // 0=X, 1=Y, 2=Z
         [[nodiscard]] bool isAxisVisible(int axis) const override;
 
-        // Render the coordinate axes - now returns Result
-        Result<void> render(const glm::mat4& view, const glm::mat4& projection);
+        Result<void> render(const glm::mat4& view, const glm::mat4& projection, bool equirectangular = false);
 
     private:
         void createAxesGeometry();
@@ -64,4 +63,4 @@ namespace gs::rendering {
 
         std::vector<AxisVertex> vertices_;
     };
-} // namespace gs::rendering
+} // namespace lfs::rendering

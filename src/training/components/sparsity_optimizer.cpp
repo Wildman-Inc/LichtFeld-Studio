@@ -1,40 +1,48 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
- *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "sparsity_optimizer.hpp"
 #include "core/logger.hpp"
+#include <cuda_runtime.h>
 #include <format>
-#include <print>
 
-namespace gs::training {
+namespace lfs::training {
+
+    // Forward declaration of CUDA kernel launcher (defined in sparsity_optimizer_kernels.cu)
+    void launch_admm_backward_fused(
+        float* grad_opacities,
+        const float* opa_sigmoid,
+        const float* z,
+        const float* u,
+        float rho,
+        float grad_loss,
+        size_t n,
+        bool accumulate);
 
     ADMMSparsityOptimizer::ADMMSparsityOptimizer(const Config& config)
         : config_(config) {
-        LOG_DEBUG("Initializing ADMM sparsity optimizer with rho={}, prune_ratio={}, steps={}, start_iteration={}",
-                  config_.init_rho, config_.prune_ratio, config_.sparsify_steps, config_.start_iteration);
     }
 
-    std::expected<void, std::string> ADMMSparsityOptimizer::initialize(const torch::Tensor& opacities) {
+    std::expected<void, std::string> ADMMSparsityOptimizer::initialize(const lfs::core::Tensor& opacities) {
         try {
-            torch::NoGradGuard no_grad;
-
-            if (!opacities.defined() || opacities.numel() == 0) {
+            if (opacities.numel() == 0) {
                 return std::unexpected("Invalid opacity tensor for initialization");
             }
 
             // Initialize ADMM variables
-            auto opa = torch::sigmoid(opacities).detach().contiguous();
-            u_ = torch::zeros_like(opa);
-            z_ = prune_z(opa + u_);
+            // opa = sigmoid(opacities)
+            opa_sigmoid_ = opacities.sigmoid();
+
+            // u = zeros_like(opa)
+            u_ = lfs::core::Tensor::zeros(opa_sigmoid_.shape(),
+                                          lfs::core::Device::CUDA,
+                                          lfs::core::DataType::Float32);
+
+            // z = prune_z(opa + u)
+            auto opa_plus_u = opa_sigmoid_ + u_;
+            z_ = prune_z(opa_plus_u);
+
             initialized_ = true;
-
-            LOG_INFO("=== ADMM Sparsity Optimizer Initialized ===");
-            LOG_INFO("Number of Gaussians: {}", opa.numel());
-            LOG_INFO("Target pruning ratio: {}%", config_.prune_ratio * 100);
-            LOG_INFO("Will prune approximately {} Gaussians", static_cast<int>(config_.prune_ratio * opa.numel()));
-            LOG_INFO("ADMM penalty parameter (rho): {}", config_.init_rho);
-
             return {};
         } catch (const std::exception& e) {
             LOG_ERROR("Failed to initialize ADMM sparsity optimizer: {}", e.what());
@@ -42,57 +50,113 @@ namespace gs::training {
         }
     }
 
-    std::expected<torch::Tensor, std::string> ADMMSparsityOptimizer::compute_loss(const torch::Tensor& opacities) const {
+    std::expected<std::pair<lfs::core::Tensor, SparsityLossContext>, std::string>
+    ADMMSparsityOptimizer::compute_loss_forward(const lfs::core::Tensor& opacities) {
         try {
             if (!initialized_) {
-                LOG_WARN("ADMM optimizer compute_loss called before initialization");
-                return torch::zeros({1}, torch::kFloat32).to(opacities.device()).requires_grad_();
+                SparsityLossContext empty_ctx{};
+                auto zero_loss = lfs::core::Tensor::zeros({1}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                return std::make_pair(std::move(zero_loss), empty_ctx);
             }
 
-            if (!opacities.defined() || opacities.numel() == 0) {
+            if (opacities.numel() == 0) {
                 return std::unexpected("Invalid opacity tensor for loss computation");
             }
 
-            // Compute ADMM sparsity loss
-            auto opa = torch::sigmoid(opacities);
-            auto diff = opa - z_.detach() + u_.detach();
-            auto loss = 0.5f * config_.init_rho * torch::pow(torch::norm(diff, 2), 2);
+            // Compute ADMM sparsity loss (manual - no autograd)
+            // Loss: L = 0.5 * rho * ||opa - z + u||^2
+            // ALL ON GPU - NO CPU SYNC!
 
-            LOG_TRACE("ADMM sparsity loss: {}", loss.item<float>());
-            return loss;
+            // opa = sigmoid(opacities)
+            opa_sigmoid_ = opacities.sigmoid();
+
+            // diff = opa - z + u
+            auto diff = opa_sigmoid_ - z_ + u_;
+
+            // ||diff||^2 = sum(diff^2) - stays on GPU as scalar tensor
+            auto diff_sq_sum = (diff * diff).sum();
+
+            // loss = 0.5 * rho * ||diff||^2 - GPU scalar
+            auto loss_tensor = diff_sq_sum * (0.5f * config_.init_rho);
+
+            // Create minimal context (pointers only, no tensor copies)
+            SparsityLossContext ctx{
+                .opacities_ptr = opacities.template ptr<const float>(),
+                .opa_sigmoid_ptr = opa_sigmoid_.template ptr<const float>(),
+                .z_ptr = z_.template ptr<const float>(),
+                .u_ptr = u_.template ptr<const float>(),
+                .n = static_cast<size_t>(opacities.numel()),
+                .rho = config_.init_rho};
+
+            return std::make_pair(std::move(loss_tensor), ctx);
         } catch (const std::exception& e) {
-            LOG_ERROR("Failed to compute ADMM sparsity loss: {}", e.what());
+            LOG_ERROR("Failed to compute ADMM sparsity loss (manual forward): {}", e.what());
             return std::unexpected(std::format("Failed to compute sparsity loss: {}", e.what()));
         }
     }
 
-    std::expected<void, std::string> ADMMSparsityOptimizer::update_state(const torch::Tensor& opacities) {
+    std::expected<void, std::string>
+    ADMMSparsityOptimizer::compute_loss_backward(const SparsityLossContext& ctx,
+                                                 float grad_loss,
+                                                 lfs::core::Tensor& grad_opacities) {
         try {
-            torch::NoGradGuard no_grad;
+            // Use FUSED CUDA KERNEL for maximum performance
+            // Computes: grad_opacities = rho * (opa - z + u) * opa * (1 - opa) * grad_loss
+            // Single kernel launch, zero intermediate tensor allocations!
+            // accumulate=true: adds to existing gradients (if grad_opacities already has values)
+            // accumulate=false: overwrites (no need to zero first - saves 6 μs!)
 
+            const size_t n = ctx.n;
+
+            // Launch fused kernel via wrapper function
+            // Note: Use accumulate=true in production if other losses contribute gradients
+            launch_admm_backward_fused(
+                grad_opacities.ptr<float>(), // Output: gradients
+                ctx.opa_sigmoid_ptr,         // Input: sigmoid(opacities)
+                ctx.z_ptr,                   // Input: ADMM auxiliary variable
+                ctx.u_ptr,                   // Input: ADMM dual variable
+                ctx.rho,                     // ADMM penalty parameter
+                grad_loss,                   // Gradient from upstream
+                n,                           // Number of elements
+                true                         // accumulate: add to existing grads
+            );
+
+            // Check for kernel errors
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                return std::unexpected(std::format("CUDA kernel error: {}", cudaGetErrorString(err)));
+            }
+
+            return {};
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to compute ADMM sparsity loss backward: {}", e.what());
+            return std::unexpected(std::format("Failed to compute sparsity loss backward: {}", e.what()));
+        }
+    }
+
+    std::expected<void, std::string> ADMMSparsityOptimizer::update_state(const lfs::core::Tensor& opacities) {
+        try {
             if (!initialized_) {
-                LOG_DEBUG("Initializing ADMM optimizer on first update");
                 return initialize(opacities);
             }
 
-            if (!opacities.defined() || opacities.numel() == 0) {
+            if (opacities.numel() == 0) {
                 return std::unexpected("Invalid opacity tensor for state update");
             }
 
             // ADMM update step
-            auto opa = torch::sigmoid(opacities).detach().contiguous();
-            auto z_temp = opa + u_;
+            // opa = sigmoid(opacities)
+            opa_sigmoid_ = opacities.sigmoid();
+
+            // z_temp = opa + u
+            auto z_temp = opa_sigmoid_ + u_;
+
+            // z = prune_z(z_temp)
             z_ = prune_z(z_temp);
-            u_ += opa - z_;
 
-            // Calculate sparsity statistics
-            int num_zeros = (z_ == 0).sum().item<int>();
-            float sparsity_ratio = static_cast<float>(num_zeros) / z_.numel();
-
-            LOG_TRACE("ADMM state updated - ||u||={:.4f}, ||z||={:.4f}, current sparsity={:.2f}%",
-                      torch::norm(u_).item<float>(),
-                      torch::norm(z_).item<float>(),
-                      sparsity_ratio * 100);
+            // u += opa - z
+            auto opa_minus_z = opa_sigmoid_ - z_;
+            u_.add_(opa_minus_z);
 
             return {};
         } catch (const std::exception& e) {
@@ -101,39 +165,34 @@ namespace gs::training {
         }
     }
 
-    std::expected<torch::Tensor, std::string> ADMMSparsityOptimizer::get_prune_mask(const torch::Tensor& opacities) const {
+    std::expected<lfs::core::Tensor, std::string>
+    ADMMSparsityOptimizer::get_prune_mask(const lfs::core::Tensor& opacities) {
         try {
-            if (!opacities.defined() || opacities.numel() == 0) {
+            if (opacities.numel() == 0) {
                 return std::unexpected("Invalid opacity tensor for pruning");
             }
 
-            auto opa = torch::sigmoid(opacities.flatten());
-            int n_prune = static_cast<int>(config_.prune_ratio * opa.size(0));
+            // opa = sigmoid(opacities.flatten())
+            auto opa = opacities.flatten().sigmoid();
+            int n_prune = static_cast<int>(config_.prune_ratio * opa.shape()[0]);
 
             if (n_prune == 0) {
-                LOG_DEBUG("No Gaussians to prune (n_prune=0)");
-                return torch::zeros(opa.size(0), torch::kBool).to(opa.device());
+                return lfs::core::Tensor::zeros_bool({opa.shape()[0]}, lfs::core::Device::CUDA);
             }
 
-            // Find indices of smallest opacities
-            auto [sorted_values, prune_indices] = torch::topk(opa, n_prune, -1, /*largest=*/false);
+            // Find indices of smallest opacities using sort
+            // sort returns (values, indices) - we want smallest so ascending=true
+            auto [sorted_values, sorted_indices] = opa.sort(0, /*descending=*/false);
 
-            // Create boolean mask
-            auto mask = torch::zeros(opa.size(0), torch::kBool).to(opa.device());
-            mask.index_put_({prune_indices}, true);
+            // Take first n_prune elements (indices only, we don't need the values)
+            auto prune_indices = sorted_indices.slice(0, 0, n_prune).to(lfs::core::DataType::Int64);
 
-            // Calculate statistics for logging
-            float min_pruned = sorted_values[0].item<float>();
-            float max_pruned = sorted_values[-1].item<float>();
-            float mean_remaining = opa.masked_select(~mask).mean().item<float>();
+            // Create boolean mask and use proper index_put_ (now that it's fixed!)
+            auto mask = lfs::core::Tensor::zeros_bool({opa.shape()[0]}, lfs::core::Device::CUDA);
+            auto true_values = lfs::core::Tensor::ones_bool({static_cast<size_t>(n_prune)}, lfs::core::Device::CUDA);
 
-            LOG_INFO("=== Sparsity Pruning Results ===");
-            LOG_INFO("Total Gaussians: {}", opa.size(0));
-            LOG_INFO("Pruning: {} Gaussians ({:.1f}%)", n_prune, config_.prune_ratio * 100);
-            LOG_INFO("Remaining: {} Gaussians", opa.size(0) - n_prune);
-            LOG_INFO("Opacity range of pruned: [{:.6f}, {:.6f}]", min_pruned, max_pruned);
-            LOG_INFO("Mean opacity of remaining: {:.6f}", mean_remaining);
-            LOG_INFO("Compression ratio: {:.2f}x", 1.0f / (1.0f - config_.prune_ratio));
+            // Use index_put_ to set mask values
+            mask.index_put_({prune_indices}, true_values);
 
             return mask;
         } catch (const std::exception& e) {
@@ -142,29 +201,37 @@ namespace gs::training {
         }
     }
 
-    int ADMMSparsityOptimizer::get_num_to_prune(const torch::Tensor& opacities) const {
-        if (!opacities.defined() || opacities.numel() == 0) {
+    int ADMMSparsityOptimizer::get_num_to_prune(const lfs::core::Tensor& opacities) {
+        if (opacities.numel() == 0) {
             return 0;
         }
-        return static_cast<int>(config_.prune_ratio * opacities.flatten().size(0));
+        return static_cast<int>(config_.prune_ratio * opacities.flatten().shape()[0]);
     }
 
-    torch::Tensor ADMMSparsityOptimizer::prune_z(const torch::Tensor& z) const {
+    lfs::core::Tensor ADMMSparsityOptimizer::prune_z(const lfs::core::Tensor& z) {
         if (z.numel() == 0) {
-            return torch::zeros_like(z);
+            return lfs::core::Tensor::zeros(z.shape(), lfs::core::Device::CUDA);
         }
 
-        int index = static_cast<int>(config_.prune_ratio * z.size(0));
+        int index = static_cast<int>(config_.prune_ratio * z.shape()[0]);
         if (index == 0) {
-            return torch::zeros_like(z);
+            return lfs::core::Tensor::zeros(z.shape(), lfs::core::Device::CUDA);
         }
 
         // Sort to find threshold
-        auto [z_sorted, _] = torch::sort(z.flatten(), 0);
-        auto z_threshold = z_sorted[index - 1];
+        auto [z_sorted, _] = z.flatten().sort(0, /*descending=*/false);
 
-        // Apply soft thresholding
-        return (z > z_threshold) * z;
+        // Get threshold - create tensor containing single element, then extract
+        auto z_threshold_tensor = z_sorted.slice(0, index - 1, index);
+        float z_threshold = z_threshold_tensor.item<float>();
+
+        // Apply soft thresholding: result = (z > threshold) * z
+        // This keeps values above threshold, zeros out values below
+        auto threshold_mask = (z > z_threshold);
+        auto result = lfs::core::Tensor::where(threshold_mask, z,
+                                               lfs::core::Tensor::zeros(z.shape(), lfs::core::Device::CUDA));
+
+        return result;
     }
 
     // Factory implementation
@@ -178,4 +245,4 @@ namespace gs::training {
         return nullptr;
     }
 
-} // namespace gs::training
+} // namespace lfs::training

@@ -9,8 +9,8 @@
 #include "rendering/rendering.hpp"
 #include "shader_manager.hpp"
 
-namespace gs::rendering {
-    class RenderBoundingBox : public geometry::BoundingBox, public IBoundingBox {
+namespace lfs::rendering {
+    class RenderBoundingBox : public lfs::geometry::BoundingBox, public IBoundingBox {
     public:
         RenderBoundingBox();
         ~RenderBoundingBox() override = default;
@@ -31,11 +31,19 @@ namespace gs::rendering {
         glm::vec3 getSize() const override { return BoundingBox::getSize(); }
         glm::vec3 getLocalCenter() const override { return BoundingBox::getLocalCenter(); }
 
-        void setworld2BBox(const geometry::EuclideanTransform& transform) override {
+        void setworld2BBox(const lfs::geometry::EuclideanTransform& transform) override {
             BoundingBox::setworld2BBox(transform);
+            box2world_mat4_ = transform.inv().toMat4();
+            use_mat4_transform_ = false;
         }
-        geometry::EuclideanTransform getworld2BBox() const override {
+        lfs::geometry::EuclideanTransform getworld2BBox() const override {
             return BoundingBox::getworld2BBox();
+        }
+
+        // Set transform using mat4 directly (preserves scale from parent nodes)
+        void setWorld2BBoxMat4(const glm::mat4& world2box) {
+            box2world_mat4_ = glm::inverse(world2box);
+            use_mat4_transform_ = true;
         }
 
         // Set bounding box color
@@ -60,6 +68,10 @@ namespace gs::rendering {
         float line_width_;
         bool initialized_;
 
+        // Mat4 transform for scale support (box-to-world)
+        glm::mat4 box2world_mat4_{1.0f};
+        bool use_mat4_transform_ = false;
+
         // OpenGL resources using RAII
         ManagedShader shader_;
         VAO vao_;
@@ -73,4 +85,4 @@ namespace gs::rendering {
         // Line indices for wireframe cube (12 edges, 24 indices)
         static const unsigned int cube_line_indices_[24];
     };
-} // namespace gs::rendering
+} // namespace lfs::rendering

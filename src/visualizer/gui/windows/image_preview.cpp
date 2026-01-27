@@ -6,15 +6,226 @@
 #include "core/events.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
+#include "gui/dpi_scale.hpp"
+#include "gui/localization_manager.hpp"
+#include "gui/string_keys.hpp"
+#include "theme/theme.hpp"
 #include <algorithm>
+#include <cstring>
 #include <format>
+#include <fstream>
 #include <future>
 #include <glad/glad.h>
-#include <imgui.h>
 #include <stdexcept>
 #include <thread>
+#include <imgui.h>
 
-namespace gs::gui {
+namespace lfs::vis::gui {
+
+    using namespace lichtfeld::Strings;
+
+    // EXIF tag IDs
+    namespace exif_tags {
+        constexpr uint16_t MAKE = 0x010F;
+        constexpr uint16_t MODEL = 0x0110;
+        constexpr uint16_t ORIENTATION = 0x0112;
+        constexpr uint16_t SOFTWARE = 0x0131;
+        constexpr uint16_t DATE_TIME = 0x0132;
+        constexpr uint16_t EXIF_IFD = 0x8769;
+        constexpr uint16_t EXPOSURE_TIME = 0x829A;
+        constexpr uint16_t F_NUMBER = 0x829D;
+        constexpr uint16_t ISO = 0x8827;
+        constexpr uint16_t DATE_TIME_ORIGINAL = 0x9003;
+        constexpr uint16_t FOCAL_LENGTH = 0xA404;
+        constexpr uint16_t FOCAL_LENGTH_35MM = 0xA405;
+        constexpr uint16_t LENS_MODEL = 0xA434;
+    } // namespace exif_tags
+
+    ExifData parseExifData(const std::filesystem::path& path) {
+        ExifData result;
+
+        std::string ext = path.extension().string();
+        for (char& c : ext)
+            c = static_cast<char>(std::tolower(c));
+        if (ext != ".jpg" && ext != ".jpeg")
+            return result;
+
+        std::ifstream file;
+        if (!lfs::core::open_file_for_read(path, std::ios::binary, file))
+            return result;
+
+        uint8_t buf[2];
+        file.read(reinterpret_cast<char*>(buf), 2);
+        if (buf[0] != 0xFF || buf[1] != 0xD8)
+            return result;
+
+        while (file) {
+            file.read(reinterpret_cast<char*>(buf), 2);
+            if (buf[0] != 0xFF)
+                break;
+
+            if (buf[1] == 0xE1) {
+                uint8_t len_buf[2];
+                file.read(reinterpret_cast<char*>(len_buf), 2);
+                const uint16_t segment_len = (len_buf[0] << 8) | len_buf[1];
+
+                std::vector<uint8_t> segment(segment_len - 2);
+                file.read(reinterpret_cast<char*>(segment.data()), segment.size());
+
+                if (segment.size() < 14 || std::memcmp(segment.data(), "Exif\0\0", 6) != 0)
+                    continue;
+
+                const uint8_t* const tiff = segment.data() + 6;
+                const size_t tiff_size = segment.size() - 6;
+                const bool big_endian = (tiff[0] == 'M' && tiff[1] == 'M');
+                if (!big_endian && !(tiff[0] == 'I' && tiff[1] == 'I'))
+                    continue;
+
+                const auto read16 = [big_endian, tiff, tiff_size](const size_t offset) -> uint16_t {
+                    if (offset + 2 > tiff_size)
+                        return 0;
+                    if (big_endian)
+                        return (tiff[offset] << 8) | tiff[offset + 1];
+                    return tiff[offset] | (tiff[offset + 1] << 8);
+                };
+
+                const auto read32 = [big_endian, tiff, tiff_size](const size_t offset) -> uint32_t {
+                    if (offset + 4 > tiff_size)
+                        return 0;
+                    if (big_endian)
+                        return (tiff[offset] << 24) | (tiff[offset + 1] << 16) |
+                               (tiff[offset + 2] << 8) | tiff[offset + 3];
+                    return tiff[offset] | (tiff[offset + 1] << 8) |
+                           (tiff[offset + 2] << 16) | (tiff[offset + 3] << 24);
+                };
+
+                const auto read_string = [tiff, tiff_size](const size_t offset, const size_t count) {
+                    if (offset + count > tiff_size)
+                        return std::string{};
+                    std::string s(reinterpret_cast<const char*>(tiff + offset), count);
+                    while (!s.empty() && (s.back() == '\0' || s.back() == ' '))
+                        s.pop_back();
+                    return s;
+                };
+
+                const auto read_rational = [&read32](const size_t offset) {
+                    return std::pair{read32(offset), read32(offset + 4)};
+                };
+
+                const uint32_t ifd0_offset = read32(4);
+                if (ifd0_offset + 2 > tiff_size)
+                    continue;
+
+                uint32_t exif_ifd_offset = 0;
+
+                const auto parse_ifd = [&](const uint32_t ifd_offset, const bool is_exif_ifd) {
+                    if (ifd_offset + 2 > tiff_size)
+                        return;
+                    const uint16_t num_entries = read16(ifd_offset);
+                    size_t entry_offset = ifd_offset + 2;
+
+                    for (uint16_t i = 0; i < num_entries && entry_offset + 12 <= tiff_size; ++i, entry_offset += 12) {
+                        const uint16_t tag = read16(entry_offset);
+                        const uint16_t type = read16(entry_offset + 2);
+                        const uint32_t count = read32(entry_offset + 4);
+                        uint32_t value_offset = static_cast<uint32_t>(entry_offset + 8);
+
+                        size_t data_size = count;
+                        if (type == 3)
+                            data_size *= 2;
+                        else if (type == 4)
+                            data_size *= 4;
+                        else if (type == 5)
+                            data_size *= 8;
+
+                        if (data_size > 4)
+                            value_offset = read32(entry_offset + 8);
+
+                        switch (tag) {
+                        case exif_tags::MAKE:
+                            result.camera_make = read_string(value_offset, count);
+                            break;
+                        case exif_tags::MODEL:
+                            result.camera_model = read_string(value_offset, count);
+                            break;
+                        case exif_tags::SOFTWARE:
+                            result.software = read_string(value_offset, count);
+                            break;
+                        case exif_tags::DATE_TIME:
+                        case exif_tags::DATE_TIME_ORIGINAL:
+                            if (result.date_time.empty())
+                                result.date_time = read_string(value_offset, count);
+                            break;
+                        case exif_tags::ORIENTATION:
+                            result.orientation = read16(value_offset);
+                            break;
+                        case exif_tags::EXIF_IFD:
+                            exif_ifd_offset = read32(value_offset);
+                            break;
+                        case exif_tags::EXPOSURE_TIME:
+                            if (is_exif_ifd) {
+                                const auto [num, den] = read_rational(value_offset);
+                                if (den > 0) {
+                                    result.exposure_time = (num == 1)
+                                                               ? std::format("1/{}s", den)
+                                                               : std::format("{:.1f}s", static_cast<double>(num) / den);
+                                }
+                            }
+                            break;
+                        case exif_tags::F_NUMBER:
+                            if (is_exif_ifd) {
+                                const auto [num, den] = read_rational(value_offset);
+                                if (den > 0)
+                                    result.f_number = std::format("f/{:.1f}", static_cast<double>(num) / den);
+                            }
+                            break;
+                        case exif_tags::ISO:
+                            if (is_exif_ifd)
+                                result.iso = std::format("ISO {}", read16(value_offset));
+                            break;
+                        case exif_tags::FOCAL_LENGTH:
+                            if (is_exif_ifd) {
+                                const auto [num, den] = read_rational(value_offset);
+                                if (den > 0)
+                                    result.focal_length = std::format("{:.0f}mm", static_cast<double>(num) / den);
+                            }
+                            break;
+                        case exif_tags::FOCAL_LENGTH_35MM:
+                            if (is_exif_ifd)
+                                result.focal_length_35mm = std::format("{}mm (35mm eq.)", read16(value_offset));
+                            break;
+                        case exif_tags::LENS_MODEL:
+                            if (is_exif_ifd)
+                                result.lens_model = read_string(value_offset, count);
+                            break;
+                        default: break;
+                        }
+                    }
+                };
+
+                parse_ifd(ifd0_offset, false);
+                if (exif_ifd_offset > 0)
+                    parse_ifd(exif_ifd_offset, true);
+
+                result.valid = !result.camera_make.empty() || !result.camera_model.empty() ||
+                               !result.exposure_time.empty() || !result.f_number.empty();
+                break;
+            } else if (buf[1] >= 0xE0 && buf[1] <= 0xEF) {
+                uint8_t len_buf[2];
+                file.read(reinterpret_cast<char*>(len_buf), 2);
+                file.seekg((len_buf[0] << 8 | len_buf[1]) - 2, std::ios::cur);
+            } else if (buf[1] == 0xDA) {
+                break;
+            } else {
+                uint8_t len_buf[2];
+                file.read(reinterpret_cast<char*>(len_buf), 2);
+                file.seekg((len_buf[0] << 8 | len_buf[1]) - 2, std::ios::cur);
+            }
+        }
+
+        return result;
+    }
 
     ImagePreview::ImagePreview() = default;
 
@@ -46,6 +257,7 @@ namespace gs::gui {
         image_paths_ = image_paths;
         current_index_ = std::min(initial_index, image_paths.size() - 1);
         is_open_ = true;
+        focus_on_next_frame_ = true;
 
         // Reset view
         zoom_ = 1.0f;
@@ -68,56 +280,93 @@ namespace gs::gui {
         LOG_INFO("Opened image {}/{}: {}",
                  current_index_ + 1,
                  image_paths_.size(),
-                 image_paths_[current_index_].filename().string());
+                 lfs::core::path_to_utf8(image_paths_[current_index_].filename()));
     }
 
     void ImagePreview::open(const std::filesystem::path& image_path) {
         open(std::vector{image_path}, 0);
     }
 
+    void ImagePreview::openWithOverlay(const std::vector<std::filesystem::path>& image_paths,
+                                       const std::vector<std::filesystem::path>& overlay_paths,
+                                       const size_t initial_index) {
+        open(image_paths, initial_index);
+        overlay_paths_ = overlay_paths;
+        loadCurrentOverlay();
+    }
+
+    void ImagePreview::loadCurrentOverlay() {
+        overlay_texture_.reset();
+        if (current_index_ < overlay_paths_.size() && !overlay_paths_[current_index_].empty()) {
+            try {
+                auto data = loadImageData(overlay_paths_[current_index_]);
+                overlay_texture_ = createTexture(std::move(*data), overlay_paths_[current_index_]);
+            } catch (const std::exception& e) {
+                LOG_WARN("Failed to load overlay: {}", e.what());
+            }
+        }
+    }
+
+    bool ImagePreview::hasValidOverlay() const {
+        return current_index_ < overlay_paths_.size() &&
+               !overlay_paths_[current_index_].empty() &&
+               overlay_texture_ && overlay_texture_->texture.valid();
+    }
+
     void ImagePreview::close() {
         is_open_ = false;
         image_paths_.clear();
+        overlay_paths_.clear();
         current_texture_.reset();
+        previous_texture_.reset();
+        overlay_texture_.reset();
         prev_texture_.reset();
         next_texture_.reset();
 
-        // Clear preload results
         {
-            std::lock_guard<std::mutex> lock(preload_mutex_);
+            std::lock_guard lock(preload_mutex_);
             prev_result_.reset();
             next_result_.reset();
         }
 
         load_error_.clear();
-        LOG_DEBUG("Image preview closed");
+        show_overlay_ = false;
     }
 
     std::unique_ptr<ImageData> ImagePreview::loadImageData(const std::filesystem::path& path) {
-        LOG_TIMER_TRACE("LoadImageData");
+        LOG_TIMER("LoadImageData");
 
-        LOG_TRACE("Loading image data from: {}", path.string());
+        LOG_TRACE("Loading image data from: {}", lfs::core::path_to_utf8(path));
 
-        // Load image
-        auto [data, width, height, channels] = ::load_image(path);
+        // Load image (max_width = -1 disables downscaling for preview)
+        auto [data, width, height, channels] = [&]() {
+            LOG_TIMER("load_image call");
+            return lfs::core::load_image(path, -1, -1);
+        }();
 
         // Wrap in RAII immediately
-        auto image_data = std::make_unique<ImageData>(data, width, height, channels);
+        auto image_data = [&]() {
+            LOG_TIMER("ImageData construction");
+            return std::make_unique<ImageData>(data, width, height, channels);
+        }();
 
         // Validate
-        if (!image_data->valid()) {
-            LOG_ERROR("Failed to load image data from: {}", path.string());
-            throw std::runtime_error("Failed to load image data");
-        }
+        {
+            LOG_TIMER("Image validation");
+            if (!image_data->valid()) {
+                LOG_ERROR("Failed to load image data from: {}", lfs::core::path_to_utf8(path));
+                throw std::runtime_error("Failed to load image data");
+            }
 
-        if (width <= 0 || height <= 0) {
-            LOG_ERROR("Invalid image dimensions: {}x{} for: {}", width, height, path.string());
-            throw std::runtime_error(std::format("Invalid image dimensions: {}x{}", width, height));
-        }
+            if (width <= 0 || height <= 0) {
+                LOG_ERROR("Invalid image dimensions: {}x{} for: {}", width, height, lfs::core::path_to_utf8(path));
+                throw std::runtime_error(std::format("Invalid image dimensions: {}x{}", width, height));
+            }
 
-        if (channels < 1 || channels > 4) {
-            LOG_ERROR("Invalid number of channels: {} for: {}", channels, path.string());
-            throw std::runtime_error(std::format("Invalid number of channels: {}", channels));
+            if (channels < 1 || channels > 4) {
+                LOG_ERROR("Invalid number of channels: {} for: {}", channels, lfs::core::path_to_utf8(path));
+                throw std::runtime_error(std::format("Invalid number of channels: {}", channels));
+            }
         }
 
         LOG_TRACE("Loaded image: {}x{}, {} channels", width, height, channels);
@@ -126,9 +375,12 @@ namespace gs::gui {
 
     std::unique_ptr<ImagePreview::ImageTexture> ImagePreview::createTexture(
         ImageData&& data, const std::filesystem::path& path) {
-        LOG_TIMER_TRACE("CreateTexture");
+        LOG_TIMER("CreateTexture");
 
-        ensureMaxTextureSizeInitialized();
+        {
+            LOG_TIMER("ensureMaxTextureSizeInitialized");
+            ensureMaxTextureSizeInitialized();
+        }
 
         int width = data.width();
         int height = data.height();
@@ -165,25 +417,28 @@ namespace gs::gui {
         texture->height = height;
         texture->path = path;
 
-        // Clear any existing OpenGL errors
-        while (glGetError() != GL_NO_ERROR) {}
-
-        // Generate texture
-        if (!texture->texture.generate()) {
-            LOG_ERROR("Failed to generate texture ID for: {}", path.string());
-            throw std::runtime_error("Failed to generate texture ID");
+        {
+            LOG_TIMER("GL texture generation");
+            // Generate texture
+            if (!texture->texture.generate()) {
+                LOG_ERROR("Failed to generate texture ID for: {}", lfs::core::path_to_utf8(path));
+                throw std::runtime_error("Failed to generate texture ID");
+            }
         }
 
-        texture->texture.bind();
+        {
+            LOG_TIMER("GL texture bind and setup");
+            texture->texture.bind();
 
-        // Set texture parameters
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            // Set texture parameters
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        // Set pixel alignment
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            // Set pixel alignment
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        }
 
         // Determine format
         GLenum format = GL_RGB;
@@ -203,40 +458,44 @@ namespace gs::gui {
             internal_format = GL_RGBA8;
             break;
         default:
-            LOG_ERROR("Unsupported channel count: {} for: {}", channels, path.string());
+            LOG_ERROR("Unsupported channel count: {} for: {}", channels, lfs::core::path_to_utf8(path));
             throw std::runtime_error(std::format("Unsupported channel count: {}", channels));
         }
 
         LOG_TRACE("Creating {}x{} texture with {} channels", width, height, channels);
 
         // Upload texture
-        glTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0,
-                     format, GL_UNSIGNED_BYTE, data.data());
+        {
+            LOG_TIMER("glTexImage2D upload");
+            glTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0,
+                         format, GL_UNSIGNED_BYTE, data.data());
+        }
 
-        // Check for errors
-        GLenum error = glGetError();
-        if (error != GL_NO_ERROR) {
-            std::string error_str;
-            switch (error) {
-            case GL_INVALID_ENUM: error_str = "GL_INVALID_ENUM"; break;
-            case GL_INVALID_VALUE: error_str = "GL_INVALID_VALUE"; break;
-            case GL_INVALID_OPERATION: error_str = "GL_INVALID_OPERATION"; break;
-            case GL_OUT_OF_MEMORY: error_str = "GL_OUT_OF_MEMORY"; break;
-            default: error_str = std::format("0x{:X}", error); break;
+        {
+            // Check for errors
+            GLenum error = glGetError();
+            if (error != GL_NO_ERROR) {
+                std::string error_str;
+                switch (error) {
+                case GL_INVALID_ENUM: error_str = "GL_INVALID_ENUM"; break;
+                case GL_INVALID_VALUE: error_str = "GL_INVALID_VALUE"; break;
+                case GL_INVALID_OPERATION: error_str = "GL_INVALID_OPERATION"; break;
+                case GL_OUT_OF_MEMORY: error_str = "GL_OUT_OF_MEMORY"; break;
+                default: error_str = std::format("0x{:X}", error); break;
+                }
+                LOG_ERROR("OpenGL error creating texture: {} for: {}", error_str, lfs::core::path_to_utf8(path));
+                throw std::runtime_error(std::format("OpenGL error: {}", error_str));
             }
-            LOG_ERROR("OpenGL error creating texture: {} for: {}", error_str, path.string());
-            throw std::runtime_error(std::format("OpenGL error: {}", error_str));
+
+            // Set swizzle for grayscale
+            if (channels == 1) {
+                GLint swizzleMask[] = {GL_RED, GL_RED, GL_RED, GL_ONE};
+                glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleMask);
+            }
         }
 
-        // Set swizzle for grayscale
-        if (channels == 1) {
-            GLint swizzleMask[] = {GL_RED, GL_RED, GL_RED, GL_ONE};
-            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleMask);
-        }
-
-        GLTexture::unbind();
-
-        LOG_DEBUG("Created texture {}x{} for: {}", width, height, path.filename().string());
+        // State guard will restore texture binding automatically
+        LOG_DEBUG("Created texture {}x{} for: {}", width, height, lfs::core::path_to_utf8(path.filename()));
         return texture;
     }
 
@@ -245,16 +504,14 @@ namespace gs::gui {
             is_loading_ = true;
             load_error_.clear();
 
-            LOG_DEBUG("Loading image: {}", path.string());
+            LOG_DEBUG("Loading image: {}", lfs::core::path_to_utf8(path));
 
             // Load image data with RAII
             auto image_data = loadImageData(path);
 
-            // Create texture from data
-            current_texture_ = createTexture(std::move(*image_data), path);
-
-            // Try to load mask for this image
-            loadMask(path);
+            // Create new texture first, then swap (keeps old texture visible during load)
+            auto new_texture = createTexture(std::move(*image_data), path);
+            current_texture_ = std::move(new_texture);
 
             is_loading_ = false;
             return true;
@@ -262,71 +519,13 @@ namespace gs::gui {
         } catch (const std::exception& e) {
             load_error_ = e.what();
             is_loading_ = false;
-            LOG_ERROR("Error loading image '{}': {}", path.string(), e.what());
-            return false;
-        }
-    }
-
-    bool ImagePreview::loadMask(const std::filesystem::path& image_path) {
-        try {
-            // Clear existing mask
-            mask_texture_.reset();
-
-            // Construct potential mask paths
-            // image_path is like: C:\...\dataset\images\cam_2\00.png
-            // We want mask at: C:\...\dataset\masks\cam_2\00.png.png
-            auto parent = image_path.parent_path();  // C:\...\dataset\images\cam_2
-            auto filename = image_path.filename();    // 00.png
-            auto camera_folder = parent.filename();   // cam_2
-            auto dataset_root = parent.parent_path().parent_path();  // C:\...\dataset
-            auto masks_dir = dataset_root / "masks" / camera_folder;  // C:\...\dataset\masks\cam_2
-
-            LOG_INFO("Looking for mask for image: {}", image_path.string());
-            LOG_INFO("  Mask directory: {}", masks_dir.string());
-
-            // Try both mask formats: .ext.png (priority) and .ext (fallback)
-            std::filesystem::path mask_path_png = masks_dir / (filename.string() + ".png");
-            std::filesystem::path mask_path_same = masks_dir / filename;
-
-            LOG_INFO("  Trying: {}", mask_path_png.string());
-            LOG_INFO("  Or: {}", mask_path_same.string());
-
-            std::filesystem::path mask_path;
-            if (std::filesystem::exists(mask_path_png)) {
-                mask_path = mask_path_png;
-                LOG_INFO("  Found mask (format 1): {}", mask_path.string());
-            } else if (std::filesystem::exists(mask_path_same)) {
-                mask_path = mask_path_same;
-                LOG_INFO("  Found mask (format 2): {}", mask_path.string());
-            } else {
-                LOG_INFO("  No mask found for image: {}", image_path.string());
-                return false;
-            }
-
-            LOG_INFO("Loading mask: {}", mask_path.string());
-
-            // Load mask data
-            auto mask_data = loadImageData(mask_path);
-            if (!mask_data || !mask_data->valid()) {
-                LOG_WARN("Failed to load mask data: {}", mask_path.string());
-                return false;
-            }
-
-            // Create texture from mask
-            mask_texture_ = createTexture(std::move(*mask_data), mask_path);
-
-            LOG_INFO("Mask loaded successfully: {}", mask_path.string());
-            return true;
-
-        } catch (const std::exception& e) {
-            LOG_INFO("Error loading mask for '{}': {}", image_path.string(), e.what());
-            mask_texture_.reset();
+            LOG_ERROR("Error loading image '{}': {}", lfs::core::path_to_utf8(path), e.what());
             return false;
         }
     }
 
     void ImagePreview::preloadAdjacentImages() {
-        LOG_TIMER_TRACE("PreloadAdjacentImages");
+        LOG_TIMER("PreloadAdjacentImages");
 
         // Don't start new preload if one is already in progress
         bool expected = false;
@@ -355,6 +554,7 @@ namespace gs::gui {
             LOG_TRACE("Starting preload of previous image (index {})", current_index_ - 1);
             std::thread([this, prev_idx = current_index_ - 1, max_size]() {
                 try {
+                    LOG_TIMER("Preload prev image data");
                     auto image_data = loadImageData(image_paths_[prev_idx]);
 
                     // Check if downscaling is needed
@@ -366,8 +566,8 @@ namespace gs::gui {
                         }
 
                         LOG_TRACE("Preloaded image needs downscaling by factor of {}", scale);
-                        // Reload at lower resolution
-                        auto [data, w, h, c] = ::load_image(image_paths_[prev_idx], scale);
+                        // Reload at lower resolution (max_width = -1 disables additional downscaling)
+                        auto [data, w, h, c] = lfs::core::load_image(image_paths_[prev_idx], scale, -1);
                         image_data = std::make_unique<ImageData>(data, w, h, c);
                     }
 
@@ -379,7 +579,7 @@ namespace gs::gui {
 
                     std::lock_guard<std::mutex> lock(preload_mutex_);
                     prev_result_ = std::move(result);
-                    LOG_TRACE("Successfully preloaded previous image");
+                    LOG_TRACE("Successfully preloaded previous image data");
                 } catch (const std::exception& e) {
                     auto result = std::make_unique<LoadResult>();
                     result->error = e.what();
@@ -396,6 +596,7 @@ namespace gs::gui {
             LOG_TRACE("Starting preload of next image (index {})", current_index_ + 1);
             std::thread([this, next_idx = current_index_ + 1, max_size]() {
                 try {
+                    LOG_TIMER("Preload next image data");
                     auto image_data = loadImageData(image_paths_[next_idx]);
 
                     // Check if downscaling is needed
@@ -407,8 +608,8 @@ namespace gs::gui {
                         }
 
                         LOG_TRACE("Preloaded image needs downscaling by factor of {}", scale);
-                        // Reload at lower resolution
-                        auto [data, w, h, c] = ::load_image(image_paths_[next_idx], scale);
+                        // Reload at lower resolution (max_width = -1 disables additional downscaling)
+                        auto [data, w, h, c] = lfs::core::load_image(image_paths_[next_idx], scale, -1);
                         image_data = std::make_unique<ImageData>(data, w, h, c);
                     }
 
@@ -420,7 +621,7 @@ namespace gs::gui {
 
                     std::lock_guard<std::mutex> lock(preload_mutex_);
                     next_result_ = std::move(result);
-                    LOG_TRACE("Successfully preloaded next image");
+                    LOG_TRACE("Successfully preloaded next image data");
                 } catch (const std::exception& e) {
                     auto result = std::make_unique<LoadResult>();
                     result->error = e.what();
@@ -438,12 +639,14 @@ namespace gs::gui {
     }
 
     void ImagePreview::checkPreloadedImages() {
+        LOG_TIMER("CheckPreloadedImages");
         std::lock_guard<std::mutex> lock(preload_mutex_);
 
         // Check previous image
         if (prev_result_ && !prev_texture_) {
             if (prev_result_->image) {
                 try {
+                    LOG_TIMER("Create prev texture");
                     prev_texture_ = createTexture(
                         std::move(prev_result_->image->data),
                         prev_result_->image->path);
@@ -459,6 +662,7 @@ namespace gs::gui {
         if (next_result_ && !next_texture_) {
             if (next_result_->image) {
                 try {
+                    LOG_TIMER("Create next texture");
                     next_texture_ = createTexture(
                         std::move(next_result_->image->data),
                         next_result_->image->path);
@@ -475,76 +679,54 @@ namespace gs::gui {
         if (image_paths_.empty() || current_index_ + 1 >= image_paths_.size()) {
             return;
         }
-
-        current_index_++;
-
-        // Always reset view when changing images
-        zoom_ = 1.0f;
-        pan_x_ = 0.0f;
-        pan_y_ = 0.0f;
-
-        LOG_DEBUG("Navigating to next image (index {})", current_index_);
-
-        // Use preloaded texture if available
-        if (next_texture_) {
-            current_texture_ = std::move(next_texture_);
-            LOG_TRACE("Using preloaded texture for next image");
-        } else {
-            if (!loadImage(image_paths_[current_index_])) {
-                LOG_ERROR("Failed to load next image: {}", load_error_);
-                // Don't throw here, GUI will display error
-            }
+        if (!next_texture_ && is_loading_) {
+            return; // Skip if no preload and currently loading
         }
 
+        current_index_++;
+        previous_texture_ = std::move(current_texture_); // Keep old texture in GPU memory
+
+        if (next_texture_) {
+            current_texture_ = std::move(next_texture_);
+        } else {
+            loadImage(image_paths_[current_index_]);
+        }
+
+        loadCurrentOverlay();
         preloadAdjacentImages();
     }
 
     void ImagePreview::previousImage() {
-        if (image_paths_.empty() || current_index_ == 0) {
+        if (image_paths_.empty() || current_index_ == 0)
             return;
-        }
+        if (!prev_texture_ && is_loading_)
+            return;
 
-        current_index_--;
+        --current_index_;
+        previous_texture_ = std::move(current_texture_);
 
-        // Always reset view when changing images
-        zoom_ = 1.0f;
-        pan_x_ = 0.0f;
-        pan_y_ = 0.0f;
-
-        LOG_DEBUG("Navigating to previous image (index {})", current_index_);
-
-        // Use preloaded texture if available
         if (prev_texture_) {
             current_texture_ = std::move(prev_texture_);
-            LOG_TRACE("Using preloaded texture for previous image");
         } else {
-            if (!loadImage(image_paths_[current_index_])) {
-                LOG_ERROR("Failed to load previous image: {}", load_error_);
-                // Don't throw here, GUI will display error
-            }
+            loadImage(image_paths_[current_index_]);
         }
 
+        loadCurrentOverlay();
         preloadAdjacentImages();
     }
 
-    void ImagePreview::goToImage(size_t index) {
-        if (index >= image_paths_.size()) {
+    void ImagePreview::goToImage(const size_t index) {
+        if (index >= image_paths_.size())
             return;
-        }
 
         current_index_ = index;
-
-        // Always reset view
         zoom_ = 1.0f;
         pan_x_ = 0.0f;
         pan_y_ = 0.0f;
 
-        LOG_DEBUG("Jumping to image index {}", index);
-
-        if (!loadImage(image_paths_[current_index_])) {
-            LOG_ERROR("Failed to load image at index {}: {}", index, load_error_);
-            // Don't throw here, GUI will display error
-        }
+        previous_texture_ = std::move(current_texture_);
+        loadImage(image_paths_[current_index_]);
+        loadCurrentOverlay();
 
         preloadAdjacentImages();
     }
@@ -577,41 +759,43 @@ namespace gs::gui {
         // Check for preloaded images and convert to textures
         checkPreloadedImages();
 
-        // Window setup
-        ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
-        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoScrollbar |
-                                        ImGuiWindowFlags_NoScrollWithMouse |
-                                        ImGuiWindowFlags_MenuBar;
+        // Initial size: half viewport, centered
+        const auto* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowSize({vp->Size.x * 0.5f, vp->Size.y * 0.5f}, ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos({vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f},
+                                ImGuiCond_FirstUseEver, {0.5f, 0.5f});
 
-        std::string title = "Image Preview";
-        if (!image_paths_.empty()) {
-            title = std::format("Image Preview - {}/{} - {}",
-                                current_index_ + 1,
-                                image_paths_.size(),
-                                image_paths_[current_index_].filename().string());
+        constexpr ImGuiWindowFlags WINDOW_FLAGS = ImGuiWindowFlags_NoScrollbar |
+                                                  ImGuiWindowFlags_NoScrollWithMouse |
+                                                  ImGuiWindowFlags_MenuBar;
+
+        const std::string title = image_paths_.empty()
+                                      ? "Image Preview###ImagePreview"
+                                      : std::format("Image Preview - {}/{} - {}###ImagePreview",
+                                                    current_index_ + 1, image_paths_.size(),
+                                                    lfs::core::path_to_utf8(image_paths_[current_index_].filename()));
+
+        if (focus_on_next_frame_) {
+            ImGui::SetNextWindowFocus();
+            focus_on_next_frame_ = false;
         }
 
-        if (!ImGui::Begin(title.c_str(), p_open, window_flags)) {
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, theme().palette.surface);
+        if (!ImGui::Begin(title.c_str(), p_open, WINDOW_FLAGS)) {
+            ImGui::PopStyleColor();
             ImGui::End();
             return;
         }
 
-        // Menu bar
         if (ImGui::BeginMenuBar()) {
-            if (ImGui::BeginMenu("View")) {
-                ImGui::MenuItem("Fit to Window", "F", &fit_to_window_);
-                ImGui::Separator();
-
-                // Mask overlay controls
-                if (mask_texture_ && mask_texture_->texture.valid()) {
-                    ImGui::MenuItem("Show Mask Overlay", "M", &show_mask_overlay_);
-                    if (show_mask_overlay_) {
-                        ImGui::SliderFloat("Mask Opacity", &mask_opacity_, 0.0f, 1.0f, "%.2f");
-                    }
-                    ImGui::Separator();
+            if (ImGui::BeginMenu(LOC(lichtfeld::Strings::ImagePreview::VIEW))) {
+                ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::FIT_TO_WINDOW), "F", &fit_to_window_);
+                ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::SHOW_INFO_PANEL), "I", &show_info_panel_);
+                if (hasValidOverlay()) {
+                    ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::SHOW_MASK_OVERLAY), "M", &show_overlay_);
                 }
-
-                if (ImGui::MenuItem("Reset View", "R") || ImGui::MenuItem("Actual Size", "1")) {
+                ImGui::Separator();
+                if (ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::RESET_VIEW), "R") || ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::ACTUAL_SIZE), "1")) {
                     zoom_ = 1.0f;
                     pan_x_ = 0.0f;
                     pan_y_ = 0.0f;
@@ -619,19 +803,19 @@ namespace gs::gui {
                 ImGui::EndMenu();
             }
 
-            if (ImGui::BeginMenu("Navigate")) {
-                if (ImGui::MenuItem("Previous", "Left", nullptr, current_index_ > 0)) {
+            if (ImGui::BeginMenu(LOC(lichtfeld::Strings::ImagePreview::NAVIGATE))) {
+                if (ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::PREVIOUS), "Left", nullptr, current_index_ > 0)) {
                     previousImage();
                 }
-                if (ImGui::MenuItem("Next", "Right", nullptr,
+                if (ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::NEXT), "Right", nullptr,
                                     current_index_ + 1 < image_paths_.size())) {
                     nextImage();
                 }
                 ImGui::Separator();
-                if (ImGui::MenuItem("First", "Home", nullptr, !image_paths_.empty())) {
+                if (ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::FIRST), "Home", nullptr, !image_paths_.empty())) {
                     goToImage(0);
                 }
-                if (ImGui::MenuItem("Last", "End", nullptr, !image_paths_.empty())) {
+                if (ImGui::MenuItem(LOC(lichtfeld::Strings::ImagePreview::LAST), "End", nullptr, !image_paths_.empty())) {
                     goToImage(image_paths_.size() - 1);
                 }
                 ImGui::EndMenu();
@@ -645,81 +829,226 @@ namespace gs::gui {
             ImGui::EndMenuBar();
         }
 
-        ImVec2 content_size = ImGui::GetContentRegionAvail();
+        const ImVec2 content_size = ImGui::GetContentRegionAvail();
 
-        if (is_loading_) {
-            ImGui::SetCursorPos(ImVec2(content_size.x * 0.5f - 50, content_size.y * 0.5f));
-            ImGui::Text("Loading...");
-            ImGui::End();
-            return;
-        }
-
-        if (!load_error_.empty()) {
+        if (!load_error_.empty() && !current_texture_) {
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error: %s", load_error_.c_str());
             ImGui::End();
+            ImGui::PopStyleColor();
             return;
         }
 
         if (!current_texture_ || !current_texture_->texture.valid()) {
-            ImGui::Text("No image loaded");
+            ImGui::Text(is_loading_ ? "Loading..." : "No image loaded");
             ImGui::End();
+            ImGui::PopStyleColor();
             return;
         }
 
-        auto [display_width, display_height] = calculateDisplaySize(
-            static_cast<int>(content_size.x),
-            static_cast<int>(content_size.y));
+        const float scale = getDpiScale();
+        const float INFO_PANEL_WIDTH = 260.0f * scale;
+        const float PANEL_MARGIN = 8.0f * scale;
 
-        float x_offset = (content_size.x - display_width) * 0.5f + pan_x_;
-        float y_offset = (content_size.y - display_height) * 0.5f + pan_y_;
+        // Reserve space for info panel if visible
+        const float available_width = show_info_panel_
+                                          ? content_size.x - INFO_PANEL_WIDTH - PANEL_MARGIN * 2.0f
+                                          : content_size.x;
 
-        // Store the image position for overlay
-        float image_y = y_offset + ImGui::GetCursorPosY();
+        const auto [display_width, display_height] = calculateDisplaySize(
+            static_cast<int>(available_width), static_cast<int>(content_size.y));
 
-        ImGui::SetCursorPos(ImVec2(x_offset, image_y));
-        ImGui::Image(
-            (ImTextureID)(uintptr_t)current_texture_->texture.id(),
-            ImVec2(display_width, display_height));
+        // Center image in available space (excluding info panel if visible)
+        const float x_offset = (available_width - display_width) * 0.5f + pan_x_;
+        const float y_offset = (content_size.y - display_height) * 0.5f + pan_y_;
+        const float base_cursor_y = ImGui::GetCursorPosY();
 
-        // Overlay mask if enabled - draw at same position as image
-        if (show_mask_overlay_ && mask_texture_ && mask_texture_->texture.valid()) {
-            ImGui::SetCursorPos(ImVec2(x_offset, image_y));
+        // Invisible button for mouse interaction
+        ImGui::SetCursorPos(ImVec2(0, base_cursor_y));
+        ImGui::InvisibleButton("##ImageArea", content_size);
+        const bool image_hovered = ImGui::IsItemHovered();
+        const bool image_active = ImGui::IsItemActive();
 
-            // Apply blend mode for overlay effect
-            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, mask_opacity_);
-            ImGui::Image(
-                (ImTextureID)(uintptr_t)mask_texture_->texture.id(),
-                ImVec2(display_width, display_height));
-            ImGui::PopStyleVar();
+        ImGui::SetCursorPos(ImVec2(x_offset, y_offset + base_cursor_y));
+        ImGui::Image(static_cast<ImTextureID>(current_texture_->texture.id()),
+                     ImVec2(display_width, display_height));
+
+        // Draw mask overlay
+        if (show_overlay_ && hasValidOverlay()) {
+            constexpr ImVec4 OVERLAY_TINT{1.0f, 0.2f, 0.2f, 0.5f};
+            ImGui::SetCursorPos(ImVec2(x_offset, y_offset + base_cursor_y));
+            ImGui::Image(static_cast<ImTextureID>(overlay_texture_->texture.id()),
+                         ImVec2(display_width, display_height),
+                         ImVec2(0, 0), ImVec2(1, 1), OVERLAY_TINT, ImVec4(0, 0, 0, 0));
         }
 
-        if (ImGui::IsItemHovered()) {
-            float wheel = ImGui::GetIO().MouseWheel;
-            if (wheel != 0.0f) {
-                float zoom_delta = wheel * 0.1f;
-                zoom_ = std::clamp(zoom_ + zoom_delta, 0.1f, 10.0f);
-                LOG_TRACE("Zoom changed to: {}", zoom_);
+        // Floating info panel
+        if (show_info_panel_ && current_texture_) {
+            const float MAX_PANEL_HEIGHT = 400.0f * scale;
+            const float panel_height = std::min(content_size.y - 2.0f * PANEL_MARGIN, MAX_PANEL_HEIGHT);
+            ImGui::SetCursorPos(ImVec2(content_size.x - INFO_PANEL_WIDTH - PANEL_MARGIN, base_cursor_y + PANEL_MARGIN));
+
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.1f, 0.1f, 0.12f, 0.85f));
+            ImGui::BeginChild("##ImageInfoPanel", ImVec2(INFO_PANEL_WIDTH, panel_height), true);
+
+            const auto& path = image_paths_[current_index_];
+            const std::string filename = lfs::core::path_to_utf8(path.filename());
+            std::string ext = path.extension().string();
+            if (!ext.empty() && ext[0] == '.')
+                ext = ext.substr(1);
+            for (char& c : ext)
+                c = static_cast<char>(std::toupper(c));
+
+            // File info section
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "FILE");
+            ImGui::Separator();
+            ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::NAME), filename.c_str());
+            ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::FORMAT), ext.c_str());
+            if (std::filesystem::exists(path)) {
+                const auto file_size = std::filesystem::file_size(path);
+                if (file_size >= 1024 * 1024)
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::SIZE_MB), file_size / (1024.0 * 1024.0));
+                else if (file_size >= 1024)
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::SIZE_KB), file_size / 1024.0);
+                else
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::SIZE_BYTES), file_size);
+
+                const auto ftime = std::filesystem::last_write_time(path);
+                const auto sys_time = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+                const auto time_t = std::chrono::system_clock::to_time_t(sys_time);
+                char time_buf[64];
+                std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M", std::localtime(&time_t));
+                ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::MODIFIED), time_buf);
+            }
+            ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::PATH), lfs::core::path_to_utf8(path.parent_path()).c_str());
+
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            // Image info section
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "IMAGE");
+            ImGui::Separator();
+            ImGui::Text("Dimensions: %dx%d", current_texture_->width, current_texture_->height);
+            ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::MEGAPIXELS),
+                        (current_texture_->width * current_texture_->height) / 1e6);
+
+            // Infer channels from extension
+            const char* channels = "RGB (3)";
+            const char* color_space = "sRGB";
+            if (ext == "PNG" || ext == "WEBP" || ext == "TIFF" || ext == "TIF") {
+                channels = "RGBA (4)";
+            } else if (ext == "EXR" || ext == "HDR") {
+                channels = "RGBA (4)";
+                color_space = "Linear";
+            }
+            ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::CHANNELS), channels);
+            ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::COLOR_SPACE), color_space);
+
+            // Aspect ratio
+            const float aspect = static_cast<float>(current_texture_->width) /
+                                 static_cast<float>(current_texture_->height);
+            const char* aspect_name = "Custom";
+            if (std::abs(aspect - 16.0f / 9.0f) < 0.01f)
+                aspect_name = "16:9";
+            else if (std::abs(aspect - 4.0f / 3.0f) < 0.01f)
+                aspect_name = "4:3";
+            else if (std::abs(aspect - 3.0f / 2.0f) < 0.01f)
+                aspect_name = "3:2";
+            else if (std::abs(aspect - 1.0f) < 0.01f)
+                aspect_name = "1:1";
+            else if (std::abs(aspect - 21.0f / 9.0f) < 0.02f)
+                aspect_name = "21:9";
+            ImGui::Text("Aspect Ratio: %s (%.2f)", aspect_name, aspect);
+
+            // EXIF section (only for JPEG files with valid EXIF)
+            if (exif_cache_index_ != current_index_) {
+                current_exif_ = parseExifData(path);
+                exif_cache_index_ = current_index_;
             }
 
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-                ImVec2 delta = ImGui::GetIO().MouseDelta;
-                pan_x_ += delta.x;
-                pan_y_ += delta.y;
+            if (current_exif_.valid) {
+                ImGui::Spacing();
+                ImGui::Spacing();
+
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "EXIF");
+                ImGui::Separator();
+
+                if (!current_exif_.camera_make.empty() || !current_exif_.camera_model.empty()) {
+                    std::string camera;
+                    if (!current_exif_.camera_make.empty())
+                        camera = current_exif_.camera_make;
+                    if (!current_exif_.camera_model.empty()) {
+                        if (!camera.empty())
+                            camera += " ";
+                        camera += current_exif_.camera_model;
+                    }
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::CAMERA), camera.c_str());
+                }
+                if (!current_exif_.lens_model.empty())
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::LENS), current_exif_.lens_model.c_str());
+                if (!current_exif_.focal_length.empty())
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::FOCAL_LENGTH), current_exif_.focal_length.c_str());
+                if (!current_exif_.focal_length_35mm.empty())
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::FOCAL_35MM), current_exif_.focal_length_35mm.c_str());
+                if (!current_exif_.exposure_time.empty())
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::EXPOSURE), current_exif_.exposure_time.c_str());
+                if (!current_exif_.f_number.empty())
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::APERTURE), current_exif_.f_number.c_str());
+                if (!current_exif_.iso.empty())
+                    ImGui::Text("%s", current_exif_.iso.c_str());
+                if (!current_exif_.date_time.empty())
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::DATE), current_exif_.date_time.c_str());
+                if (!current_exif_.software.empty())
+                    ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::SOFTWARE), current_exif_.software.c_str());
             }
 
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            // View info section
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "VIEW");
+            ImGui::Separator();
+            ImGui::Text("Zoom: %.0f%%", zoom_ * 100.0f);
+            ImGui::Text("Pan: %.0f, %.0f", pan_x_, pan_y_);
+            ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::FIT_STATUS), fit_to_window_ ? LOC(Training::Status::YES) : LOC(Training::Status::NO));
+
+            if (hasValidOverlay()) {
+                ImGui::Spacing();
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", LOC(lichtfeld::Strings::ImagePreview::MASK_SECTION));
+                ImGui::Separator();
+                ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::OVERLAY_STATUS), show_overlay_ ? LOC(lichtfeld::Strings::ImagePreview::VISIBLE) : LOC(lichtfeld::Strings::ImagePreview::HIDDEN));
+                ImGui::Text(LOC(lichtfeld::Strings::ImagePreview::FILE_LABEL), lfs::core::path_to_utf8(overlay_paths_[current_index_].filename()).c_str());
+            }
+
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+        }
+
+        // Mouse interaction
+        if (image_hovered) {
+            if (const float wheel = ImGui::GetIO().MouseWheel; wheel != 0.0f) {
+                constexpr float ZOOM_SPEED = 0.15f;
+                zoom_ = std::clamp(zoom_ + wheel * ZOOM_SPEED, 0.1f, 10.0f);
+            }
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 zoom_ = 1.0f;
                 pan_x_ = 0.0f;
                 pan_y_ = 0.0f;
-                LOG_TRACE("View reset via double-click");
             }
         }
 
+        if (image_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            const ImVec2 delta = ImGui::GetIO().MouseDelta;
+            pan_x_ += delta.x;
+            pan_y_ += delta.y;
+        }
+
         if (ImGui::IsWindowFocused()) {
-            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+            // Disable key repeat for navigation (false = no repeat)
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) {
                 previousImage();
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) {
                 nextImage();
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Home)) {
@@ -731,15 +1060,16 @@ namespace gs::gui {
             if (ImGui::IsKeyPressed(ImGuiKey_F)) {
                 fit_to_window_ = !fit_to_window_;
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_M) && mask_texture_ && mask_texture_->texture.valid()) {
-                show_mask_overlay_ = !show_mask_overlay_;
-                LOG_TRACE("Mask overlay toggled: {}", show_mask_overlay_);
+            if (ImGui::IsKeyPressed(ImGuiKey_I)) {
+                show_info_panel_ = !show_info_panel_;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_M) && hasValidOverlay()) {
+                show_overlay_ = !show_overlay_;
             }
             if (ImGui::IsKeyPressed(ImGuiKey_R) || ImGui::IsKeyPressed(ImGuiKey_1)) {
                 zoom_ = 1.0f;
                 pan_x_ = 0.0f;
                 pan_y_ = 0.0f;
-                LOG_TRACE("View reset via keyboard");
             }
 
             if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl)) {
@@ -756,6 +1086,7 @@ namespace gs::gui {
         }
 
         ImGui::End();
+        ImGui::PopStyleColor();
     }
 
-} // namespace gs::gui
+} // namespace lfs::vis::gui

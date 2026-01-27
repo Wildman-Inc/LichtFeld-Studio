@@ -3,24 +3,32 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "visualizer_impl.hpp"
+#include "command/commands/crop_command.hpp"
+#include "command/commands/selection_command.hpp"
 #include "core/data_loading_service.hpp"
+#include "core/event_bus.hpp"
 #include "core/logger.hpp"
-#include "core/parameters.hpp"
+#include "core/path_utils.hpp"
+#include "core/services.hpp"
 #include "scene/scene_manager.hpp"
-#include "tools/translation_gizmo_tool.hpp"
-#include <fstream>
-#include <nlohmann/json.hpp>
+#include "tools/align_tool.hpp"
+#include "tools/brush_tool.hpp"
+#include "tools/selection_tool.hpp"
 #include <stdexcept>
 #ifdef WIN32
 #include <windows.h>
 #endif
 
-namespace gs::visualizer {
+namespace lfs::vis {
+
+    using namespace lfs::core::events;
 
     VisualizerImpl::VisualizerImpl(const ViewerOptions& options)
         : options_(options),
           viewport_(options.width, options.height),
-          window_manager_(std::make_unique<WindowManager>(options.title, options.width, options.height)) {
+          window_manager_(std::make_unique<WindowManager>(options.title, options.width, options.height,
+                                                          options.monitor_x, options.monitor_y,
+                                                          options.monitor_width, options.monitor_height)) {
 
         LOG_DEBUG("Creating visualizer with window size {}x{}", options.width, options.height);
 
@@ -30,16 +38,12 @@ namespace gs::visualizer {
         // Create trainer manager
         trainer_manager_ = std::make_shared<TrainerManager>();
         trainer_manager_->setViewer(this);
-        scene_manager_->setTrainerManager(trainer_manager_.get());
 
         // Create support components
         gui_manager_ = std::make_unique<gui::GuiManager>(this);
 
         // Create rendering manager with initial antialiasing setting
         rendering_manager_ = std::make_unique<RenderingManager>();
-
-        // Connect scene manager to rendering manager
-        scene_manager_->setRenderingManager(rendering_manager_.get());
 
         // Set initial antialiasing
         RenderSettings initial_settings;
@@ -50,8 +54,20 @@ namespace gs::visualizer {
         // Create data loading service
         data_loader_ = std::make_unique<DataLoadingService>(scene_manager_.get());
 
+        // Create parameter manager (lazy-loads JSON files on first use)
+        parameter_manager_ = std::make_unique<ParameterManager>();
+
         // Create main loop
         main_loop_ = std::make_unique<MainLoop>();
+
+        // Register services in the service locator
+        services().set(scene_manager_.get());
+        services().set(trainer_manager_.get());
+        services().set(rendering_manager_.get());
+        services().set(window_manager_.get());
+        services().set(&command_history_);
+        services().set(gui_manager_.get());
+        services().set(parameter_manager_.get());
 
         // Setup connections
         setupEventHandlers();
@@ -59,13 +75,17 @@ namespace gs::visualizer {
     }
 
     VisualizerImpl::~VisualizerImpl() {
+        // Clear event handlers before destroying components to prevent use-after-free
+        lfs::core::event::bus().clear_all();
+        services().clear();
+
         trainer_manager_.reset();
-        translation_gizmo_tool_.reset();
+        brush_tool_.reset();
         tool_context_.reset();
         if (gui_manager_) {
             gui_manager_->shutdown();
         }
-        LOG_INFO("Visualizer destroyed");
+        LOG_DEBUG("Visualizer destroyed");
     }
 
     void VisualizerImpl::initializeTools() {
@@ -74,27 +94,42 @@ namespace gs::visualizer {
             return;
         }
 
-        // Create the tool context
         tool_context_ = std::make_unique<ToolContext>(
             rendering_manager_.get(),
             scene_manager_.get(),
             &viewport_,
-            window_manager_->getWindow());
+            window_manager_->getWindow(),
+            &command_history_);
 
-        // Create translation gizmo tool
-        translation_gizmo_tool_ = std::make_shared<tools::TranslationGizmoTool>();
+        // Connect tool context to input controller
+        if (input_controller_) {
+            input_controller_->setToolContext(tool_context_.get());
+        }
 
-        // Initialize the tool with the context
-        if (!translation_gizmo_tool_->initialize(*tool_context_)) {
-            LOG_ERROR("Failed to initialize translation gizmo tool");
-            translation_gizmo_tool_.reset();
-        } else {
-            // Connect tool to input controller
-            if (input_controller_) {
-                input_controller_->setTranslationGizmoTool(translation_gizmo_tool_);
-                input_controller_->setToolContext(tool_context_.get());
-            }
-            LOG_DEBUG("Translation gizmo tool initialized successfully");
+        brush_tool_ = std::make_shared<tools::BrushTool>();
+        if (!brush_tool_->initialize(*tool_context_)) {
+            LOG_ERROR("Failed to initialize brush tool");
+            brush_tool_.reset();
+        } else if (input_controller_) {
+            input_controller_->setBrushTool(brush_tool_);
+        }
+
+        align_tool_ = std::make_shared<tools::AlignTool>();
+        if (!align_tool_->initialize(*tool_context_)) {
+            LOG_ERROR("Failed to initialize align tool");
+            align_tool_.reset();
+        } else if (input_controller_) {
+            input_controller_->setAlignTool(align_tool_);
+        }
+
+        selection_tool_ = std::make_shared<tools::SelectionTool>();
+        if (!selection_tool_->initialize(*tool_context_)) {
+            LOG_ERROR("Failed to initialize selection tool");
+            selection_tool_.reset();
+        } else if (input_controller_) {
+            input_controller_->setSelectionTool(selection_tool_);
+            // Connect input bindings to selection tool for customizable scroll actions
+            selection_tool_->setInputBindings(&input_controller_->getBindings());
         }
 
         tools_initialized_ = true;
@@ -109,112 +144,122 @@ namespace gs::visualizer {
         main_loop_->setShouldCloseCallback([this]() { return allowclose(); });
 
         gui_manager_->setFileSelectedCallback([this](const std::filesystem::path& path, bool is_dataset) {
-            events::cmd::LoadFile{.path = path, .is_dataset = is_dataset}.emit();
+            lfs::core::events::cmd::LoadFile{.path = path, .is_dataset = is_dataset}.emit();
         });
     }
 
     void VisualizerImpl::setupEventHandlers() {
-        using namespace events;
+        using namespace lfs::core::events;
 
-        // Training commands
-        cmd::StartTraining::when([this](const auto&) {
-            if (trainer_manager_) {
-                trainer_manager_->startTraining();
+        // NOTE: Training control commands (Start/Pause/Resume/Stop/SaveCheckpoint)
+        // are now handled by TrainerManager::setupEventHandlers()
+
+        cmd::ResetTraining::when([this](const auto&) {
+            if (!scene_manager_ || !scene_manager_->hasDataset()) {
+                LOG_WARN("Cannot reset: no dataset");
+                return;
             }
-        });
-
-        cmd::PauseTraining::when([this](const auto&) {
-            if (trainer_manager_) {
-                trainer_manager_->pauseTraining();
-            }
-        });
-
-        cmd::ResumeTraining::when([this](const auto&) {
-            if (trainer_manager_) {
-                trainer_manager_->resumeTraining();
-            }
-        });
-
-        cmd::StopTraining::when([this](const auto&) {
-            if (trainer_manager_) {
+            if (trainer_manager_ && trainer_manager_->isTrainingActive()) {
                 trainer_manager_->stopTraining();
+                trainer_manager_->waitForCompletion();
+            }
+            const auto& path = scene_manager_->getDatasetPath();
+            const auto& init_path = data_loader_->getParameters().init_path;
+            if (path.empty()) {
+                LOG_ERROR("Cannot reset: empty path");
+                return;
+            }
+            // Preserve user-modified params
+            if (auto* const param_mgr = services().paramsOrNull(); param_mgr && param_mgr->ensureLoaded()) {
+                auto params = param_mgr->createForDataset(path, {});
+                if (trainer_manager_) {
+                    params.dataset = trainer_manager_->getEditableDatasetParams();
+                    params.dataset.data_path = path;
+                    params.init_path = init_path;
+                }
+                data_loader_->setParameters(params);
+            }
+            LOG_DEBUG("Resetting: reloading {}", lfs::core::path_to_utf8(path));
+            if (const auto result = data_loader_->loadDataset(path); !result) {
+                LOG_ERROR("Reload failed: {}", result.error());
             }
         });
 
-        cmd::SaveCheckpoint::when([this](const auto&) {
-            if (trainer_manager_) {
-                trainer_manager_->requestSaveCheckpoint();
+        cmd::ClearScene::when([this](const auto&) {
+            if (auto* const param_mgr = services().paramsOrNull()) {
+                param_mgr->resetToDefaults();
             }
         });
 
-        // Render settings changes
-        ui::RenderSettingsChanged::when([this]([[maybe_unused]] const auto& event) {
-            if (rendering_manager_) {
-                // The rendering manager handles this internally now
-                // Just need to mark dirty which happens in its event handler
-            }
-        });
+        // Undo/Redo commands (require command_history_ which lives here)
+        cmd::Undo::when([this](const auto&) { undo(); });
+        cmd::Redo::when([this](const auto&) { redo(); });
 
-        // Camera moves - mark dirty
-        ui::CameraMove::when([this](const auto&) {
-            if (rendering_manager_) {
-                rendering_manager_->markDirty();
-            }
-        });
+        // Selection operations (require command_history_ and tools)
+        cmd::DeleteSelected::when([this](const auto&) { deleteSelectedGaussians(); });
+        cmd::InvertSelection::when([this](const auto&) { invertSelection(); });
+        cmd::DeselectAll::when([this](const auto&) { deselectAll(); });
+        cmd::SelectAll::when([this](const auto&) { selectAll(); });
+        cmd::CopySelection::when([this](const auto&) { copySelection(); });
+        cmd::PasteSelection::when([this](const auto&) { pasteSelection(); });
 
-        // Scene changes - mark dirty
+        // NOTE: ui::RenderSettingsChanged, ui::CameraMove, state::SceneChanged,
+        // ui::PointCloudModeChanged are handled by RenderingManager::setupEventHandlers()
+
+        // Window redraw requests on scene/mode changes
         state::SceneChanged::when([this](const auto&) {
             if (window_manager_) {
                 window_manager_->requestRedraw();
             }
-            if (rendering_manager_) {
-                rendering_manager_->markDirty();
+        });
+
+        ui::PointCloudModeChanged::when([this](const auto&) {
+            if (window_manager_) {
+                window_manager_->requestRedraw();
             }
         });
 
+        // Trainer ready signal
         internal::TrainerReady::when([this](const auto&) {
             internal::TrainingReadyToStart{}.emit();
         });
 
-        // Training progress - don't mark dirty, let throttling handle it
-        state::TrainingProgress::when([this]([[maybe_unused]] const auto& event) {
-            // Just update loss buffer, don't force render
-            // The 1 FPS throttle will handle rendering
+        // Training started - switch to splat rendering and select training model
+        state::TrainingStarted::when([this](const auto&) {
+            ui::PointCloudModeChanged{
+                .enabled = false,
+                .voxel_size = 0.03f}
+                .emit();
+
+            // Select the training model so it's visible
+            if (scene_manager_) {
+                const auto& scene = scene_manager_->getScene();
+                const auto& model_name = scene.getTrainingModelNodeName();
+                if (!model_name.empty()) {
+                    scene_manager_->selectNode(model_name);
+                    LOG_INFO("Selected training model '{}' for training", model_name);
+                }
+            }
+
+            LOG_INFO("Switched to splat rendering mode (training started)");
         });
 
-        // Listen for 3DGUT auto-enable notification
-        state::GutAutoEnabled::when([this](const auto&) {
-            gut_auto_enabled_warning_ = true;
-        });
-
-        // Listen for file load commands
-        cmd::LoadProject::when([this](const auto& cmd) {
-            handleLoadProjectCommand(cmd);
-        });
-
-        // Listen to TrainingCompleted
-        events::state::TrainingCompleted::when([this](const auto& event) {
+        // Training completed - update content type
+        state::TrainingCompleted::when([this](const auto& event) {
             handleTrainingCompleted(event);
         });
 
-        // Listen to load dataset (we need to update project)
+        // File loading commands
         cmd::LoadFile::when([this](const auto& cmd) {
             handleLoadFileCommand(cmd);
         });
 
-        // Listen to save project
-        cmd::SaveProject::when([this](const auto& cmd) {
-            handleSaveProject(cmd);
+        cmd::LoadConfigFile::when([this](const auto& cmd) {
+            handleLoadConfigFile(cmd.path);
         });
 
-        // Listen to export config
-        cmd::ExportConfig::when([this](const auto& cmd) {
-            handleExportConfig(cmd);
-        });
-
-        // Listen to import config
-        cmd::ImportConfig::when([this](const auto& cmd) {
-            handleImportConfig(cmd);
+        cmd::SwitchToLatestCheckpoint::when([this](const auto&) {
+            handleSwitchToLatestCheckpoint();
         });
     }
 
@@ -233,7 +278,7 @@ namespace gs::visualizer {
             }
             window_initialized_ = true;
 
-            // CRITICAL: Poll events once to get actual window dimensions from the OS
+            // Poll events to get actual window dimensions
             window_manager_->pollEvents();
             window_manager_->updateWindowSize();
 
@@ -260,12 +305,11 @@ namespace gs::visualizer {
         }
 
         // Create simplified input controller AFTER ImGui is initialized
+        // NOTE: InputController uses services() for TrainerManager, RenderingManager, GuiManager
         if (!input_controller_) {
             input_controller_ = std::make_unique<InputController>(
                 window_manager_->getWindow(), viewport_);
             input_controller_->initialize();
-            input_controller_->setTrainingManager(trainer_manager_);
-            input_controller_->setRenderingManager(rendering_manager_.get());
         }
 
         // Initialize rendering with proper viewport dimensions
@@ -287,13 +331,26 @@ namespace gs::visualizer {
     void VisualizerImpl::update() {
         window_manager_->updateWindowSize();
 
-        // Update the main viewport with window size
-        viewport_.windowSize = window_manager_->getWindowSize();
+        if (gui_manager_) {
+            const auto& size = gui_manager_->getViewportSize();
+            viewport_.windowSize = {static_cast<int>(size.x), static_cast<int>(size.y)};
+        } else {
+            viewport_.windowSize = window_manager_->getWindowSize();
+        }
         viewport_.frameBufferSize = window_manager_->getFramebufferSize();
 
-        // Update gizmo tool if active
-        if (translation_gizmo_tool_ && translation_gizmo_tool_->isEnabled() && tool_context_) {
-            translation_gizmo_tool_->update(*tool_context_);
+        if (brush_tool_ && brush_tool_->isEnabled() && tool_context_) {
+            brush_tool_->update(*tool_context_);
+        }
+        if (selection_tool_ && selection_tool_->isEnabled() && tool_context_) {
+            selection_tool_->update(*tool_context_);
+        }
+
+        // Auto-start training if --train flag was passed
+        if (pending_auto_train_ && trainer_manager_ && trainer_manager_->canStart()) {
+            pending_auto_train_ = false;
+            LOG_INFO("Auto-starting training (--train flag)");
+            cmd::StartTraining{}.emit();
         }
     }
 
@@ -312,6 +369,9 @@ namespace gs::visualizer {
             auto pos = gui_manager_->getViewportPos();
             auto size = gui_manager_->getViewportSize();
             input_controller_->updateViewportBounds(pos.x, pos.y, size.x, size.y);
+            if (tool_context_) {
+                tool_context_->updateViewportBounds(pos.x, pos.y, size.x, size.y);
+            }
         }
 
         // Update point cloud mode in input controller
@@ -340,7 +400,7 @@ namespace gs::visualizer {
             has_viewport_region = true;
         }
 
-        // Create render context
+        // viewport_region accounts for toolbar offset - required for all render modes
         RenderingManager::RenderContext context{
             .viewport = viewport_,
             .settings = rendering_manager_->getSettings(),
@@ -348,149 +408,321 @@ namespace gs::visualizer {
             .has_focus = gui_manager_ && gui_manager_->isViewportFocused(),
             .scene_manager = scene_manager_.get()};
 
+        if (gui_manager_) {
+            rendering_manager_->setCropboxGizmoActive(gui_manager_->isCropboxGizmoActive());
+            rendering_manager_->setEllipsoidGizmoActive(gui_manager_->isEllipsoidGizmoActive());
+        }
+
         rendering_manager_->renderFrame(context, scene_manager_.get());
 
         gui_manager_->render();
 
         window_manager_->swapBuffers();
-        window_manager_->pollEvents();
+
+        // Render-on-demand: VSync handles frame pacing, waitEvents saves CPU when idle
+        const bool is_training = trainer_manager_ && trainer_manager_->isRunning();
+        const bool needs_render = rendering_manager_->needsRender();
+        const bool continuous_input = input_controller_ && input_controller_->isContinuousInputActive();
+
+        if (needs_render || continuous_input) {
+            // Dirty or active input (WASD/orbit/pan): poll for smooth interaction
+            window_manager_->pollEvents();
+        } else if (is_training) {
+            // Training: longer wait to reduce GPU load and memory fragmentation
+            constexpr double TRAINING_WAIT_SEC = 0.1; // ~10 Hz
+            window_manager_->waitEvents(TRAINING_WAIT_SEC);
+        } else {
+            // Idle: long wait to minimize CPU usage (VSync still applies on wake)
+            constexpr double IDLE_WAIT_SEC = 0.5;
+            window_manager_->waitEvents(IDLE_WAIT_SEC);
+        }
     }
 
     bool VisualizerImpl::allowclose() {
-        // If we are trying to close and the project is temporary, show dialog
-        if (window_manager_->shouldClose() && !gui_manager_->isForceExit()) {
-            if (project_) {
-                if (project_->getIsTempProject() && !project_->getIsProjectEmpty()) {
-                    gui_manager_->showWindow("project_changed_dialog_box", true);
-                    window_manager_->cancelClose();
-                }
-            }
-        }
-        // If we are trying to close and the project is temporary and we are forcing exit, unlock project
-        if (window_manager_->shouldClose() && gui_manager_->isForceExit()) {
-            if (project_) {
-                if (project_->getIsTempProject()) {
-                    project_->unlockProject();
-                }
-            }
+        if (!window_manager_->shouldClose()) {
+            return false;
         }
 
+        if (!gui_manager_) {
+            return true;
+        }
+
+        // User confirmed exit
+        if (gui_manager_->isForceExit()) {
 #ifdef WIN32
-        // show console in case it was hidden to prevent cmd window to stay hidden/in memory after closing the application
-        if (window_manager_->shouldClose()) {
-            HWND hwnd = GetConsoleWindow();
+            // Restore console visibility on Windows
+            const HWND hwnd = GetConsoleWindow();
             Sleep(1);
-            HWND owner = GetWindow(hwnd, GW_OWNER);
-            DWORD dwProcessId;
-            GetWindowThreadProcessId(hwnd, &dwProcessId);
-
-            // show console if we started from console
-            if (GetCurrentProcessId() != dwProcessId) {
-                if (owner == NULL) {
-                    ShowWindow(hwnd, SW_SHOW); // Windows 10
-                } else {
-                    ShowWindow(owner, SW_SHOW); // Windows 11
-                }
+            const HWND owner = GetWindow(hwnd, GW_OWNER);
+            DWORD process_id = 0;
+            GetWindowThreadProcessId(hwnd, &process_id);
+            if (GetCurrentProcessId() != process_id) {
+                ShowWindow(owner ? owner : hwnd, SW_SHOW);
             }
-        }
 #endif
+            return true;
+        }
 
-        return window_manager_->shouldClose();
+        // Show confirmation or wait for pending dialog
+        if (!gui_manager_->isExitConfirmationPending()) {
+            gui_manager_->requestExitConfirmation();
+        }
+        window_manager_->cancelClose();
+        return false;
     }
 
     void VisualizerImpl::shutdown() {
+        // Stop training before GPU resources are freed
+        if (trainer_manager_) {
+            if (trainer_manager_->isTrainingActive()) {
+                trainer_manager_->stopTraining();
+                trainer_manager_->waitForCompletion();
+            }
+            trainer_manager_.reset();
+        }
+
         // Shutdown tools
-        if (translation_gizmo_tool_) {
-            translation_gizmo_tool_->shutdown();
-            translation_gizmo_tool_.reset();
+        if (brush_tool_) {
+            brush_tool_->shutdown();
+            brush_tool_.reset();
+        }
+        if (selection_tool_) {
+            selection_tool_->shutdown();
+            selection_tool_.reset();
         }
 
         // Clean up tool context
         tool_context_.reset();
 
+        command_history_.clear();
+
         tools_initialized_ = false;
     }
 
-    bool VisualizerImpl::LoadProject() {
-        if (project_) {
-            try {
-                LOG_TIMER("LoadProject");
-                // write to project file on every change - maybe configurable in the future?
-                project_->setUpdateFileOnChange(true);
-                // slicing intended
-                auto dataset = static_cast<const param::DatasetConfig&>(project_->getProjectData().data_set_info);
-                if (!dataset.data_path.empty()) {
-                    LOG_DEBUG("Loading dataset from project: {}", dataset.data_path.string());
-                    auto result = data_loader_->loadDataset(dataset.data_path);
-                    if (!result) {
-                        LOG_ERROR("Failed to load dataset from project: {}", result.error());
-                        throw std::runtime_error(std::format("Failed to load dataset from project: {}", result.error()));
-                    }
-                }
-                // update the project of all the different managers
-                updateProjectOnModules();
-                // load plys
-                LoadProjectPlys();
-
-                auto plys = project_->getPlys();
-                LOG_INFO("Project loaded successfully with {} PLY files", plys.size());
-            } catch (const std::exception& e) {
-                LOG_ERROR("Failed to load project: {}", e.what());
-                throw std::runtime_error(std::format("Failed to load project: {}", e.what()));
-            }
-
-            return true;
+    void VisualizerImpl::undo() {
+        command_history_.undo();
+        if (rendering_manager_) {
+            rendering_manager_->markDirty();
         }
-        return false;
     }
 
-    void VisualizerImpl::LoadProjectPlys() {
-        if (!project_) {
-            LOG_ERROR("LoadProjectPlys: project is not initialized");
+    void VisualizerImpl::redo() {
+        command_history_.redo();
+        if (rendering_manager_) {
+            rendering_manager_->markDirty();
+        }
+    }
+
+    void VisualizerImpl::deleteSelectedGaussians() {
+        if (!scene_manager_)
+            return;
+
+        auto& scene = scene_manager_->getScene();
+        auto selection = scene.getSelectionMask();
+
+        if (!selection || !selection->is_valid()) {
+            LOG_INFO("No Gaussians selected to delete");
             return;
         }
 
-        auto plys = project_->getPlys();
-        LOG_DEBUG("Loading {} PLY files from project", plys.size());
+        // Get all visible nodes and apply deletion
+        auto nodes = scene.getVisibleNodes();
+        if (nodes.empty())
+            return;
 
-        // sort according to iter numbers
-        std::sort(plys.begin(), plys.end(),
-                  [](const gs::management::PlyData& a, const gs::management::PlyData& b) {
-                      return a.ply_training_iter_number < b.ply_training_iter_number;
-                  });
+        size_t offset = 0;
+        bool any_deleted = false;
 
-        if (!plys.empty()) {
-            scene_manager_->changeContentType(SceneManager::ContentType::SplatFiles);
-        }
-
-        // set all of the nodes to invisible except the last one
-        for (auto it = plys.begin(); it != plys.end(); ++it) {
-            std::string ply_name = it->ply_name;
-            if (!std::filesystem::exists(it->ply_path)) {
-                LOG_ERROR("ply path not exists {}. skip loading", it->ply_path.string());
+        for (const auto* node : nodes) {
+            if (!node || !node->model)
                 continue;
-            }
-            bool is_last = (std::next(it) == plys.end());
 
-            LOG_TRACE("Adding PLY '{}' to scene (visible: {})", ply_name, is_last);
-            try {
-                scene_manager_->addSplatFile(it->ply_path, ply_name, is_last);
-                scene_manager_->setPLYVisibility(ply_name, is_last);
-            } catch (const std::exception& e) {
-                LOG_ERROR("failed loading ply path {}. reason {} ", it->ply_path.string(), e.what());
+            const size_t node_size = node->model->size();
+            if (node_size == 0)
+                continue;
+
+            // Extract selection for this node
+            auto node_selection = selection->slice(0, offset, offset + node_size);
+
+            // Convert selection (uint8) to bool tensor for soft_delete
+            auto bool_mask = node_selection.to(lfs::core::DataType::Bool);
+
+            // Get old state for undo (clone before modifying)
+            auto old_deleted = node->model->has_deleted_mask()
+                                   ? node->model->deleted().clone()
+                                   : lfs::core::Tensor::zeros({node_size}, lfs::core::Device::CUDA, lfs::core::DataType::Bool);
+
+            // Apply soft delete (OR with existing deleted mask)
+            node->model->soft_delete(bool_mask);
+
+            // Get new state for redo
+            auto new_deleted = node->model->deleted().clone();
+
+            // Create undo command (uses services() internally)
+            auto cmd = std::make_unique<command::CropCommand>(
+                node->name, std::move(old_deleted), std::move(new_deleted));
+            command_history_.execute(std::move(cmd));
+
+            any_deleted = true;
+            offset += node_size;
+        }
+
+        if (any_deleted) {
+            LOG_INFO("Deleted selected Gaussians");
+            // Mark scene as dirty to rebuild combined model with updated deletion masks
+            scene.markDirty();
+            // Clear selection after deletion
+            scene.clearSelection();
+            if (rendering_manager_) {
+                rendering_manager_->markDirty();
             }
         }
+    }
+
+    void VisualizerImpl::invertSelection() {
+        if (!scene_manager_)
+            return;
+        auto& scene = scene_manager_->getScene();
+        const size_t total = scene.getTotalGaussianCount();
+        if (total == 0)
+            return;
+
+        const auto old_mask = scene.getSelectionMask();
+        const auto ones = lfs::core::Tensor::ones({total}, lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
+        auto new_mask = std::make_shared<lfs::core::Tensor>(
+            (old_mask && old_mask->is_valid()) ? ones - *old_mask : ones);
+
+        scene.setSelectionMask(new_mask);
+        command_history_.execute(std::make_unique<command::SelectionCommand>(
+            scene_manager_.get(),
+            old_mask ? std::make_shared<lfs::core::Tensor>(old_mask->clone()) : nullptr,
+            new_mask));
+        if (rendering_manager_)
+            rendering_manager_->markDirty();
+    }
+
+    void VisualizerImpl::deselectAll() {
+        if (selection_tool_)
+            selection_tool_->clearPolygon();
+
+        if (!scene_manager_)
+            return;
+        auto& scene = scene_manager_->getScene();
+        if (!scene.hasSelection())
+            return;
+
+        const auto old_mask = scene.getSelectionMask();
+        scene.clearSelection();
+        command_history_.execute(std::make_unique<command::SelectionCommand>(
+            scene_manager_.get(),
+            old_mask ? std::make_shared<lfs::core::Tensor>(old_mask->clone()) : nullptr,
+            nullptr));
+        if (rendering_manager_)
+            rendering_manager_->markDirty();
+    }
+
+    void VisualizerImpl::selectAll() {
+        if (!scene_manager_)
+            return;
+
+        const auto tool = editor_context_.getActiveTool();
+        const bool is_selection_tool = (tool == ToolType::Selection || tool == ToolType::Brush);
+
+        if (is_selection_tool) {
+            // Select all gaussians for the active node
+            auto& scene = scene_manager_->getScene();
+            const size_t total = scene.getTotalGaussianCount();
+            if (total == 0)
+                return;
+
+            const auto& selected_name = scene_manager_->getSelectedNodeName();
+            if (selected_name.empty())
+                return;
+
+            const int node_index = scene.getVisibleNodeIndex(selected_name);
+            if (node_index < 0)
+                return;
+
+            const auto transform_indices = scene.getTransformIndices();
+            if (!transform_indices || transform_indices->numel() != total)
+                return;
+
+            const auto old_mask = scene.getSelectionMask();
+            auto new_mask = std::make_shared<lfs::core::Tensor>(transform_indices->eq(node_index));
+            scene.setSelectionMask(new_mask);
+            command_history_.execute(std::make_unique<command::SelectionCommand>(
+                scene_manager_.get(),
+                old_mask ? std::make_shared<lfs::core::Tensor>(old_mask->clone()) : nullptr,
+                new_mask));
+        } else {
+            // Select all SPLAT nodes
+            const auto& scene = scene_manager_->getScene();
+            const auto nodes = scene.getNodes();
+            std::vector<std::string> splat_names;
+            splat_names.reserve(nodes.size());
+            for (const auto* node : nodes) {
+                if (node->type == NodeType::SPLAT) {
+                    splat_names.push_back(node->name);
+                }
+            }
+            if (!splat_names.empty()) {
+                scene_manager_->selectNodes(splat_names);
+            }
+        }
+        if (rendering_manager_)
+            rendering_manager_->markDirty();
+    }
+
+    void VisualizerImpl::copySelection() {
+        if (!scene_manager_)
+            return;
+
+        const auto tool = editor_context_.getActiveTool();
+        const bool is_selection_tool = (tool == ToolType::Selection || tool == ToolType::Brush);
+
+        if (is_selection_tool && scene_manager_->getScene().hasSelection()) {
+            scene_manager_->copySelectedGaussians();
+        } else {
+            scene_manager_->copySelectedNodes();
+        }
+    }
+
+    void VisualizerImpl::pasteSelection() {
+        if (!scene_manager_)
+            return;
+
+        const auto pasted = scene_manager_->hasGaussianClipboard()
+                                ? scene_manager_->pasteGaussians()
+                                : scene_manager_->pasteNodes();
+
+        if (pasted.empty())
+            return;
+
+        if (selection_tool_) {
+            selection_tool_->clearPolygon();
+            selection_tool_->setEnabled(false);
+        }
+        scene_manager_->getScene().resetSelectionState();
+
+        scene_manager_->clearSelection();
+        for (const auto& name : pasted) {
+            scene_manager_->addToSelection(name);
+        }
+
+        if (rendering_manager_)
+            rendering_manager_->markDirty();
     }
 
     void VisualizerImpl::run() {
-        // The main loop will call initialize() as its init callback
-        // Don't duplicate initialization here
-        LoadProject();
         main_loop_->run();
     }
 
-    void VisualizerImpl::setParameters(const param::TrainingParameters& params) {
+    void VisualizerImpl::setParameters(const lfs::core::param::TrainingParameters& params) {
         data_loader_->setParameters(params);
+        if (parameter_manager_) {
+            parameter_manager_->setSessionDefaults(params);
+        }
+        pending_auto_train_ = params.optimization.auto_train;
     }
 
     std::expected<void, std::string> VisualizerImpl::loadPLY(const std::filesystem::path& path) {
@@ -502,338 +734,74 @@ namespace gs::visualizer {
             return std::unexpected("Failed to initialize visualizer");
         }
 
-        LOG_INFO("Loading PLY file: {}", path.string());
+        LOG_INFO("Loading PLY file: {}", lfs::core::path_to_utf8(path));
         return data_loader_->loadPLY(path);
+    }
+
+    std::expected<void, std::string> VisualizerImpl::addSplatFile(const std::filesystem::path& path) {
+        if (!initialize()) {
+            return std::unexpected("Failed to initialize visualizer");
+        }
+        try {
+            data_loader_->addSplatFileToScene(path);
+            return {};
+        } catch (const std::exception& e) {
+            return std::unexpected(std::format("Failed to add splat file: {}", e.what()));
+        }
     }
 
     std::expected<void, std::string> VisualizerImpl::loadDataset(const std::filesystem::path& path) {
         LOG_TIMER("LoadDataset");
 
-        // Ensure full initialization before loading dataset
-        // This will only initialize once due to the guard in initialize()
         if (!initialize()) {
             return std::unexpected("Failed to initialize visualizer");
         }
 
-        LOG_INFO("Loading dataset: {}", path.string());
-        auto result = data_loader_->loadDataset(path);
-        if (result && project_) {
-            auto data_config = project_->getProjectData().data_set_info;
-            if (data_config.data_path.empty() || data_config.data_path == path) { // empty project or same data
-                data_config.data_path = path;
-                project_->setDataInfo(data_config);
-            } else {
-                project_ = gs::management::CreateTempNewProject(data_config, project_->getOptimizationParams());
-                updateProjectOnModules();
-            }
+        LOG_INFO("Loading dataset: {}", lfs::core::path_to_utf8(path));
+        return data_loader_->loadDataset(path);
+    }
+
+    std::expected<void, std::string> VisualizerImpl::loadCheckpointForTraining(const std::filesystem::path& path) {
+        LOG_TIMER("LoadCheckpointForTraining");
+
+        // Ensure full initialization before loading checkpoint
+        if (!initialize()) {
+            return std::unexpected("Failed to initialize visualizer");
         }
 
-        return result;
+        LOG_INFO("Loading checkpoint for training: {}", lfs::core::path_to_utf8(path));
+        return data_loader_->loadCheckpointForTraining(path);
+    }
+
+    void VisualizerImpl::consolidateModels() {
+        scene_manager_->consolidateNodeModels();
     }
 
     void VisualizerImpl::clearScene() {
         data_loader_->clearScene();
     }
 
-    bool VisualizerImpl::openProject(const std::filesystem::path& path) {
-        LOG_TIMER("OpenProject");
-
-        auto project = std::make_shared<gs::management::Project>();
-
-        if (!project) {
-            LOG_ERROR("Failed to create project object");
-            throw std::runtime_error("Failed to create project object");
-        }
-
-        if (!project->readFromFile(path)) {
-            LOG_ERROR("Failed to read project file: {}", path.string());
-            throw std::runtime_error(std::format("Failed to read project file: {}", path.string()));
-        }
-
-        if (!project->validateProjectData()) {
-            LOG_ERROR("Failed to validate project data from: {}", path.string());
-            throw std::runtime_error(std::format("Failed to validate project data from: {}", path.string()));
-        }
-
-        project_ = project;
-        LOG_INFO("Project opened successfully: {}", path.string());
-
-        return true;
+    void VisualizerImpl::handleLoadFileCommand([[maybe_unused]] const lfs::core::events::cmd::LoadFile& cmd) {
+        // File loading is handled by the data_loader_ service
     }
 
-    bool VisualizerImpl::closeProject(const std::filesystem::path& path) {
-        if (!project_) {
-            LOG_WARN("No project to close");
-            return false;
-        }
-
-        if (!path.empty()) {
-            project_->setProjectFileName(path);
-        }
-
-        bool success = project_->writeToFile();
-        if (success) {
-            LOG_INFO("Project saved successfully");
-        } else {
-            LOG_ERROR("Failed to save project");
-        }
-
-        return success;
-    }
-
-    void VisualizerImpl::attachProject(std::shared_ptr<gs::management::Project> _project) {
-        project_ = _project;
-        updateProjectOnModules();
-    }
-
-    std::shared_ptr<gs::management::Project> VisualizerImpl::getProject() {
-        return project_;
-    }
-
-    void VisualizerImpl::handleLoadProjectCommand(const events::cmd::LoadProject& cmd) {
-        try {
-            bool success = openProject(cmd.path);
-            if (!success) {
-                throw std::runtime_error(std::format("Failed opening project: {}", cmd.path.string()));
-            }
-
-            success = LoadProject();
-            if (!success) {
-                throw std::runtime_error(std::format("Failed to load project content: {}", cmd.path.string()));
-            }
-        } catch (const std::exception& e) {
-            LOG_ERROR("Error handling LoadProject command: {}", e.what());
-
-            // Re-throw to let higher level handle it
-            throw;
-        }
-    }
-
-    void VisualizerImpl::handleLoadFileCommand(const events::cmd::LoadFile& cmd) {
-        if (cmd.is_dataset && project_) {
-            auto data_config = project_->getProjectData().data_set_info;
-            data_config.data_path = cmd.path;
-
-            if (project_->getIsTempProject()) {
-                data_config.output_path.clear();
-                project_ = gs::management::CreateTempNewProject(data_config, project_->getOptimizationParams());
-            } else { // else: project already exits (with output dir) - only need to replace data path
-                project_->setDataInfo(data_config);
-            }
-
-            updateProjectOnModules();
-        }
-    }
-
-    void VisualizerImpl::handleSaveProject(const events::cmd::SaveProject& cmd) {
-        if (project_) {
-            const auto& dst_dir = cmd.project_dir;
-            if (!std::filesystem::exists(dst_dir)) {
-                bool success = std::filesystem::create_directories(dst_dir);
-                if (!success) {
-                    LOG_ERROR("Directory creation failed {}", dst_dir.string());
-                    return;
-                }
-                LOG_INFO("created directory successfully {}", dst_dir.string());
-            }
-            if (project_->getIsTempProject()) {
-                if (!project_->portProjectToDir(dst_dir)) {
-                    LOG_ERROR("porting project failed. Dst dir {} ", project_->getProjectOutputFolder().string());
-                }
-                project_->setIsTempProject(false);
-
-                for (const auto& ply : project_->getPlys()) {
-                    scene_manager_->updatePlyPath(ply.ply_name, ply.ply_path);
-                }
-
-            } else {
-                if (!project_->writeToFile()) {
-                    LOG_ERROR("save project failed {} ", project_->getProjectFileName().string());
-                }
-            }
-            LOG_INFO("Project was saved successfully to {}", project_->getProjectFileName().string());
-        }
-    }
-
-    void VisualizerImpl::handleExportConfig(const events::cmd::ExportConfig& cmd) {
-        if (!project_) {
-            gui_manager_->showNotificationPopup("No project loaded", true);
-            LOG_ERROR("No project loaded to export configuration from");
+    void VisualizerImpl::handleLoadConfigFile(const std::filesystem::path& path) {
+        auto result = lfs::core::param::read_optim_params_from_json(path);
+        if (!result) {
+            state::ConfigLoadFailed{.path = path, .error = result.error()}.emit();
             return;
         }
-
-        try {
-            // Check if parent directory exists and is writable
-            auto parent_path = cmd.path.parent_path();
-            if (!parent_path.empty() && !std::filesystem::exists(parent_path)) {
-                gui_manager_->showNotificationPopup("Directory does not exist: " + parent_path.string(), true);
-                LOG_ERROR("Parent directory does not exist: {}", parent_path.string());
-                return;
-            }
-
-            // Get current optimization parameters
-            auto opt_params = project_->getOptimizationParams();
-
-            // Convert to JSON
-            nlohmann::json config_json = opt_params.to_json();
-
-            // Write to file with pretty printing
-            std::ofstream file(cmd.path);
-            if (!file.is_open()) {
-                gui_manager_->showNotificationPopup("Failed to open file for writing: " + cmd.path.filename().string(), true);
-                LOG_ERROR("Failed to open file for writing: {}", cmd.path.string());
-                return;
-            }
-
-            file << config_json.dump(4); // 4 spaces indentation
-            file.flush(); // Ensure data is written to disk
-
-            // Check if write was successful
-            if (!file.good()) {
-                gui_manager_->showNotificationPopup("Failed to write configuration (disk full?)", true);
-                LOG_ERROR("Failed to write configuration to: {}", cmd.path.string());
-                file.close();
-
-                // Try to clean up partial file
-                std::error_code ec;
-                std::filesystem::remove(cmd.path, ec);
-                return;
-            }
-
-            file.close();
-
-            // Verify file was actually created and has content
-            if (!std::filesystem::exists(cmd.path) || std::filesystem::file_size(cmd.path) == 0) {
-                gui_manager_->showNotificationPopup("File verification failed (file missing or empty)", true);
-                LOG_ERROR("File verification failed: {}", cmd.path.string());
-                return;
-            }
-
-            // Show success notification
-            std::string success_msg = std::format("Configuration exported successfully to:\n{}", cmd.path.filename().string());
-            gui_manager_->showNotificationPopup(success_msg, false);
-
-            LOG_INFO("Configuration exported successfully to: {}", cmd.path.string());
-
-        } catch (const std::exception& e) {
-            gui_manager_->showNotificationPopup(std::format("Export failed: {}", e.what()), true);
-            LOG_ERROR("Failed to export configuration: {}", e.what());
-        }
+        parameter_manager_->importParams(*result);
     }
 
-    void VisualizerImpl::handleImportConfig(const events::cmd::ImportConfig& cmd) {
-        if (!project_) {
-            gui_manager_->showNotificationPopup("No project loaded", true);
-            LOG_ERROR("No project loaded to import configuration into");
-            return;
-        }
-
-        try {
-            // Read JSON file with RAII - file automatically closes when out of scope
-            nlohmann::json config_json;
-            {
-                std::ifstream file(cmd.path);
-                if (!file.is_open()) {
-                    gui_manager_->showNotificationPopup("Failed to open file: " + cmd.path.filename().string(), true);
-                    LOG_ERROR("Failed to open config file: {}", cmd.path.string());
-                    return;
-                }
-                file >> config_json;
-            } // File automatically closed here
-
-            // Parse optimization parameters from JSON
-            auto opt_params = gs::param::OptimizationParameters::from_json(config_json);
-
-            // Validate critical parameters
-            if (opt_params.iterations == 0 || opt_params.iterations > 1000000) {
-                gui_manager_->showNotificationPopup(std::format("Invalid iterations: {} (must be 1-1,000,000)", opt_params.iterations), true);
-                LOG_ERROR("Invalid iterations value: {}", opt_params.iterations);
-                return;
-            }
-
-            if (opt_params.means_lr <= 0 || opt_params.means_lr > 1.0) {
-                gui_manager_->showNotificationPopup(std::format("Invalid position learning rate: {:.6f}\n(must be > 0 and <= 1.0)", opt_params.means_lr), true);
-                LOG_ERROR("Invalid means_lr value: {}", opt_params.means_lr);
-                return;
-            }
-
-            if (opt_params.shs_lr <= 0 || opt_params.shs_lr > 1.0) {
-                gui_manager_->showNotificationPopup(std::format("Invalid SH learning rate: {:.6f}\n(must be > 0 and <= 1.0)", opt_params.shs_lr), true);
-                LOG_ERROR("Invalid shs_lr value: {}", opt_params.shs_lr);
-                return;
-            }
-
-            if (opt_params.sh_degree < 0 || opt_params.sh_degree > 3) {
-                gui_manager_->showNotificationPopup(std::format("Invalid SH degree: {} (must be 0-3)", opt_params.sh_degree), true);
-                LOG_ERROR("Invalid sh_degree value: {}", opt_params.sh_degree);
-                return;
-            }
-
-            // Check GPU availability if specific GPU requested
-            if (opt_params.gpu_id >= 0) {
-                int device_count = torch::cuda::is_available() ? torch::cuda::device_count() : 0;
-                if (opt_params.gpu_id >= device_count) {
-                    gui_manager_->showNotificationPopup(std::format("Invalid GPU ID: {}\n(only {} GPU(s) available)", opt_params.gpu_id, device_count), true);
-                    LOG_ERROR("Invalid gpu_id: {} (max: {})", opt_params.gpu_id, device_count - 1);
-                    return;
-                }
-            }
-
-            // Validate strategy
-            if (opt_params.strategy != "mcmc" && opt_params.strategy != "default" && !opt_params.strategy.empty()) {
-                gui_manager_->showNotificationPopup(std::format("Invalid strategy: '{}'\n(must be 'mcmc' or 'default')", opt_params.strategy), true);
-                LOG_ERROR("Invalid strategy: {}", opt_params.strategy);
-                return;
-            }
-
-            // Update project with validated parameters
-            project_->setOptimizationParams(opt_params);
-
-            // Show success notification
-            std::string success_msg = std::format("Configuration imported successfully!\n{} iterations, {} strategy",
-                                         opt_params.iterations,
-                                         opt_params.strategy.empty() ? "default" : opt_params.strategy);
-            gui_manager_->showNotificationPopup(success_msg, false);
-
-            LOG_INFO("Configuration imported successfully from: {}", cmd.path.string());
-            LOG_INFO("Imported {} iterations, strategy: {}", opt_params.iterations, opt_params.strategy);
-
-        } catch (const nlohmann::json::parse_error& e) {
-            gui_manager_->showNotificationPopup(std::format("Invalid JSON format:\n{}", e.what()), true);
-            LOG_ERROR("JSON parse error: {}", e.what());
-        } catch (const nlohmann::json::type_error& e) {
-            gui_manager_->showNotificationPopup(std::format("JSON type error:\n{}", e.what()), true);
-            LOG_ERROR("JSON type error: {}", e.what());
-        } catch (const std::exception& e) {
-            gui_manager_->showNotificationPopup(std::format("Import failed:\n{}", e.what()), true);
-            LOG_ERROR("Failed to import configuration: {}", e.what());
-        }
-    }
-
-    void VisualizerImpl::handleTrainingCompleted([[maybe_unused]] const events::state::TrainingCompleted& event) {
-
-        if (!scene_manager_) {
-            LOG_ERROR("scene manager is not initialized");
-            return;
-        }
-        if (!project_) {
-            LOG_ERROR("project is not initialized");
-            return;
-        }
-        // load plys
-        LoadProjectPlys();
-
+    void VisualizerImpl::handleTrainingCompleted([[maybe_unused]] const state::TrainingCompleted& event) {
         if (scene_manager_) {
             scene_manager_->changeContentType(SceneManager::ContentType::Dataset);
         }
     }
 
-    void VisualizerImpl::updateProjectOnModules() {
-        if (trainer_manager_) {
-            trainer_manager_->setProject(project_);
-        }
-        if (scene_manager_) {
-            scene_manager_->setProject(project_);
-        }
+    void VisualizerImpl::handleSwitchToLatestCheckpoint() {
+        LOG_WARN("Switch to latest checkpoint not implemented without project management");
     }
-} // namespace gs::visualizer
+
+} // namespace lfs::vis

@@ -4,6 +4,7 @@
 
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 
 #include "gui/utils/windows_utils.hpp"
 
@@ -12,23 +13,21 @@
 #include <windows.h>
 #endif // WIN32
 
-namespace gs::gui {
+namespace lfs::vis::gui {
 #ifdef WIN32
 
     namespace utils {
         HRESULT selectFileNative(PWSTR& strDirectory,
                                  COMDLG_FILTERSPEC rgSpec[],
                                  UINT cFileTypes,
-                                 bool blnDirectory,
-                                 LPCWSTR defaultFolder) {
+                                 bool blnDirectory) {
 
-            HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
             if (FAILED(hr)) {
                 LOG_ERROR("Failed to initialize COM: {:#x}", static_cast<unsigned int>(hr));
             } else {
-                // Create the FileOpenDialog instance
                 IFileOpenDialog* pFileOpen = nullptr;
-                hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL,
+                hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
                                       IID_IFileOpenDialog, reinterpret_cast<void**>(&pFileOpen));
 
                 if (SUCCEEDED(hr)) {
@@ -52,18 +51,7 @@ namespace gs::gui {
                         }
                     }
 
-                    // Set default folder if provided
-                    if (defaultFolder != nullptr) {
-                        IShellItem* pDefaultFolder = nullptr;
-                        hr = SHCreateItemFromParsingName(defaultFolder, NULL, IID_PPV_ARGS(&pDefaultFolder));
-                        if (SUCCEEDED(hr)) {
-                            pFileOpen->SetFolder(pDefaultFolder);
-                            pDefaultFolder->Release();
-                        }
-                    }
-
-                    // Show the Open File dialog
-                    hr = pFileOpen->Show(NULL);
+                    hr = pFileOpen->Show(nullptr);
 
                     if (SUCCEEDED(hr)) {
                         IShellItem* pItem;
@@ -74,7 +62,7 @@ namespace gs::gui {
 
                             if (SUCCEEDED(hr)) {
                                 strDirectory = filePath;
-                                CoTaskMemFree(filePath);
+                                // Caller is responsible for calling CoTaskMemFree(strDirectory)
                             }
                             pItem->Release();
                         }
@@ -88,169 +76,498 @@ namespace gs::gui {
             }
             return hr;
         }
-        HRESULT saveFileNative(PWSTR& strDirectory,
+    } // namespace utils
+
+    namespace utils {
+        // Helper function to convert UTF-8 string to wide string (UTF-16)
+        // Properly handles Unicode characters including Japanese, Chinese, etc.
+        std::wstring utf8_to_wstring(const std::string& utf8_str) {
+            if (utf8_str.empty()) {
+                return std::wstring();
+            }
+
+            // Get required buffer size
+            const int size_needed = MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(),
+                                                        static_cast<int>(utf8_str.size()),
+                                                        nullptr, 0);
+            if (size_needed <= 0) {
+                LOG_ERROR("UTF-8 to wide string conversion failed");
+                return std::wstring();
+            }
+
+            // Perform conversion
+            std::wstring wstr(size_needed, 0);
+            const int converted = MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(),
+                                                      static_cast<int>(utf8_str.size()),
+                                                      &wstr[0], size_needed);
+            if (converted <= 0) {
+                LOG_ERROR("UTF-8 to wide string conversion failed during write");
+                return std::wstring();
+            }
+            wstr.resize(converted);
+            return wstr;
+        }
+
+        HRESULT saveFileNative(PWSTR& outPath,
                                COMDLG_FILTERSPEC rgSpec[],
                                UINT cFileTypes,
-                               LPCWSTR defaultFileName,
-                               LPCWSTR defaultFolder) {
-
-            HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+                               const wchar_t* defaultName) {
+            HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
             if (FAILED(hr)) {
                 LOG_ERROR("Failed to initialize COM: {:#x}", static_cast<unsigned int>(hr));
-            } else {
-                // Create the FileSaveDialog instance
-                IFileSaveDialog* pFileSave = nullptr;
-                hr = CoCreateInstance(CLSID_FileSaveDialog, NULL, CLSCTX_ALL,
-                                      IID_IFileSaveDialog, reinterpret_cast<void**>(&pFileSave));
+                return hr;
+            }
+
+            IFileSaveDialog* pFileSave = nullptr;
+            hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_ALL,
+                                  IID_IFileSaveDialog, reinterpret_cast<void**>(&pFileSave));
+
+            if (SUCCEEDED(hr)) {
+                if (rgSpec != nullptr && cFileTypes > 0) {
+                    pFileSave->SetFileTypes(cFileTypes, rgSpec);
+                    pFileSave->SetFileTypeIndex(1);
+                    pFileSave->SetDefaultExtension(L"ply");
+                }
+
+                if (defaultName != nullptr) {
+                    pFileSave->SetFileName(defaultName);
+                }
+
+                hr = pFileSave->Show(nullptr);
 
                 if (SUCCEEDED(hr)) {
-                    // Set file type filters
-                    if (rgSpec != nullptr && cFileTypes > 0) {
-                        hr = pFileSave->SetFileTypes(cFileTypes, rgSpec);
-                        if (SUCCEEDED(hr)) {
-                            pFileSave->SetFileTypeIndex(1);
-                            pFileSave->SetDefaultExtension(L"json");
-                        } else {
-                            LOG_ERROR("Failed to set file types: {:#x}", static_cast<unsigned int>(hr));
-                        }
-                    }
-
-                    // Set default file name if provided
-                    if (defaultFileName != nullptr) {
-                        pFileSave->SetFileName(defaultFileName);
-                    }
-
-                    // Set default folder if provided
-                    if (defaultFolder != nullptr) {
-                        IShellItem* pDefaultFolder = nullptr;
-                        hr = SHCreateItemFromParsingName(defaultFolder, NULL, IID_PPV_ARGS(&pDefaultFolder));
-                        if (SUCCEEDED(hr)) {
-                            pFileSave->SetFolder(pDefaultFolder);
-                            pDefaultFolder->Release();
-                        }
-                    }
-
-                    // Show the Save File dialog
-                    hr = pFileSave->Show(NULL);
-
+                    IShellItem* pItem;
+                    hr = pFileSave->GetResult(&pItem);
                     if (SUCCEEDED(hr)) {
-                        IShellItem* pItem;
-                        hr = pFileSave->GetResult(&pItem);
+                        PWSTR filePath = nullptr;
+                        hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &filePath);
                         if (SUCCEEDED(hr)) {
-                            PWSTR filePath = nullptr;
-                            hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &filePath);
-
-                            if (SUCCEEDED(hr)) {
-                                strDirectory = filePath;
-                                CoTaskMemFree(filePath);
-                            }
-                            pItem->Release();
+                            outPath = filePath;
                         }
+                        pItem->Release();
                     }
-                    pFileSave->Release();
-                } else {
-                    LOG_ERROR("Failed to create FileSaveDialog: {:#x}", static_cast<unsigned int>(hr));
-                    CoUninitialize();
                 }
-                CoUninitialize();
+                pFileSave->Release();
             }
+            CoUninitialize();
             return hr;
         }
     } // namespace utils
 
-    void OpenProjectFileDialog() {
-        // show native windows file dialog for project file selection
-        PWSTR filePath = nullptr;
-
-        COMDLG_FILTERSPEC rgSpec[] =
-            {
-                {L"LichtFeldStudio Project File", L"*.lfs;*.ls"},
-            };
-
-        if (SUCCEEDED(gs::gui::utils::selectFileNative(filePath, rgSpec, 1, false))) {
-            std::filesystem::path project_path(filePath);
-            events::cmd::LoadProject{.path = project_path}.emit();
-            LOG_INFO("Loading project file : {}", std::filesystem::path(project_path).string());
-        }
-    }
-
-    void OpenPlyFileDialog() {
-        // show native windows file dialog for PLY file selection
-        PWSTR filePath = nullptr;
-        COMDLG_FILTERSPEC rgSpec[] =
-            {
-                {L"Point Cloud", L"*.ply;"},
-            };
-        if (SUCCEEDED(gs::gui::utils::selectFileNative(filePath, rgSpec, 1, false))) {
-            std::filesystem::path ply_path(filePath);
-            events::cmd::LoadFile{.path = ply_path}.emit();
-            LOG_INFO("Loading PLY file : {}", std::filesystem::path(ply_path).string()); // FIXED: Changed from "Loading project file"
-        }
-    }
-
-    void OpenDatasetFolderDialog() {
-        // show native windows file dialog for folder selection
-        PWSTR filePath = nullptr;
-        if (SUCCEEDED(gs::gui::utils::selectFileNative(filePath, nullptr, 0, true))) {
-            std::filesystem::path dataset_path(filePath);
-            if (std::filesystem::is_directory(dataset_path)) {
-                events::cmd::LoadFile{.path = dataset_path, .is_dataset = true}.emit();
-                LOG_INFO("Loading dataset : {}", std::filesystem::path(dataset_path).string());
-            }
-        }
-    }
-
-    void SaveProjectFileDialog(bool* p_open) {
-        // show native windows file dialog for project directory selection
-        PWSTR filePath = nullptr;
-        if (SUCCEEDED(gs::gui::utils::selectFileNative(filePath, nullptr, 0, true))) {
-            std::filesystem::path project_path(filePath);
-            events::cmd::SaveProject{project_path}.emit();
-            LOG_INFO("Saving project file into : {}", std::filesystem::path(project_path).string());
-            *p_open = false;
-        }
-    }
-
-    void ExportConfigFileDialog() {
-        // show native windows save file dialog for config JSON export
-        PWSTR filePath = nullptr;
-        COMDLG_FILTERSPEC rgSpec[] =
-            {
-                {L"JSON Configuration", L"*.json"},
-                {L"All Files", L"*.*"}
-            };
-
-        // Get absolute path to parameter directory
-        auto param_dir = std::filesystem::absolute("parameter");
-        std::wstring param_dir_wstr = param_dir.wstring();
-
-        if (SUCCEEDED(gs::gui::utils::saveFileNative(filePath, rgSpec, 2, L"optimization_config.json", param_dir_wstr.c_str()))) {
-            std::filesystem::path config_path(filePath);
-            events::cmd::ExportConfig{.path = config_path}.emit();
-            LOG_INFO("Exporting config to: {}", config_path.string());
-        }
-    }
-
-    void ImportConfigFileDialog() {
-        // show native windows file dialog for config JSON import
-        PWSTR filePath = nullptr;
-        COMDLG_FILTERSPEC rgSpec[] =
-            {
-                {L"JSON Configuration", L"*.json"},
-                {L"All Files", L"*.*"}
-            };
-
-        // Get absolute path to parameter directory
-        auto param_dir = std::filesystem::absolute("parameter");
-        std::wstring param_dir_wstr = param_dir.wstring();
-
-        if (SUCCEEDED(gs::gui::utils::selectFileNative(filePath, rgSpec, 2, false, param_dir_wstr.c_str()))) {
-            std::filesystem::path config_path(filePath);
-            events::cmd::ImportConfig{.path = config_path}.emit();
-            LOG_INFO("Importing config from: {}", config_path.string());
-        }
-    }
-
 #endif // WIN32
 
-} // namespace gs::gui
+    namespace {
+#ifndef _WIN32
+        constexpr size_t DIALOG_BUFFER_SIZE = 4096;
+
+        // Escape a string for safe use in shell single-quoted arguments
+        // Single quotes in the string are handled by ending the quote, adding escaped quote, resuming quote
+        // Example: "it's" becomes 'it'\''s'
+        std::string shell_escape(const std::string& str) {
+            std::string result = "'";
+            for (char c : str) {
+                if (c == '\'') {
+                    // End single quote, add escaped single quote, start new single quote
+                    result += "'\\''";
+                } else {
+                    result += c;
+                }
+            }
+            result += "'";
+            return result;
+        }
+
+        // Execute dialog command, trying fallback if primary fails
+        std::string runDialogCommand(const std::string& primary_cmd, const std::string& fallback_cmd) {
+            FILE* pipe = popen(primary_cmd.c_str(), "r");
+            if (!pipe && !fallback_cmd.empty()) {
+                pipe = popen(fallback_cmd.c_str(), "r");
+            }
+            if (!pipe)
+                return {};
+
+            char buffer[DIALOG_BUFFER_SIZE];
+            std::string result;
+            while (fgets(buffer, sizeof(buffer), pipe)) {
+                result += buffer;
+            }
+            pclose(pipe);
+
+            // Trim trailing newlines
+            while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+                result.pop_back();
+            }
+            return result;
+        }
+#endif
+    } // namespace
+
+    std::filesystem::path SaveJsonFileDialog(const std::string& defaultName) {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"JSON File", L"*.json"}};
+        const std::wstring wDefaultName = utils::utf8_to_wstring(defaultName);
+
+        if (SUCCEEDED(utils::saveFileNative(filePath, rgSpec, 1, wDefaultName.c_str()))) {
+            std::filesystem::path result(filePath);
+            CoTaskMemFree(filePath);
+            if (result.extension() != ".json") {
+                result += ".json";
+            }
+            return result;
+        }
+        return {};
+#else
+        const std::string escaped_name = shell_escape(defaultName + ".json");
+        const std::string primary = "zenity --file-selection --save --confirm-overwrite "
+                                    "--file-filter='JSON files|*.json' "
+                                    "--filename=" +
+                                    escaped_name + " 2>/dev/null";
+        const std::string fallback = "kdialog --getsavefilename . 'JSON files (*.json)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        if (result.empty())
+            return {};
+
+        std::filesystem::path path(result);
+        if (path.extension() != ".json") {
+            path += ".json";
+        }
+        return path;
+#endif
+    }
+
+    std::filesystem::path OpenJsonFileDialog() {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"JSON File", L"*.json"}};
+
+        if (SUCCEEDED(utils::selectFileNative(filePath, rgSpec, 1, false))) {
+            std::filesystem::path result(filePath);
+            CoTaskMemFree(filePath);
+            return result;
+        }
+        return {};
+#else
+        const std::string primary = "zenity --file-selection --file-filter='JSON files|*.json' 2>/dev/null";
+        const std::string fallback = "kdialog --getopenfilename . 'JSON files (*.json)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        if (result.empty())
+            return {};
+        return std::filesystem::path(result);
+#endif
+    }
+
+    std::filesystem::path OpenImageFileDialog(const std::filesystem::path& startDir) {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"Image Files", L"*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.hdr;*.exr"}};
+
+        if (SUCCEEDED(utils::selectFileNative(filePath, rgSpec, 1, false))) {
+            std::filesystem::path result(filePath);
+            CoTaskMemFree(filePath);
+            return result;
+        }
+        return {};
+#else
+        const bool has_valid_start = !startDir.empty() && std::filesystem::exists(startDir);
+        const std::string start_path = has_valid_start
+                                           ? shell_escape(lfs::core::path_to_utf8(startDir))
+                                           : "'.'";
+        const std::string primary = "zenity --file-selection "
+                                    "--filename=" +
+                                    start_path + "/ "
+                                                 "--file-filter='Image files|*.png *.jpg *.jpeg *.bmp *.tga *.hdr *.exr' "
+                                                 "--title='Open Background Image' 2>/dev/null";
+        const std::string fallback = "kdialog --getopenfilename " + start_path + " 'Image files (*.png *.jpg *.jpeg *.bmp *.tga *.hdr *.exr)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        return result.empty() ? std::filesystem::path{} : std::filesystem::path(result);
+#endif
+    }
+
+    std::filesystem::path SavePlyFileDialog(const std::string& defaultName) {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"PLY Point Cloud", L"*.ply"}};
+        const std::wstring wDefaultName = utils::utf8_to_wstring(defaultName);
+
+        if (SUCCEEDED(utils::saveFileNative(filePath, rgSpec, 1, wDefaultName.c_str()))) {
+            std::filesystem::path result(filePath);
+            CoTaskMemFree(filePath);
+            if (result.extension() != ".ply") {
+                result += ".ply";
+            }
+            return result;
+        }
+        return {};
+#else
+        const std::string escaped_name = shell_escape(defaultName + ".ply");
+        const std::string primary = "zenity --file-selection --save --confirm-overwrite "
+                                    "--file-filter='PLY files|*.ply' "
+                                    "--filename=" +
+                                    escaped_name + " 2>/dev/null";
+        const std::string fallback = "kdialog --getsavefilename . 'PLY files (*.ply)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        if (result.empty())
+            return {};
+
+        std::filesystem::path path(result);
+        if (path.extension() != ".ply") {
+            path += ".ply";
+        }
+        return path;
+#endif
+    }
+
+    std::filesystem::path SaveSogFileDialog(const std::string& defaultName) {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"SOG File (SuperSplat)", L"*.sog"}};
+        const std::wstring wDefaultName = utils::utf8_to_wstring(defaultName);
+
+        if (SUCCEEDED(utils::saveFileNative(filePath, rgSpec, 1, wDefaultName.c_str()))) {
+            std::filesystem::path result(filePath);
+            CoTaskMemFree(filePath);
+            if (result.extension() != ".sog") {
+                result += ".sog";
+            }
+            return result;
+        }
+        return {};
+#else
+        const std::string escaped_name = shell_escape(defaultName + ".sog");
+        const std::string primary = "zenity --file-selection --save --confirm-overwrite "
+                                    "--file-filter='SOG files (SuperSplat)|*.sog' "
+                                    "--filename=" +
+                                    escaped_name + " 2>/dev/null";
+        const std::string fallback = "kdialog --getsavefilename . 'SOG files (*.sog)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        if (result.empty())
+            return {};
+
+        std::filesystem::path path(result);
+        if (path.extension() != ".sog") {
+            path += ".sog";
+        }
+        return path;
+#endif
+    }
+
+    std::filesystem::path SaveSpzFileDialog(const std::string& defaultName) {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"SPZ File (Niantic)", L"*.spz"}};
+        const std::wstring wDefaultName = utils::utf8_to_wstring(defaultName);
+
+        if (SUCCEEDED(utils::saveFileNative(filePath, rgSpec, 1, wDefaultName.c_str()))) {
+            std::filesystem::path result(filePath);
+            CoTaskMemFree(filePath);
+            if (result.extension() != ".spz") {
+                result += ".spz";
+            }
+            return result;
+        }
+        return {};
+#else
+        const std::string escaped_name = shell_escape(defaultName + ".spz");
+        const std::string primary = "zenity --file-selection --save --confirm-overwrite "
+                                    "--file-filter='SPZ files (Niantic)|*.spz' "
+                                    "--filename=" +
+                                    escaped_name + " 2>/dev/null";
+        const std::string fallback = "kdialog --getsavefilename . 'SPZ files (*.spz)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        if (result.empty())
+            return {};
+
+        std::filesystem::path path(result);
+        if (path.extension() != ".spz") {
+            path += ".spz";
+        }
+        return path;
+#endif
+    }
+
+    std::filesystem::path SaveHtmlFileDialog(const std::string& defaultName) {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"HTML Viewer", L"*.html"}};
+        const std::wstring wDefaultName = utils::utf8_to_wstring(defaultName);
+
+        if (SUCCEEDED(utils::saveFileNative(filePath, rgSpec, 1, wDefaultName.c_str()))) {
+            std::filesystem::path result(filePath);
+            CoTaskMemFree(filePath);
+            if (result.extension() != ".html") {
+                result += ".html";
+            }
+            return result;
+        }
+        return {};
+#else
+        const std::string escaped_name = shell_escape(defaultName + ".html");
+        const std::string primary = "zenity --file-selection --save --confirm-overwrite "
+                                    "--file-filter='HTML files|*.html' "
+                                    "--filename=" +
+                                    escaped_name + " 2>/dev/null";
+        const std::string fallback = "kdialog --getsavefilename . 'HTML files (*.html)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        if (result.empty())
+            return {};
+
+        std::filesystem::path path(result);
+        if (path.extension() != ".html") {
+            path += ".html";
+        }
+        return path;
+#endif
+    }
+
+    std::filesystem::path SelectFolderDialog(const std::string& title, const std::filesystem::path& startDir) {
+#ifdef _WIN32
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if (FAILED(hr)) {
+            LOG_ERROR("COM init failed: {:#x}", static_cast<unsigned int>(hr));
+            return {};
+        }
+
+        IFileOpenDialog* pFileOpen = nullptr;
+        hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
+                              IID_IFileOpenDialog, reinterpret_cast<void**>(&pFileOpen));
+
+        std::filesystem::path result;
+        if (SUCCEEDED(hr)) {
+            DWORD dwOptions = 0;
+            if (SUCCEEDED(pFileOpen->GetOptions(&dwOptions))) {
+                pFileOpen->SetOptions(dwOptions | FOS_PICKFOLDERS);
+            }
+
+            if (!startDir.empty() && std::filesystem::exists(startDir)) {
+                IShellItem* pStartFolder = nullptr;
+                const std::wstring wStartDir = startDir.wstring();
+                hr = SHCreateItemFromParsingName(wStartDir.c_str(), nullptr, IID_PPV_ARGS(&pStartFolder));
+                if (SUCCEEDED(hr)) {
+                    pFileOpen->SetFolder(pStartFolder);
+                    pStartFolder->Release();
+                }
+            }
+
+            hr = pFileOpen->Show(nullptr);
+            if (SUCCEEDED(hr)) {
+                IShellItem* pItem = nullptr;
+                hr = pFileOpen->GetResult(&pItem);
+                if (SUCCEEDED(hr)) {
+                    PWSTR filePath = nullptr;
+                    hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &filePath);
+                    if (SUCCEEDED(hr)) {
+                        result = std::filesystem::path(filePath);
+                        CoTaskMemFree(filePath);
+                    }
+                    pItem->Release();
+                }
+            }
+            pFileOpen->Release();
+        }
+        CoUninitialize();
+        return result;
+#else
+        std::filesystem::path abs_start_dir = startDir;
+        if (!abs_start_dir.empty()) {
+            if (abs_start_dir.is_relative()) {
+                abs_start_dir = std::filesystem::absolute(abs_start_dir);
+            }
+        }
+
+        const bool has_valid_start = !abs_start_dir.empty() &&
+                                     std::filesystem::exists(abs_start_dir) &&
+                                     std::filesystem::is_directory(abs_start_dir);
+
+        // Use path_to_utf8 for proper Unicode handling on Linux
+        const std::string start_dir_utf8 = has_valid_start
+                                               ? lfs::core::path_to_utf8(abs_start_dir) + "/"
+                                               : "";
+        const std::string start_arg = has_valid_start
+                                          ? " --filename=" + shell_escape(start_dir_utf8)
+                                          : "";
+
+        const std::string escaped_title = shell_escape(title);
+        const std::string primary = "zenity --file-selection --directory "
+                                    "--title=" +
+                                    escaped_title + start_arg + " 2>/dev/null";
+        const std::string fallback_dir = has_valid_start
+                                             ? shell_escape(lfs::core::path_to_utf8(abs_start_dir))
+                                             : "'.'";
+        const std::string fallback = "kdialog --getexistingdirectory " + fallback_dir + " 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        return result.empty() ? std::filesystem::path{} : std::filesystem::path(result);
+#endif
+    }
+
+    std::filesystem::path OpenPlyFileDialogNative(const std::filesystem::path& startDir) {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"Point Cloud", L"*.ply;*.sog;*.spz"}};
+
+        if (SUCCEEDED(utils::selectFileNative(filePath, rgSpec, 1, false))) {
+            std::filesystem::path result(filePath);
+            return result;
+        }
+        return {};
+#else
+        const bool has_valid_start = !startDir.empty() && std::filesystem::exists(startDir);
+        const std::string start_path = has_valid_start
+                                           ? shell_escape(lfs::core::path_to_utf8(startDir))
+                                           : "'.'";
+        const std::string primary = "zenity --file-selection "
+                                    "--filename=" +
+                                    start_path + "/ "
+                                                 "--file-filter='Point Cloud|*.ply *.sog *.spz' "
+                                                 "--title='Open Point Cloud' 2>/dev/null";
+        const std::string fallback = "kdialog --getopenfilename " + start_path + " 'Point Cloud (*.ply *.sog *.spz)' 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        return result.empty() ? std::filesystem::path{} : std::filesystem::path(result);
+#endif
+    }
+
+    std::filesystem::path OpenCheckpointFileDialog() {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        COMDLG_FILTERSPEC rgSpec[] = {{L"Checkpoint", L"*.resume"}};
+
+        if (SUCCEEDED(utils::selectFileNative(filePath, rgSpec, 1, false))) {
+            return std::filesystem::path(filePath);
+        }
+        return {};
+#else
+        const std::string result = runDialogCommand(
+            "zenity --file-selection --file-filter='Checkpoint|*.resume' --title='Open Checkpoint' 2>/dev/null",
+            "kdialog --getopenfilename . 'Checkpoint (*.resume)' 2>/dev/null");
+        return result.empty() ? std::filesystem::path{} : std::filesystem::path(result);
+#endif
+    }
+
+    std::filesystem::path OpenDatasetFolderDialogNative() {
+#ifdef _WIN32
+        PWSTR filePath = nullptr;
+        if (SUCCEEDED(utils::selectFileNative(filePath, nullptr, 0, true))) {
+            std::filesystem::path result(filePath);
+            return result;
+        }
+        return {};
+#else
+        const std::string primary = "zenity --file-selection --directory "
+                                    "--title='Select Dataset Folder' 2>/dev/null";
+        const std::string fallback = "kdialog --getexistingdirectory . 2>/dev/null";
+
+        const std::string result = runDialogCommand(primary, fallback);
+        return result.empty() ? std::filesystem::path{} : std::filesystem::path(result);
+#endif
+    }
+
+} // namespace lfs::vis::gui

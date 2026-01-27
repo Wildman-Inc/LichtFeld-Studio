@@ -1,7 +1,7 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -96,7 +96,7 @@ TEST_F(TensorMemoryTest, MemoryOwnership) {
         auto torch_t = torch::zeros({100, 100}, torch::TensorOptions().device(torch::kCUDA));
 
         EXPECT_TRUE(custom_t.owns_memory());
-        EXPECT_NE(custom_t.raw_ptr(), nullptr);
+        EXPECT_NE(custom_t.data_ptr(), nullptr);
         EXPECT_NE(torch_t.data_ptr(), nullptr);
 
         compare_tensors(custom_t, torch_t, 1e-6f, 1e-7f, "OwningMemory");
@@ -114,7 +114,7 @@ TEST_F(TensorMemoryTest, MemoryOwnership) {
                                         torch::TensorOptions().device(torch::kCUDA));
 
         EXPECT_FALSE(custom_t.owns_memory());
-        EXPECT_EQ(custom_t.raw_ptr(), cuda_data);
+        EXPECT_EQ(custom_t.data_ptr(), cuda_data);
         EXPECT_EQ(torch_t.data_ptr(), cuda_data);
 
         compare_tensors(custom_t, torch_t, 1e-6f, 1e-7f, "NonOwningBlob");
@@ -129,12 +129,12 @@ TEST_F(TensorMemoryTest, MoveSemantics) {
     {
         auto custom_t1 = Tensor::ones({50, 50}, Device::CUDA);
         EXPECT_TRUE(custom_t1.owns_memory());
-        original_ptr = custom_t1.raw_ptr();
+        original_ptr = custom_t1.data_ptr();
 
         auto custom_t2 = std::move(custom_t1);
-        EXPECT_EQ(custom_t2.raw_ptr(), original_ptr);
+        EXPECT_EQ(custom_t2.data_ptr(), original_ptr);
         EXPECT_TRUE(custom_t2.owns_memory());
-        EXPECT_EQ(custom_t1.raw_ptr(), nullptr);
+        EXPECT_EQ(custom_t1.data_ptr(), nullptr);
         EXPECT_FALSE(custom_t1.owns_memory());
 
         // Verify data is correct
@@ -147,13 +147,13 @@ TEST_F(TensorMemoryTest, MoveSemantics) {
         auto custom_t1 = Tensor::zeros({30, 30}, Device::CUDA);
         auto custom_t2 = Tensor::ones({20, 20}, Device::CUDA);
 
-        void* ptr1 = custom_t1.raw_ptr();
-        void* ptr2 = custom_t2.raw_ptr();
+        void* ptr1 = custom_t1.data_ptr();
+        void* ptr2 = custom_t2.data_ptr();
 
         custom_t2 = std::move(custom_t1);
 
-        EXPECT_EQ(custom_t2.raw_ptr(), ptr1);
-        EXPECT_EQ(custom_t1.raw_ptr(), nullptr);
+        EXPECT_EQ(custom_t2.data_ptr(), ptr1);
+        EXPECT_EQ(custom_t1.data_ptr(), nullptr);
 
         // Verify data is zeros
         auto torch_zeros = torch::zeros({30, 30}, torch::TensorOptions().device(torch::kCUDA));
@@ -173,7 +173,7 @@ TEST_F(TensorMemoryTest, ViewDoesNotOwnMemory) {
     auto torch_view = torch_original.view({20, 6});
 
     EXPECT_FALSE(custom_view.owns_memory());
-    EXPECT_EQ(custom_view.raw_ptr(), custom_original.raw_ptr());
+    EXPECT_EQ(custom_view.data_ptr(), custom_original.data_ptr());
     EXPECT_EQ(torch_view.data_ptr(), torch_original.data_ptr());
 
     compare_tensors(custom_view, torch_view, 1e-6f, 1e-7f, "ViewDoesNotOwn");
@@ -203,9 +203,9 @@ TEST_F(TensorMemoryTest, SliceDoesNotOwnMemory) {
     EXPECT_FALSE(custom_slice.owns_memory());
 
     // Both slices should point to part of original memory
-    EXPECT_GE(custom_slice.raw_ptr(), custom_original.raw_ptr());
-    EXPECT_LT(custom_slice.raw_ptr(),
-              static_cast<char*>(custom_original.raw_ptr()) + custom_original.bytes());
+    EXPECT_GE(custom_slice.data_ptr(), custom_original.data_ptr());
+    EXPECT_LT(custom_slice.data_ptr(),
+              static_cast<char*>(custom_original.data_ptr()) + custom_original.bytes());
 
     compare_tensors(custom_slice, torch_slice, 1e-6f, 1e-7f, "SliceDoesNotOwn");
 }
@@ -220,7 +220,7 @@ TEST_F(TensorMemoryTest, CloneOwnsMemory) {
     auto torch_cloned = torch_original.clone();
 
     EXPECT_TRUE(custom_cloned.owns_memory());
-    EXPECT_NE(custom_cloned.raw_ptr(), custom_original.raw_ptr());
+    EXPECT_NE(custom_cloned.data_ptr(), custom_original.data_ptr());
     EXPECT_NE(torch_cloned.data_ptr(), torch_original.data_ptr());
 
     compare_tensors(custom_cloned, torch_cloned, 1e-6f, 1e-7f, "CloneOwnsMemory");
@@ -257,7 +257,7 @@ TEST_F(TensorMemoryTest, DeviceTransferOwnsMemory) {
     auto torch_cpu = torch_cuda.to(torch::kCPU);
 
     EXPECT_TRUE(custom_cpu.owns_memory());
-    EXPECT_NE(custom_cpu.raw_ptr(), custom_cuda.raw_ptr());
+    EXPECT_NE(custom_cpu.data_ptr(), custom_cuda.data_ptr());
     EXPECT_NE(torch_cpu.data_ptr(), torch_cuda.data_ptr());
 
     compare_tensors(custom_cpu, torch_cpu, 1e-6f, 1e-7f, "CPUTransfer");
@@ -266,8 +266,8 @@ TEST_F(TensorMemoryTest, DeviceTransferOwnsMemory) {
     auto torch_cuda2 = torch_cpu.to(torch::kCUDA);
 
     EXPECT_TRUE(custom_cuda2.owns_memory());
-    EXPECT_NE(custom_cuda2.raw_ptr(), custom_cuda.raw_ptr());
-    EXPECT_NE(custom_cuda2.raw_ptr(), custom_cpu.raw_ptr());
+    EXPECT_NE(custom_cuda2.data_ptr(), custom_cuda.data_ptr());
+    EXPECT_NE(custom_cuda2.data_ptr(), custom_cpu.data_ptr());
 
     compare_tensors(custom_cuda2, torch_cuda2, 1e-6f, 1e-7f, "CUDATransfer");
 }
@@ -361,9 +361,9 @@ TEST_F(TensorMemoryTest, MultipleViewsOfSameMemory) {
     auto torch_view3 = torch_original.view({4, 6});
 
     // All views should share the same memory
-    EXPECT_EQ(custom_view1.raw_ptr(), custom_original.raw_ptr());
-    EXPECT_EQ(custom_view2.raw_ptr(), custom_original.raw_ptr());
-    EXPECT_EQ(custom_view3.raw_ptr(), custom_original.raw_ptr());
+    EXPECT_EQ(custom_view1.data_ptr(), custom_original.data_ptr());
+    EXPECT_EQ(custom_view2.data_ptr(), custom_original.data_ptr());
+    EXPECT_EQ(custom_view3.data_ptr(), custom_original.data_ptr());
 
     EXPECT_EQ(torch_view1.data_ptr(), torch_original.data_ptr());
     EXPECT_EQ(torch_view2.data_ptr(), torch_original.data_ptr());
@@ -397,9 +397,9 @@ TEST_F(TensorMemoryTest, NestedViews) {
     auto torch_v3 = torch_v2.view({120});
 
     // All should point to same memory
-    EXPECT_EQ(custom_v1.raw_ptr(), custom_t.raw_ptr());
-    EXPECT_EQ(custom_v2.raw_ptr(), custom_t.raw_ptr());
-    EXPECT_EQ(custom_v3.raw_ptr(), custom_t.raw_ptr());
+    EXPECT_EQ(custom_v1.data_ptr(), custom_t.data_ptr());
+    EXPECT_EQ(custom_v2.data_ptr(), custom_t.data_ptr());
+    EXPECT_EQ(custom_v3.data_ptr(), custom_t.data_ptr());
 
     compare_tensors(custom_v3, torch_v3, 1e-6f, 1e-7f, "NestedViews");
 }
@@ -416,8 +416,8 @@ TEST_F(TensorMemoryTest, CopyFromPreservesOwnership) {
     EXPECT_TRUE(custom_t1.owns_memory());
     EXPECT_TRUE(custom_t2.owns_memory());
 
-    void* ptr1 = custom_t1.raw_ptr();
-    void* ptr2 = custom_t2.raw_ptr();
+    void* ptr1 = custom_t1.data_ptr();
+    void* ptr2 = custom_t2.data_ptr();
 
     custom_t2.copy_from(custom_t1);
     torch_t2.copy_(torch_t1);
@@ -427,8 +427,8 @@ TEST_F(TensorMemoryTest, CopyFromPreservesOwnership) {
     EXPECT_TRUE(custom_t2.owns_memory());
 
     // Pointers should not have changed
-    EXPECT_EQ(custom_t1.raw_ptr(), ptr1);
-    EXPECT_EQ(custom_t2.raw_ptr(), ptr2);
+    EXPECT_EQ(custom_t1.data_ptr(), ptr1);
+    EXPECT_EQ(custom_t2.data_ptr(), ptr2);
 
     compare_tensors(custom_t1, torch_t1, 1e-6f, 1e-7f, "CopyFromSource");
     compare_tensors(custom_t2, torch_t2, 1e-6f, 1e-7f, "CopyFromDest");
@@ -454,7 +454,7 @@ TEST_F(TensorMemoryTest, InvalidTensorOperations) {
     Tensor custom_invalid;
 
     EXPECT_FALSE(custom_invalid.is_valid());
-    EXPECT_EQ(custom_invalid.raw_ptr(), nullptr);
+    EXPECT_EQ(custom_invalid.data_ptr(), nullptr);
     EXPECT_FALSE(custom_invalid.owns_memory());
 
     // Operations on invalid tensor should return invalid tensors
@@ -492,7 +492,7 @@ TEST_F(TensorMemoryTest, MemoryAlignmentAndPadding) {
     auto custom_t = Tensor::empty({17}, Device::CUDA); // Odd size
 
     // CUDA memory should be aligned to at least 256 bytes
-    uintptr_t addr = reinterpret_cast<uintptr_t>(custom_t.raw_ptr());
+    uintptr_t addr = reinterpret_cast<uintptr_t>(custom_t.data_ptr());
     EXPECT_EQ(addr % 256, 0) << "CUDA memory not properly aligned";
 
     // PyTorch also aligns memory

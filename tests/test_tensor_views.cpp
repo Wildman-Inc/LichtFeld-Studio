@@ -1,7 +1,7 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 #include <vector>
@@ -35,9 +35,9 @@ namespace {
         torch::Tensor result = torch::empty(shape, options);
 
         if (t.device() == Device::CPU) {
-            std::memcpy(result.data_ptr(), t.raw_ptr(), t.bytes());
+            std::memcpy(result.data_ptr(), t.data_ptr(), t.bytes());
         } else {
-            cudaMemcpy(result.data_ptr(), t.raw_ptr(), t.bytes(), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(result.data_ptr(), t.data_ptr(), t.bytes(), cudaMemcpyDeviceToDevice);
         }
 
         return result;
@@ -65,12 +65,12 @@ namespace {
         Tensor result = Tensor::empty(TensorShape(shape), device, dtype);
 
         if (device == Device::CPU) {
-            std::memcpy(result.raw_ptr(), t_cont.data_ptr(), result.bytes());
+            std::memcpy(result.data_ptr(), t_cont.data_ptr(), result.bytes());
         } else {
             if (t_cont.is_cpu()) {
-                cudaMemcpy(result.raw_ptr(), t_cont.data_ptr(), result.bytes(), cudaMemcpyHostToDevice);
+                cudaMemcpy(result.data_ptr(), t_cont.data_ptr(), result.bytes(), cudaMemcpyHostToDevice);
             } else {
-                cudaMemcpy(result.raw_ptr(), t_cont.data_ptr(), result.bytes(), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(result.data_ptr(), t_cont.data_ptr(), result.bytes(), cudaMemcpyDeviceToDevice);
             }
         }
 

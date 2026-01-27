@@ -4,44 +4,51 @@
 
 #pragma once
 
+#include "checkpoint.hpp"
 #include "components/bilateral_grid.hpp"
-#include "components/poseopt.hpp"
 #include "components/sparsity_optimizer.hpp"
-#include "core/events.hpp"
+#include "core/camera.hpp"
 #include "core/parameters.hpp"
+#include "core/tensor.hpp"
 #include "dataset.hpp"
+#include "lfs/kernels/ssim.cuh"
 #include "metrics/metrics.hpp"
-#include "optimizers/scheduler.hpp"
+#include "optimizer/scheduler.hpp"
 #include "progress.hpp"
-#include "project/project.hpp"
-#include "rasterization/rasterizer.hpp"
 #include "strategies/istrategy.hpp"
-#if defined(USE_HIP) && USE_HIP
-#include <ATen/hip/HIPEvent.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
-#include <c10/hip/HIPStream.h>
-#else
-#include <ATen/cuda/CUDAEvent.h>
-#include <c10/cuda/CUDAStream.h>
-#endif
+#include "core/cuda/hip_runtime_compat.h"
 #include <atomic>
 #include <expected>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <stop_token>
-#include <torch/torch.h>
+#include <unordered_map>
 
-// Forward declaration
-class Camera;
+// Forward declaration for Scene
+namespace lfs::vis {
+    class Scene;
+}
 
-namespace gs::training {
+namespace lfs::training {
+    class AdamOptimizer;
     class Trainer {
     public:
-        // Constructor that takes ownership of strategy and shares datasets
+        // Legacy constructor - takes ownership of strategy and shares datasets
         Trainer(std::shared_ptr<CameraDataset> dataset,
                 std::unique_ptr<IStrategy> strategy,
                 std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>> provided_splits);
+
+        /**
+         * @brief New constructor - takes Scene reference (Scene owns all data)
+         *
+         * Scene provides:
+         * - Training model via getTrainingModel() (SplatData)
+         * - Train/val cameras via getTrainCameras()/getValCameras()
+         *
+         * Strategy type ("mcmc" or "default") is determined by params during initialize()
+         */
+        Trainer(lfs::vis::Scene& scene);
 
         // Delete copy operations
         Trainer(const Trainer&) = delete;
@@ -56,7 +63,7 @@ namespace gs::training {
         ~Trainer();
 
         // Initialize trainer - must be called before training
-        std::expected<void, std::string> initialize(const param::TrainingParameters& params);
+        std::expected<void, std::string> initialize(const lfs::core::param::TrainingParameters& params);
 
         // Check if trainer is initialized
         bool isInitialized() const { return initialized_.load(); }
@@ -85,20 +92,17 @@ namespace gs::training {
         // Allow viewer to lock for rendering
         std::shared_mutex& getRenderMutex() const { return render_mutex_; }
 
-        const param::TrainingParameters& getParams() const { return params_; }
+        const lfs::core::param::TrainingParameters& getParams() const { return params_; }
+        void setParams(const lfs::core::param::TrainingParameters& params);
 
-        std::shared_ptr<const Camera> getCamById(int camId) const;
+        std::expected<void, std::string> save_checkpoint(int iteration);
+        std::expected<int, std::string> load_checkpoint(const std::filesystem::path& checkpoint_path);
+        void save_final_ply_and_checkpoint(int iteration);
 
-        std::vector<std::shared_ptr<const Camera>> getCamList() const;
-
-        void setProject(std::shared_ptr<gs::management::Project> project) { lf_project_ = project; }
-
-        void load_cameras_info();
+        // Orderly shutdown - GPU sync, wait for async saves, release resources. Idempotent.
+        void shutdown();
 
     private:
-        // Validate masks for all cameras in dataset
-        std::expected<void, std::string> validate_and_prepare_masks(
-            std::shared_ptr<CameraDataset> dataset);
         // Helper for deferred event emission to prevent deadlocks
         struct DeferredEvents {
             std::vector<std::function<void()>> events;
@@ -122,55 +126,64 @@ namespace gs::training {
         };
 
         // Returns the background color to use at a given iteration
-        torch::Tensor& background_for_step(int iter);
+        lfs::core::Tensor& background_for_step(int iter);
+
+        // Returns the resized background image for the given camera dimensions
+        // Returns empty tensor if no background image is set
+        lfs::core::Tensor get_background_image_for_camera(int width, int height);
+
+        lfs::core::Tensor get_random_background_for_camera(int width, int height, int iteration);
 
         // Protected method for processing a single training step
         std::expected<StepResult, std::string> train_step(
             int iter,
-            Camera* cam,
-            torch::Tensor gt_image,
-            torch::Tensor mask,
+            lfs::core::Camera* cam,
+            lfs::core::Tensor gt_image,
             RenderMode render_mode,
             std::stop_token stop_token = {});
 
-        // Protected methods for computing loss
-        std::expected<torch::Tensor, std::string> compute_photometric_loss(
-            const RenderOutput& render_output,
-            const torch::Tensor& gt_image,
-            const SplatData& splatData,
-            const param::OptimizationParameters& opt_params);
+        // Compute photometric loss AND gradient manually (no autograd)
+        // Returns GPU tensor for loss (avoid sync!)
+        std::expected<std::pair<lfs::core::Tensor, lfs::core::Tensor>, std::string> compute_photometric_loss_with_gradient(
+            const lfs::core::Tensor& rendered,
+            const lfs::core::Tensor& gt_image,
+            const lfs::core::param::OptimizationParameters& opt_params);
 
-        std::expected<torch::Tensor, std::string> compute_photometric_loss_withMask(
-            const RenderOutput& render_output,
-            const torch::Tensor& gt_image,
-            const torch::Tensor& mask,
-            const SplatData& splatData,
-            const param::OptimizationParameters& opt_params);
+        struct MaskLossResult {
+            lfs::core::Tensor loss;
+            lfs::core::Tensor grad_image;
+            lfs::core::Tensor grad_alpha;
+        };
 
-        std::expected<float, std::string> compute_scale_reg_loss(
-            SplatData& splatData,
-            const param::OptimizationParameters& opt_params);
+        // Masked photometric loss with optional alpha gradient
+        std::expected<MaskLossResult, std::string> compute_photometric_loss_with_mask(
+            const lfs::core::Tensor& rendered,
+            const lfs::core::Tensor& gt_image,
+            const lfs::core::Tensor& mask,
+            const lfs::core::Tensor& alpha,
+            const lfs::core::param::OptimizationParameters& opt_params);
 
-        std::expected<float, std::string> compute_opacity_reg_loss(
-            SplatData& splatData,
-            const param::OptimizationParameters& opt_params);
+        // Validate masks exist for all cameras when mask mode is enabled
+        std::expected<void, std::string> validate_masks();
 
-        std::expected<torch::Tensor, std::string> compute_bilateral_grid_tv_loss(
-            const std::unique_ptr<BilateralGrid>& bilateral_grid,
-            const param::OptimizationParameters& opt_params);
+        // Returns GPU tensor for loss (avoid sync!)
+        std::expected<lfs::core::Tensor, std::string> compute_scale_reg_loss(
+            lfs::core::SplatData& splatData,
+            AdamOptimizer& optimizer,
+            const lfs::core::param::OptimizationParameters& opt_params);
 
-        // Sparsity-related methods
-        std::expected<torch::Tensor, std::string> compute_sparsity_loss(
-            int iter,
-            const SplatData& splatData);
+        // Returns GPU tensor for loss (avoid sync!)
+        std::expected<lfs::core::Tensor, std::string> compute_opacity_reg_loss(
+            lfs::core::SplatData& splatData,
+            AdamOptimizer& optimizer,
+            const lfs::core::param::OptimizationParameters& opt_params);
 
-        std::expected<void, std::string> handle_sparsity_update(
-            int iter,
-            SplatData& splatData);
+        // Sparsity optimization - returns GPU tensor (no CPU sync)
+        std::expected<std::pair<lfs::core::Tensor, SparsityLossContext>, std::string> compute_sparsity_loss_forward(
+            const int iter, const lfs::core::SplatData& splat_data);
 
-        std::expected<void, std::string> apply_sparsity_pruning(
-            int iter,
-            SplatData& splatData);
+        std::expected<void, std::string> handle_sparsity_update(const int iter, lfs::core::SplatData& splat_data);
+        std::expected<void, std::string> apply_sparsity_pruning(const int iter, lfs::core::SplatData& splat_data);
 
         // Cleanup method for re-initialization
         void cleanup();
@@ -183,32 +196,34 @@ namespace gs::training {
         void save_ply(const std::filesystem::path& save_path, int iter_num, bool join_threads = true);
 
         // Member variables
-        std::shared_ptr<CameraDataset> base_dataset_;
+        lfs::vis::Scene* scene_ = nullptr;            // Non-owning pointer to Scene (new mode)
+        std::shared_ptr<CameraDataset> base_dataset_; // Legacy mode only - source cameras
         std::shared_ptr<CameraDataset> train_dataset_;
         std::shared_ptr<CameraDataset> val_dataset_;
         std::unique_ptr<IStrategy> strategy_;
-        param::TrainingParameters params_;
+        lfs::core::param::TrainingParameters params_;
         std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>> provided_splits_;
 
-        torch::Device device_{torch::kCUDA, 0};  // CUDA device to use for training
-        torch::Tensor background_{};
-        torch::Tensor bg_mix_buffer_;
+        lfs::core::Tensor background_{};
+        lfs::core::Tensor bg_mix_buffer_;
+        lfs::core::Tensor bg_image_base_{};                              // Original background image [C, H, W]
+        std::unordered_map<uint64_t, lfs::core::Tensor> bg_image_cache_; // Cache of resized bg images keyed by (H << 32) | W
+        lfs::core::Tensor random_bg_buffer_{};                           // Reusable buffer for random background
         std::unique_ptr<TrainingProgress> progress_;
         size_t train_dataset_size_ = 0;
 
-        // Bilateral grid components
+        // Pre-loaded mask from pipelined dataloader (used in train_step)
+        lfs::core::Tensor pipelined_mask_;
+
+        // Bilateral grid for appearance modeling (optional)
         std::unique_ptr<BilateralGrid> bilateral_grid_;
-        std::unique_ptr<torch::optim::Adam> bilateral_grid_optimizer_;
-        std::unique_ptr<WarmupExponentialLR> bilateral_grid_scheduler_;
 
-        std::unique_ptr<PoseOptimizationModule> poseopt_module_; // Pose optimization module
-        std::unique_ptr<torch::optim::Adam> poseopt_optimizer_;  // Optimizer for pose optimization
-
-        // Sparsity optimizer
         std::unique_ptr<ISparsityOptimizer> sparsity_optimizer_;
 
+        lfs::training::kernels::MaskedFusedL1SSIMWorkspace masked_fused_workspace_;
+
         // Metrics evaluator - handles all evaluation logic
-        std::unique_ptr<MetricsEvaluator> evaluator_;
+        std::unique_ptr<lfs::training::MetricsEvaluator> evaluator_;
 
         // Single mutex that protects the model during training
         mutable std::shared_mutex render_mutex_;
@@ -225,26 +240,15 @@ namespace gs::training {
         std::atomic<bool> training_complete_{false};
         std::atomic<bool> ready_to_start_{false};
         std::atomic<bool> initialized_{false};
+        std::atomic<bool> shutdown_complete_{false};
 
         // Current training state
         std::atomic<int> current_iteration_{0};
         std::atomic<float> current_loss_{0.0f};
 
-        // Callback system for async operations
+        // Async callback system
         std::function<void()> callback_;
         std::atomic<bool> callback_busy_{false};
-#if defined(USE_HIP) && USE_HIP
-        c10::hip::HIPStreamMasqueradingAsCUDA callback_stream_ = c10::hip::getStreamFromPoolMasqueradingAsCUDA(false);
-        at::cuda::CUDAEvent callback_launch_event_; // HIPEvent.h defines this in at::cuda namespace
-#else
-        c10::cuda::CUDAStream callback_stream_ = c10::cuda::getStreamFromPool(false);
-        at::cuda::CUDAEvent callback_launch_event_;
-#endif
-
-        // camera id to cam
-        std::map<int, std::shared_ptr<const Camera>> m_cam_id_to_cam;
-
-        // LichtFeld project
-        std::shared_ptr<gs::management::Project> lf_project_ = nullptr;
+        cudaStream_t callback_stream_ = nullptr;
     };
-} // namespace gs::training
+} // namespace lfs::training

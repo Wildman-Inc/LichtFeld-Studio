@@ -3,10 +3,8 @@ build/
 cmake-build-debug/
 cmake-build-release/
 external/libtorch/
-external/glad/
-external/imgui/
-external/debug/
-external/release/
+external/release/libtorch/
+external/debug/libtorch/
 output*
 results
 .idea
@@ -16,6 +14,7 @@ data
 *.py
 .venv/
 *.png
+!src/**/assets/**/*.png
 *.sqlite
 test.py
 *.nsys-rep

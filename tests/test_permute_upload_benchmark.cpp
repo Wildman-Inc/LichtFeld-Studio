@@ -1,7 +1,7 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core_new/tensor.hpp"
+#include "core/tensor.hpp"
 #include <chrono>
 #include <gtest/gtest.h>
 #include <iomanip>
@@ -796,4 +796,3 @@ TEST_F(PermuteUploadBenchmarkTest, ContiguousVsStridedTransfer) {
     std::cout << "  - Non-contiguous transfers may trigger gather/copy operations" << std::endl;
     std::cout << "  - Large difference indicates need for contiguous() call before transfer" << std::endl;
 }
-

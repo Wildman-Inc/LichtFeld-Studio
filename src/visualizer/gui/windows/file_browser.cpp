@@ -3,58 +3,63 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/windows/file_browser.hpp"
-#include "loader/loader.hpp"
-#include "project/project.hpp"
+#include "core/path_utils.hpp"
+#include "gui/dpi_scale.hpp"
+#include "gui/localization_manager.hpp"
+#include "gui/string_keys.hpp"
+#include "io/loader.hpp"
+#include "theme/theme.hpp"
 #include <algorithm>
 #include <imgui.h>
 
-namespace gs::gui {
-    using management::Project;
-}
+namespace lfs::vis::gui {
 
-namespace gs::gui {
+    using namespace lichtfeld::Strings;
 
     FileBrowser::FileBrowser() {
-        current_path_ = std::filesystem::current_path().string();
+        current_path_ = lfs::core::path_to_utf8(std::filesystem::current_path());
     }
 
     void FileBrowser::render(bool* p_open) {
-        ImGui::SetNextWindowSize(ImVec2(700, 450), ImGuiCond_FirstUseEver);
+        const float scale = getDpiScale();
+        ImGui::SetNextWindowSize(ImVec2(700 * scale, 450 * scale), ImGuiCond_FirstUseEver);
 
         // Add NoDocking flag
         ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoDocking;
 
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.1f, 0.1f, 0.15f, 0.95f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, 1.0f));
+        const auto& t = theme();
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, withAlpha(t.palette.surface, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_Text, t.palette.text);
 
-        if (!ImGui::Begin("File Browser", p_open, window_flags)) {
+        if (!ImGui::Begin(LOC(lichtfeld::Strings::FileBrowser::TITLE), p_open, window_flags)) {
             ImGui::End();
             ImGui::PopStyleColor(2);
             return;
         }
 
         if (ImGui::BeginMenuBar()) {
-            if (ImGui::BeginMenu("Quick Access")) {
-                if (ImGui::MenuItem("Current Directory")) {
-                    current_path_ = std::filesystem::current_path().string();
+            if (ImGui::BeginMenu(LOC(lichtfeld::Strings::FileBrowser::QUICK_ACCESS))) {
+                if (ImGui::MenuItem(LOC(lichtfeld::Strings::FileBrowser::CURRENT_DIR))) {
+                    current_path_ = lfs::core::path_to_utf8(std::filesystem::current_path());
                 }
-                if (ImGui::MenuItem("Home")) {
-                    current_path_ = std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : "/").string();
+                if (ImGui::MenuItem(LOC(lichtfeld::Strings::FileBrowser::HOME))) {
+                    const char* home = std::getenv("HOME");
+                    current_path_ = lfs::core::path_to_utf8(home ? lfs::core::utf8_to_path(home) : std::filesystem::path("/"));
                 }
                 ImGui::EndMenu();
             }
             ImGui::EndMenuBar();
         }
 
-        ImGui::Text("Current Path: %s", current_path_.c_str());
+        ImGui::Text(LOC(lichtfeld::Strings::FileBrowser::CURRENT_PATH), current_path_.c_str());
         ImGui::Separator();
 
         if (ImGui::BeginChild("FileList", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 2), true)) {
-            std::filesystem::path current_path(current_path_);
+            std::filesystem::path current_path = lfs::core::utf8_to_path(current_path_);
 
             if (current_path.has_parent_path()) {
                 if (ImGui::Selectable("../", false, ImGuiSelectableFlags_DontClosePopups)) {
-                    current_path_ = current_path.parent_path().string();
+                    current_path_ = lfs::core::path_to_utf8(current_path.parent_path());
                     selected_file_.clear();
                 }
             }
@@ -70,8 +75,8 @@ namespace gs::gui {
                         auto ext = entry.path().extension().string();
                         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-                        // Add .sog to the list of supported file extensions
-                        if (ext == ".ply" || ext == ".sog" || ext == ".json" || ext == Project::EXTENSION ||
+                        // Supported file extensions
+                        if (ext == ".ply" || ext == ".sog" || ext == ".json" ||
                             entry.path().filename() == "cameras.bin" ||
                             entry.path().filename() == "cameras.txt" ||
                             entry.path().filename() == "images.bin" ||
@@ -86,7 +91,7 @@ namespace gs::gui {
                     }
                 }
             } catch (const std::filesystem::filesystem_error& e) {
-                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error: %s", e.what());
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s %s", LOC(FileBrowserExt::ERROR_MSG), e.what());
             }
 
             std::sort(dirs.begin(), dirs.end(), [](const auto& a, const auto& b) {
@@ -97,13 +102,13 @@ namespace gs::gui {
             });
 
             // Create a Loader instance to check if paths can be loaded
-            auto loader = gs::loader::Loader::create();
+            auto loader = lfs::io::Loader::create();
 
             for (const auto& dir : dirs) {
-                std::string dirname = "[DIR] " + dir.path().filename().string();
-                bool is_selected = (selected_file_ == dir.path().string());
+                std::string dirname = std::string(LOC(lichtfeld::Strings::FileBrowser::DIRECTORY)) + " " + lfs::core::path_to_utf8(dir.path().filename());
+                bool is_selected = (selected_file_ == lfs::core::path_to_utf8(dir.path()));
 
-                bool is_dataset = gs::loader::Loader::isDatasetPath(dir.path());
+                bool is_dataset = lfs::io::Loader::isDatasetPath(dir.path());
                 bool is_sog_dir = false;
 
                 // Check if it's a SOG directory (has meta.json and WebP files)
@@ -120,24 +125,24 @@ namespace gs::gui {
 
                 if (is_dataset) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.5f, 0.9f, 1.0f));
-                    dirname += " [Dataset]";
+                    dirname += std::string(" ") + LOC(FileBrowserExt::DATASET);
                 } else if (is_sog_dir) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.6f, 0.2f, 1.0f)); // Orange for SOG
-                    dirname += " [SOG]";
+                    dirname += std::string(" ") + LOC(FileBrowserExt::SOG);
                 }
 
                 if (ImGui::Selectable(dirname.c_str(), is_selected,
                                       ImGuiSelectableFlags_AllowDoubleClick | ImGuiSelectableFlags_DontClosePopups)) {
                     if (ImGui::IsMouseDoubleClicked(0)) {
                         if (!is_sog_dir) {
-                            current_path_ = dir.path().string();
+                            current_path_ = lfs::core::path_to_utf8(dir.path());
                             selected_file_.clear();
                         } else {
                             // For SOG directories, select them instead of entering
-                            selected_file_ = dir.path().string();
+                            selected_file_ = lfs::core::path_to_utf8(dir.path());
                         }
                     } else {
-                        selected_file_ = dir.path().string();
+                        selected_file_ = lfs::core::path_to_utf8(dir.path());
                     }
                 }
 
@@ -147,16 +152,14 @@ namespace gs::gui {
             }
 
             for (const auto& file : files) {
-                std::string filename = file.path().filename().string();
-                bool is_selected = (selected_file_ == file.path().string());
+                std::string filename = lfs::core::path_to_utf8(file.path().filename());
+                bool is_selected = (selected_file_ == lfs::core::path_to_utf8(file.path()));
 
                 ImVec4 color = ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
                 if (file.path().extension() == ".ply") {
                     color = ImVec4(0.3f, 0.8f, 0.3f, 1.0f); // Green for PLY
                 } else if (file.path().extension() == ".sog") {
                     color = ImVec4(0.9f, 0.6f, 0.2f, 1.0f); // Orange for SOG
-                } else if (file.path().extension() == Project::EXTENSION) {
-                    color = ImVec4(0.9f, 0.4f, 0.9f, 1.0f); // Pink/purple for project files
                 } else if (filename == "cameras.bin" || filename == "cameras.txt" ||
                            filename == "images.bin" || filename == "images.txt" ||
                            filename == "transforms.json" || filename == "transforms_train.json") {
@@ -177,7 +180,7 @@ namespace gs::gui {
 
                 ImGui::PushStyleColor(ImGuiCol_Text, color);
                 if (ImGui::Selectable(filename.c_str(), is_selected, ImGuiSelectableFlags_DontClosePopups)) {
-                    selected_file_ = file.path().string();
+                    selected_file_ = lfs::core::path_to_utf8(file.path());
                 }
                 ImGui::PopStyleColor();
             }
@@ -185,9 +188,9 @@ namespace gs::gui {
         ImGui::EndChild();
 
         if (!selected_file_.empty()) {
-            ImGui::Text("Selected: %s", std::filesystem::path(selected_file_).filename().string().c_str());
+            ImGui::Text(LOC(lichtfeld::Strings::FileBrowser::SELECTED), lfs::core::path_to_utf8(lfs::core::utf8_to_path(selected_file_).filename()).c_str());
         } else {
-            ImGui::TextDisabled("No file selected");
+            ImGui::TextDisabled("%s", LOC(FileBrowserExt::NO_FILE_SELECTED));
         }
 
         ImGui::Separator();
@@ -199,10 +202,10 @@ namespace gs::gui {
         }
 
         if (can_load) {
-            std::filesystem::path selected_path(selected_file_);
+            std::filesystem::path selected_path = lfs::core::utf8_to_path(selected_file_);
 
             if (std::filesystem::is_directory(selected_path)) {
-                bool is_dataset = gs::loader::Loader::isDatasetPath(selected_path);
+                bool is_dataset = lfs::io::Loader::isDatasetPath(selected_path);
 
                 // Check if it's a SOG directory
                 bool is_sog_dir = false;
@@ -218,7 +221,7 @@ namespace gs::gui {
 
                 if (is_dataset) {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.4f, 0.8f, 1.0f));
-                    if (ImGui::Button("Load Dataset", ImVec2(120, 0))) {
+                    if (ImGui::Button(LOC(lichtfeld::Strings::FileBrowser::LOAD_DATASET), ImVec2(120 * scale, 0))) {
                         if (on_file_selected_) {
                             on_file_selected_(selected_path, true);
                             *p_open = false;
@@ -228,13 +231,13 @@ namespace gs::gui {
 
                     ImGui::SameLine();
 
-                    auto dataset_type = gs::loader::Loader::getDatasetType(selected_path);
-                    const char* type_str = (dataset_type == gs::loader::DatasetType::COLMAP) ? "(COLMAP)" : (dataset_type == gs::loader::DatasetType::Transforms) ? "(Transforms)"
-                                                                                                                                                                  : "(Dataset)";
-                    ImGui::TextDisabled(type_str);
+                    auto dataset_type = lfs::io::Loader::getDatasetType(selected_path);
+                    const char* type_str = (dataset_type == lfs::io::DatasetType::COLMAP) ? "(COLMAP)" : (dataset_type == lfs::io::DatasetType::Transforms) ? "(Transforms)"
+                                                                                                                                                            : "(Dataset)";
+                    ImGui::TextDisabled("%s", type_str);
                 } else if (is_sog_dir) {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.5f, 0.1f, 1.0f)); // Orange button
-                    if (ImGui::Button("Load SOG", ImVec2(120, 0))) {
+                    if (ImGui::Button(LOC(lichtfeld::Strings::FileBrowser::LOAD_SOG), ImVec2(120 * scale, 0))) {
                         if (on_file_selected_) {
                             on_file_selected_(selected_path, false);
                             *p_open = false;
@@ -243,17 +246,17 @@ namespace gs::gui {
                     ImGui::PopStyleColor();
 
                     ImGui::SameLine();
-                    ImGui::TextDisabled("(SOG Directory)");
+                    ImGui::TextDisabled("%s", LOC(FileBrowserExt::SOG_DIRECTORY));
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-                    if (ImGui::Button("Enter Directory", ImVec2(120, 0))) {
-                        current_path_ = selected_path.string();
+                    if (ImGui::Button(LOC(lichtfeld::Strings::FileBrowser::ENTER_DIR), ImVec2(120 * scale, 0))) {
+                        current_path_ = lfs::core::path_to_utf8(selected_path);
                         selected_file_.clear();
                     }
                     ImGui::PopStyleColor();
 
                     ImGui::SameLine();
-                    ImGui::TextDisabled("(Not a dataset)");
+                    ImGui::TextDisabled("%s", LOC(FileBrowserExt::NOT_A_DATASET));
                 }
             } else {
                 auto ext = selected_path.extension().string();
@@ -261,7 +264,7 @@ namespace gs::gui {
 
                 if (ext == ".ply") {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-                    if (ImGui::Button("Load PLY", ImVec2(120, 0))) {
+                    if (ImGui::Button(LOC(lichtfeld::Strings::FileBrowser::LOAD_PLY), ImVec2(120 * scale, 0))) {
                         if (on_file_selected_) {
                             on_file_selected_(selected_path, false);
                             *p_open = false;
@@ -270,16 +273,7 @@ namespace gs::gui {
                     ImGui::PopStyleColor();
                 } else if (ext == ".sog") {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.5f, 0.1f, 1.0f)); // Orange button
-                    if (ImGui::Button("Load SOG", ImVec2(120, 0))) {
-                        if (on_file_selected_) {
-                            on_file_selected_(selected_path, false);
-                            *p_open = false;
-                        }
-                    }
-                    ImGui::PopStyleColor();
-                } else if (ext == Project::EXTENSION) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.3f, 0.7f, 1.0f));
-                    if (ImGui::Button("Load LichtFeldStudio Project", ImVec2(200, 0))) {
+                    if (ImGui::Button(LOC(lichtfeld::Strings::FileBrowser::LOAD_SOG), ImVec2(120 * scale, 0))) {
                         if (on_file_selected_) {
                             on_file_selected_(selected_path, false);
                             *p_open = false;
@@ -300,7 +294,7 @@ namespace gs::gui {
 
                     if (is_sog_meta) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.5f, 0.1f, 1.0f)); // Orange button
-                        if (ImGui::Button("Load SOG", ImVec2(120, 0))) {
+                        if (ImGui::Button(LOC(lichtfeld::Strings::FileBrowser::LOAD_SOG), ImVec2(120 * scale, 0))) {
                             if (on_file_selected_) {
                                 on_file_selected_(selected_path, false);
                                 *p_open = false;
@@ -309,7 +303,7 @@ namespace gs::gui {
                         ImGui::PopStyleColor();
 
                         ImGui::SameLine();
-                        ImGui::TextDisabled("(SOG meta.json)");
+                        ImGui::TextDisabled("%s", LOC(FileBrowserExt::SOG_META));
                     }
                 }
             }
@@ -321,7 +315,7 @@ namespace gs::gui {
 
         ImGui::SameLine();
 
-        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+        if (ImGui::Button(LOC(Common::CANCEL), ImVec2(120 * scale, 0))) {
             *p_open = false;
             selected_file_.clear();
         }
@@ -335,15 +329,15 @@ namespace gs::gui {
     }
 
     void FileBrowser::setCurrentPath(const std::filesystem::path& path) {
-        current_path_ = path.string();
+        current_path_ = lfs::core::path_to_utf8(path);
     }
 
     void FileBrowser::setSelectedPath(const std::filesystem::path& path) {
-        selected_file_ = path.string();
+        selected_file_ = lfs::core::path_to_utf8(path);
         if (std::filesystem::is_directory(path)) {
-            current_path_ = path.string();
+            current_path_ = lfs::core::path_to_utf8(path);
         } else {
-            current_path_ = path.parent_path().string();
+            current_path_ = lfs::core::path_to_utf8(path.parent_path());
         }
     }
-} // namespace gs::gui
+} // namespace lfs::vis::gui

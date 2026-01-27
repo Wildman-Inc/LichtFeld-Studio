@@ -10,7 +10,7 @@
 #include <glad/glad.h>
 #include <string>
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     // Error handling with std::expected (C++23)
     template <typename T>
@@ -46,6 +46,7 @@ namespace gs::rendering {
             GLint current_program;
             GLint vertex_array_binding;
             GLint texture_binding_2d;
+            GLint texture_binding_2d_array;
             GLfloat line_width;
             GLboolean line_smooth;
             GLint unpack_alignment;
@@ -79,6 +80,7 @@ namespace gs::rendering {
             glGetIntegerv(GL_CURRENT_PROGRAM, &saved_.current_program);
             glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &saved_.vertex_array_binding);
             glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.texture_binding_2d);
+            glGetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &saved_.texture_binding_2d_array);
             glGetFloatv(GL_LINE_WIDTH, &saved_.line_width);
             saved_.line_smooth = glIsEnabled(GL_LINE_SMOOTH);
             glGetIntegerv(GL_UNPACK_ALIGNMENT, &saved_.unpack_alignment);
@@ -148,6 +150,7 @@ namespace gs::rendering {
             glUseProgram(saved_.current_program);
             glBindVertexArray(saved_.vertex_array_binding);
             glBindTexture(GL_TEXTURE_2D, saved_.texture_binding_2d);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, saved_.texture_binding_2d_array);
             glLineWidth(saved_.line_width);
 
             if (saved_.line_smooth)
@@ -204,4 +207,4 @@ namespace gs::rendering {
             LOG_TRACE("GLLineGuard: Restored line width to {}", saved_width_);
         }
     };
-} // namespace gs::rendering
+} // namespace lfs::rendering

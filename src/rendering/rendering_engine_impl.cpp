@@ -4,10 +4,12 @@
 
 #include "rendering_engine_impl.hpp"
 #include "core/logger.hpp"
+#include "core/point_cloud.hpp"
 #include "framebuffer_factory.hpp"
 #include "geometry/bounding_box.hpp"
+#include "rendering/render_constants.hpp"
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     RenderingEngineImpl::RenderingEngineImpl() {
         LOG_DEBUG("Initializing RenderingEngineImpl");
@@ -54,12 +56,26 @@ namespace gs::rendering {
         }
         LOG_DEBUG("Bounding box renderer initialized");
 
+        if (auto result = ellipsoid_renderer_.init(); !result) {
+            LOG_ERROR("Failed to initialize ellipsoid renderer: {}", result.error());
+            shutdown();
+            return std::unexpected(result.error());
+        }
+        LOG_DEBUG("Ellipsoid renderer initialized");
+
         if (auto result = axes_renderer_.init(); !result) {
             LOG_ERROR("Failed to initialize axes renderer: {}", result.error());
             shutdown();
             return std::unexpected(result.error());
         }
         LOG_DEBUG("Axes renderer initialized");
+
+        if (auto result = pivot_renderer_.init(); !result) {
+            LOG_ERROR("Failed to initialize pivot renderer: {}", result.error());
+            shutdown();
+            return std::unexpected(result.error());
+        }
+        LOG_DEBUG("Pivot renderer initialized");
 
         if (auto result = viewport_gizmo_.initialize(); !result) {
             LOG_ERROR("Failed to initialize viewport gizmo: {}", result.error());
@@ -68,14 +84,6 @@ namespace gs::rendering {
         }
         LOG_DEBUG("Viewport gizmo initialized");
 
-        // Initialize translation gizmo
-        if (auto result = translation_gizmo_.initialize(); !result) {
-            LOG_ERROR("Failed to initialize translation gizmo: {}", result.error());
-            shutdown();
-            return std::unexpected(result.error());
-        }
-        LOG_DEBUG("Translation gizmo initialized");
-
         // Initialize camera frustum renderer
         if (auto result = camera_frustum_renderer_.init(); !result) {
             LOG_ERROR("Failed to initialize camera frustum renderer: {}", result.error());
@@ -83,9 +91,6 @@ namespace gs::rendering {
         } else {
             LOG_DEBUG("Camera frustum renderer initialized");
         }
-
-        // Create gizmo interaction adapter
-        gizmo_interaction_ = std::make_shared<GizmoInteractionAdapter>(&translation_gizmo_);
 
         auto shader_result = initializeShaders();
         if (!shader_result) {
@@ -104,9 +109,7 @@ namespace gs::rendering {
         quad_shader_ = ManagedShader();
         screen_renderer_.reset();
         split_view_renderer_.reset();
-        translation_gizmo_.shutdown();
         viewport_gizmo_.shutdown();
-        gizmo_interaction_.reset();
         // Other components clean up in their destructors
     }
 
@@ -129,7 +132,7 @@ namespace gs::rendering {
     }
 
     Result<RenderResult> RenderingEngineImpl::renderGaussians(
-        const SplatData& splat_data,
+        const lfs::core::SplatData& splat_data,
         const RenderRequest& request) {
 
         if (!isInitialized()) {
@@ -154,6 +157,8 @@ namespace gs::rendering {
             .fov = request.viewport.fov,
             .scaling_modifier = request.scaling_modifier,
             .antialiasing = request.antialiasing,
+            .mip_filter = request.mip_filter,
+            .sh_degree = request.sh_degree,
             .render_mode = RenderMode::RGB,
             .crop_box = nullptr,
             .background_color = request.background_color,
@@ -161,19 +166,115 @@ namespace gs::rendering {
             .voxel_size = request.voxel_size,
             .gut = request.gut,
             .equirectangular = request.equirectangular,
-            .sh_degree = request.sh_degree};
+            .show_rings = request.show_rings,
+            .ring_width = request.ring_width,
+            .show_center_markers = request.show_center_markers,
+            .model_transforms = request.model_transforms,
+            .transform_indices = request.transform_indices,
+            .selection_mask = request.selection_mask,
+            .output_screen_positions = request.output_screen_positions,
+            .brush_active = request.brush_active,
+            .brush_x = request.brush_x,
+            .brush_y = request.brush_y,
+            .brush_radius = request.brush_radius,
+            .brush_add_mode = request.brush_add_mode,
+            .brush_selection_tensor = request.brush_selection_tensor,
+            .brush_saturation_mode = request.brush_saturation_mode,
+            .brush_saturation_amount = request.brush_saturation_amount,
+            .selection_mode_rings = request.selection_mode_rings,
+            .hovered_depth_id = request.hovered_depth_id,
+            .highlight_gaussian_id = request.highlight_gaussian_id,
+            .far_plane = request.far_plane,
+            .selected_node_mask = request.selected_node_mask,
+            .node_visibility_mask = request.node_visibility_mask,
+            .desaturate_unselected = request.desaturate_unselected,
+            .selection_flash_intensity = request.selection_flash_intensity,
+            .orthographic = request.orthographic,
+            .ortho_scale = request.ortho_scale};
 
         // Convert crop box if present
-        std::unique_ptr<gs::geometry::BoundingBox> temp_crop_box;
+        std::unique_ptr<lfs::geometry::BoundingBox> temp_crop_box;
+        Tensor crop_box_transform_tensor, crop_box_min_tensor, crop_box_max_tensor;
         if (request.crop_box.has_value()) {
-            temp_crop_box = std::make_unique<gs::geometry::BoundingBox>();
+            temp_crop_box = std::make_unique<lfs::geometry::BoundingBox>();
             temp_crop_box->setBounds(request.crop_box->min, request.crop_box->max);
 
             // Convert the transform matrix to EuclideanTransform
-            geometry::EuclideanTransform transform(request.crop_box->transform);
+            lfs::geometry::EuclideanTransform transform(request.crop_box->transform);
             temp_crop_box->setworld2BBox(transform);
 
             pipeline_req.crop_box = temp_crop_box.get();
+
+            // Prepare crop box tensors for GPU visualization
+            // The transform is world-to-box (inverse of box-to-world)
+            const glm::mat4& w2b = request.crop_box->transform;
+            std::vector<float> transform_data(16);
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    transform_data[row * 4 + col] = w2b[col][row]; // Transpose to row-major
+                }
+            }
+            crop_box_transform_tensor = Tensor::from_vector(transform_data, {4, 4}, lfs::core::Device::CPU).cuda();
+
+            std::vector<float> min_data = {request.crop_box->min.x, request.crop_box->min.y, request.crop_box->min.z};
+            crop_box_min_tensor = Tensor::from_vector(min_data, {3}, lfs::core::Device::CPU).cuda();
+
+            std::vector<float> max_data = {request.crop_box->max.x, request.crop_box->max.y, request.crop_box->max.z};
+            crop_box_max_tensor = Tensor::from_vector(max_data, {3}, lfs::core::Device::CPU).cuda();
+
+            pipeline_req.crop_box_transform = &crop_box_transform_tensor;
+            pipeline_req.crop_box_min = &crop_box_min_tensor;
+            pipeline_req.crop_box_max = &crop_box_max_tensor;
+            pipeline_req.crop_inverse = request.crop_inverse;
+            pipeline_req.crop_desaturate = request.crop_desaturate;
+            pipeline_req.crop_parent_node_index = request.crop_parent_node_index;
+        }
+
+        // Convert ellipsoid if present
+        Tensor ellipsoid_transform_tensor, ellipsoid_radii_tensor;
+        if (request.ellipsoid.has_value()) {
+            // Transform is world-to-ellipsoid-local
+            const glm::mat4& w2e = request.ellipsoid->transform;
+            std::vector<float> transform_data(16);
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    transform_data[row * 4 + col] = w2e[col][row]; // Transpose to row-major
+                }
+            }
+            ellipsoid_transform_tensor = Tensor::from_vector(transform_data, {4, 4}, lfs::core::Device::CPU).cuda();
+
+            std::vector<float> radii_data = {request.ellipsoid->radii.x, request.ellipsoid->radii.y, request.ellipsoid->radii.z};
+            ellipsoid_radii_tensor = Tensor::from_vector(radii_data, {3}, lfs::core::Device::CPU).cuda();
+
+            pipeline_req.ellipsoid_transform = &ellipsoid_transform_tensor;
+            pipeline_req.ellipsoid_radii = &ellipsoid_radii_tensor;
+            pipeline_req.ellipsoid_inverse = request.ellipsoid_inverse;
+            pipeline_req.ellipsoid_desaturate = request.ellipsoid_desaturate;
+            pipeline_req.ellipsoid_parent_node_index = request.ellipsoid_parent_node_index;
+        }
+
+        // Convert depth filter if present (Selection tool - separate from crop box)
+        Tensor depth_filter_transform_tensor, depth_filter_min_tensor, depth_filter_max_tensor;
+        if (request.depth_filter.has_value()) {
+            // Prepare depth filter tensors for GPU desaturation
+            const glm::mat4& w2b = request.depth_filter->transform;
+            std::vector<float> transform_data(16);
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    transform_data[row * 4 + col] = w2b[col][row]; // Transpose to row-major
+                }
+            }
+            depth_filter_transform_tensor = Tensor::from_vector(transform_data, {4, 4}, lfs::core::Device::CPU).cuda();
+
+            std::vector<float> min_data = {request.depth_filter->min.x, request.depth_filter->min.y, request.depth_filter->min.z};
+            depth_filter_min_tensor = Tensor::from_vector(min_data, {3}, lfs::core::Device::CPU).cuda();
+
+            std::vector<float> max_data = {request.depth_filter->max.x, request.depth_filter->max.y, request.depth_filter->max.z};
+            depth_filter_max_tensor = Tensor::from_vector(max_data, {3}, lfs::core::Device::CPU).cuda();
+
+            pipeline_req.depth_filter_transform = &depth_filter_transform_tensor;
+            pipeline_req.depth_filter_min = &depth_filter_min_tensor;
+            pipeline_req.depth_filter_max = &depth_filter_max_tensor;
         }
 
         auto pipeline_result = pipeline_.render(splat_data, pipeline_req);
@@ -185,8 +286,95 @@ namespace gs::rendering {
 
         // Convert result
         RenderResult result{
-            .image = std::make_shared<torch::Tensor>(pipeline_result->image),
-            .depth = std::make_shared<torch::Tensor>(pipeline_result->depth)};
+            .image = std::make_shared<Tensor>(pipeline_result->image),
+            .depth = std::make_shared<Tensor>(pipeline_result->depth),
+            .screen_positions = pipeline_result->screen_positions.is_valid()
+                                    ? std::make_shared<Tensor>(pipeline_result->screen_positions)
+                                    : nullptr,
+            .valid = true,
+            .depth_is_ndc = pipeline_result->depth_is_ndc,
+            .external_depth_texture = pipeline_result->external_depth_texture,
+            .near_plane = pipeline_result->near_plane,
+            .far_plane = pipeline_result->far_plane,
+            .orthographic = pipeline_result->orthographic};
+
+        return result;
+    }
+
+    Result<RenderResult> RenderingEngineImpl::renderPointCloud(
+        const lfs::core::PointCloud& point_cloud,
+        const RenderRequest& request) {
+
+        if (!isInitialized()) {
+            LOG_ERROR("Rendering engine not initialized");
+            return std::unexpected("Rendering engine not initialized");
+        }
+
+        // Validate request
+        if (request.viewport.size.x <= 0 || request.viewport.size.y <= 0 ||
+            request.viewport.size.x > 16384 || request.viewport.size.y > 16384) {
+            LOG_ERROR("Invalid viewport dimensions: {}x{}", request.viewport.size.x, request.viewport.size.y);
+            return std::unexpected("Invalid viewport dimensions");
+        }
+
+        LOG_TRACE("Rendering point cloud with viewport {}x{}", request.viewport.size.x, request.viewport.size.y);
+
+        // Convert to internal pipeline request (simplified - no crop box for point clouds)
+        RenderingPipeline::RenderRequest pipeline_req{
+            .view_rotation = request.viewport.rotation,
+            .view_translation = request.viewport.translation,
+            .viewport_size = request.viewport.size,
+            .fov = request.viewport.fov,
+            .scaling_modifier = request.scaling_modifier,
+            .antialiasing = false,
+            .mip_filter = false, // Not applicable to point clouds
+            .sh_degree = 0,
+            .render_mode = RenderMode::RGB,
+            .crop_box = nullptr,
+            .background_color = request.background_color,
+            .point_cloud_mode = true,
+            .voxel_size = request.voxel_size,
+            .gut = false,
+            .equirectangular = request.equirectangular,
+            .show_rings = false,
+            .ring_width = 0.0f,
+            .show_center_markers = false,
+            .model_transforms = request.model_transforms,
+            .transform_indices = nullptr,
+            .selection_mask = nullptr,
+            .output_screen_positions = false,
+            .brush_active = false,
+            .brush_x = 0.0f,
+            .brush_y = 0.0f,
+            .brush_radius = 0.0f,
+            .brush_add_mode = true,
+            .brush_selection_tensor = nullptr,
+            .brush_saturation_mode = false,
+            .brush_saturation_amount = 0.0f,
+            .selection_mode_rings = false,
+            .hovered_depth_id = nullptr,
+            .highlight_gaussian_id = -1,
+            .far_plane = DEFAULT_FAR_PLANE,
+            .selected_node_mask = {}};
+
+        auto pipeline_result = pipeline_.renderRawPointCloud(point_cloud, pipeline_req);
+
+        if (!pipeline_result) {
+            LOG_ERROR("Pipeline render failed: {}", pipeline_result.error());
+            return std::unexpected(pipeline_result.error());
+        }
+
+        // Convert result
+        RenderResult result{
+            .image = std::make_shared<Tensor>(pipeline_result->image),
+            .depth = std::make_shared<Tensor>(pipeline_result->depth),
+            .screen_positions = nullptr,
+            .valid = true,
+            .depth_is_ndc = pipeline_result->depth_is_ndc,
+            .external_depth_texture = pipeline_result->external_depth_texture,
+            .near_plane = pipeline_result->near_plane,
+            .far_plane = pipeline_result->far_plane,
+            .orthographic = pipeline_result->orthographic};
 
         return result;
     }
@@ -213,6 +401,7 @@ namespace gs::rendering {
         const RenderResult& result,
         const glm::ivec2& viewport_pos,
         const glm::ivec2& viewport_size) {
+        LOG_TIMER_TRACE("RenderingEngineImpl::presentToScreen");
 
         if (!isInitialized()) {
             LOG_ERROR("Rendering engine not initialized");
@@ -224,14 +413,19 @@ namespace gs::rendering {
             return std::unexpected("Invalid render result");
         }
 
-        LOG_TRACE("Presenting to screen at position ({}, {}) with size {}x{}",
+        LOG_TRACE("Presenting to screen at ({}, {}) size {}x{}",
                   viewport_pos.x, viewport_pos.y, viewport_size.x, viewport_size.y);
 
         // Convert back to internal result type
         RenderingPipeline::RenderResult internal_result;
         internal_result.image = *result.image;
-        internal_result.depth = result.depth ? *result.depth : torch::Tensor();
+        internal_result.depth = result.depth ? *result.depth : Tensor();
         internal_result.valid = true;
+        internal_result.depth_is_ndc = result.depth_is_ndc;
+        internal_result.external_depth_texture = result.external_depth_texture;
+        internal_result.near_plane = result.near_plane;
+        internal_result.far_plane = result.far_plane;
+        internal_result.orthographic = result.orthographic;
 
         if (auto upload_result = RenderingPipeline::uploadToScreen(internal_result, *screen_renderer_, viewport_size);
             !upload_result) {
@@ -239,10 +433,10 @@ namespace gs::rendering {
             return upload_result;
         }
 
-        // Set viewport for rendering
-        glViewport(viewport_pos.x, viewport_pos.y, viewport_size.x, viewport_size.y);
+        // Note: glViewport should be set by the caller to the DISPLAY size
+        // The viewport_size here is the IMAGE size for upload validation
+        // The fullscreen quad will stretch the texture to fill whatever viewport is set
 
-        // Use the quad shader directly
         return screen_renderer_->render(quad_shader_);
     }
 
@@ -262,7 +456,7 @@ namespace gs::rendering {
         grid_renderer_.setPlane(static_cast<RenderInfiniteGrid::GridPlane>(plane));
         grid_renderer_.setOpacity(opacity);
 
-        return grid_renderer_.render(view, proj);
+        return grid_renderer_.render(view, proj, viewport.orthographic);
     }
 
     Result<void> RenderingEngineImpl::renderBoundingBox(
@@ -280,9 +474,7 @@ namespace gs::rendering {
         bbox_renderer_.setColor(color);
         bbox_renderer_.setLineWidth(line_width);
 
-        // Set the transform from the box
-        geometry::EuclideanTransform transform(box.transform);
-        bbox_renderer_.setworld2BBox(transform);
+        bbox_renderer_.setWorld2BBoxMat4(box.transform);
 
         auto view = createViewMatrix(viewport);
         auto proj = createProjectionMatrix(viewport);
@@ -290,10 +482,33 @@ namespace gs::rendering {
         return bbox_renderer_.render(view, proj);
     }
 
+    Result<void> RenderingEngineImpl::renderEllipsoid(
+        const Ellipsoid& ellipsoid,
+        const ViewportData& viewport,
+        const glm::vec3& color,
+        float line_width) {
+
+        if (!isInitialized() || !ellipsoid_renderer_.isInitialized()) {
+            LOG_ERROR("Ellipsoid renderer not initialized");
+            return std::unexpected("Ellipsoid renderer not initialized");
+        }
+
+        ellipsoid_renderer_.setRadii(ellipsoid.radii);
+        ellipsoid_renderer_.setTransform(ellipsoid.transform);
+        ellipsoid_renderer_.setColor(color);
+        ellipsoid_renderer_.setLineWidth(line_width);
+
+        auto view = createViewMatrix(viewport);
+        auto proj = createProjectionMatrix(viewport);
+
+        return ellipsoid_renderer_.render(view, proj);
+    }
+
     Result<void> RenderingEngineImpl::renderCoordinateAxes(
         const ViewportData& viewport,
         float size,
-        const std::array<bool, 3>& visible) {
+        const std::array<bool, 3>& visible,
+        bool equirectangular) {
 
         if (!isInitialized() || !axes_renderer_.isInitialized()) {
             LOG_ERROR("Axes renderer not initialized");
@@ -308,7 +523,27 @@ namespace gs::rendering {
         auto view = createViewMatrix(viewport);
         auto proj = createProjectionMatrix(viewport);
 
-        return axes_renderer_.render(view, proj);
+        return axes_renderer_.render(view, proj, equirectangular);
+    }
+
+    Result<void> RenderingEngineImpl::renderPivot(
+        const ViewportData& viewport,
+        const glm::vec3& pivot_position,
+        float size,
+        float opacity) {
+
+        if (!isInitialized() || !pivot_renderer_.isInitialized()) {
+            return std::unexpected("Pivot renderer not initialized");
+        }
+
+        pivot_renderer_.setPosition(pivot_position);
+        pivot_renderer_.setSize(size);
+        pivot_renderer_.setOpacity(opacity);
+
+        auto view = createViewMatrix(viewport);
+        auto proj = createProjectionMatrix(viewport);
+
+        return pivot_renderer_.render(view, proj);
     }
 
     Result<void> RenderingEngineImpl::renderViewportGizmo(
@@ -324,29 +559,47 @@ namespace gs::rendering {
         return viewport_gizmo_.render(camera_rotation, viewport_pos, viewport_size);
     }
 
-    Result<void> RenderingEngineImpl::renderTranslationGizmo(
-        const glm::vec3& position,
-        const ViewportData& viewport,
-        float scale) {
-
-        if (!isInitialized()) {
-            LOG_ERROR("Rendering engine not initialized");
-            return std::unexpected("Rendering engine not initialized");
+    int RenderingEngineImpl::hitTestViewportGizmo(
+        const glm::vec2& click_pos,
+        const glm::vec2& viewport_pos,
+        const glm::vec2& viewport_size) const {
+        if (const auto hit = viewport_gizmo_.hitTest(click_pos, viewport_pos, viewport_size)) {
+            return static_cast<int>(hit->axis) + (hit->negative ? 3 : 0);
         }
+        return -1;
+    }
 
-        auto view = createViewMatrix(viewport);
-        auto proj = createProjectionMatrix(viewport);
+    void RenderingEngineImpl::setViewportGizmoHover(const int axis) {
+        if (axis >= 0 && axis <= 2) {
+            viewport_gizmo_.setHoveredAxis(static_cast<GizmoAxis>(axis), false);
+        } else if (axis >= 3 && axis <= 5) {
+            viewport_gizmo_.setHoveredAxis(static_cast<GizmoAxis>(axis - 3), true);
+        } else {
+            viewport_gizmo_.setHoveredAxis(std::nullopt);
+        }
+    }
 
-        return translation_gizmo_.render(view, proj, position, scale);
+    Result<void> RenderingEngineImpl::renderTranslationGizmo(
+        [[maybe_unused]] const glm::vec3& position,
+        [[maybe_unused]] const ViewportData& viewport,
+        [[maybe_unused]] float scale) {
+        // Deprecated - translation gizmo removed, now using ImGuizmo
+        return {};
+    }
+
+    std::shared_ptr<GizmoInteraction> RenderingEngineImpl::getGizmoInteraction() {
+        // Deprecated - return nullptr since gizmo is removed
+        return nullptr;
     }
 
     Result<void> RenderingEngineImpl::renderCameraFrustums(
-        const std::vector<std::shared_ptr<const Camera>>& cameras,
+        const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
         const ViewportData& viewport,
         float scale,
         const glm::vec3& train_color,
         const glm::vec3& eval_color,
-        const glm::mat4& world_transform) {
+        const glm::mat4& scene_transform,
+        bool equirectangular_view) {
 
         if (!camera_frustum_renderer_.isInitialized()) {
             return {}; // Silent fail if not initialized
@@ -355,17 +608,18 @@ namespace gs::rendering {
         auto view = createViewMatrix(viewport);
         auto proj = createProjectionMatrix(viewport);
 
-        return camera_frustum_renderer_.render(cameras, view, proj, scale, train_color, eval_color, world_transform);
+        return camera_frustum_renderer_.render(cameras, view, proj, scale, train_color, eval_color, scene_transform, equirectangular_view);
     }
 
     Result<void> RenderingEngineImpl::renderCameraFrustumsWithHighlight(
-        const std::vector<std::shared_ptr<const Camera>>& cameras,
+        const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
         const ViewportData& viewport,
         float scale,
         const glm::vec3& train_color,
         const glm::vec3& eval_color,
         int highlight_index,
-        const glm::mat4& world_transform) {
+        const glm::mat4& scene_transform,
+        bool equirectangular_view) {
 
         if (!camera_frustum_renderer_.isInitialized()) {
             return {}; // Silent fail if not initialized
@@ -377,17 +631,17 @@ namespace gs::rendering {
         auto view = createViewMatrix(viewport);
         auto proj = createProjectionMatrix(viewport);
 
-        return camera_frustum_renderer_.render(cameras, view, proj, scale, train_color, eval_color, world_transform);
+        return camera_frustum_renderer_.render(cameras, view, proj, scale, train_color, eval_color, scene_transform, equirectangular_view);
     }
 
     Result<int> RenderingEngineImpl::pickCameraFrustum(
-        const std::vector<std::shared_ptr<const Camera>>& cameras,
+        const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
         const glm::vec2& mouse_pos,
         const glm::vec2& viewport_pos,
         const glm::vec2& viewport_size,
         const ViewportData& viewport,
         float scale,
-        const glm::mat4& world_transform) {
+        const glm::mat4& scene_transform) {
 
         if (!camera_frustum_renderer_.isInitialized()) {
             return -1;
@@ -397,15 +651,15 @@ namespace gs::rendering {
         auto proj = createProjectionMatrix(viewport);
 
         return camera_frustum_renderer_.pickCamera(
-            cameras, mouse_pos, viewport_pos, viewport_size, view, proj, scale, world_transform);
+            cameras, mouse_pos, viewport_pos, viewport_size, view, proj, scale, scene_transform);
     }
 
-    std::shared_ptr<GizmoInteraction> RenderingEngineImpl::getGizmoInteraction() {
-        return gizmo_interaction_;
+    void RenderingEngineImpl::clearFrustumCache() {
+        camera_frustum_renderer_.clearThumbnailCache();
     }
 
     RenderingPipelineResult RenderingEngineImpl::renderWithPipeline(
-        const SplatData& model,
+        const lfs::core::SplatData& model,
         const RenderingPipelineRequest& request) {
 
         LOG_TRACE("Rendering with pipeline");
@@ -419,12 +673,14 @@ namespace gs::rendering {
             .scaling_modifier = request.scaling_modifier,
             .antialiasing = request.antialiasing,
             .render_mode = request.render_mode,
-            .crop_box = static_cast<const geometry::BoundingBox*>(request.crop_box),
+            .crop_box = static_cast<const lfs::geometry::BoundingBox*>(request.crop_box),
             .background_color = request.background_color,
             .point_cloud_mode = request.point_cloud_mode,
             .voxel_size = request.voxel_size,
             .gut = request.gut,
-            .sh_degree = request.sh_degree};
+            .equirectangular = request.equirectangular,
+            .show_rings = request.show_rings,
+            .ring_width = request.ring_width};
 
         auto result = pipeline_.render(model, internal_request);
 
@@ -468,9 +724,7 @@ namespace gs::rendering {
     }
 
     glm::mat4 RenderingEngineImpl::createProjectionMatrix(const ViewportData& viewport) const {
-        float aspect = static_cast<float>(viewport.size.x) / viewport.size.y;
-        float fov_rad = glm::radians(viewport.fov);
-        return glm::perspective(fov_rad, aspect, 0.1f, 1000.0f);
+        return viewport.getProjectionMatrix();
     }
 
     Result<std::shared_ptr<IBoundingBox>> RenderingEngineImpl::createBoundingBox() {
@@ -505,4 +759,4 @@ namespace gs::rendering {
         return axes;
     }
 
-} // namespace gs::rendering
+} // namespace lfs::rendering

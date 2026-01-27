@@ -5,7 +5,7 @@
 #include "main_loop.hpp"
 #include "core/logger.hpp"
 
-namespace gs::visualizer {
+namespace lfs::vis {
 
     void MainLoop::run() {
         LOG_INFO("Main loop starting");
@@ -46,4 +46,4 @@ namespace gs::visualizer {
         LOG_INFO("Main loop ended");
     }
 
-} // namespace gs::visualizer
+} // namespace lfs::vis

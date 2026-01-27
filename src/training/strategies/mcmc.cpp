@@ -3,499 +3,629 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "mcmc.hpp"
-#include "Ops.h"
 #include "core/logger.hpp"
-#include "core/parameters.hpp"
-#include "optimizers/fused_adam.hpp"
-#include "rasterization/rasterizer.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
+#include "kernels/mcmc_kernels.hpp"
 #include "strategy_utils.hpp"
-#include <iostream>
-#include <random>
+#include <chrono>
+#include <cmath>
 
-#ifdef _WIN32
-#include <c10/cuda/CUDACachingAllocator.h> //required for emptyCache
-#endif
+namespace lfs::training {
 
-namespace gs::training {
-    void MCMC::ExponentialLR::step() {
-        if (param_group_index_ >= 0) {
-            auto& group = optimizer_.param_groups()[param_group_index_];
+    MCMC::MCMC(lfs::core::SplatData& splat_data) : _splat_data(&splat_data) {}
 
-            // Try to cast to our custom Options first
-            auto* fused_adam_options = static_cast<FusedAdam::Options*>(&group.options());
-            double current_lr = fused_adam_options->lr();
-            fused_adam_options->lr(current_lr * gamma_);
-        } else {
-            // Update all param groups
-            for (auto& group : optimizer_.param_groups()) {
-                auto* fused_adam_options = static_cast<FusedAdam::Options*>(&group.options());
-                double current_lr = fused_adam_options->lr();
-                fused_adam_options->lr(current_lr * gamma_);
-            }
-        }
+    lfs::core::Tensor MCMC::multinomial_sample(const lfs::core::Tensor& weights, int n, bool replacement) {
+        // Use the tensor library's built-in multinomial sampling
+        return lfs::core::Tensor::multinomial(weights, n, replacement);
     }
 
-    MCMC::MCMC(gs::SplatData&& splat_data)
-        : _splat_data(std::move(splat_data)) {
-    }
+    void MCMC::update_optimizer_for_relocate(
+        const lfs::core::Tensor& sampled_indices,
+        const lfs::core::Tensor& dead_indices,
+        ParamType param_type) {
 
-    torch::Tensor MCMC::multinomial_sample(const torch::Tensor& weights, int n, bool replacement) {
-        const int64_t num_elements = weights.size(0);
-
-        // PyTorch's multinomial has a limit of 2^24 elements
-        if (num_elements <= (1 << 24)) {
-            return torch::multinomial(weights, n, replacement);
-        }
-        // For larger arrays, we need to implement sampling manually
-        auto weights_normalized = weights / weights.sum();
-        auto weights_cpu = weights_normalized.cpu();
-
-        std::vector<int64_t> sampled_indices;
-        sampled_indices.reserve(n);
-
-        // Create cumulative distribution
-        auto cumsum = weights_cpu.cumsum(0);
-        auto cumsum_data = cumsum.accessor<float, 1>();
-
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_real_distribution<float> dis(0.0, 1.0);
-
-        for (int i = 0; i < n; ++i) {
-            float u = dis(gen);
-            // Binary search for the index
-            int64_t idx = 0;
-            int64_t left = 0, right = num_elements - 1;
-            while (left <= right) {
-                int64_t mid = (left + right) / 2;
-                if (cumsum_data[mid] < u) {
-                    left = mid + 1;
-                } else {
-                    idx = mid;
-                    right = mid - 1;
-                }
-            }
-            sampled_indices.push_back(idx);
-        }
-
-        auto result = torch::tensor(sampled_indices, torch::kLong);
-        return result.to(weights.device());
-    }
-
-    void MCMC::update_optimizer_for_relocate(torch::optim::Optimizer* optimizer,
-                                             const torch::Tensor& sampled_indices,
-                                             const torch::Tensor& dead_indices,
-                                             int param_position) {
-        // Get the parameter
-        auto& param = optimizer->param_groups()[param_position].params()[0];
-        void* param_key = param.unsafeGetTensorImpl();
-
-        // Check if optimizer state exists
-        auto state_it = optimizer->state().find(param_key);
-        if (state_it == optimizer->state().end()) {
-            // No state exists yet - this can happen if optimizer.step() hasn't been called
-            // In this case, there's nothing to reset, so we can safely return
-            return;
-        }
-
-        // Get the optimizer state - handle both Adam types
-        auto& param_state = *state_it->second;
-        auto* fused_adam_state = static_cast<FusedAdam::AdamParamState*>(&param_state);
-        fused_adam_state->exp_avg.index_put_({sampled_indices}, 0);
-        fused_adam_state->exp_avg_sq.index_put_({sampled_indices}, 0);
-
-        if (fused_adam_state->max_exp_avg_sq.defined()) {
-            fused_adam_state->max_exp_avg_sq.index_put_({sampled_indices}, 0);
-        }
+        // Reset optimizer state (exp_avg and exp_avg_sq) for relocated Gaussians
+        // Use GPU version for efficiency (indices already on GPU)
+        _optimizer->relocate_params_at_indices_gpu(
+            param_type,
+            sampled_indices.ptr<int64_t>(),
+            sampled_indices.numel());
     }
 
     int MCMC::relocate_gs() {
-        // Get opacities and handle both [N] and [N, 1] shapes
-        torch::NoGradGuard no_grad;
-        auto opacities = _splat_data.get_opacity();
-        if (opacities.dim() == 2 && opacities.size(1) == 1) {
-            opacities = opacities.squeeze(-1);
+        LOG_TIMER("MCMC::relocate_gs");
+        using namespace lfs::core;
+
+        // Get opacities (handle both [N] and [N, 1] shapes)
+        Tensor opacities;
+        {
+            LOG_TIMER("relocate_get_opacities");
+            opacities = _splat_data->get_opacity();
+            if (opacities.ndim() == 2 && opacities.shape()[1] == 1) {
+                opacities = opacities.squeeze(-1);
+            }
         }
 
-        auto rotation_raw = _splat_data.rotation_raw();
-        auto dead_mask = opacities <= _params->min_opacity | (rotation_raw * rotation_raw).sum(-1) < 1e-8f;
-        auto dead_indices = dead_mask.nonzero().squeeze(-1);
-        int n_dead = dead_indices.numel();
+        // Find dead Gaussians: opacity <= min_opacity OR rotation magnitude near zero
+        Tensor dead_mask, dead_indices;
+        size_t n_dead;
+        {
+            LOG_TIMER("relocate_find_dead");
+            // Fully fused kernel - no intermediate allocations
+            const size_t N = opacities.numel();
+            dead_mask = Tensor::empty({N}, Device::CUDA, DataType::Bool);
+            mcmc::launch_compute_dead_mask(
+                opacities.ptr<float>(),
+                _splat_data->rotation_raw().ptr<float>(),
+                dead_mask.ptr<uint8_t>(),
+                N,
+                _params->min_opacity);
+            dead_indices = dead_mask.nonzero().squeeze(-1);
+            n_dead = dead_indices.numel();
+        }
 
         if (n_dead == 0)
             return 0;
 
-        auto alive_mask = ~dead_mask;
-        auto alive_indices = alive_mask.nonzero().squeeze(-1);
+        Tensor alive_indices;
+        {
+            LOG_TIMER("relocate_find_alive");
+            Tensor alive_mask = dead_mask.logical_not();
+            alive_indices = alive_mask.nonzero().squeeze(-1);
+        }
 
         if (alive_indices.numel() == 0)
             return 0;
 
-        // Sample from alive Gaussians based on opacity
-        auto probs = opacities.index_select(0, alive_indices);
-        auto sampled_idxs_local = multinomial_sample(probs, n_dead, true);
-        auto sampled_idxs = alive_indices.index_select(0, sampled_idxs_local);
+        Tensor sampled_idxs, sampled_opacities, sampled_scales;
+        {
+            LOG_TIMER("relocate_multinomial_sample_and_gather_FUSED");
+            const size_t N = opacities.numel();
 
-        // Get parameters for sampled Gaussians
-        auto sampled_opacities = opacities.index_select(0, sampled_idxs);
-        auto sampled_scales = _splat_data.get_scaling().index_select(0, sampled_idxs);
+            // Get source tensors (contiguous)
+            Tensor opacities_contig = opacities.contiguous();
+            Tensor scaling_raw_contig = _splat_data->scaling_raw().contiguous(); // Pass raw scaling, kernel applies exp()
 
-        // Count occurrences of each sampled index
-        auto ratios = torch::ones_like(opacities, torch::kInt32);
-        ratios.index_add_(0, sampled_idxs, torch::ones_like(sampled_idxs, torch::kInt32));
-        ratios = ratios.index_select(0, sampled_idxs).contiguous();
+            // Allocate outputs
+            sampled_idxs = Tensor::empty({n_dead}, Device::CUDA, DataType::Int64);
+            sampled_opacities = Tensor::empty({n_dead}, Device::CUDA, DataType::Float32);
+            sampled_scales = Tensor::empty({n_dead, 3}, Device::CUDA, DataType::Float32);
 
-        // IMPORTANT: Clamp as in Python implementation
-        const int n_max = static_cast<int>(_binoms.size(0));
-        ratios = torch::clamp_max_(ratios, n_max);
+            // Generate random seed
+            static uint64_t seed_counter = 0;
+            uint64_t seed = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + seed_counter++;
 
-        // Call the CUDA relocation function from gsplat
-        auto relocation_result = gsplat::relocation(
-            sampled_opacities,
-            sampled_scales,
-            ratios,
-            _binoms,
-            n_max);
-
-        auto new_opacities = std::get<0>(relocation_result);
-        auto new_scales = std::get<1>(relocation_result);
-
-        // Clamp new opacities
-        new_opacities = torch::clamp_(new_opacities, _params->min_opacity, 1.0f - 1e-7f);
-
-        // Update parameters for sampled indices
-        // Handle opacity shape properly
-        if (_splat_data.opacity_raw().dim() == 2) {
-            _splat_data.opacity_raw().index_put_({sampled_idxs, torch::indexing::Slice()},
-                                                 torch::logit(new_opacities).unsqueeze(-1));
-        } else {
-            _splat_data.opacity_raw().index_put_({sampled_idxs}, torch::logit(new_opacities));
+            // does multinomial sampling + gathering in one pass
+            mcmc::launch_multinomial_sample_and_gather(
+                opacities_contig.ptr<float>(),
+                scaling_raw_contig.ptr<float>(), // Pass raw scaling
+                alive_indices.ptr<int64_t>(),
+                alive_indices.numel(),
+                n_dead,
+                seed,
+                sampled_idxs.ptr<int64_t>(),
+                sampled_opacities.ptr<float>(),
+                sampled_scales.ptr<float>(),
+                N);
         }
-        _splat_data.scaling_raw().index_put_({sampled_idxs}, torch::log(new_scales));
 
-        // Copy from sampled to dead indices
-        _splat_data.means().index_put_({dead_indices}, _splat_data.means().index_select(0, sampled_idxs));
-        _splat_data.sh0().index_put_({dead_indices}, _splat_data.sh0().index_select(0, sampled_idxs));
-        _splat_data.shN().index_put_({dead_indices}, _splat_data.shN().index_select(0, sampled_idxs));
-        _splat_data.scaling_raw().index_put_({dead_indices}, _splat_data.scaling_raw().index_select(0, sampled_idxs));
-        _splat_data.rotation_raw().index_put_({dead_indices}, _splat_data.rotation_raw().index_select(0, sampled_idxs));
-        _splat_data.opacity_raw().index_put_({dead_indices}, _splat_data.opacity_raw().index_select(0, sampled_idxs));
+        // Count occurrences of each sampled index (how many times each was sampled)
+        Tensor ratios;
+        {
+            LOG_TIMER("relocate_count_occurrences");
+            ratios = Tensor::ones_like(opacities, DataType::Int32);
+            ratios = ratios.index_add_(0, sampled_idxs, Tensor::ones({sampled_idxs.numel()}, Device::CUDA, DataType::Int32));
+            ratios = ratios.index_select(0, sampled_idxs).contiguous();
 
-        // Update optimizer states for sampled indices
-        for (int i = 0; i < 6; ++i) {
-            update_optimizer_for_relocate(_optimizer.get(), sampled_idxs, dead_indices, i);
+            // Clamp ratios to [1, n_max]
+            const int n_max = static_cast<int>(_binoms.shape()[0]);
+            ratios = ratios.clamp(1, n_max);
+        }
+
+        // Allocate output tensors and call CUDA kernel
+        Tensor new_opacities, new_scales;
+        {
+            LOG_TIMER("relocate_cuda_kernel");
+            const int n_max = static_cast<int>(_binoms.shape()[0]);
+            new_opacities = Tensor::empty(sampled_opacities.shape(), Device::CUDA);
+            new_scales = Tensor::empty(sampled_scales.shape(), Device::CUDA);
+
+            mcmc::launch_relocation_kernel(
+                sampled_opacities.ptr<float>(),
+                sampled_scales.ptr<float>(),
+                ratios.ptr<int32_t>(),
+                _binoms.ptr<float>(),
+                n_max,
+                new_opacities.ptr<float>(),
+                new_scales.ptr<float>(),
+                sampled_opacities.numel());
+        }
+
+        // Clamp new opacities and compute raw values
+        Tensor new_opacity_raw;
+        {
+            LOG_TIMER("relocate_compute_raw_values");
+            new_opacities = new_opacities.clamp(_params->min_opacity, 1.0f - 1e-7f);
+            new_opacity_raw = (new_opacities / (Tensor::ones_like(new_opacities) - new_opacities)).log();
+
+            if (_splat_data->opacity_raw().ndim() == 2) {
+                new_opacity_raw = new_opacity_raw.unsqueeze(-1);
+            }
+        }
+
+        // Update parameters
+        {
+            LOG_TIMER("relocate_update_params");
+            const int opacity_dim = (_splat_data->opacity_raw().ndim() == 2) ? 1 : 0;
+            const size_t N = _splat_data->means().shape()[0]; // Total number of Gaussians
+
+            // Compute log(scales) for the new scales
+            Tensor new_scales_log = new_scales.log();
+
+            // Update sampled indices with new opacity/scaling using direct CUDA kernel
+            // This preserves tensor capacity (unlike index_put_ which creates new tensors)
+            mcmc::launch_update_scaling_opacity(
+                sampled_idxs.ptr<int64_t>(),
+                new_scales_log.ptr<float>(),
+                new_opacity_raw.ptr<float>(),
+                _splat_data->scaling_raw().ptr<float>(),
+                _splat_data->opacity_raw().ptr<float>(),
+                sampled_idxs.numel(),
+                opacity_dim,
+                N);
+
+            // Copy sampled params to dead slots
+            const size_t sh_coeffs = (_splat_data->shN().is_valid() && _splat_data->shN().ndim() >= 2)
+                                         ? _splat_data->shN().shape()[1]
+                                         : 0;
+            mcmc::launch_copy_gaussian_params(
+                sampled_idxs.ptr<int64_t>(),
+                dead_indices.ptr<int64_t>(),
+                _splat_data->means().ptr<float>(),
+                _splat_data->sh0().ptr<float>(),
+                _splat_data->shN().ptr<float>(),
+                _splat_data->scaling_raw().ptr<float>(),
+                _splat_data->rotation_raw().ptr<float>(),
+                _splat_data->opacity_raw().ptr<float>(),
+                dead_indices.numel(),
+                sh_coeffs,
+                opacity_dim,
+                N);
+        }
+
+        // Update optimizer states for all parameters
+        {
+            LOG_TIMER("relocate_update_optimizer");
+            update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Means);
+            update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Sh0);
+            update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::ShN);
+            update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Scaling);
+            update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Rotation);
+            update_optimizer_for_relocate(sampled_idxs, dead_indices, ParamType::Opacity);
         }
 
         return n_dead;
     }
 
     int MCMC::add_new_gs() {
-        // Add this check at the beginning
-        torch::NoGradGuard no_grad;
+        LOG_TIMER("MCMC::add_new_gs");
+        using namespace lfs::core;
+
         if (!_optimizer) {
-            std::cerr << "Warning: add_new_gs called but optimizer not initialized" << std::endl;
+            LOG_ERROR("MCMC::add_new_gs: optimizer not initialized");
             return 0;
         }
 
-        const int current_n = _splat_data.size();
+        const int current_n = _splat_data->size();
         const int n_target = std::min(_params->max_cap, static_cast<int>(1.05f * current_n));
-        const int n_new = std::max(0, n_target - current_n);
+        const size_t n_new = std::max(0, n_target - current_n);
 
         if (n_new == 0)
             return 0;
 
-        // Get opacities and handle both [N] and [N, 1] shapes
-        auto opacities = _splat_data.get_opacity();
-        if (opacities.dim() == 2 && opacities.size(1) == 1) {
-            opacities = opacities.squeeze(-1);
+        // Get opacities (handle both [N] and [N, 1] shapes)
+        Tensor opacities;
+        {
+            LOG_TIMER("add_new_get_opacities");
+            opacities = _splat_data->get_opacity();
+            if (opacities.ndim() == 2 && opacities.shape()[1] == 1) {
+                opacities = opacities.squeeze(-1);
+            }
         }
 
-        auto probs = opacities.flatten();
-        auto sampled_idxs = multinomial_sample(probs, n_new, true);
+        Tensor sampled_idxs;
+        Tensor sampled_opacities;
+        Tensor sampled_scales;
+        {
+            LOG_TIMER("add_new_multinomial_sample_and_gather");
+
+            const size_t N = opacities.numel();
+
+            // Get raw scaling and ensure contiguity
+            auto scaling_raw_contig = _splat_data->scaling_raw().contiguous(); // Pass raw scaling, kernel applies exp()
+            auto opacities_contig = opacities.contiguous();
+
+            // Allocate output tensors
+            sampled_idxs = Tensor::empty({n_new}, Device::CUDA, DataType::Int64);
+            sampled_opacities = Tensor::empty({n_new}, Device::CUDA, DataType::Float32);
+            sampled_scales = Tensor::empty({n_new, 3}, Device::CUDA, DataType::Float32);
+
+            // Generate random seed
+            auto seed = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+
+            // Call fused CUDA kernel
+            mcmc::launch_multinomial_sample_all(
+                opacities_contig.ptr<float>(),
+                scaling_raw_contig.ptr<float>(), // Pass raw scaling
+                N,
+                n_new,
+                seed,
+                sampled_idxs.ptr<int64_t>(),
+                sampled_opacities.ptr<float>(),
+                sampled_scales.ptr<float>());
+        }
+
+        // Count occurrences (ratio starts at 0, add 1 for each occurrence, then add 1 more)
+        Tensor ratios;
+        {
+            LOG_TIMER("add_new_count_occurrences");
+            ratios = Tensor::zeros({opacities.numel()}, Device::CUDA, DataType::Float32);
+            ratios = ratios.index_add_(0, sampled_idxs, Tensor::ones({sampled_idxs.numel()}, Device::CUDA));
+            ratios = ratios.index_select(0, sampled_idxs) + Tensor::ones_like(ratios.index_select(0, sampled_idxs));
+
+            // Clamp and convert to int32
+            const int n_max = static_cast<int>(_binoms.shape()[0]);
+            ratios = ratios.clamp(1.0f, static_cast<float>(n_max));
+            ratios = ratios.to(DataType::Int32).contiguous();
+        }
+
+        // Allocate output tensors and call CUDA kernel
+        Tensor new_opacities, new_scales;
+        {
+            LOG_TIMER("add_new_relocation_kernel");
+            const int n_max = static_cast<int>(_binoms.shape()[0]);
+            new_opacities = Tensor::empty(sampled_opacities.shape(), Device::CUDA);
+            new_scales = Tensor::empty(sampled_scales.shape(), Device::CUDA);
+
+            mcmc::launch_relocation_kernel(
+                sampled_opacities.ptr<float>(),
+                sampled_scales.ptr<float>(),
+                ratios.ptr<int32_t>(),
+                _binoms.ptr<float>(),
+                n_max,
+                new_opacities.ptr<float>(),
+                new_scales.ptr<float>(),
+                sampled_opacities.numel());
+        }
+
+        // Clamp new opacities and prepare raw values
+        Tensor new_opacity_raw, new_scaling_raw;
+        {
+            LOG_TIMER("add_new_compute_raw_values");
+            new_opacities = new_opacities.clamp(_params->min_opacity, 1.0f - 1e-7f);
+            new_opacity_raw = (new_opacities / (Tensor::ones_like(new_opacities) - new_opacities)).log();
+            new_scaling_raw = new_scales.log();
+
+            if (_splat_data->opacity_raw().ndim() == 2) {
+                new_opacity_raw = new_opacity_raw.unsqueeze(-1);
+            }
+        }
+
+        // Update existing Gaussians first (before concatenation)
+        {
+            LOG_TIMER("add_new_update_original");
+            const int opacity_dim = (_splat_data->opacity_raw().ndim() == 2) ? 1 : 0;
+            const size_t N = _splat_data->means().shape()[0];
+
+            // Use direct CUDA kernel to preserve tensor capacity
+            mcmc::launch_update_scaling_opacity(
+                sampled_idxs.ptr<int64_t>(),
+                new_scaling_raw.ptr<float>(),
+                new_opacity_raw.ptr<float>(),
+                _splat_data->scaling_raw().ptr<float>(),
+                _splat_data->opacity_raw().ptr<float>(),
+                sampled_idxs.numel(),
+                opacity_dim,
+                N);
+        }
+
+        // Use add_new_params_gather() to leverage reserved capacity
+        {
+            LOG_TIMER("add_new_append_gather");
+            // Gather and append parameters for new Gaussians (done after updating opacity/scaling)
+            _optimizer->add_new_params_gather(ParamType::Means, sampled_idxs);
+            _optimizer->add_new_params_gather(ParamType::Sh0, sampled_idxs);
+            _optimizer->add_new_params_gather(ParamType::ShN, sampled_idxs);
+            _optimizer->add_new_params_gather(ParamType::Rotation, sampled_idxs);
+            _optimizer->add_new_params_gather(ParamType::Opacity, sampled_idxs);
+            _optimizer->add_new_params_gather(ParamType::Scaling, sampled_idxs);
+        }
+
+        return n_new;
+    }
+
+    // Test helper: add_new_gs with explicitly specified indices (no multinomial sampling)
+    int MCMC::add_new_gs_with_indices_test(const lfs::core::Tensor& sampled_idxs) {
+        LOG_TIMER("MCMC::add_new_gs_with_indices_test");
+        using namespace lfs::core;
+
+        if (!_optimizer) {
+            LOG_ERROR("add_new_gs_with_indices_test called but optimizer not initialized");
+            return 0;
+        }
+
+        const int n_new = sampled_idxs.numel();
+        if (n_new == 0)
+            return 0;
+
+        // Ensure indices are Int64 (test may pass Int32)
+        Tensor sampled_idxs_i64 = (sampled_idxs.dtype() == DataType::Int64) ? sampled_idxs : sampled_idxs.to(DataType::Int64);
+
+        // Get opacities
+        auto opacities = _splat_data->get_opacity();
 
         // Get parameters for sampled Gaussians
-        auto sampled_opacities = opacities.index_select(0, sampled_idxs);
-        auto sampled_scales = _splat_data.get_scaling().index_select(0, sampled_idxs);
+        auto sampled_opacities = opacities.index_select(0, sampled_idxs_i64);
+        auto sampled_scales = _splat_data->get_scaling().index_select(0, sampled_idxs_i64);
 
         // Count occurrences
-        auto ratios = torch::zeros({opacities.size(0)}, torch::kFloat32).to(torch::kCUDA);
-        ratios.index_add_(0, sampled_idxs, torch::ones_like(sampled_idxs, torch::kFloat32));
-        ratios = ratios.index_select(0, sampled_idxs) + 1;
+        auto ratios = Tensor::zeros({static_cast<size_t>(_splat_data->size())}, Device::CUDA, DataType::Float32);
+        ratios.index_add_(0, sampled_idxs_i64, Tensor::ones_like(sampled_idxs_i64).to(DataType::Float32));
+        ratios = ratios.index_select(0, sampled_idxs_i64) + 1.0f;
 
-        // IMPORTANT: Clamp and convert to int as in Python implementation
-        const int n_max = static_cast<int>(_binoms.size(0));
-        ratios = torch::clamp(ratios, 1, n_max);
-        ratios = ratios.to(torch::kInt32).contiguous(); // Convert to int!
+        // Clamp and convert to int
+        const int n_max = static_cast<int>(_binoms.shape()[0]);
+        ratios = ratios.clamp(1.0f, static_cast<float>(n_max));
+        ratios = ratios.to(DataType::Int32).contiguous();
 
-        // Call the CUDA relocation function from gsplat
-        auto relocation_result = gsplat::relocation(
-            sampled_opacities,
-            sampled_scales,
-            ratios,
-            _binoms,
-            n_max);
+        // Call the CUDA relocation function
+        Tensor new_opacities, new_scales;
+        {
+            LOG_TIMER("add_new_relocation");
+            new_opacities = Tensor::empty(sampled_opacities.shape(), Device::CUDA);
+            new_scales = Tensor::empty(sampled_scales.shape(), Device::CUDA);
 
-        auto new_opacities = std::get<0>(relocation_result);
-        auto new_scales = std::get<1>(relocation_result);
-
-        // Clamp new opacities
-        new_opacities = torch::clamp(new_opacities, _params->min_opacity, 1.0f - 1e-7f);
-
-        // Update existing Gaussians FIRST (before concatenation)
-        if (_splat_data.opacity_raw().dim() == 2) {
-            _splat_data.opacity_raw().index_put_({sampled_idxs, torch::indexing::Slice()},
-                                                 torch::logit(new_opacities).unsqueeze(-1));
-        } else {
-            _splat_data.opacity_raw().index_put_({sampled_idxs}, torch::logit(new_opacities));
-        }
-        _splat_data.scaling_raw().index_put_({sampled_idxs}, torch::log(new_scales));
-
-        // Prepare new Gaussians to concatenate
-        auto new_means = _splat_data.means().index_select(0, sampled_idxs);
-        auto new_sh0 = _splat_data.sh0().index_select(0, sampled_idxs);
-        auto new_shN = _splat_data.shN().index_select(0, sampled_idxs);
-        auto new_scaling = _splat_data.scaling_raw().index_select(0, sampled_idxs);
-        auto new_rotation = _splat_data.rotation_raw().index_select(0, sampled_idxs);
-        auto new_opacity = _splat_data.opacity_raw().index_select(0, sampled_idxs);
-
-        // Step 1: Concatenate all parameters
-        auto concat_means = torch::cat({_splat_data.means(), new_means}, 0).set_requires_grad(true);
-        auto concat_sh0 = torch::cat({_splat_data.sh0(), new_sh0}, 0).set_requires_grad(true);
-        auto concat_shN = torch::cat({_splat_data.shN(), new_shN}, 0).set_requires_grad(true);
-        auto concat_scaling = torch::cat({_splat_data.scaling_raw(), new_scaling}, 0).set_requires_grad(true);
-        auto concat_rotation = torch::cat({_splat_data.rotation_raw(), new_rotation}, 0).set_requires_grad(true);
-        auto concat_opacity = torch::cat({_splat_data.opacity_raw(), new_opacity}, 0).set_requires_grad(true);
-
-        // Step 2: SAFER optimizer state update
-        // Store the new parameters in a temporary array first
-        std::array new_params = {
-            &concat_means, &concat_sh0, &concat_shN,
-            &concat_scaling, &concat_rotation, &concat_opacity};
-
-        // Collect old parameter keys and states
-        std::vector<void*> old_param_keys;
-        std::vector<std::unique_ptr<torch::optim::OptimizerParamState>> saved_states;
-
-        for (int i = 0; i < 6; ++i) {
-            auto& old_param = _optimizer->param_groups()[i].params()[0];
-            void* old_param_key = old_param.unsafeGetTensorImpl();
-            old_param_keys.push_back(old_param_key);
-
-            // Check if state exists
-            auto state_it = _optimizer->state().find(old_param_key);
-            if (state_it == _optimizer->state().end()) {
-                saved_states.push_back(nullptr);
-            }
-
-            auto* fused_adam_state = static_cast<FusedAdam::AdamParamState*>(state_it->second.get());
-            // FusedAdam state
-            torch::IntArrayRef new_shape;
-            if (i == 0)
-                new_shape = new_means.sizes();
-            else if (i == 1)
-                new_shape = new_sh0.sizes();
-            else if (i == 2)
-                new_shape = new_shN.sizes();
-            else if (i == 3)
-                new_shape = new_scaling.sizes();
-            else if (i == 4)
-                new_shape = new_rotation.sizes();
-            else
-                new_shape = new_opacity.sizes();
-
-            auto zeros_to_add = torch::zeros(new_shape, fused_adam_state->exp_avg.options());
-            auto new_exp_avg = torch::cat({fused_adam_state->exp_avg, zeros_to_add}, 0);
-            auto new_exp_avg_sq = torch::cat({fused_adam_state->exp_avg_sq, zeros_to_add}, 0);
-
-            // Create new state
-            auto new_state = std::make_unique<FusedAdam::AdamParamState>();
-            new_state->step_count = fused_adam_state->step_count;
-            new_state->exp_avg = new_exp_avg;
-            new_state->exp_avg_sq = new_exp_avg_sq;
-            if (fused_adam_state->max_exp_avg_sq.defined()) {
-                auto new_max_exp_avg_sq = torch::cat({fused_adam_state->max_exp_avg_sq, zeros_to_add}, 0);
-                new_state->max_exp_avg_sq = new_max_exp_avg_sq;
-            }
-
-            saved_states.push_back(std::move(new_state));
+            mcmc::launch_relocation_kernel(
+                sampled_opacities.ptr<float>(),
+                sampled_scales.ptr<float>(),
+                ratios.ptr<int32_t>(),
+                _binoms.ptr<float>(),
+                n_max,
+                new_opacities.ptr<float>(),
+                new_scales.ptr<float>(),
+                sampled_opacities.numel());
         }
 
-        // Now remove all old states
-        for (auto key : old_param_keys) {
-            _optimizer->state().erase(key);
-        }
+        // Clamp new opacities and prepare raw values
+        Tensor new_opacity_raw, new_scaling_raw;
+        {
+            LOG_TIMER("add_new_compute_raw_values");
+            new_opacities = new_opacities.clamp(_params->min_opacity, 1.0f - 1e-7f);
+            new_opacity_raw = (new_opacities / (Tensor::ones_like(new_opacities) - new_opacities)).log();
+            new_scaling_raw = new_scales.log();
 
-        // Update parameters and add new states
-        for (int i = 0; i < 6; ++i) {
-            _optimizer->param_groups()[i].params()[0] = *new_params[i];
-
-            if (saved_states[i]) {
-                void* new_param_key = new_params[i]->unsafeGetTensorImpl();
-                _optimizer->state()[new_param_key] = std::move(saved_states[i]);
+            if (_splat_data->opacity_raw().ndim() == 2) {
+                new_opacity_raw = new_opacity_raw.unsqueeze(-1);
             }
         }
 
-        // Step 3: Finally update the model's parameters
-        _splat_data.means() = concat_means;
-        _splat_data.sh0() = concat_sh0;
-        _splat_data.shN() = concat_shN;
-        _splat_data.scaling_raw() = concat_scaling;
-        _splat_data.rotation_raw() = concat_rotation;
-        _splat_data.opacity_raw() = concat_opacity;
+        // Update existing Gaussians first
+        {
+            LOG_TIMER("add_new_update_original");
+            const int opacity_dim = (_splat_data->opacity_raw().ndim() == 2) ? 1 : 0;
+            const size_t N = _splat_data->means().shape()[0];
+
+            // Use direct CUDA kernel to preserve tensor capacity
+            mcmc::launch_update_scaling_opacity(
+                sampled_idxs_i64.ptr<int64_t>(),
+                new_scaling_raw.ptr<float>(),
+                new_opacity_raw.ptr<float>(),
+                _splat_data->scaling_raw().ptr<float>(),
+                _splat_data->opacity_raw().ptr<float>(),
+                sampled_idxs_i64.numel(),
+                opacity_dim,
+                N);
+        }
+
+        // Use fused append_gather() operation
+        {
+            LOG_TIMER("add_new_params_gather");
+            // Gather opacity/scaling after updating them
+            _optimizer->add_new_params_gather(ParamType::Means, sampled_idxs_i64);
+            _optimizer->add_new_params_gather(ParamType::Sh0, sampled_idxs_i64);
+            _optimizer->add_new_params_gather(ParamType::ShN, sampled_idxs_i64);
+            _optimizer->add_new_params_gather(ParamType::Rotation, sampled_idxs_i64);
+            _optimizer->add_new_params_gather(ParamType::Opacity, sampled_idxs_i64);
+            _optimizer->add_new_params_gather(ParamType::Scaling, sampled_idxs_i64);
+        }
 
         return n_new;
     }
 
     void MCMC::inject_noise() {
-        torch::NoGradGuard no_grad;
+        LOG_TIMER("MCMC::inject_noise");
+        using namespace lfs::core;
 
         // Get current learning rate from optimizer (after scheduler has updated it)
-        auto& group = _optimizer->param_groups()[0];
-        auto* fused_adam_options = static_cast<FusedAdam::Options*>(&group.options());
-        const float current_lr = static_cast<float>(fused_adam_options->lr()) * _noise_lr;
+        const float current_lr = _optimizer->get_lr() * _noise_lr;
 
-        // Generate noise
-        auto noise = torch::randn_like(_splat_data.means());
+        // Generate noise in pre-allocated buffer
+        {
+            LOG_TIMER("inject_noise_generate");
+            if (_noise_buffer.is_valid() && _noise_buffer.capacity() > 0) {
+                // Fill pre-allocated buffer with random values (kernel will use first size() elements)
+                _noise_buffer.normal_(0.0f, 1.0f);
+            } else {
+                // Fallback for non-capacity mode
+                _noise_buffer = Tensor::randn(_splat_data->means().shape(), Device::CUDA, DataType::Float32);
+            }
+        }
 
-        gsplat::add_noise(
-            _splat_data.opacity_raw(),
-            _splat_data.scaling_raw(),
-            _splat_data.rotation_raw(),
-            noise,
-            _splat_data.means(),
-            current_lr);
+        // Call CUDA add_noise kernel (uses first size() elements of buffer)
+        {
+            LOG_TIMER("inject_noise_cuda_kernel");
+            mcmc::launch_add_noise_kernel(
+                _splat_data->opacity_raw().ptr<float>(),
+                _splat_data->scaling_raw().ptr<float>(),
+                _splat_data->rotation_raw().ptr<float>(),
+                _noise_buffer.ptr<float>(),
+                _splat_data->means().ptr<float>(),
+                current_lr,
+                _splat_data->size());
+        }
     }
 
     void MCMC::post_backward(int iter, RenderOutput& render_output) {
-        // Increment SH degree every 1000 iterations
-        torch::NoGradGuard no_grad;
+        LOG_TIMER("MCMC::post_backward");
+
+        // Increment SH degree every sh_degree_interval iterations
         if (iter % _params->sh_degree_interval == 0) {
-            _splat_data.increment_sh_degree();
+            _splat_data->increment_sh_degree();
         }
 
         // Refine Gaussians
         if (is_refining(iter)) {
             // Relocate dead Gaussians
-            relocate_gs();
+            int n_relocated = relocate_gs();
+            if (n_relocated > 0) {
+                LOG_DEBUG("MCMC: Relocated {} dead Gaussians at iteration {}", n_relocated, iter);
+            }
 
             // Add new Gaussians
-            add_new_gs();
+            int n_added = add_new_gs();
+            if (n_added > 0) {
+                LOG_DEBUG("MCMC: Added {} new Gaussians at iteration {} (total: {})",
+                          n_added, iter, _splat_data->size());
+            }
+            // Release cached pool memory to avoid bloat (important after add_new_gs)
+            lfs::core::CudaMemoryPool::instance().trim_cached_memory();
         }
 
-        // Inject noise to positions
+        // Inject noise to positions every iteration
         inject_noise();
-
-#ifdef _WIN32
-        // Windows doesn't support CUDACachingAllocator expandable_segments
-        if (iter % 10 == 0)
-            c10::cuda::CUDACachingAllocator::emptyCache();
-#endif
     }
 
     void MCMC::step(int iter) {
+        LOG_TIMER("MCMC::step");
         if (iter < _params->iterations) {
-            auto* fused_adam = dynamic_cast<FusedAdam*>(_optimizer.get());
-            fused_adam->step(iter);
-            fused_adam->zero_grad(true, iter);
-            _scheduler->step();
+            {
+                LOG_TIMER("step_optimizer_step");
+                _optimizer->step(iter);
+            }
+            {
+                LOG_TIMER("step_zero_grad");
+                _optimizer->zero_grad(iter);
+            }
+            {
+                LOG_TIMER("step_scheduler");
+                _scheduler->step();
+            }
         }
     }
 
-    void MCMC::remove_gaussians(const torch::Tensor& mask) {
-        torch::NoGradGuard no_grad;
+    void MCMC::remove_gaussians(const lfs::core::Tensor& mask) {
+        using namespace lfs::core;
 
-        if (mask.sum().item<int>() == 0) {
-            LOG_DEBUG("No Gaussians to remove");
+        // Convert bool to int32 for sum
+        Tensor mask_int = mask.to(DataType::Int32);
+        int n_remove = mask_int.sum().item<int>();
+
+        LOG_INFO("MCMC::remove_gaussians called: mask size={}, n_remove={}, current size={}",
+                 mask.numel(), n_remove, _splat_data->size());
+
+        if (n_remove == 0) {
+            LOG_DEBUG("MCMC: No Gaussians to remove");
             return;
         }
 
-        LOG_DEBUG("MCMC: Removing {} Gaussians", mask.sum().item<int>());
+        LOG_DEBUG("MCMC: Removing {} Gaussians", n_remove);
 
-        const torch::Tensor sampled_idxs = mask.logical_not().nonzero().squeeze(-1);
+        // Get indices to keep
+        Tensor keep_mask = mask.logical_not();
+        Tensor keep_indices = keep_mask.nonzero().squeeze(-1);
 
-        const auto param_fn = [&sampled_idxs](const int i, const torch::Tensor& param) {
-            return param.index_select(0, sampled_idxs).set_requires_grad(param.requires_grad());
-        };
+        // Select only the Gaussians we want to keep
+        _splat_data->means() = _splat_data->means().index_select(0, keep_indices).contiguous();
+        _splat_data->sh0() = _splat_data->sh0().index_select(0, keep_indices).contiguous();
+        if (_splat_data->shN().is_valid()) {
+            _splat_data->shN() = _splat_data->shN().index_select(0, keep_indices).contiguous();
+        }
+        _splat_data->scaling_raw() = _splat_data->scaling_raw().index_select(0, keep_indices).contiguous();
+        _splat_data->rotation_raw() = _splat_data->rotation_raw().index_select(0, keep_indices).contiguous();
+        _splat_data->opacity_raw() = _splat_data->opacity_raw().index_select(0, keep_indices).contiguous();
 
-        const auto optimizer_fn = [&sampled_idxs](
-                                      torch::optim::OptimizerParamState& state,
-                                      const torch::Tensor& new_param)
-            -> std::unique_ptr<torch::optim::OptimizerParamState> {
-            if (auto* fused_adam_state = dynamic_cast<FusedAdam::AdamParamState*>(&state)) {
-                // FusedAdam state
-                auto new_exp_avg = fused_adam_state->exp_avg.index_select(0, sampled_idxs);
-                auto new_exp_avg_sq = fused_adam_state->exp_avg_sq.index_select(0, sampled_idxs);
+        // Recreate optimizer with reduced parameters (simpler than manual state update)
+        _optimizer = create_optimizer(*_splat_data, *_params);
 
-                // Create new state
-                auto new_state = std::make_unique<FusedAdam::AdamParamState>();
-                new_state->step_count = fused_adam_state->step_count;
-                new_state->exp_avg = new_exp_avg;
-                new_state->exp_avg_sq = new_exp_avg_sq;
-                if (fused_adam_state->max_exp_avg_sq.defined()) {
-                    auto new_max_exp_avg_sq = fused_adam_state->max_exp_avg_sq.index_select(0, sampled_idxs);
-                    new_state->max_exp_avg_sq = new_max_exp_avg_sq;
-                }
-                return new_state;
-            }
-            return nullptr;
-        };
-
-        update_param_with_optimizer(param_fn, optimizer_fn, _optimizer, _splat_data);
+        // Recreate scheduler
+        const double gamma = std::pow(0.01, 1.0 / _params->iterations);
+        _scheduler = create_scheduler(*_params, *_optimizer);
     }
 
-    void MCMC::initialize(const gs::param::OptimizationParameters& optimParams) {
-        _params = std::make_unique<const gs::param::OptimizationParameters>(optimParams);
+    void MCMC::initialize(const lfs::core::param::OptimizationParameters& optimParams) {
+        using namespace lfs::core;
 
-        const auto dev = torch::kCUDA;
-        _splat_data.means() = _splat_data.means().to(dev).set_requires_grad(true);
-        _splat_data.scaling_raw() = _splat_data.scaling_raw().to(dev).set_requires_grad(true);
-        _splat_data.rotation_raw() = _splat_data.rotation_raw().to(dev).set_requires_grad(true);
-        _splat_data.opacity_raw() = _splat_data.opacity_raw().to(dev).set_requires_grad(true);
-        _splat_data.sh0() = _splat_data.sh0().to(dev).set_requires_grad(true);
-        _splat_data.shN() = _splat_data.shN().to(dev).set_requires_grad(true);
-        _splat_data._densification_info = torch::empty({0});
+        _params = std::make_unique<const lfs::core::param::OptimizationParameters>(optimParams);
 
-        // Initialize binomial coefficients
+        // Pre-allocate tensor capacity if max_cap is specified
+        if (_params->max_cap > 0) {
+            const size_t capacity = static_cast<size_t>(_params->max_cap);
+            const size_t current_size = _splat_data->size();
+            LOG_INFO("Pre-allocating capacity for {} Gaussians (current size: {}, utilization: {:.1f}%)",
+                     capacity, current_size, 100.0f * current_size / capacity);
+
+            try {
+                // ELIMINATE ALL POOL ALLOCATIONS: Replace pool-allocated parameters with direct cudaMalloc versions
+                LOG_DEBUG("  Replacing pool-allocated parameters with direct cudaMalloc versions:");
+
+                auto replace_with_direct = [capacity](Tensor& param) {
+                    // Create new tensor with direct cudaMalloc (ZERO pool usage!)
+                    auto new_param = Tensor::zeros_direct(param.shape(), capacity);
+                    // Copy data from old pool-allocated tensor to new direct tensor
+                    cudaMemcpy(new_param.ptr<float>(), param.ptr<float>(),
+                               param.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
+                    // Replace (old pool-allocated tensor gets freed)
+                    param = new_param;
+                };
+
+                replace_with_direct(_splat_data->means());
+                replace_with_direct(_splat_data->sh0());
+                if (_splat_data->shN().is_valid() && _splat_data->shN().ndim() > 0) {
+                    replace_with_direct(_splat_data->shN());
+                }
+                replace_with_direct(_splat_data->scaling_raw());
+                replace_with_direct(_splat_data->rotation_raw());
+                replace_with_direct(_splat_data->opacity_raw());
+
+                // Pre-allocate noise buffer [max_cap, 3]
+                _noise_buffer = Tensor::zeros_direct(TensorShape({capacity, 3}), capacity);
+
+                LOG_INFO("Pre-allocated capacity: {}/{} Gaussians ({:.1f}%)",
+                         current_size, capacity, 100.0f * current_size / capacity);
+            } catch (const std::exception& e) {
+                LOG_WARN("Failed to pre-allocate capacity: {}. Continuing without pre-allocation.", e.what());
+            }
+        }
+
+        // Initialize binomial coefficients (same as original)
         const int n_max = 51;
-        _binoms = torch::zeros({n_max, n_max}, torch::kFloat32);
-        auto binoms_accessor = _binoms.accessor<float, 2>();
+        std::vector<float> binoms_data(n_max * n_max, 0.0f);
         for (int n = 0; n < n_max; ++n) {
             for (int k = 0; k <= n; ++k) {
-                // Compute binomial coefficient C(n,k)
                 float binom = 1.0f;
                 for (int i = 0; i < k; ++i) {
                     binom *= static_cast<float>(n - i) / static_cast<float>(i + 1);
                 }
-                binoms_accessor[n][k] = binom;
+                binoms_data[n * n_max + k] = binom;
             }
         }
-        _binoms = _binoms.to(dev);
+        _binoms = Tensor::from_vector(binoms_data, TensorShape({static_cast<size_t>(n_max), static_cast<size_t>(n_max)}), Device::CUDA);
 
-        // Initialize optimizer
-        using Options = FusedAdam::Options;
-        std::vector<torch::optim::OptimizerParamGroup> groups;
+        _optimizer = create_optimizer(*_splat_data, *_params);
+        _optimizer->allocate_gradients(_params->max_cap > 0 ? static_cast<size_t>(_params->max_cap) : 0);
+        _scheduler = create_scheduler(*_params, *_optimizer);
 
-        // Create groups with proper unique_ptr<Options>
-        auto add_param_group = [&groups](const torch::Tensor& param, double lr) {
-            auto options = std::make_unique<Options>(lr);
-            options->eps(1e-15).betas(std::make_tuple(0.9, 0.999));
-            groups.emplace_back(
-                std::vector<torch::Tensor>{param},
-                std::unique_ptr<torch::optim::OptimizerOptions>(std::move(options)));
-        };
-
-        add_param_group(_splat_data.means(), _params->means_lr * _splat_data.get_scene_scale());
-        add_param_group(_splat_data.sh0(), _params->shs_lr);
-        add_param_group(_splat_data.shN(), _params->shs_lr / 20.f);
-        add_param_group(_splat_data.scaling_raw(), _params->scaling_lr);
-        add_param_group(_splat_data.rotation_raw(), _params->rotation_lr);
-        add_param_group(_splat_data.opacity_raw(), _params->opacity_lr);
-
-        auto global_options = std::make_unique<Options>(0.f);
-        global_options->eps(1e-15);
-        _optimizer = std::make_unique<FusedAdam>(std::move(groups), std::move(global_options));
-        const double gamma = compute_lr_decay_gamma(_params->final_lr_fraction, _params->iterations);
-        _scheduler = std::make_unique<ExponentialLR>(*_optimizer, gamma, 0);
+        LOG_INFO("MCMC strategy initialized with {} Gaussians", _splat_data->size());
     }
 
     bool MCMC::is_refining(int iter) const {
@@ -503,4 +633,75 @@ namespace gs::training {
                 iter > _params->start_refine &&
                 iter % _params->refine_every == 0);
     }
-} // namespace gs::training
+
+    // ===== Serialization =====
+
+    namespace {
+        constexpr uint32_t MCMC_MAGIC = 0x4C464D43; // "LFMC"
+        constexpr uint32_t MCMC_VERSION = 1;
+    } // namespace
+
+    void MCMC::serialize(std::ostream& os) const {
+        os.write(reinterpret_cast<const char*>(&MCMC_MAGIC), sizeof(MCMC_MAGIC));
+        os.write(reinterpret_cast<const char*>(&MCMC_VERSION), sizeof(MCMC_VERSION));
+
+        // Serialize optimizer state
+        if (_optimizer) {
+            uint8_t has_optimizer = 1;
+            os.write(reinterpret_cast<const char*>(&has_optimizer), sizeof(has_optimizer));
+            _optimizer->serialize(os);
+        } else {
+            uint8_t has_optimizer = 0;
+            os.write(reinterpret_cast<const char*>(&has_optimizer), sizeof(has_optimizer));
+        }
+
+        // Serialize scheduler state
+        if (_scheduler) {
+            uint8_t has_scheduler = 1;
+            os.write(reinterpret_cast<const char*>(&has_scheduler), sizeof(has_scheduler));
+            _scheduler->serialize(os);
+        } else {
+            uint8_t has_scheduler = 0;
+            os.write(reinterpret_cast<const char*>(&has_scheduler), sizeof(has_scheduler));
+        }
+
+        LOG_DEBUG("Serialized MCMC strategy");
+    }
+
+    void MCMC::deserialize(std::istream& is) {
+        uint32_t magic, version;
+        is.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        is.read(reinterpret_cast<char*>(&version), sizeof(version));
+
+        if (magic != MCMC_MAGIC) {
+            throw std::runtime_error("Invalid MCMC checkpoint: wrong magic");
+        }
+        if (version != MCMC_VERSION) {
+            throw std::runtime_error("Unsupported MCMC checkpoint version: " + std::to_string(version));
+        }
+
+        // Deserialize optimizer state
+        uint8_t has_optimizer;
+        is.read(reinterpret_cast<char*>(&has_optimizer), sizeof(has_optimizer));
+        if (has_optimizer && _optimizer) {
+            _optimizer->deserialize(is);
+        }
+
+        // Deserialize scheduler state
+        uint8_t has_scheduler;
+        is.read(reinterpret_cast<char*>(&has_scheduler), sizeof(has_scheduler));
+        if (has_scheduler && _scheduler) {
+            _scheduler->deserialize(is);
+        }
+
+        LOG_DEBUG("Deserialized MCMC strategy");
+    }
+
+    void MCMC::reserve_optimizer_capacity(size_t capacity) {
+        if (_optimizer) {
+            _optimizer->reserve_capacity(capacity);
+            LOG_INFO("Reserved optimizer capacity for {} Gaussians", capacity);
+        }
+    }
+
+} // namespace lfs::training

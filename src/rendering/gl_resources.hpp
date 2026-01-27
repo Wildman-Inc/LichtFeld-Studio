@@ -12,7 +12,7 @@
 #include <span>
 #include <utility>
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     // Consistent error handling
     template <typename T>
@@ -296,4 +296,4 @@ namespace gs::rendering {
         GLuint get() const { return vao_.get(); }
     };
 
-} // namespace gs::rendering
+} // namespace lfs::rendering

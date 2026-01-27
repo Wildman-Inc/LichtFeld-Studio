@@ -8,61 +8,88 @@
 #include "shader_manager.hpp"
 #include <glm/glm.hpp>
 #include <memory>
+#include <optional>
 
-namespace gs::rendering {
+namespace lfs::rendering {
 
     class TextRenderer; // Forward declaration
 
+    enum class GizmoAxis { X = 0,
+                           Y = 1,
+                           Z = 2 };
+
+    struct GizmoHitResult {
+        GizmoAxis axis;
+        bool negative;
+    };
+
     class ViewportGizmo {
     public:
-        ViewportGizmo();  // Declare constructor (not defaulted)
-        ~ViewportGizmo(); // Declare destructor
+        ViewportGizmo();
+        ~ViewportGizmo();
 
-        // Initialize OpenGL resources - now returns Result
         Result<void> initialize();
+        void shutdown();
 
-        // Render the gizmo - now returns Result
         Result<void> render(const glm::mat3& camera_rotation,
                             const glm::vec2& viewport_pos,
                             const glm::vec2& viewport_size);
 
-        // Cleanup
-        void shutdown();
+        [[nodiscard]] std::optional<GizmoHitResult> hitTest(const glm::vec2& click_pos,
+                                                            const glm::vec2& viewport_pos,
+                                                            const glm::vec2& viewport_size) const;
 
-        // Settings
+        [[nodiscard]] static glm::mat3 getAxisViewRotation(GizmoAxis axis, bool negative = false);
+
         void setSize(int size) { size_ = size; }
-        void setMargin(int margin) { margin_ = margin; }
-        int getSize() const { return size_; }
-        int getMargin() const { return margin_; }
+        void setMargins(int x, int y) {
+            margin_x_ = x;
+            margin_y_ = y;
+        }
+        [[nodiscard]] int getSize() const { return size_; }
+        [[nodiscard]] int getMarginX() const { return margin_x_; }
+        [[nodiscard]] int getMarginY() const { return margin_y_; }
+
+        void setHoveredAxis(std::optional<GizmoAxis> axis, bool negative = false) {
+            hovered_axis_ = axis;
+            hovered_negative_ = negative;
+        }
+        [[nodiscard]] std::optional<GizmoAxis> getHoveredAxis() const { return hovered_axis_; }
 
     private:
         Result<void> generateGeometry();
         Result<void> createShaders();
 
-        // OpenGL resources using RAII
         VAO vao_;
         VBO vbo_;
         ManagedShader shader_;
-
-        // Text rendering
         std::unique_ptr<TextRenderer> text_renderer_;
 
-        // Geometry info
         int cylinder_vertex_count_ = 0;
         int sphere_vertex_start_ = 0;
         int sphere_vertex_count_ = 0;
+        int ring_vertex_start_ = 0;
+        int ring_vertex_count_ = 0;
 
-        // Settings
         int size_ = 95;
-        int margin_ = 10;
+        int margin_x_ = 10;
+        int margin_y_ = 10;
         bool initialized_ = false;
+        std::optional<GizmoAxis> hovered_axis_;
+        bool hovered_negative_ = false;
 
-        // Gizmo colors (RGB -> XYZ)
-        static constexpr glm::vec3 colors_[3] = {
-            {0.89f, 0.15f, 0.21f}, // X - Red
-            {0.54f, 0.86f, 0.20f}, // Y - Green
-            {0.17f, 0.48f, 0.87f}  // Z - Blue
+        struct HitInfo {
+            glm::vec2 screen_pos{0.0f};
+            float radius = 0.0f;
+            bool visible = false;
         };
+        mutable HitInfo sphere_hits_[3];
+        mutable HitInfo ring_hits_[3];
+
+        static constexpr glm::vec3 AXIS_COLORS[3] = {
+            {0.89f, 0.15f, 0.21f},
+            {0.54f, 0.86f, 0.20f},
+            {0.17f, 0.48f, 0.87f}};
     };
 
-} // namespace gs::rendering
+} // namespace lfs::rendering
