@@ -589,14 +589,14 @@
     "seq_loop_off": "Schleifenwiedergabe aktivieren",
     "seq_loop_on": "Schleifenwiedergabe deaktivieren",
     "seq_add": "Keyframe an aktueller Position hinzufügen",
-    "seq_speed": "Wiedergabegeschwindigkeit (Rechtsklick für Optionen)",
-    "seq_snap": "Keyframes am Raster einrasten",
+    "seq_speed": "Wiedergabegeschwindigkeit (Klick zum Wechseln)",
+    "seq_snap": "Keyframes am Raster einrasten (Rechtsklick für Optionen)",
     "seq_follow": "Abspielkopf bei Wiedergabe folgen",
     "seq_film_strip": "Filmstreifen unterhalb der Zeitleiste anzeigen",
-    "seq_pip_preview": "Bild-in-Bild-Vorschau anzeigen",
+    "seq_pip_preview": "Bild-in-Bild-Vorschau anzeigen (Rechtsklick für Optionen)",
     "seq_save_path": "Kamerapfad in Datei speichern",
     "seq_load_path": "Kamerapfad aus Datei laden",
-    "seq_format": "Export-Formatvorlage",
+    "seq_format": "Export-Formatvorlage (Rechtsklick für Optionen)",
     "seq_quality": "CRF-Qualität (niedriger = bessere Qualität, größere Datei)",
     "seq_export": "Video aus Kamerapfad exportieren",
     "seq_clear": "Alle Keyframes löschen",
@@ -1059,5 +1059,13 @@
     "quality": "Qualitaet",
     "export_video": "Video exportieren...",
     "custom": "Benutzerdefiniert"
+  },
+  "context_menu": {
+    "snap_interval": "Rasterintervall",
+    "preview_scale": "Vorschaugröße",
+    "video_format": "Videoformat",
+    "clear_confirm": "Alle Keyframes löschen?",
+    "confirm": "Bestätigen",
+    "cancel": "Abbrechen"
   }
 }

@@ -589,14 +589,14 @@
     "seq_loop_off": "반복 재생 활성화",
     "seq_loop_on": "반복 재생 비활성화",
     "seq_add": "현재 위치에 키프레임 추가",
-    "seq_speed": "재생 속도 (우클릭으로 옵션)",
-    "seq_snap": "키프레임을 그리드에 스냅",
+    "seq_speed": "재생 속도 (클릭으로 전환)",
+    "seq_snap": "키프레임을 그리드에 스냅 (우클릭으로 옵션)",
     "seq_follow": "재생 중 플레이헤드 따라가기",
     "seq_film_strip": "타임라인 아래에 필름 스트립 표시",
-    "seq_pip_preview": "화면 속 화면 미리보기 표시",
+    "seq_pip_preview": "화면 속 화면 미리보기 표시 (우클릭으로 옵션)",
     "seq_save_path": "카메라 경로를 파일로 저장",
     "seq_load_path": "파일에서 카메라 경로 불러오기",
-    "seq_format": "내보내기 형식 프리셋",
+    "seq_format": "내보내기 형식 프리셋 (우클릭으로 옵션)",
     "seq_quality": "CRF 품질 (낮을수록 = 높은 품질, 큰 파일)",
     "seq_export": "카메라 경로에서 동영상 내보내기",
     "seq_clear": "모든 키프레임 삭제",
@@ -1059,5 +1059,13 @@
     "appearance": "Appearance",
     "line_width": "Line Width",
     "instructions": "Enter: Commit selection | Ctrl+C: Copy contents"
+  },
+  "context_menu": {
+    "snap_interval": "스냅 간격",
+    "preview_scale": "미리보기 크기",
+    "video_format": "비디오 형식",
+    "clear_confirm": "모든 키프레임을 삭제하시겠습니까?",
+    "confirm": "확인",
+    "cancel": "취소"
   }
 }
