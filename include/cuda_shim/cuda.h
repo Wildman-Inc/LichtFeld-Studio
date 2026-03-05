@@ -10,7 +10,13 @@
 #define _LFS_CUDA_DRIVER_SHIM_H_
 
 // Include HIP runtime compatibility layer (provides driver-like APIs too)
+#if __has_include("core/cuda/hip_runtime_compat.h")
 #include "core/cuda/hip_runtime_compat.h"
+#elif __has_include("../../src/core/include/core/cuda/hip_runtime_compat.h")
+#include "../../src/core/include/core/cuda/hip_runtime_compat.h"
+#else
+#error "hip_runtime_compat.h not found. Add src/core/include to include paths."
+#endif
 
 // For driver API specific functionality, include HIP driver API
 #if defined(USE_HIP) && USE_HIP

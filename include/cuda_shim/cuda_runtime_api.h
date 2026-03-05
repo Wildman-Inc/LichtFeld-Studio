@@ -10,6 +10,12 @@
 #define _LFS_CUDA_RUNTIME_API_SHIM_H_
 
 // Include HIP runtime compatibility layer
+#if __has_include("core/cuda/hip_runtime_compat.h")
 #include "core/cuda/hip_runtime_compat.h"
+#elif __has_include("../../src/core/include/core/cuda/hip_runtime_compat.h")
+#include "../../src/core/include/core/cuda/hip_runtime_compat.h"
+#else
+#error "hip_runtime_compat.h not found. Add src/core/include to include paths."
+#endif
 
 #endif // _LFS_CUDA_RUNTIME_API_SHIM_H_

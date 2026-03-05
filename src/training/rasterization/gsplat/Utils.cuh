@@ -3,11 +3,37 @@
 #include "Common.h"
 
 #include <cooperative_groups.h>
+#if __has_include(<cooperative_groups/reduce.h>)
 #include <cooperative_groups/reduce.h>
+#endif
 
 namespace gsplat_lfs {
 
     namespace cg = cooperative_groups;
+
+    template <class WarpT>
+    inline __device__ float warp_reduce_sum_scalar(float val, WarpT& warp) {
+#if defined(LFS_USE_HIP) && LFS_USE_HIP
+        for (uint32_t offset = warp.size() / 2; offset > 0; offset >>= 1) {
+            val += warp.shfl_down(val, offset);
+        }
+        return val;
+#else
+        return cg::reduce(warp, val, cg::plus<float>());
+#endif
+    }
+
+    template <class WarpT>
+    inline __device__ float warp_reduce_max_scalar(float val, WarpT& warp) {
+#if defined(LFS_USE_HIP) && LFS_USE_HIP
+        for (uint32_t offset = warp.size() / 2; offset > 0; offset >>= 1) {
+            val = fmaxf(val, warp.shfl_down(val, offset));
+        }
+        return val;
+#else
+        return cg::reduce(warp, val, cg::greater<float>());
+#endif
+    }
 
     ///////////////////////////////
     // Reduce
@@ -17,34 +43,34 @@ namespace gsplat_lfs {
     inline __device__ void warpSum(float* val, WarpT& warp) {
 #pragma unroll
         for (uint32_t i = 0; i < DIM; i++) {
-            val[i] = cg::reduce(warp, val[i], cg::plus<float>());
+            val[i] = warp_reduce_sum_scalar(val[i], warp);
         }
     }
 
     template <class WarpT>
     inline __device__ void warpSum(float& val, WarpT& warp) {
-        val = cg::reduce(warp, val, cg::plus<float>());
+        val = warp_reduce_sum_scalar(val, warp);
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec4& val, WarpT& warp) {
-        val.x = cg::reduce(warp, val.x, cg::plus<float>());
-        val.y = cg::reduce(warp, val.y, cg::plus<float>());
-        val.z = cg::reduce(warp, val.z, cg::plus<float>());
-        val.w = cg::reduce(warp, val.w, cg::plus<float>());
+        val.x = warp_reduce_sum_scalar(val.x, warp);
+        val.y = warp_reduce_sum_scalar(val.y, warp);
+        val.z = warp_reduce_sum_scalar(val.z, warp);
+        val.w = warp_reduce_sum_scalar(val.w, warp);
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec3& val, WarpT& warp) {
-        val.x = cg::reduce(warp, val.x, cg::plus<float>());
-        val.y = cg::reduce(warp, val.y, cg::plus<float>());
-        val.z = cg::reduce(warp, val.z, cg::plus<float>());
+        val.x = warp_reduce_sum_scalar(val.x, warp);
+        val.y = warp_reduce_sum_scalar(val.y, warp);
+        val.z = warp_reduce_sum_scalar(val.z, warp);
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec2& val, WarpT& warp) {
-        val.x = cg::reduce(warp, val.x, cg::plus<float>());
-        val.y = cg::reduce(warp, val.y, cg::plus<float>());
+        val.x = warp_reduce_sum_scalar(val.x, warp);
+        val.y = warp_reduce_sum_scalar(val.y, warp);
     }
 
     template <class WarpT>
@@ -70,7 +96,7 @@ namespace gsplat_lfs {
 
     template <class WarpT>
     inline __device__ void warpMax(float& val, WarpT& warp) {
-        val = cg::reduce(warp, val, cg::greater<float>());
+        val = warp_reduce_max_scalar(val, warp);
     }
 
     ///////////////////////////////

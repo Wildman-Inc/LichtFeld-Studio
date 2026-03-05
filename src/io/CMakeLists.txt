@@ -82,16 +82,21 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
         libavutil
 )
 
-set(LFS_VIDEO_SOURCES
-        video/video_export_options.hpp
-        video/video_encoder.hpp
-        video/video_encoder.cpp
-        video/color_convert.cuh
-        video/color_convert.cu
-)
 if(USE_HIP)
-    lfs_hip_add_library(lfs_video STATIC ${LFS_VIDEO_SOURCES})
+    set(LFS_VIDEO_SOURCES
+            video/video_export_options.hpp
+            video/video_encoder.hpp
+            video/video_encoder_stub.cpp
+    )
+    add_library(lfs_video STATIC ${LFS_VIDEO_SOURCES})
 else()
+    set(LFS_VIDEO_SOURCES
+            video/video_export_options.hpp
+            video/video_encoder.hpp
+            video/video_encoder.cpp
+            video/color_convert.cuh
+            video/color_convert.cu
+    )
     add_library(lfs_video STATIC ${LFS_VIDEO_SOURCES})
 endif()
 
@@ -141,6 +146,14 @@ else()
         nvcodec_image_loader.hpp
         nvcodec_image_loader_stub.cpp
     )
+endif()
+
+if(USE_HIP)
+    set(IO_VIDEO_FRAME_EXTRACTOR_SOURCE video_frame_extractor_stub.cpp)
+    set(IO_VIDEO_PLAYER_SOURCE video_player_stub.cpp)
+else()
+    set(IO_VIDEO_FRAME_EXTRACTOR_SOURCE video_frame_extractor.cpp)
+    set(IO_VIDEO_PLAYER_SOURCE video_player.cpp)
 endif()
 
 # Main IO library
@@ -197,11 +210,11 @@ add_library(lfs_io STATIC
 
         # Video frame extraction
         video_frame_extractor.hpp
-        video_frame_extractor.cpp
+        ${IO_VIDEO_FRAME_EXTRACTOR_SOURCE}
 
         # Video playback for preview
         video_player.hpp
-        video_player.cpp
+        ${IO_VIDEO_PLAYER_SOURCE}
 )
 
 # Set include directories

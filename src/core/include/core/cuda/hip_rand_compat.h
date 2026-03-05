@@ -104,6 +104,7 @@ constexpr auto CURAND_RNG_QUASI_SCRAMBLED_SOBOL64 = HIPRAND_RNG_QUASI_SCRAMBLED_
 #define curandCreateGeneratorHost hiprandCreateGeneratorHost
 #define curandDestroyGenerator hiprandDestroyGenerator
 #define curandSetPseudoRandomGeneratorSeed hiprandSetPseudoRandomGeneratorSeed
+#define curandSetGeneratorOffset hiprandSetGeneratorOffset
 #define curandSetStream hiprandSetStream
 #define curandGetVersion hiprandGetVersion
 

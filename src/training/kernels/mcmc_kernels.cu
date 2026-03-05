@@ -16,8 +16,30 @@
 #include <thrust/scatter.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
+#if LFS_USE_HIP
+#include <thrust/system/hip/execution_policy.h>
+#else
+#include <thrust/system/cuda/execution_policy.h>
+#endif
+#include <cmath>
 
 namespace lfs::training::mcmc {
+
+    namespace {
+        inline auto thrust_exec(cudaStream_t stream) {
+#if LFS_USE_HIP
+            return thrust::hip::par.on(stream);
+#else
+            return thrust::cuda::par.on(stream);
+#endif
+        }
+
+#if LFS_USE_HIP
+        constexpr uint64_t WARP_FULL_MASK = 0xFFFFFFFFFFFFFFFFull;
+#else
+        constexpr uint32_t WARP_FULL_MASK = 0xffffffffu;
+#endif
+    } // namespace
 
     // GLM type aliases for CUDA (matching gsplat)
     using vec2 = glm::vec<2, float>;
@@ -35,7 +57,8 @@ namespace lfs::training::mcmc {
             float binom = 1.0f;
             for (int k = 0; k <= n; k++) {
                 const float sign = (k % 2 == 0) ? 1.0f : -1.0f;
-                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * rsqrtf(static_cast<float>(k + 1));
+                coeffs[n * RELOCATION_N_MAX + k] =
+                    binom * sign / std::sqrt(static_cast<float>(k + 1));
                 if (k < n)
                     binom *= static_cast<float>(n - k) / static_cast<float>(k + 1);
             }
@@ -640,7 +663,7 @@ namespace lfs::training::mcmc {
 
         // Warp-level reduction to sum counts
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            count += __shfl_down_sync(0xffffffff, count, offset);
+            count += __shfl_down_sync(WARP_FULL_MASK, count, offset);
         }
 
         // First lane writes the result
@@ -665,24 +688,24 @@ namespace lfs::training::mcmc {
 
         // Step 1: Create position array and copy indices
         thrust::device_vector<int32_t> orig_positions(n_samples);
-        thrust::sequence(thrust::cuda::par.on(cuda_stream), orig_positions.begin(), orig_positions.end());
+        thrust::sequence(thrust_exec(cuda_stream), orig_positions.begin(), orig_positions.end());
 
         thrust::device_vector<int64_t> sorted_indices(indices, indices + n_samples);
 
         // Step 2: Sort indices while tracking original positions
-        thrust::sort_by_key(thrust::cuda::par.on(cuda_stream),
+        thrust::sort_by_key(thrust_exec(cuda_stream),
                             sorted_indices.begin(), sorted_indices.end(),
                             orig_positions.begin());
 
         // Step 3: Mark segment boundaries (1 where index changes, 0 otherwise)
         thrust::device_vector<int32_t> head_flags(n_samples);
-        thrust::adjacent_difference(thrust::cuda::par.on(cuda_stream),
+        thrust::adjacent_difference(thrust_exec(cuda_stream),
                                     sorted_indices.begin(), sorted_indices.end(),
                                     head_flags.begin(),
                                     thrust::not_equal_to<int64_t>());
         // First element is always a segment head
         if (n_samples > 0) {
-            thrust::fill_n(thrust::cuda::par.on(cuda_stream), head_flags.begin(), 1, 1);
+            thrust::fill_n(thrust_exec(cuda_stream), head_flags.begin(), 1, 1);
         }
 
         // Step 4: Compute run lengths with exclusive_scan_by_key
@@ -690,7 +713,7 @@ namespace lfs::training::mcmc {
         thrust::device_vector<int32_t> run_positions(n_samples);
         thrust::device_vector<int32_t> ones(n_samples, 1);
 
-        thrust::exclusive_scan_by_key(thrust::cuda::par.on(cuda_stream),
+        thrust::exclusive_scan_by_key(thrust_exec(cuda_stream),
                                       sorted_indices.begin(), sorted_indices.end(),
                                       ones.begin(),
                                       run_positions.begin());
@@ -699,7 +722,7 @@ namespace lfs::training::mcmc {
         // Use a kernel to compute the count for each element
         thrust::device_vector<int32_t> run_counts(n_samples);
 
-        thrust::transform(thrust::cuda::par.on(cuda_stream),
+        thrust::transform(thrust_exec(cuda_stream),
                           thrust::make_counting_iterator<int>(0),
                           thrust::make_counting_iterator<int>(n_samples),
                           run_counts.begin(),
@@ -724,7 +747,7 @@ namespace lfs::training::mcmc {
                           });
 
         // Step 6: Scatter counts back to original positions
-        thrust::scatter(thrust::cuda::par.on(cuda_stream),
+        thrust::scatter(thrust_exec(cuda_stream),
                         run_counts.begin(), run_counts.end(),
                         orig_positions.begin(),
                         output_counts);
@@ -961,7 +984,7 @@ namespace lfs::training::mcmc {
         auto alive_probs = lfs::core::Tensor::empty({n_alive}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
         auto cumsum_buf = lfs::core::Tensor::empty({n_alive}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
 
-        thrust::transform(thrust::cuda::par.on(cuda_stream),
+        thrust::transform(thrust_exec(cuda_stream),
                           thrust::counting_iterator<int>(0),
                           thrust::counting_iterator<int>(n_alive),
                           thrust::device_ptr<float>(alive_probs.ptr<float>()),

@@ -6,6 +6,7 @@
 #include "core/export.hpp"
 #include "core/tensor.hpp"
 #include "io/cache_image_loader.hpp"
+#include <cuda_runtime.h>
 
 #include <atomic>
 #include <chrono>
@@ -19,9 +20,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-struct CUstream_st;
-using cudaStream_t = CUstream_st*;
 
 namespace lfs::io {
 

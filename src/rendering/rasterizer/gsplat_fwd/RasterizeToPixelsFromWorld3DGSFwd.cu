@@ -375,6 +375,7 @@ namespace gsplat_fwd {
             return;
         }
 
+#if !LFS_USE_HIP
         auto err = cudaFuncSetAttribute(
             rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -386,6 +387,7 @@ namespace gsplat_fwd {
                     shmem_size, cudaGetErrorString(err));
             return;
         }
+#endif
 
         rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>
             <<<grid, threads, shmem_size, stream>>>(

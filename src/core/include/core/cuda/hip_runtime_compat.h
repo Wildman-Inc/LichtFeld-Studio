@@ -110,6 +110,13 @@ using cudaArray_t = hipArray_t;
 #define cudaMemcpyDefault hipMemcpyDefault
 #endif
 
+#ifndef cudaMemoryTypeHost
+#define cudaMemoryTypeHost hipMemoryTypeHost
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaMemoryTypeManaged hipMemoryTypeUnified
+#define cudaMemoryTypeUnregistered hipMemoryTypeUnregistered
+#endif
+
 #ifndef cudaHostAllocDefault
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocPortable hipHostMallocPortable
@@ -240,6 +247,10 @@ using cudaGraphNode_t = hipGraphNode_t;
 #ifndef cudaMemcpy
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyToSymbol hipMemcpyToSymbol
+#define cudaMemcpyToSymbolAsync hipMemcpyToSymbolAsync
+#define cudaMemcpyFromSymbol hipMemcpyFromSymbol
+#define cudaMemcpyFromSymbolAsync hipMemcpyFromSymbolAsync
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaMemGetInfo hipMemGetInfo

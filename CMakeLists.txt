@@ -550,7 +550,10 @@ elseif(USE_HIP)
             
             # Include directories - use short paths to avoid FindHIP.cmake issues
             set(HIP_INCLUDE_DIRS "${HIP_PATH_CMAKE_SHORT}/include")
-            set(GPU_INCLUDE_DIRS "${HIP_INCLUDE_DIRS}")
+            set(GPU_INCLUDE_DIRS
+                "${HIP_INCLUDE_DIRS}"
+                "${CMAKE_SOURCE_DIR}/src/core/include"
+            )
             
             # Library directories - use short paths
             set(HIP_LIB_DIR "${HIP_PATH_CMAKE_SHORT}/lib")
@@ -664,7 +667,10 @@ elseif(USE_HIP)
                 set(HIP_INCLUDE_DIRS "")
             endif()
         endif()
-        set(GPU_INCLUDE_DIRS "${HIP_INCLUDE_DIRS}")
+        set(GPU_INCLUDE_DIRS
+            "${HIP_INCLUDE_DIRS}"
+            "${CMAKE_SOURCE_DIR}/src/core/include"
+        )
         set(HIP_LIBRARIES "${GPU_RUNTIME_LIBRARY}")
         set(GPU_ARCH_FLAG "${HIP_ARCHITECTURES}")
 

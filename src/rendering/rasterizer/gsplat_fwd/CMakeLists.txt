@@ -33,8 +33,14 @@ else()
     add_library(gsplat_fwd STATIC ${GSPLAT_FWD_SOURCES})
 endif()
 
+if(USE_HIP)
+    set(_gsplat_fwd_cxx_standard 20)
+else()
+    set(_gsplat_fwd_cxx_standard 23)
+endif()
+
 set_target_properties(gsplat_fwd PROPERTIES
-        CXX_STANDARD 23
+        CXX_STANDARD ${_gsplat_fwd_cxx_standard}
         CXX_STANDARD_REQUIRED ON
         POSITION_INDEPENDENT_CODE ON
 )
@@ -87,10 +93,10 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 # GLM workarounds for CUDA 12.x compatibility
-target_compile_definitions(gsplat_fwd PRIVATE
-    GLM_FORCE_CUDA
-    GLM_COMPILER=0
-)
+target_compile_definitions(gsplat_fwd PRIVATE GLM_COMPILER=0)
+if(USE_CUDA)
+    target_compile_definitions(gsplat_fwd PRIVATE GLM_FORCE_CUDA)
+endif()
 
 message(STATUS "gsplat_fwd configuration:")
 message(STATUS "  - Sources: ${GSPLAT_FWD_SOURCES}")

@@ -40,8 +40,14 @@ else()
     add_library(gsplat_backend_lfs STATIC ${GSPLAT_SOURCES})
 endif()
 
+if(USE_HIP)
+    set(_gsplat_cxx_standard 20)
+else()
+    set(_gsplat_cxx_standard 23)
+endif()
+
 set_target_properties(gsplat_backend_lfs PROPERTIES
-        CXX_STANDARD 23
+        CXX_STANDARD ${_gsplat_cxx_standard}
         CXX_STANDARD_REQUIRED ON
         POSITION_INDEPENDENT_CODE ON
 )
@@ -96,10 +102,10 @@ endif()
 # GLM workarounds for CUDA 12.x compatibility
 # GLM_COMPILER=0 disables compiler detection (needed for CUDA 12.x)
 # GLM_FORCE_CUDA enables CUDA support
-target_compile_definitions(gsplat_backend_lfs PRIVATE
-    GLM_FORCE_CUDA
-    GLM_COMPILER=0
-)
+target_compile_definitions(gsplat_backend_lfs PRIVATE GLM_COMPILER=0)
+if(USE_CUDA)
+    target_compile_definitions(gsplat_backend_lfs PRIVATE GLM_FORCE_CUDA)
+endif()
 
 # Print debug info
 message(STATUS "gsplat_backend_lfs configuration:")
