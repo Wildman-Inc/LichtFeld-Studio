@@ -40,15 +40,24 @@ macro(lfs_hip_add_library target_name lib_type)
                 # Create .hip symlink/copy in binary dir
                 set(_hip_file "${CMAKE_CURRENT_BINARY_DIR}/${_source_name}.hip.cpp")
                 
-                # Configure a simple wrapper file that includes the original
-                # Include hip_runtime_compat.h first to block cuda_runtime.h and provide CUDA->HIP mappings
-                # Then include hip_runtime.h for HIP intrinsics
-                file(WRITE "${_hip_file}" 
-                    "// Auto-generated HIP wrapper for ${_source}\n"
-                    "#include \"${CMAKE_SOURCE_DIR}/src/core/include/core/cuda/hip_runtime_compat.h\"\n"
-                    "#include <hip/hip_runtime.h>\n"
-                    "#include \"${_source_abs}\"\n"
-                )
+                # Configure a simple wrapper file that includes the original.
+                # Most CUDA-style sources need hip_runtime_compat.h for CUDA->HIP
+                # mappings, but a few HIP-clean sources (e.g. cuda_gl_kernels.cu)
+                # should skip it to avoid runtime header conflicts.
+                if(_source_abs MATCHES "src/rendering/cuda_gl_kernels\\.cu$")
+                    file(WRITE "${_hip_file}"
+                        "// Auto-generated HIP wrapper for ${_source}\n"
+                        "#include <hip/hip_runtime.h>\n"
+                        "#include \"${_source_abs}\"\n"
+                    )
+                else()
+                    file(WRITE "${_hip_file}"
+                        "// Auto-generated HIP wrapper for ${_source}\n"
+                        "#include \"${CMAKE_SOURCE_DIR}/src/core/include/core/cuda/hip_runtime_compat.h\"\n"
+                        "#include <hip/hip_runtime.h>\n"
+                        "#include \"${_source_abs}\"\n"
+                    )
+                endif()
                 
                 list(APPEND _hip_sources "${_hip_file}")
                 list(APPEND _hip_device_sources "${_hip_file}")

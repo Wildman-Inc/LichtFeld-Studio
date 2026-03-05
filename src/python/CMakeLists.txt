@@ -6,7 +6,10 @@ message(STATUS "Configuring Python components (runner + nanobind module)")
 
 #Python for interpreter + embedding + nanobind
 find_package(Python REQUIRED COMPONENTS Interpreter Development Development.Module Development.SABIModule)
-find_package(nanobind CONFIG REQUIRED)
+option(LFS_BUILD_PYTHON_MODULE "Build the nanobind Python extension module (lfs_py)" ON)
+if(LFS_BUILD_PYTHON_MODULE)
+    find_package(nanobind CONFIG REQUIRED)
+endif()
 
 # vcpkg extension modules use release ABI; debug libpython has Py_DEBUG which
 # changes _PyRuntimeState layout, causing ABI mismatch crashes.
@@ -123,59 +126,60 @@ set_target_properties(lfs_python_utils PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 
-# nanobind module (Python import name: lichtfeld)
-# NOTE: We intentionally do NOT use STABLE_ABI here because:
-# 1. The main app embeds Python and links to python312.dll
-# 2. STABLE_ABI would make the .pyd link to python3.dll instead
-# 3. On Windows, having both DLLs loaded causes double Python initialization
-# 4. This makes the .pyd version-specific but avoids the DLL conflict
-nanobind_add_module(
-    lfs_py
-    NB_STATIC
-    lfs/module.cpp
-    lfs/py_animation.cpp
-    lfs/py_command.cpp
-    lfs/py_gizmo.cpp
-    lfs/py_keymap.cpp
-    lfs/py_tensor.cpp
-    lfs/py_splat_data.cpp
-    lfs/py_scene.cpp
-    lfs/py_scripts.cpp
-    lfs/py_cameras.cpp
-    lfs/py_io.cpp
-    lfs/py_packages.cpp
-    lfs/py_params.cpp
-    lfs/py_plugins.cpp
-    lfs/py_ui.cpp
-    lfs/py_ui_context.cpp
-    lfs/py_ui_theme.cpp
-    lfs/py_ui_operators.cpp
-    lfs/py_modal_registry.cpp
-    lfs/py_ui_modals.cpp
-    lfs/notification_bridge.cpp
-    lfs/py_ui_hooks.cpp
-    lfs/py_ui_menus.cpp
-    lfs/py_ui_panels.cpp
-    lfs/py_uilist.cpp
-    lfs/py_viewport.cpp
-    viewport_overlay.cpp
-    lfs/py_mcp.cpp
-    lfs/py_mesh.cpp
-    lfs/py_mesh2splat.cpp
-    lfs/openmesh/handles.cpp
-    lfs/openmesh/io.cpp
-    lfs/py_rendering.cpp
-    lfs/py_selection.cpp
-    lfs/py_operator.cpp
-    lfs/py_pipeline.cpp
-    lfs/py_prop_registry.cpp
-    lfs/py_signals.cpp
-    lfs/py_rml.cpp
-    lfs/rml_python_panel_adapter.cpp
-    lfs/py_rml_im_mode_layout.cpp
-    lfs/rml_im_mode_layout.cpp
-    lfs/rml_im_mode_panel_adapter.cpp
-)
+if(LFS_BUILD_PYTHON_MODULE)
+    # nanobind module (Python import name: lichtfeld)
+    # NOTE: We intentionally do NOT use STABLE_ABI here because:
+    # 1. The main app embeds Python and links to python312.dll
+    # 2. STABLE_ABI would make the .pyd link to python3.dll instead
+    # 3. On Windows, having both DLLs loaded causes double Python initialization
+    # 4. This makes the .pyd version-specific but avoids the DLL conflict
+    nanobind_add_module(
+        lfs_py
+        NB_STATIC
+        lfs/module.cpp
+        lfs/py_animation.cpp
+        lfs/py_command.cpp
+        lfs/py_gizmo.cpp
+        lfs/py_keymap.cpp
+        lfs/py_tensor.cpp
+        lfs/py_splat_data.cpp
+        lfs/py_scene.cpp
+        lfs/py_scripts.cpp
+        lfs/py_cameras.cpp
+        lfs/py_io.cpp
+        lfs/py_packages.cpp
+        lfs/py_params.cpp
+        lfs/py_plugins.cpp
+        lfs/py_ui.cpp
+        lfs/py_ui_context.cpp
+        lfs/py_ui_theme.cpp
+        lfs/py_ui_operators.cpp
+        lfs/py_modal_registry.cpp
+        lfs/py_ui_modals.cpp
+        lfs/notification_bridge.cpp
+        lfs/py_ui_hooks.cpp
+        lfs/py_ui_menus.cpp
+        lfs/py_ui_panels.cpp
+        lfs/py_uilist.cpp
+        lfs/py_viewport.cpp
+        viewport_overlay.cpp
+        lfs/py_mcp.cpp
+        lfs/py_mesh.cpp
+        lfs/py_mesh2splat.cpp
+        lfs/openmesh/handles.cpp
+        lfs/openmesh/io.cpp
+        lfs/py_rendering.cpp
+        lfs/py_selection.cpp
+        lfs/py_operator.cpp
+        lfs/py_pipeline.cpp
+        lfs/py_prop_registry.cpp
+        lfs/py_signals.cpp
+        lfs/py_rml.cpp
+        lfs/rml_python_panel_adapter.cpp
+        lfs/py_rml_im_mode_layout.cpp
+        lfs/rml_im_mode_layout.cpp
+        lfs/rml_im_mode_panel_adapter.cpp
+    )
 
 set_target_properties(lfs_py PROPERTIES
     LINKER_LANGUAGE CXX
@@ -374,7 +378,8 @@ add_custom_target(lfs_plugins_copy ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/lfs_plugins ${CMAKE_CURRENT_BINARY_DIR}/lfs_plugins
     COMMENT "Copying lfs_plugins Python module"
 )
-add_dependencies(lfs_py lfs_plugins_copy)
+    add_dependencies(lfs_py lfs_plugins_copy)
+endif()
 
 # UV package manager for Python package installation support
 include(${CMAKE_SOURCE_DIR}/cmake/FetchUV.cmake)
@@ -391,16 +396,18 @@ install_uv()
 set(PYTHON_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/python")
 
 # Install lichtfeld Python module (.so/.pyd) to bin for portable builds
-if(BUILD_PORTABLE)
-    install(TARGETS lfs_py
-        LIBRARY DESTINATION "${CMAKE_INSTALL_BINDIR}"
-        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"  # Windows DLLs
-    )
-else()
-    install(TARGETS lfs_py
-        LIBRARY DESTINATION "${PYTHON_INSTALL_DIR}"
-        RUNTIME DESTINATION "${PYTHON_INSTALL_DIR}"  # Windows DLLs
-    )
+if(TARGET lfs_py)
+    if(BUILD_PORTABLE)
+        install(TARGETS lfs_py
+            LIBRARY DESTINATION "${CMAKE_INSTALL_BINDIR}"
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"  # Windows DLLs
+        )
+    else()
+        install(TARGETS lfs_py
+            LIBRARY DESTINATION "${PYTHON_INSTALL_DIR}"
+            RUNTIME DESTINATION "${PYTHON_INSTALL_DIR}"  # Windows DLLs
+        )
+    endif()
 endif()
 
 # Install lfs_python_runtime shared library (required by lichtfeld module and exe)

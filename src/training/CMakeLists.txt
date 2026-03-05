@@ -73,6 +73,18 @@ if(MSVC)
     )
 endif()
 # Optimizer sources
+if(USE_HIP AND WIN32)
+    set(LFS_PPISP_CONTROLLER_SOURCES
+        components/ppisp_controller_stub.cpp
+        components/ppisp_controller_pool_stub.cpp
+    )
+else()
+    set(LFS_PPISP_CONTROLLER_SOURCES
+        components/ppisp_controller.cu
+        components/ppisp_controller_pool.cu
+    )
+endif()
+
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
     optimizer/scheduler.cpp
@@ -86,8 +98,7 @@ set(TRAINING_NEW_SOURCES
     rasterization/gsplat_rasterizer.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
-    components/ppisp_controller.cu
-    components/ppisp_controller_pool.cu
+    ${LFS_PPISP_CONTROLLER_SOURCES}
     components/ppisp_file.cpp
     components/sparsity_optimizer.cpp
     control/command_api.cpp

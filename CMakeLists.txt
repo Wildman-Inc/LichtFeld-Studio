@@ -178,13 +178,23 @@ option(ENABLE_TENSOR_OP_TRACING "Enable tensor operation tracing" OFF)
 set(BUILD_CUDA_ALL_MIN_SM "86" CACHE STRING "Minimum SM (compute capability) used when BUILD_CUDA_ALL_SM=ON Examples: 75, 80, 86, 89...")
 
 # HIP architecture selection for ROCm
-set(LFS_AMDGPU_ARCH "gfx942" CACHE STRING "AMDGPU target arch for HIP backend (e.g., gfx942 or auto)")
+if(WIN32)
+    set(_lfs_default_amdgpu_arch "gfx1151")
+else()
+    set(_lfs_default_amdgpu_arch "gfx942")
+endif()
+set(LFS_AMDGPU_ARCH "${_lfs_default_amdgpu_arch}" CACHE STRING "AMDGPU target arch for HIP backend (e.g., gfx942, gfx1151, or auto)")
 option(LFS_AMDGPU_ARCH_AUTO_DETECT "Auto-detect AMDGPU arch via rocminfo when available" ON)
 
 if(USE_HIP)
     if(LFS_ENABLE_NVIMAGECODEC)
         message(STATUS "LFS_ENABLE_NVIMAGECODEC forced OFF for HIP backend")
         set(LFS_ENABLE_NVIMAGECODEC OFF CACHE BOOL "Enable NVIDIA nvImageCodec integration (CUDA backend only)" FORCE)
+    endif()
+
+    if(LFS_AMDGPU_ARCH STREQUAL "auto" AND NOT LFS_AMDGPU_ARCH_AUTO_DETECT)
+        set(LFS_AMDGPU_ARCH "${_lfs_default_amdgpu_arch}" CACHE STRING "AMDGPU target arch for HIP backend (e.g., gfx942, gfx1151, or auto)" FORCE)
+        message(STATUS "LFS_AMDGPU_ARCH=auto with auto-detect disabled; using default ${LFS_AMDGPU_ARCH}")
     endif()
 
     set(_should_detect_arch OFF)
@@ -207,10 +217,10 @@ if(USE_HIP)
             string(REGEX MATCH "gfx[0-9a-z]+" _detected_amd_arch "${_rocminfo_out}")
         endif()
         if(_detected_amd_arch)
-            set(LFS_AMDGPU_ARCH "${_detected_amd_arch}" CACHE STRING "AMDGPU target arch for HIP backend (e.g., gfx942 or auto)" FORCE)
+            set(LFS_AMDGPU_ARCH "${_detected_amd_arch}" CACHE STRING "AMDGPU target arch for HIP backend (e.g., gfx942, gfx1151, or auto)" FORCE)
             message(STATUS "Detected AMDGPU arch via rocminfo: ${LFS_AMDGPU_ARCH}")
         elseif(LFS_AMDGPU_ARCH STREQUAL "auto")
-            set(LFS_AMDGPU_ARCH "gfx942" CACHE STRING "AMDGPU target arch for HIP backend (e.g., gfx942 or auto)" FORCE)
+            set(LFS_AMDGPU_ARCH "${_lfs_default_amdgpu_arch}" CACHE STRING "AMDGPU target arch for HIP backend (e.g., gfx942, gfx1151, or auto)" FORCE)
             message(STATUS "Could not detect AMDGPU arch via rocminfo, falling back to ${LFS_AMDGPU_ARCH}")
         else()
             message(STATUS "Using configured AMDGPU arch: ${LFS_AMDGPU_ARCH}")
@@ -976,6 +986,12 @@ elseif(USE_HIP)
 endif()
 add_definitions(-DLFS_GPU_BACKEND_STR="${LFS_GPU_BACKEND}")
 
+option(LFS_BUILD_PYTHON_MODULE "Build the nanobind Python extension module (lfs_py)" ON)
+if(USE_HIP AND LFS_BUILD_PYTHON_MODULE)
+    message(STATUS "Disabling lfs_py module for HIP builds (runtime/utils remain enabled)")
+    set(LFS_BUILD_PYTHON_MODULE OFF CACHE BOOL "Build the nanobind Python extension module (lfs_py)" FORCE)
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
     if(USE_CUDA)
@@ -995,8 +1011,11 @@ add_subdirectory(src/core)      # Core module (lfs::core namespace)
 add_subdirectory(src/training)  # Training module (lfs::training namespace)
 add_subdirectory(src/io)        # I/O module (lfs::io namespace)
 add_subdirectory(src/rendering) # Rendering module (lfs::rendering namespace)
-add_subdirectory(src/visualizer) # Visualizer module (lfs::vis namespace)
 add_subdirectory(src/geometry)  # Geometry utilities
+add_subdirectory(src/sequencer) # Sequencer module
+add_subdirectory(src/python)    # Python runtime + utilities (+ optional lfs_py module)
+add_subdirectory(src/mcp)       # MCP module
+add_subdirectory(src/visualizer) # Visualizer module (lfs::vis namespace)
 
 # =============================================================================
 # MAIN EXECUTABLES
@@ -1008,6 +1027,7 @@ add_subdirectory(src/geometry)  # Geometry utilities
 add_executable(${PROJECT_NAME}
     src/app/main.cpp
     src/app/application.cpp
+    src/app/converter.cpp
     src/app/splash_screen.cpp
     resources/lichtfeld-studio.rc
 )
@@ -1044,6 +1064,7 @@ target_link_libraries(${PROJECT_NAME}
         lfs_geometry       # For EuclideanTransform
         lfs_core           # Core library
         lfs_io             # For CacheLoader
+        lfs_mcp            # MCP server mode (main.cpp)
         fastlfs_backend    # Rasterizer and optimizer
 
         ${OPENGL_LIBRARIES}
@@ -1053,6 +1074,7 @@ target_link_libraries(${PROJECT_NAME}
         OpenImageIO::OpenImageIO
         glad::glad         # For splash screen
         glfw               # For splash screen
+        SDL3::SDL3         # For splash screen
 )
 
 # Copy nvImageCodec shared libraries next to executable for easy deployment

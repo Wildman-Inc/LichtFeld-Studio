@@ -16,8 +16,23 @@
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
+#if LFS_USE_HIP
+#include <thrust/system/hip/execution_policy.h>
+#else
+#include <thrust/system/cuda/execution_policy.h>
+#endif
 
 namespace lfs::rendering {
+
+    namespace {
+        inline auto thrust_exec(cudaStream_t stream) {
+#if LFS_USE_HIP
+            return thrust::hip::par.on(stream);
+#else
+            return thrust::cuda::par.on(stream);
+#endif
+        }
+    } // namespace
 
     inline std::function<char*(size_t)> resize_function_wrapper_tensor(Tensor& t) {
         return [&t](size_t N) -> char* {
@@ -114,7 +129,7 @@ namespace lfs::rendering {
             auto out_ptr = thrust::device_pointer_cast(result.tensor.ptr<int>());
 
             auto end_it = thrust::copy_if(
-                thrust::cuda::par.on(stream),
+                thrust_exec(stream),
                 counting, counting + n_gaussians, out_ptr, predicate);
 
             result.count = static_cast<size_t>(end_it - out_ptr);
@@ -957,10 +972,6 @@ namespace lfs::rendering {
         const float* const tangential_ptr = (tangential_coeffs && tangential_coeffs->is_valid()) ? tangential_coeffs->ptr<float>() : nullptr;
         const float* const bg_ptr = (background && background->is_valid()) ? background->ptr<float>() : nullptr;
 
-        const auto prepared_transforms = PreparedModelTransforms::from(model_transforms);
-        const float* model_transforms_ptr = prepared_transforms.ptr;
-        const int num_transforms = prepared_transforms.count;
-
         // Transform indices (N-sized, not filtered)
         const int* transform_indices_ptr = (transform_indices && transform_indices->is_valid())
                                                ? transform_indices->ptr<int>()
@@ -994,9 +1005,7 @@ namespace lfs::rendering {
             bg_ptr,
             GutRenderMode::RGB,
             1.0f,
-            model_transforms_ptr,
             transform_indices_ptr,
-            num_transforms,
             visibility_mask.ptr,
             visibility_mask.count,
             visible_indices_ptr, // Kernel uses this for indirect indexing

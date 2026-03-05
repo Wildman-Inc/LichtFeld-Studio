@@ -12,6 +12,12 @@ namespace cg = cooperative_groups;
 
 namespace lfs::rendering::kernels {
 
+#if defined(__HIP_PLATFORM_AMD__)
+    constexpr unsigned long long kWarpSyncMask = 0xffffffffffffffffull;
+#else
+    constexpr unsigned int kWarpSyncMask = 0xffffffffu;
+#endif
+
     __device__ inline float3 mat3_transpose_mul_vec3(
         const mat3x3& m,
         const float3& v) {
@@ -78,7 +84,9 @@ namespace lfs::rendering::kernels {
         const float2 t = make_float2(
             not_in_y_range * __saturatef((d.x * conic.x * diff.x + d.x * conic.y * diff.y) / (d.x * conic.x * d.x)),
             not_in_x_range * __saturatef((d.y * conic.y * diff.x + d.y * conic.z * diff.y) / (d.y * conic.z * d.y)));
-        const float2 max_contribution_point = closest_corner + t * d;
+        const float2 max_contribution_point = make_float2(
+            closest_corner.x + t.x * d.x,
+            closest_corner.y + t.y * d.y);
         const float2 delta = mean - max_contribution_point;
         const float max_power_in_tile = 0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) + conic.y * delta.x * delta.y;
         return max_power_in_tile <= power_threshold;
@@ -109,7 +117,7 @@ namespace lfs::rendering::kernels {
         const uint warp_idx = cg::this_thread_block().thread_rank() / 32u;
 
         const int compute_cooperatively = active && tile_count > config::n_sequential_threshold;
-        const uint remaining_threads = __ballot_sync(0xffffffffu, compute_cooperatively);
+        const uint remaining_threads = static_cast<uint>(__ballot_sync(kWarpSyncMask, compute_cooperatively));
         if (remaining_threads == 0)
             return n_touched_tiles;
 
@@ -118,21 +126,21 @@ namespace lfs::rendering::kernels {
             const uint current_lane = __fns(remaining_threads, 0, n + 1); // find lane index of next remaining thread
 
             const uint4 screen_bounds_coop = make_uint4(
-                __shfl_sync(0xffffffffu, screen_bounds.x, current_lane),
-                __shfl_sync(0xffffffffu, screen_bounds.y, current_lane),
-                __shfl_sync(0xffffffffu, screen_bounds.z, current_lane),
-                __shfl_sync(0xffffffffu, screen_bounds.w, current_lane));
+                __shfl_sync(kWarpSyncMask, screen_bounds.x, current_lane),
+                __shfl_sync(kWarpSyncMask, screen_bounds.y, current_lane),
+                __shfl_sync(kWarpSyncMask, screen_bounds.z, current_lane),
+                __shfl_sync(kWarpSyncMask, screen_bounds.w, current_lane));
             const uint screen_bounds_width_coop = screen_bounds_coop.y - screen_bounds_coop.x;
             const uint tile_count_coop = (screen_bounds_coop.w - screen_bounds_coop.z) * screen_bounds_width_coop;
 
             const float2 mean2d_shifted_coop = make_float2(
-                __shfl_sync(0xffffffffu, mean2d_shifted.x, current_lane),
-                __shfl_sync(0xffffffffu, mean2d_shifted.y, current_lane));
+                __shfl_sync(kWarpSyncMask, mean2d_shifted.x, current_lane),
+                __shfl_sync(kWarpSyncMask, mean2d_shifted.y, current_lane));
             const float3 conic_coop = make_float3(
-                __shfl_sync(0xffffffffu, conic.x, current_lane),
-                __shfl_sync(0xffffffffu, conic.y, current_lane),
-                __shfl_sync(0xffffffffu, conic.z, current_lane));
-            const float power_threshold_coop = __shfl_sync(0xffffffffu, power_threshold, current_lane);
+                __shfl_sync(kWarpSyncMask, conic.x, current_lane),
+                __shfl_sync(kWarpSyncMask, conic.y, current_lane),
+                __shfl_sync(kWarpSyncMask, conic.z, current_lane));
+            const float power_threshold_coop = __shfl_sync(kWarpSyncMask, power_threshold, current_lane);
 
             const uint remaining_tile_count = tile_count_coop - config::n_sequential_threshold;
             const int n_iterations = div_round_up(remaining_tile_count, 32u);
@@ -142,7 +150,7 @@ namespace lfs::rendering::kernels {
                 const uint tile_y = screen_bounds_coop.z + (instance_idx / screen_bounds_width_coop);
                 const uint tile_x = screen_bounds_coop.x + (instance_idx % screen_bounds_width_coop);
                 const uint contributes = active_current && will_primitive_contribute(mean2d_shifted_coop, conic_coop, tile_x, tile_y, power_threshold_coop);
-                const uint contributes_ballot = __ballot_sync(0xffffffffu, contributes);
+                const uint contributes_ballot = static_cast<uint>(__ballot_sync(kWarpSyncMask, contributes));
                 const uint n_contributes = __popc(contributes_ballot);
                 n_touched_tiles += (current_lane == lane_idx) * n_contributes;
             }

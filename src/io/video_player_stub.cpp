@@ -6,6 +6,8 @@
 
 namespace lfs::io {
 
+    class VideoPlayer::Impl {};
+
     VideoPlayer::VideoPlayer() = default;
     VideoPlayer::~VideoPlayer() = default;
 

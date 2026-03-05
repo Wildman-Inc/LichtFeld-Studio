@@ -22,6 +22,8 @@
 
 namespace lfs::rendering {
 
+    using Tensor = lfs::core::Tensor;
+
     struct PointCloudCropParams {
         bool enabled = false;
         glm::mat4 transform{1.0f};

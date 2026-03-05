@@ -38,7 +38,6 @@ set(TENSOR_SOURCES
         tensor/tensor_nn_ops.cpp
         tensor/pinned_memory_allocator.cpp
         tensor/offset_allocator.cpp
-        tensor/tensor_exports.cu
 )
 
 # Core module sources
@@ -97,6 +96,14 @@ target_link_libraries(lfs_core
         OpenImageIO::OpenImageIO
         $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
 )
+
+if(USE_HIP AND WIN32)
+    # Keep all tensor kernel instantiations inside lfs_core.dll so downstream DLLs
+    # resolve imported launch_* symbols from lfs_core on Windows.
+    target_link_options(lfs_core PRIVATE
+        "LINKER:/WHOLEARCHIVE:$<TARGET_FILE:lfs_tensor_kernels>"
+    )
+endif()
 
 # OpenMP for tensor multi-threaded operations
 find_package(OpenMP)

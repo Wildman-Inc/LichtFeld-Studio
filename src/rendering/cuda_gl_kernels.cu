@@ -4,10 +4,14 @@
 
 #include "config.h"
 
-#ifdef CUDA_GL_INTEROP_ENABLED
-
+#if LFS_USE_HIP
+#include "core/cuda/hip_runtime_compat.h"
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
+#ifdef CUDA_GL_INTEROP_ENABLED
 namespace lfs {
 
     // CUDA kernel to interleave position and color data

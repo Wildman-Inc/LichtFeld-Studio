@@ -766,7 +766,7 @@ namespace lfs::training {
 
         // Release GPU memory pools back to system
         lfs::core::Tensor::trim_memory_pool();
-        lfs::core::GlobalArenaManager::instance().get_arena().full_reset();
+        lfs::core::GlobalArenaManager::instance().reset();
         cudaDeviceSynchronize();
         LOG_DEBUG("GPU memory released");
 
@@ -1509,8 +1509,7 @@ namespace lfs::training {
                                               ? tile_grad_alpha
                                               : lfs::core::Tensor::zeros_like(output.alpha);
                         gsplat_rasterize_backward(*gsplat_ctx, raster_grad, grad_alpha,
-                                                  strategy_->get_model(), strategy_->get_optimizer(),
-                                                  use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{});
+                                                  strategy_->get_model(), strategy_->get_optimizer());
                     } else {
                         fast_rasterize_backward(*fast_ctx, raster_grad, strategy_->get_model(),
                                                 strategy_->get_optimizer(), tile_grad_alpha,
@@ -1905,7 +1904,7 @@ namespace lfs::training {
                         cudaDeviceSynchronize();
                         cudaGetLastError();
 
-                        lfs::core::GlobalArenaManager::instance().get_arena().full_reset();
+                        lfs::core::GlobalArenaManager::instance().reset();
                         lfs::core::Tensor::trim_memory_pool();
 
                         cudaDeviceSynchronize();

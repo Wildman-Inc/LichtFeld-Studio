@@ -129,7 +129,6 @@ namespace lfs::vis::terminal {
             .sb_pushline = onPushline,
             .sb_popline = onPopline,
             .sb_clear = nullptr,
-            .sb_pushline4 = nullptr,
         };
 
         vterm_screen_set_callbacks(screen_, &callbacks, this);

@@ -25,16 +25,36 @@ set(RENDERING_SOURCES
         mesh_renderer.cpp
         mesh2splat.cpp
         depth_compositor.cpp
+        # Needed even when interop is disabled:
+        # - CudaGLInteropTextureImpl<false> definitions (cuda_gl_interop.cpp)
+        cuda_gl_interop.cpp
 )
 
-# Conditionally add CUDA GL interop
-if(CUDA_GL_INTEROP_ENABLED)
-    list(APPEND RENDERING_SOURCES
-        cuda_gl_interop.cpp
-        cuda_gl_kernels.cu)
+if(USE_HIP AND WIN32)
+    # ROCm Windows currently fails compiling cuda_gl_kernels.cu due HIP/cmath
+    # header conflicts. Use a no-op fallback so rendering/visualizer can link.
+    list(APPEND RENDERING_SOURCES cuda_gl_kernels_stub.cpp)
+else()
+    list(APPEND RENDERING_SOURCES cuda_gl_kernels.cu)
 endif()
 
-add_library(lfs_rendering STATIC ${RENDERING_SOURCES})
+# When interop is enabled, cuda_gl_kernels.cu also exports GL interop kernels.
+if(CUDA_GL_INTEROP_ENABLED)
+    message(STATUS "Rendering: GPU-GL interop kernels enabled")
+else()
+    message(STATUS "Rendering: GPU-GL interop kernels disabled (fallback mode)")
+endif()
+
+if(USE_HIP)
+    lfs_hip_add_library(lfs_rendering STATIC ${RENDERING_SOURCES})
+else()
+    add_library(lfs_rendering STATIC ${RENDERING_SOURCES})
+endif()
+
+set_target_properties(lfs_rendering PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
 
 target_link_libraries(lfs_rendering
         PUBLIC
