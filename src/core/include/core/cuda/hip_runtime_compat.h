@@ -52,8 +52,18 @@
 // Include HIP runtime
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
+#include <hip/math_functions.h>
 #if defined(__linux__) || defined(__APPLE__)
 #include <hip/hip_gl_interop.h>
+#endif
+
+// On HIP device compilation (not host pass), Clang's HIP wrappers provide
+// __device__ math overloads (fminf/fmaxf/sqrtf/expf/__expf/etc.) that CUDA code
+// expects. Include them explicitly on Windows to avoid falling back to UCRT
+// host-only declarations during kernel compilation.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(_WIN32)
+#include <__clang_hip_math.h>
+#include <__clang_hip_cmath.h>
 #endif
 
 // Define CUDART_VERSION equivalent for HIP

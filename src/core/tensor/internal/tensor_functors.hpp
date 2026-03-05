@@ -24,7 +24,7 @@ namespace lfs::core {
         // Helper for clamping (std::clamp not always available in CUDA)
         template <typename T>
         HOST_DEVICE constexpr T clamp_value(const T& v, const T& lo, const T& hi) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
             return fminf(fmaxf(v, lo), hi);
 #else
             return (v < lo) ? lo : (hi < v) ? hi
@@ -44,7 +44,7 @@ namespace lfs::core {
         struct abs_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fabsf(x);
 #else
                 return std::abs(x);
@@ -69,7 +69,7 @@ namespace lfs::core {
         struct inverse_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return T(1) / fmaxf(fabsf(x), T(1e-10));
 #else
                 return T(1) / std::max(std::abs(x), T(1e-10));
@@ -80,7 +80,7 @@ namespace lfs::core {
         struct exp_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return expf(x);
 #else
                 return std::exp(x);
@@ -91,7 +91,7 @@ namespace lfs::core {
         struct exp2_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return exp2f(x);
 #else
                 return std::exp2(x);
@@ -102,7 +102,7 @@ namespace lfs::core {
         struct log_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return logf(fmaxf(x, T(1e-10)));
 #else
                 return std::log(std::max(x, T(1e-10)));
@@ -113,7 +113,7 @@ namespace lfs::core {
         struct log2_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return log2f(fmaxf(x, T(1e-10)));
 #else
                 return std::log2(std::max(x, T(1e-10)));
@@ -124,7 +124,7 @@ namespace lfs::core {
         struct log10_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return log10f(fmaxf(x, T(1e-10)));
 #else
                 return std::log10(std::max(x, T(1e-10)));
@@ -135,7 +135,7 @@ namespace lfs::core {
         struct log1p_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return log1pf(x);
 #else
                 return std::log1p(x);
@@ -146,7 +146,7 @@ namespace lfs::core {
         struct sqrt_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return sqrtf(fmaxf(x, T(0)));
 #else
                 return std::sqrt(std::max(x, T(0)));
@@ -157,7 +157,7 @@ namespace lfs::core {
         struct rsqrt_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return rsqrtf(fmaxf(x, T(1e-10)));
 #else
                 return T(1) / std::sqrt(std::max(x, T(1e-10)));
@@ -168,7 +168,7 @@ namespace lfs::core {
         struct cbrt_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return cbrtf(x);
 #else
                 return std::cbrt(x);
@@ -186,7 +186,7 @@ namespace lfs::core {
         struct sin_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return sinf(x);
 #else
                 return std::sin(x);
@@ -197,7 +197,7 @@ namespace lfs::core {
         struct cos_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return cosf(x);
 #else
                 return std::cos(x);
@@ -208,7 +208,7 @@ namespace lfs::core {
         struct tan_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return tanf(x);
 #else
                 return std::tan(x);
@@ -219,7 +219,7 @@ namespace lfs::core {
         struct asin_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return asinf(fminf(fmaxf(x, T(-1)), T(1)));
 #else
                 return std::asin(clamp_value(x, T(-1), T(1)));
@@ -230,7 +230,7 @@ namespace lfs::core {
         struct acos_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return acosf(fminf(fmaxf(x, T(-1)), T(1)));
 #else
                 return std::acos(clamp_value(x, T(-1), T(1)));
@@ -241,7 +241,7 @@ namespace lfs::core {
         struct atan_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return atanf(x);
 #else
                 return std::atan(x);
@@ -252,7 +252,7 @@ namespace lfs::core {
         struct sinh_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return sinhf(x);
 #else
                 return std::sinh(x);
@@ -263,7 +263,7 @@ namespace lfs::core {
         struct cosh_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return coshf(x);
 #else
                 return std::cosh(x);
@@ -274,7 +274,7 @@ namespace lfs::core {
         struct tanh_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return tanhf(x);
 #else
                 return std::tanh(x);
@@ -285,7 +285,7 @@ namespace lfs::core {
         struct sigmoid_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return T(1) / (T(1) + expf(-x));
 #else
                 return T(1) / (T(1) + std::exp(-x));
@@ -296,7 +296,7 @@ namespace lfs::core {
         struct relu_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmaxf(x, T(0));
 #else
                 return std::max(x, T(0));
@@ -307,7 +307,7 @@ namespace lfs::core {
         struct gelu_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 T inner = sqrtf(T(2) / T(M_PI)) * (x + T(0.044715) * x * x * x);
                 return T(0.5) * x * (T(1) + tanhf(inner));
 #else
@@ -320,7 +320,7 @@ namespace lfs::core {
         struct swish_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return x / (T(1) + expf(-x));
 #else
                 return x / (T(1) + std::exp(-x));
@@ -331,7 +331,7 @@ namespace lfs::core {
         struct floor_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return floorf(x);
 #else
                 return std::floor(x);
@@ -342,7 +342,7 @@ namespace lfs::core {
         struct ceil_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return ceilf(x);
 #else
                 return std::ceil(x);
@@ -353,7 +353,7 @@ namespace lfs::core {
         struct round_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return roundf(x);
 #else
                 return std::round(x);
@@ -364,7 +364,7 @@ namespace lfs::core {
         struct trunc_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return truncf(x);
 #else
                 return std::trunc(x);
@@ -375,7 +375,7 @@ namespace lfs::core {
         struct frac_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return x - floorf(x);
 #else
                 return x - std::floor(x);
@@ -393,7 +393,7 @@ namespace lfs::core {
         struct isnan_op {
             template <typename T>
             HOST_DEVICE constexpr unsigned char operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 // Use unqualified name in device code - resolves to CUDA math function
                 return isnan(static_cast<float>(x)) ? 1 : 0;
 #else
@@ -405,7 +405,7 @@ namespace lfs::core {
         struct isinf_op {
             template <typename T>
             HOST_DEVICE constexpr unsigned char operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 // Use unqualified name in device code - resolves to CUDA math function
                 return isinf(static_cast<float>(x)) ? 1 : 0;
 #else
@@ -417,7 +417,7 @@ namespace lfs::core {
         struct isfinite_op {
             template <typename T>
             HOST_DEVICE constexpr unsigned char operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 // Use unqualified name in device code - resolves to CUDA math function
                 return isfinite(static_cast<float>(x)) ? 1 : 0;
 #else
@@ -464,7 +464,7 @@ namespace lfs::core {
                 if (b == static_cast<T>(2.0)) {
                     return a * a;
                 }
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return powf(a, b);
 #else
                 return static_cast<T>(std::pow(static_cast<double>(a), static_cast<double>(b)));
@@ -475,7 +475,7 @@ namespace lfs::core {
         struct mod_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmodf(a, b);
 #else
                 return static_cast<T>(std::fmod(static_cast<double>(a), static_cast<double>(b)));
@@ -486,7 +486,7 @@ namespace lfs::core {
         struct fmod_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmodf(a, b);
 #else
                 return static_cast<T>(std::fmod(static_cast<double>(a), static_cast<double>(b)));
@@ -497,7 +497,7 @@ namespace lfs::core {
         struct remainder_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return remainderf(a, b);
 #else
                 return std::remainder(a, b);
@@ -508,7 +508,7 @@ namespace lfs::core {
         struct maximum_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmaxf(a, b);
 #else
                 return std::max(a, b);
@@ -519,7 +519,7 @@ namespace lfs::core {
         struct minimum_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fminf(a, b);
 #else
                 return std::min(a, b);
@@ -530,7 +530,7 @@ namespace lfs::core {
         struct atan2_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& y, const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return atan2f(y, x);
 #else
                 return std::atan2(y, x);
@@ -541,7 +541,7 @@ namespace lfs::core {
         struct hypot_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return hypotf(a, b);
 #else
                 return std::hypot(a, b);
@@ -765,7 +765,7 @@ namespace lfs::core {
         struct max_reduce_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmaxf(a, b);
 #else
                 return std::max(a, b);
@@ -776,7 +776,7 @@ namespace lfs::core {
         struct min_reduce_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fminf(a, b);
 #else
                 return std::min(a, b);
@@ -842,7 +842,7 @@ namespace lfs::core {
             T min_val;
             HOST_DEVICE constexpr clamp_min_op(T m) : min_val(m) {}
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmaxf(x, min_val);
 #else
                 return std::max(x, min_val);
@@ -855,7 +855,7 @@ namespace lfs::core {
             T max_val;
             HOST_DEVICE constexpr clamp_max_op(T m) : max_val(m) {}
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fminf(x, max_val);
 #else
                 return std::min(x, max_val);
@@ -870,7 +870,7 @@ namespace lfs::core {
             HOST_DEVICE constexpr clamp_range_op(T min_v, T max_v) : min_val(min_v),
                                                                      max_val(max_v) {}
             HOST_DEVICE constexpr T operator()(const T& x) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fminf(fmaxf(x, min_val), max_val);
 #else
                 return clamp_value(x, min_val, max_val);
@@ -897,7 +897,7 @@ namespace lfs::core {
         template <typename T>
         struct clamp_ternary_op {
             HOST_DEVICE constexpr T operator()(const T& x, const T& min_val, const T& max_val) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fminf(fmaxf(x, min_val), max_val);
 #else
                 return clamp_value(x, min_val, max_val);

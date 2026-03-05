@@ -759,10 +759,33 @@ if(USE_HIP AND WIN32)
         message(WARNING "MSVC flag filter script not found (${MSVC_FLAG_FILTER_SCRIPT}); building without compiler launcher")
     endif()
 
-    # For Windows HIP builds, set the ROCm path for clang to find device libraries
-    # Use 8.3 short path format to avoid issues with spaces
-    set(HIP_ROCM_PATH "C:/PROGRA~1/AMD/ROCm/7.10")
-    set(HIP_DEVICE_LIB_PATH "${HIP_ROCM_PATH}/lib/llvm/amdgcn/bitcode")
+    # For Windows HIP builds, set the ROCm path for clang to find device libraries.
+    # Prefer detected SDK path and support both ROCm 7.1 and 7.10+ layouts.
+    if(DEFINED HIP_PATH_CMAKE_SHORT AND EXISTS "${HIP_PATH_CMAKE_SHORT}")
+        set(HIP_ROCM_PATH "${HIP_PATH_CMAKE_SHORT}")
+    elseif(DEFINED HIP_PATH_CMAKE AND EXISTS "${HIP_PATH_CMAKE}")
+        set(HIP_ROCM_PATH "${HIP_PATH_CMAKE}")
+    elseif(DEFINED ENV{HIP_PATH} AND EXISTS "$ENV{HIP_PATH}")
+        file(TO_CMAKE_PATH "$ENV{HIP_PATH}" HIP_ROCM_PATH)
+    else()
+        set(HIP_ROCM_PATH "C:/PROGRA~1/AMD/ROCm/7.10")
+    endif()
+
+    set(HIP_DEVICE_LIB_PATH "")
+    foreach(_hip_device_lib_candidate
+        "${HIP_ROCM_PATH}/amdgcn/bitcode"
+        "${HIP_ROCM_PATH}/lib/llvm/amdgcn/bitcode")
+        if(EXISTS "${_hip_device_lib_candidate}")
+            set(HIP_DEVICE_LIB_PATH "${_hip_device_lib_candidate}")
+            break()
+        endif()
+    endforeach()
+    if(HIP_DEVICE_LIB_PATH STREQUAL "")
+        # Keep a deterministic default if path probing failed.
+        set(HIP_DEVICE_LIB_PATH "${HIP_ROCM_PATH}/amdgcn/bitcode")
+    endif()
+    message(STATUS "Windows HIP build: ROCm path: ${HIP_ROCM_PATH}")
+    message(STATUS "Windows HIP build: ROCm device libs: ${HIP_DEVICE_LIB_PATH}")
 
     # Set CMAKE_CXX_FLAGS to include ROCm paths
     # IMPORTANT: Add -fno-openmp to prevent clang's OpenMP wrappers from conflicting
