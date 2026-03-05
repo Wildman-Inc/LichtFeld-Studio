@@ -9,6 +9,9 @@ find_package(Python REQUIRED COMPONENTS Interpreter Development Development.Modu
 option(LFS_BUILD_PYTHON_MODULE "Build the nanobind Python extension module (lfs_py)" ON)
 if(LFS_BUILD_PYTHON_MODULE)
     find_package(nanobind CONFIG REQUIRED)
+    if(WIN32)
+        find_package(RmlUi CONFIG REQUIRED)
+    endif()
 endif()
 
 # vcpkg extension modules use release ABI; debug libpython has Py_DEBUG which

@@ -1273,19 +1273,13 @@ namespace lfs::core {
             return empty({0, ndim()}, device_, DataType::Int64);
         }
 
-        size_t count = count_nonzero();
-
-        if (count == 0) {
-            return empty({0, ndim()}, device_, DataType::Int64);
-        }
-
         size_t n_dims = ndim();
 
         // Special case for 1D tensors
         if (n_dims == 1) {
             // Allocate MAXIMUM size to prevent buffer overflow from Thrust/CUB mismatch
             auto temp = empty({numel()}, device_, DataType::Int64);
-            size_t actual_count = count; // Start with Thrust's count
+            size_t actual_count = 0;
 
             if (device_ == Device::CUDA) {
                 // Get ACTUAL count from CUB (not Thrust which may differ!)
@@ -1298,21 +1292,6 @@ namespace lfs::core {
                                                               reinterpret_cast<int64_t*>(temp.data_ptr()),
                                                               numel(), numel(), stream());
                 }
-
-                // DEBUG: Check count mismatch
-                if (actual_count != count) {
-                    LOG_DEBUG("nonzero() count mismatch: Thrust={}, CUB={}, numel={}", count, actual_count, numel());
-                }
-
-                // Slice to actual size - slice is [start, end) exclusive on end
-                if (actual_count < numel()) {
-                    if (actual_count > 0) {
-                        temp = temp.slice(0, 0, actual_count);
-                    } else {
-                        temp = empty({0}, device_, DataType::Int64);
-                    }
-                }
-                // No sync - tensor operation
             } else {
                 int64_t* indices = reinterpret_cast<int64_t*>(temp.data_ptr());
                 size_t write_idx = 0;
@@ -1344,17 +1323,24 @@ namespace lfs::core {
                 actual_count = write_idx;
             }
 
-            // Slice to actual size (same as CUDA path does at lines 948-954)
-            if (actual_count < numel()) {
-                if (actual_count > 0) {
-                    temp = temp.slice(0, 0, actual_count);
-                } else {
-                    temp = empty({0}, device_, DataType::Int64);
-                }
+            if (actual_count == 0) {
+                return empty({0, 1}, device_, DataType::Int64);
             }
 
-            // Reshape to (actual_count, 1) to match PyTorch
-            return temp.reshape({static_cast<int>(actual_count), 1});
+            // Slice to actual size based on the actual compacted output count.
+            if (actual_count < numel()) {
+                temp = temp.slice(0, 0, actual_count);
+            }
+
+            // Derive the output rows from the compacted tensor itself so stale counts
+            // from a backend-specific scan can't produce an invalid reshape on HIP.
+            return temp.reshape({static_cast<int>(temp.numel()), 1});
+        }
+
+        size_t count = count_nonzero();
+
+        if (count == 0) {
+            return empty({0, ndim()}, device_, DataType::Int64);
         }
 
         // Multi-dimensional case

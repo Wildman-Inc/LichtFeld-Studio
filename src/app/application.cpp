@@ -115,6 +115,14 @@ namespace lfs::app {
 
                     checkpoint_params.resume_checkpoint = *params->resume_checkpoint;
 
+                    // Preserve runtime-only CLI flags when resuming headless training.
+                    checkpoint_params.optimization.headless = params->optimization.headless;
+                    checkpoint_params.optimization.auto_train = params->optimization.auto_train;
+                    checkpoint_params.optimization.no_splash = params->optimization.no_splash;
+                    checkpoint_params.optimization.no_interop = params->optimization.no_interop;
+                    checkpoint_params.optimization.debug_python = params->optimization.debug_python;
+                    checkpoint_params.optimization.debug_python_port = params->optimization.debug_python_port;
+
                     if (params->optimization.iterations != checkpoint_params.optimization.iterations)
                         checkpoint_params.optimization.iterations = params->optimization.iterations;
 

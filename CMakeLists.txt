@@ -1010,10 +1010,6 @@ endif()
 add_definitions(-DLFS_GPU_BACKEND_STR="${LFS_GPU_BACKEND}")
 
 option(LFS_BUILD_PYTHON_MODULE "Build the nanobind Python extension module (lfs_py)" ON)
-if(USE_HIP AND LFS_BUILD_PYTHON_MODULE)
-    message(STATUS "Disabling lfs_py module for HIP builds (runtime/utils remain enabled)")
-    set(LFS_BUILD_PYTHON_MODULE OFF CACHE BOOL "Build the nanobind Python extension module (lfs_py)" FORCE)
-endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
@@ -1047,13 +1043,18 @@ add_subdirectory(src/visualizer) # Visualizer module (lfs::vis namespace)
 # -----------------------------------------------------------------------------
 # LichtFeld-Studio
 # -----------------------------------------------------------------------------
-add_executable(${PROJECT_NAME}
+set(LFS_APP_SOURCES
     src/app/main.cpp
     src/app/application.cpp
     src/app/converter.cpp
     src/app/splash_screen.cpp
-    resources/lichtfeld-studio.rc
 )
+
+if(NOT (WIN32 AND USE_HIP))
+    list(APPEND LFS_APP_SOURCES resources/lichtfeld-studio.rc)
+endif()
+
+add_executable(${PROJECT_NAME} ${LFS_APP_SOURCES})
 
 if(USE_CUDA)
     set_target_properties(${PROJECT_NAME} PROPERTIES

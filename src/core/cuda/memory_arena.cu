@@ -426,7 +426,7 @@ namespace lfs::core {
                     arena.d_ptr = 0;
                     arena.virtual_size = 0;
                 } else {
-                    LOG_INFO("VMM initialized: device=%d, virtual=%zu GB", device, arena.virtual_size >> 30);
+                    LOG_INFO("VMM initialized: device={}, virtual={} GB", device, arena.virtual_size >> 30);
 
                     if (!commit_more_memory(arena, config_.initial_commit)) {
                         cuMemAddressFree(arena.d_ptr, arena.virtual_size);
@@ -829,7 +829,7 @@ namespace lfs::core {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     continue;
                 } else {
-                    LOG_ERROR("Out of memory after %d attempts: requested=%zu MB, usage=%zu MB, committed=%zu MB, max=%zu MB",
+                    LOG_ERROR("Out of memory after {} attempts: requested={} MB, usage={} MB, committed={} MB, max={} MB",
                               MAX_RETRIES, size >> 20, current_offset >> 20, arena.committed_size >> 20, config_.max_physical >> 20);
                     return nullptr;
                 }
@@ -978,7 +978,7 @@ namespace lfs::core {
         const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(runtime).count();
         const float utilization = stats.capacity > 0 ? (100.0f * stats.peak_usage / stats.capacity) : 0.0f;
 
-        LOG_INFO("Arena stats: committed=%zu MB, peak=%zu MB (%.1f%%), frames=%zu, reallocs=%zu, runtime=%lds",
+        LOG_INFO("Arena stats: committed={} MB, peak={} MB ({:.1f}%), frames={}, reallocs={}, runtime={}s",
                  stats.capacity >> 20, stats.peak_usage >> 20, utilization,
                  stats.frame_count, stats.reallocation_count, seconds);
     }
