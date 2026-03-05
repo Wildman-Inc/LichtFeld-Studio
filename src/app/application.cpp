@@ -230,7 +230,13 @@ namespace lfs::app {
             }
 
             LOG_INFO("Initializing {} backend...", LFS_GPU_BACKEND);
+#if LFS_USE_HIP && defined(_WIN32)
+            // HIP on Windows can crash in fastgs startup warmup on some RDNA3 paths
+            // (e.g. gfx1151). Skip eager warmup and let kernels initialize lazily.
+            LOG_WARN("Skipping fastgs warmup on Windows HIP (stability workaround)");
+#else
             fast_lfs::rasterization::warmup_kernels();
+#endif
         }
 
         int runGui(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
