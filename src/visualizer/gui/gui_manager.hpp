@@ -174,7 +174,7 @@ namespace lfs::vis {
             float current_ui_scale_ = 1.0f;
             float pending_ui_scale_ = 0.0f;
 
-            // Deferred CUDA version warning (emitted on first drawFrame)
+            // Deferred CUDA version warning (emitted on first drawFrame, CUDA backend only)
             std::optional<lfs::core::CudaVersionInfo> pending_cuda_warning_;
 
             // RmlUI integration

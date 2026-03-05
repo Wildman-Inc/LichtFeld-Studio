@@ -1,9 +1,8 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
-
 #include <cooperative_groups.h>
-#include <cuda_runtime.h>
+#include "core/cuda/hip_runtime_compat.h"
 
 #include "Cameras.cuh"
 #include "Common.h"

@@ -59,7 +59,7 @@ namespace {
 
         try {
             ::args::ArgumentParser parser(
-                "LichtFeld Studio: High-performance CUDA implementation of 3D Gaussian Splatting algorithm.\n",
+                "LichtFeld Studio: High-performance GPU implementation of 3D Gaussian Splatting algorithm.\n",
                 "\nSUBCOMMANDS:\n"
                 "convert -- Convert between .ply, .sog, .spz, .html\n"
                 "plugin -- Manage plugins (create, check, list)\n"
@@ -200,7 +200,7 @@ namespace {
             ::args::Flag headless(ui_group, "headless", "Disable visualization during training", {"headless"});
             ::args::Flag auto_train(ui_group, "train", "Start training immediately on startup", {"train"});
             ::args::Flag no_splash(ui_group, "no_splash", "Skip splash screen on startup", {"no-splash"});
-            ::args::Flag no_interop(ui_group, "no_interop", "Disable CUDA-GL interop (use CPU fallback for display)", {"no-interop"});
+            ::args::Flag no_interop(ui_group, "no_interop", "Disable GPU-OpenGL interop (use CPU fallback for display)", {"no-interop"});
             ::args::Flag debug_python(ui_group, "debug_python", "Start debugpy listener on port 5678 for plugin debugging", {"debug-python"});
             ::args::ValueFlag<int> debug_python_port(ui_group, "port", "Port for debugpy listener (default: 5678)", {"debug-python-port"});
 

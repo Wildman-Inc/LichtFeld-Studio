@@ -10,7 +10,6 @@
 namespace fast_lfs::rasterization {
 
     void backward(
-        const float* densification_error_map,
         const float* grad_image,
         const float* grad_alpha,
         const float* image,

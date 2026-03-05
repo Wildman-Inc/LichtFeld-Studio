@@ -2,7 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include <cuda_runtime.h>
+#include "core/cuda/hip_runtime_compat.h"
 
 #include "Common.h"
 #include "Relocation.h"

@@ -46,7 +46,7 @@ target_link_libraries(lfs_rendering
         glm::glm
         glad::glad
         ${OPENGL_LIBRARIES}
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         spdlog::spdlog
         Freetype::Freetype
 )

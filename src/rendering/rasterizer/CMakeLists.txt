@@ -11,13 +11,23 @@ set(RASTERIZER_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/src/rasterization_api_tensor.cu
 )
 
-add_library(lfs_rasterizer STATIC ${RASTERIZER_SOURCES})
+if(USE_HIP)
+    lfs_hip_add_library(lfs_rasterizer STATIC ${RASTERIZER_SOURCES})
+else()
+    add_library(lfs_rasterizer STATIC ${RASTERIZER_SOURCES})
+endif()
 
-set_target_properties(lfs_rasterizer PROPERTIES
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION OFF
-        POSITION_INDEPENDENT_CODE ON
-)
+if(USE_CUDA)
+    set_target_properties(lfs_rasterizer PROPERTIES
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION OFF
+            POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(lfs_rasterizer PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
 target_include_directories(lfs_rasterizer
         PUBLIC
@@ -26,14 +36,14 @@ target_include_directories(lfs_rasterizer
         PRIVATE
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}  # For gsplat_fwd headers (gsplat_fwd/Ops.h, gsplat_fwd/Common.h)
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
 )
 
 target_link_libraries(lfs_rasterizer
         PUBLIC
-        CUDA::cudart
-        CUDA::curand
-        CUDA::cuda_driver
+        ${GPU_RUNTIME_LIBRARY}
+        ${GPU_RAND_LIBRARY}
+        ${GPU_DRIVER_LIBRARY}
         spdlog::spdlog
         lfs_core_cuda       # Required for shared memory arena
         gsplat_fwd          # Forward-only GUT rasterization backend (no training dependency)

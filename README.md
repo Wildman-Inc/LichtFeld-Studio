@@ -84,7 +84,17 @@ Find out how to install in our [LichtFeld Studio Wiki](https://github.com/MrNeRF
 
 Pre-built binaries for Windows are available as [releases](https://github.com/MrNeRF/LichtFeld-Studio/releases) and [nightly bulds](https://github.com/MrNeRF/LichtFeld-Studio/releases/tag/nightly) and are for users who would like to try out the software.  
 Simply download, unzip and run the .exe in the bin folder, no compilation necessary.  
-Make sure your Nvidia driver version is 570 or newer.
+For CUDA builds, make sure your Nvidia driver version is 570 or newer.
+
+### ROCm / HIP Build (Linux)
+
+LichtFeld Studio also supports AMD ROCm/HIP on Linux.
+
+- Build guide: [ROCm / HIP Build](docs/docs/installation/building/rocm.md)
+- Example configure:
+  - `cmake -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DLFS_GPU_BACKEND=HIP -DLFS_AMDGPU_ARCH=gfx942`
+- Example smoke run:
+  - `./build-hip/LichtFeld-Studio -d <dataset> -o <output> --train --iter 5 --headless`
 
 ## Contributing
 

@@ -5,8 +5,12 @@
 #include "internal/tensor_impl.hpp"
 #include "internal/tensor_ops.hpp"
 #include <atomic>
-#include <curand.h>
+#include "core/cuda/hip_rand_compat.h"
+#if LFS_USE_HIP
+#include <hiprand/hiprand_kernel.h>
+#else
 #include <curand_kernel.h>
+#endif
 #include <random>
 
 #define CHECK_CUDA(call)                              \
@@ -132,7 +136,7 @@ namespace lfs::core {
         if (device_ == Device::CUDA) {
             // Use kernel-based generation with advancing seed
             uint64_t seed = RandomGenerator::instance().get_next_cuda_seed();
-            tensor_ops::launch_uniform(ptr<float>(), n, low, high, seed, stream());
+            tensor_ops::launch_uniform(ptr<float>(), n, low, high, seed, stream_);
             // No sync - in-place operation returns *this
         } else {
             // CPU uses stateful generator

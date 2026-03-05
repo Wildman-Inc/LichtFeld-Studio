@@ -178,12 +178,16 @@ nanobind_add_module(
 )
 
 set_target_properties(lfs_py PROPERTIES
-    CUDA_ARCHITECTURES ""
-    CUDA_SEPARABLE_COMPILATION OFF
     LINKER_LANGUAGE CXX
     POSITION_INDEPENDENT_CODE ON
     OUTPUT_NAME lichtfeld
 )
+if(USE_CUDA)
+    set_target_properties(lfs_py PROPERTIES
+        CUDA_ARCHITECTURES ""
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 target_compile_definitions(lfs_py PRIVATE
     LFS_PYTHON_EXECUTABLE="${Python_EXECUTABLE}"
@@ -203,8 +207,8 @@ target_link_libraries(lfs_py PRIVATE
     $<IF:$<PLATFORM_ID:Windows>,OpenMeshTools,OpenMeshToolsStatic>
     lfs_sequencer
     OpenImageIO::OpenImageIO
-    CUDA::cudart
-    CUDA::curand
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
     ${CMAKE_DL_LIBS}
     imgui::imgui
     implot::implot
@@ -243,18 +247,20 @@ if(WIN32)
         COMMENT "Copying project DLLs to Python module directory"
     )
 
-    # Copy CUDA DLLs
-    file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
-    file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
-    set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
-    foreach(DLL ${CUDA_DLLS_FOR_PYD})
-        if(EXISTS "${DLL}")
-            add_custom_command(TARGET lfs_py POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
-                COMMENT "Copying ${DLL} to Python module directory"
-            )
-        endif()
-    endforeach()
+    if(USE_CUDA)
+        # Copy CUDA DLLs
+        file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
+        file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
+        set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
+        foreach(DLL ${CUDA_DLLS_FOR_PYD})
+            if(EXISTS "${DLL}")
+                add_custom_command(TARGET lfs_py POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
+                    COMMENT "Copying ${DLL} to Python module directory"
+                )
+            endif()
+        endforeach()
+    endif()
 
     # Copy vcpkg runtime DLLs
     add_custom_command(TARGET lfs_py POST_BUILD

@@ -1,9 +1,8 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
-
 #include <cooperative_groups.h>
-#include <cuda_runtime.h>
+#include "core/cuda/hip_runtime_compat.h"
 
 #include "Common.h"
 #include "SphericalHarmonics.h"
@@ -115,9 +114,7 @@ namespace gsplat_lfs {
         const scalar_t* __restrict__ coeffs,
         const scalar_t* __restrict__ v_colors,
         scalar_t* __restrict__ v_coeffs,
-        float* __restrict__ v_dir_x,
-        float* __restrict__ v_dir_y,
-        float* __restrict__ v_dir_z) {
+        vec3* __restrict__ v_dir) {
         const float v_colors_local = v_colors[c];
 
         v_coeffs[c] = SH_C0 * v_colors_local;
@@ -134,19 +131,20 @@ namespace gsplat_lfs {
         v_coeffs[2 * 3 + c] = SH_C1 * z * v_colors_local;
         v_coeffs[3 * 3 + c] = -SH_C1 * x * v_colors_local;
 
-        if (v_dir_x != nullptr) {
+        if (v_dir != nullptr) {
             v_x += -SH_C1 * coeffs[3 * 3 + c] * v_colors_local;
             v_y += -SH_C1 * coeffs[1 * 3 + c] * v_colors_local;
             v_z += SH_C1 * coeffs[2 * 3 + c] * v_colors_local;
         }
         if (degree < 2) {
-            if (v_dir_x != nullptr) {
+            if (v_dir != nullptr) {
                 vec3 dir_n = vec3(x, y, z);
                 vec3 v_dir_n = vec3(v_x, v_y, v_z);
                 vec3 v_d = (v_dir_n - glm::dot(v_dir_n, dir_n) * dir_n) * inorm;
-                *v_dir_x = v_d.x;
-                *v_dir_y = v_d.y;
-                *v_dir_z = v_d.z;
+
+                v_dir->x = v_d.x;
+                v_dir->y = v_d.y;
+                v_dir->z = v_d.z;
             }
             return;
         }
@@ -168,7 +166,7 @@ namespace gsplat_lfs {
 
         float fTmp0B_z, fC1_x, fC1_y, fS1_x, fS1_y, pSH6_z, pSH7_x, pSH7_z, pSH5_y,
             pSH5_z, pSH8_x, pSH8_y, pSH4_x, pSH4_y;
-        if (v_dir_x != nullptr) {
+        if (v_dir != nullptr) {
             fTmp0B_z = -1.092548430592079f;
             fC1_x = 2.f * x;
             fC1_y = -2.f * y;
@@ -196,13 +194,14 @@ namespace gsplat_lfs {
         }
 
         if (degree < 3) {
-            if (v_dir_x != nullptr) {
+            if (v_dir != nullptr) {
                 vec3 dir_n = vec3(x, y, z);
                 vec3 v_dir_n = vec3(v_x, v_y, v_z);
                 vec3 v_d = (v_dir_n - glm::dot(v_dir_n, dir_n) * dir_n) * inorm;
-                *v_dir_x = v_d.x;
-                *v_dir_y = v_d.y;
-                *v_dir_z = v_d.z;
+
+                v_dir->x = v_d.x;
+                v_dir->y = v_d.y;
+                v_dir->z = v_d.z;
             }
             return;
         }
@@ -229,7 +228,7 @@ namespace gsplat_lfs {
         float fTmp0C_z, fTmp1B_z, fC2_x, fC2_y, fS2_x, fS2_y, pSH12_z, pSH13_x,
             pSH13_z, pSH11_y, pSH11_z, pSH14_x, pSH14_y, pSH14_z, pSH10_x, pSH10_y,
             pSH10_z, pSH15_x, pSH15_y, pSH9_x, pSH9_y;
-        if (v_dir_x != nullptr) {
+        if (v_dir != nullptr) {
             fTmp0C_z = -2.285228997322329f * 2.f * z;
             fTmp1B_z = 1.445305721320277f;
             fC2_x = fC1 + x * fC1_x - y * fS1_x;
@@ -269,13 +268,14 @@ namespace gsplat_lfs {
         }
 
         if (degree < 4) {
-            if (v_dir_x != nullptr) {
+            if (v_dir != nullptr) {
                 vec3 dir_n = vec3(x, y, z);
                 vec3 v_dir_n = vec3(v_x, v_y, v_z);
                 vec3 v_d = (v_dir_n - glm::dot(v_dir_n, dir_n) * dir_n) * inorm;
-                *v_dir_x = v_d.x;
-                *v_dir_y = v_d.y;
-                *v_dir_z = v_d.z;
+
+                v_dir->x = v_d.x;
+                v_dir->y = v_d.y;
+                v_dir->z = v_d.z;
             }
             return;
         }
@@ -308,7 +308,7 @@ namespace gsplat_lfs {
             pSH21_x, pSH21_z, pSH19_y, pSH19_z, pSH22_x, pSH22_y, pSH22_z, pSH18_x,
             pSH18_y, pSH18_z, pSH23_x, pSH23_y, pSH23_z, pSH17_x, pSH17_y, pSH17_z,
             pSH24_x, pSH24_y, pSH16_x, pSH16_y;
-        if (v_dir_x != nullptr) {
+        if (v_dir != nullptr) {
             fTmp0D_z = 3.f * -4.683325804901025f * z2 + 2.007139630671868f;
             fTmp1C_z = 2.f * 3.31161143515146f * z;
             fTmp2B_z = -1.770130769779931f;
@@ -358,9 +358,10 @@ namespace gsplat_lfs {
             vec3 dir_n = vec3(x, y, z);
             vec3 v_dir_n = vec3(v_x, v_y, v_z);
             vec3 v_d = (v_dir_n - glm::dot(v_dir_n, dir_n) * dir_n) * inorm;
-            *v_dir_x = v_d.x;
-            *v_dir_y = v_d.y;
-            *v_dir_z = v_d.z;
+
+            v_dir->x = v_d.x;
+            v_dir->y = v_d.y;
+            v_dir->z = v_d.z;
         }
     }
 
@@ -456,8 +457,7 @@ namespace gsplat_lfs {
         vec3 dir = (degrees_to_use > 0 && dirs != nullptr) ? dirs[elem_id] : vec3{0.f, 0.f, 1.f};
         uint32_t effective_degree = dirs != nullptr ? degrees_to_use : 0u;
 
-        float v_dir_x = 0.f, v_dir_y = 0.f, v_dir_z = 0.f;
-        bool compute_dir_grad = (v_dirs != nullptr && dirs != nullptr);
+        vec3 v_dir = {0.f, 0.f, 0.f};
         sh_coeffs_to_color_fast_vjp(
             effective_degree,
             c,
@@ -465,13 +465,11 @@ namespace gsplat_lfs {
             coeffs + elem_id * K * 3,
             v_colors + elem_id * 3,
             v_coeffs + elem_id * K * 3,
-            compute_dir_grad ? &v_dir_x : nullptr,
-            compute_dir_grad ? &v_dir_y : nullptr,
-            compute_dir_grad ? &v_dir_z : nullptr);
-        if (compute_dir_grad) {
-            atomicAdd(v_dirs + elem_id * 3, v_dir_x);
-            atomicAdd(v_dirs + elem_id * 3 + 1, v_dir_y);
-            atomicAdd(v_dirs + elem_id * 3 + 2, v_dir_z);
+            (v_dirs == nullptr || dirs == nullptr) ? nullptr : &v_dir);
+        if (v_dirs != nullptr && dirs != nullptr) {
+            atomicAdd(v_dirs + elem_id * 3, v_dir.x);
+            atomicAdd(v_dirs + elem_id * 3 + 1, v_dir.y);
+            atomicAdd(v_dirs + elem_id * 3 + 2, v_dir.z);
         }
     }
 

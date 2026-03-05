@@ -112,9 +112,8 @@ std::tuple<int, int, int, int, int> fast_lfs::rasterization::forward(
     cudaMemcpy(&n_instances, per_primitive_buffers.n_instances, sizeof(uint), cudaMemcpyDeviceToHost);
 
     const int alloc_instances = std::max(n_instances, 1);
-    const int end_bit = extract_end_bit(static_cast<uint>(n_tiles - 1));
-    char* per_instance_buffers_blob = per_instance_buffers_func(required<PerInstanceBuffers>(alloc_instances, end_bit));
-    PerInstanceBuffers per_instance_buffers = PerInstanceBuffers::from_blob(per_instance_buffers_blob, alloc_instances, end_bit);
+    char* per_instance_buffers_blob = per_instance_buffers_func(required<PerInstanceBuffers>(alloc_instances));
+    PerInstanceBuffers per_instance_buffers = PerInstanceBuffers::from_blob(per_instance_buffers_blob, alloc_instances);
 
     if (n_visible_primitives > 0) {
         cub::DeviceRadixSort::SortPairs(
@@ -162,7 +161,7 @@ std::tuple<int, int, int, int, int> fast_lfs::rasterization::forward(
                 per_instance_buffers.cub_workspace_size,
                 per_instance_buffers.keys,
                 per_instance_buffers.primitive_indices,
-                n_instances, 0, end_bit);
+                n_instances);
             CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (Tile)")
         }
     }

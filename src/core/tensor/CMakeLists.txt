@@ -21,15 +21,25 @@ set(LFS_TENSOR_CUDA_SOURCES
 )
 
 if(LFS_TENSOR_CUDA_SOURCES)
-    add_library(lfs_tensor_kernels STATIC ${LFS_TENSOR_CUDA_SOURCES})
+    if(USE_HIP)
+        lfs_hip_add_library(lfs_tensor_kernels STATIC ${LFS_TENSOR_CUDA_SOURCES})
+    else()
+        add_library(lfs_tensor_kernels STATIC ${LFS_TENSOR_CUDA_SOURCES})
+    endif()
 
-    set_target_properties(lfs_tensor_kernels PROPERTIES
-            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-            CUDA_SEPARABLE_COMPILATION OFF
-            POSITION_INDEPENDENT_CODE ON
-            CUDA_STANDARD 20
-            CUDA_STANDARD_REQUIRED ON
-    )
+    if(USE_CUDA)
+        set_target_properties(lfs_tensor_kernels PROPERTIES
+                CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+                CUDA_SEPARABLE_COMPILATION OFF
+                POSITION_INDEPENDENT_CODE ON
+                CUDA_STANDARD 20
+                CUDA_STANDARD_REQUIRED ON
+        )
+    else()
+        set_target_properties(lfs_tensor_kernels PROPERTIES
+                POSITION_INDEPENDENT_CODE ON
+        )
+    endif()
 
     target_include_directories(lfs_tensor_kernels
             PUBLIC
@@ -37,13 +47,13 @@ if(LFS_TENSOR_CUDA_SOURCES)
             ${CMAKE_BINARY_DIR}/include
             PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CUDAToolkit_INCLUDE_DIRS}
+            ${GPU_INCLUDE_DIRS}
     )
 
     target_link_libraries(lfs_tensor_kernels
             PUBLIC
-            CUDA::cudart
-            CUDA::curand
+            ${GPU_RUNTIME_LIBRARY}
+            ${GPU_RAND_LIBRARY}
             spdlog::spdlog
     )
 

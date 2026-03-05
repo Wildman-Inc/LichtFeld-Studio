@@ -8,10 +8,16 @@
 #include <cstdint>
 #include <cstdio>
 
-// cuda.h defines CUDA_VERSION which GLM needs to detect CUDA version properly
-// Must be included before any GLM headers
+// CUDA_VERSION is used by GLM; provide compatibility for HIP builds.
+// Must be included before any GLM headers.
+#include "core/cuda/hip_runtime_compat.h"
+#if !LFS_USE_HIP
 #include <cuda.h>
-#include <cuda_runtime.h>
+#endif
+
+#ifndef CUDA_VERSION
+#define CUDA_VERSION CUDART_VERSION
+#endif
 
 #include <glm/gtc/type_ptr.hpp>
 

@@ -3,8 +3,10 @@
 
 #include "internal/tensor_functors.hpp"
 #include "internal/tensor_ops.hpp"
-#include <cuda_runtime.h>
-#include <curand_kernel.h>
+#include "internal/tensor_generic_ops.cuh"
+
+// HIP/CUDA random compatibility - includes both host API and device kernel API
+#include "core/cuda/hip_rand_compat.h"
 
 // Thrust headers for multinomial without replacement
 #include <thrust/copy.h>

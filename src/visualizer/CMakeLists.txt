@@ -193,7 +193,7 @@ target_link_libraries(lfs_visualizer
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         ${OPENGL_LIBRARIES}
         vterm
 )

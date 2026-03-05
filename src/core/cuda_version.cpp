@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/cuda_version.hpp"
+#include "config.h"
 #include <cuda_runtime.h>
 
 namespace lfs::core {
@@ -10,6 +11,18 @@ namespace lfs::core {
     CudaVersionInfo check_cuda_version() {
         CudaVersionInfo info;
 
+#if LFS_USE_HIP
+        if (cudaRuntimeGetVersion(&info.driver_version) != cudaSuccess) {
+            info.query_failed = true;
+            info.supported = true;
+            return info;
+        }
+
+        info.major = info.driver_version / 1000;
+        info.minor = (info.driver_version % 1000) / 10;
+        info.supported = true;
+        return info;
+#else
         if (cudaDriverGetVersion(&info.driver_version) != cudaSuccess) {
             info.query_failed = true;
             return info;
@@ -20,9 +33,14 @@ namespace lfs::core {
         info.supported = info.driver_version >= MIN_CUDA_VERSION;
 
         return info;
+#endif
     }
 
     std::string get_pytorch_cuda_tag(const std::string& version_hint) {
+#if LFS_USE_HIP
+        (void)version_hint;
+        return "rocm";
+#else
         // Explicit version mapping
         if (version_hint == "12.8")
             return "cu128";
@@ -58,6 +76,7 @@ namespace lfs::core {
         }
 
         return "cu118"; // Fallback for older CUDA
+#endif
     }
 
 } // namespace lfs::core

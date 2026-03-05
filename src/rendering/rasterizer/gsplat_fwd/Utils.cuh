@@ -2,12 +2,40 @@
 
 #include "Common.h"
 
+// HIP/CUDA cooperative groups
+#if USE_HIP
+#include <hip/hip_cooperative_groups.h>
+namespace cg = cooperative_groups;
+
+// HIP doesn't have cooperative_groups::reduce and cooperative_groups::plus
+// We implement warp sum/max using shuffle operations directly in the functions below
+namespace gsplat_cg_compat {
+    template<typename T>
+    __device__ __forceinline__ T warp_reduce_sum(T val) {
+        // Full warp reduction using butterfly shuffle pattern
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+            val += __shfl_xor(val, offset);
+        }
+        return val;
+    }
+
+    template<typename T>
+    __device__ __forceinline__ T warp_reduce_max(T val) {
+        // Full warp max reduction using butterfly shuffle pattern
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+            T other = __shfl_xor(val, offset);
+            val = val > other ? val : other;
+        }
+        return val;
+    }
+}
+#else
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+namespace cg = cooperative_groups;
+#endif
 
 namespace gsplat_fwd {
-
-    namespace cg = cooperative_groups;
 
     ///////////////////////////////
     // Reduce
@@ -17,34 +45,60 @@ namespace gsplat_fwd {
     inline __device__ void warpSum(float* val, WarpT& warp) {
 #pragma unroll
         for (uint32_t i = 0; i < DIM; i++) {
+#if USE_HIP
+            val[i] = gsplat_cg_compat::warp_reduce_sum(val[i]);
+#else
             val[i] = cg::reduce(warp, val[i], cg::plus<float>());
+#endif
         }
     }
 
     template <class WarpT>
     inline __device__ void warpSum(float& val, WarpT& warp) {
+#if USE_HIP
+        val = gsplat_cg_compat::warp_reduce_sum(val);
+#else
         val = cg::reduce(warp, val, cg::plus<float>());
+#endif
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec4& val, WarpT& warp) {
+#if USE_HIP
+        val.x = gsplat_cg_compat::warp_reduce_sum(val.x);
+        val.y = gsplat_cg_compat::warp_reduce_sum(val.y);
+        val.z = gsplat_cg_compat::warp_reduce_sum(val.z);
+        val.w = gsplat_cg_compat::warp_reduce_sum(val.w);
+#else
         val.x = cg::reduce(warp, val.x, cg::plus<float>());
         val.y = cg::reduce(warp, val.y, cg::plus<float>());
         val.z = cg::reduce(warp, val.z, cg::plus<float>());
         val.w = cg::reduce(warp, val.w, cg::plus<float>());
+#endif
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec3& val, WarpT& warp) {
+#if USE_HIP
+        val.x = gsplat_cg_compat::warp_reduce_sum(val.x);
+        val.y = gsplat_cg_compat::warp_reduce_sum(val.y);
+        val.z = gsplat_cg_compat::warp_reduce_sum(val.z);
+#else
         val.x = cg::reduce(warp, val.x, cg::plus<float>());
         val.y = cg::reduce(warp, val.y, cg::plus<float>());
         val.z = cg::reduce(warp, val.z, cg::plus<float>());
+#endif
     }
 
     template <class WarpT>
     inline __device__ void warpSum(vec2& val, WarpT& warp) {
+#if USE_HIP
+        val.x = gsplat_cg_compat::warp_reduce_sum(val.x);
+        val.y = gsplat_cg_compat::warp_reduce_sum(val.y);
+#else
         val.x = cg::reduce(warp, val.x, cg::plus<float>());
         val.y = cg::reduce(warp, val.y, cg::plus<float>());
+#endif
     }
 
     template <class WarpT>
@@ -70,7 +124,11 @@ namespace gsplat_fwd {
 
     template <class WarpT>
     inline __device__ void warpMax(float& val, WarpT& warp) {
+#if USE_HIP
+        val = gsplat_cg_compat::warp_reduce_max(val);
+#else
         val = cg::reduce(warp, val, cg::greater<float>());
+#endif
     }
 
     ///////////////////////////////

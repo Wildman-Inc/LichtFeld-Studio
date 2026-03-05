@@ -96,17 +96,16 @@ namespace lfs::core {
     }
 
     bool RasterizerMemoryArena::is_vmm_supported(int device) const {
-        // Check compute capability
-        int major = 0, minor = 0;
+#if !(defined(USE_HIP) && USE_HIP)
+        // CUDA: gate VMM on compute capability.
+        int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-
-        // VMM requires compute capability 6.0+
         if (major < 6) {
             return false;
         }
+#endif
 
-        // Check if we can get allocation granularity (VMM function)
+        // HIP/CUDA common: probe VMM granularity API.
         CUmemAllocationProp prop = {};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -353,23 +352,39 @@ namespace lfs::core {
         cudaFree(dummy);
     }
 
-    void RasterizerMemoryArena::full_reset() {
-        const std::lock_guard<std::mutex> lock1(arena_mutex_);
-        const std::lock_guard<std::mutex> lock2(frame_mutex_);
+    void RasterizerMemoryArena::emergency_cleanup() {
+        std::lock_guard<std::mutex> lock1(arena_mutex_);
+        std::lock_guard<std::mutex> lock2(frame_mutex_);
 
-        std::erase_if(frame_contexts_, [](const auto& kv) { return !kv.second.is_active; });
+        LOG_WARN("Emergency cleanup started");
 
+        // Clear all inactive frames
+        auto it = frame_contexts_.begin();
+        while (it != frame_contexts_.end()) {
+            if (!it->second.is_active) {
+                it = frame_contexts_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // Decommit unused memory BEFORE resetting offsets
         for (auto& [device, arena] : device_arenas_) {
             if (arena) {
                 decommit_unused_memory(*arena);
                 arena->offset.store(0, std::memory_order_release);
-                cudaSetDevice(device);
-                cudaDeviceSynchronize();
+                LOG_DEBUG("Reset arena on device %d (committed: %zu MB)", device, arena->committed_size >> 20);
             }
         }
 
         empty_cuda_cache();
-        LOG_DEBUG("Arena reset");
+
+        for (const auto& [device, arena] : device_arenas_) {
+            cudaSetDevice(device);
+            cudaDeviceSynchronize();
+        }
+
+        LOG_WARN("Emergency cleanup completed");
     }
 
     RasterizerMemoryArena::Arena& RasterizerMemoryArena::get_or_create_arena(int device) {

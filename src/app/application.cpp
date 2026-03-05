@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "app/application.hpp"
+#include "config.h"
 #include "app/splash_screen.hpp"
 #include "control/command_api.hpp"
 #include "core/checkpoint_format.hpp"
@@ -35,7 +36,7 @@ namespace lfs::app {
 
     namespace {
 
-        bool checkCudaDriverVersion();
+        bool checkGpuRuntimeVersion();
 
         int runHeadless(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
             if (params->dataset.data_path.empty() && !params->resume_checkpoint) {
@@ -43,7 +44,13 @@ namespace lfs::app {
                 return 1;
             }
 
-            checkCudaDriverVersion();
+            checkGpuRuntimeVersion();
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+                LOG_INFO("Backend: {} | GPU: {} | arch {}.{}", LFS_GPU_BACKEND, prop.name, prop.major, prop.minor);
+            } else {
+                LOG_INFO("Backend: {}", LFS_GPU_BACKEND);
+            }
             lfs::event::CommandCenterBridge::instance().set(&lfs::training::CommandCenter::instance());
 
             {
@@ -188,7 +195,16 @@ namespace lfs::app {
             return 0;
         }
 
-        bool checkCudaDriverVersion() {
+        bool checkGpuRuntimeVersion() {
+#if LFS_USE_HIP
+            int runtime_version = 0;
+            if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
+                LOG_INFO("HIP runtime version: {}.{}", runtime_version / 1000, (runtime_version % 1000) / 10);
+            } else {
+                LOG_WARN("Failed to query HIP runtime version");
+            }
+            return true;
+#else
             const auto info = lfs::core::check_cuda_version();
             if (info.query_failed) {
                 LOG_WARN("Failed to query CUDA driver version");
@@ -201,24 +217,25 @@ namespace lfs::app {
                 return false;
             }
             return true;
+#endif
         }
 
-        void warmupCuda() {
-            checkCudaDriverVersion();
+        void warmupGpuRuntime() {
+            checkGpuRuntimeVersion();
 
             cudaDeviceProp prop;
             if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
-                LOG_INFO("GPU: {} (SM {}.{}, {} MB)", prop.name, prop.major, prop.minor,
+                LOG_INFO("GPU: {} (arch {}.{}, {} MB)", prop.name, prop.major, prop.minor,
                          prop.totalGlobalMem / (1024 * 1024));
             }
 
-            LOG_INFO("Initializing CUDA...");
+            LOG_INFO("Initializing {} backend...", LFS_GPU_BACKEND);
             fast_lfs::rasterization::warmup_kernels();
         }
 
         int runGui(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
             if (params->optimization.no_interop) {
-                LOG_INFO("CUDA-GL interop disabled");
+                LOG_INFO("GPU-OpenGL interop disabled");
                 lfs::rendering::disableInterop();
             }
 
@@ -227,9 +244,9 @@ namespace lfs::app {
             }
 
             if (params->optimization.no_splash) {
-                warmupCuda();
+                warmupGpuRuntime();
             } else {
-                SplashScreen::runWithDelay([]() { warmupCuda(); return 0; });
+                SplashScreen::runWithDelay([]() { warmupGpuRuntime(); return 0; });
             }
 
             lfs::event::CommandCenterBridge::instance().set(&lfs::training::CommandCenter::instance());

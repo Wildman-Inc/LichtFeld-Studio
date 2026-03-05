@@ -31,22 +31,22 @@ namespace fast_lfs::rasterization::kernels::backward {
     }
 
     __global__ void preprocess_backward_cu(
-        const float3* __restrict__ means,
-        const float3* __restrict__ raw_scales,
-        const float4* __restrict__ raw_rotations,
-        const float3* __restrict__ sh_coefficients_rest,
-        const float4* __restrict__ w2c,
-        const float3* __restrict__ cam_position,
-        const uint* __restrict__ primitive_n_touched_tiles,
-        const float2* __restrict__ grad_mean2d,
-        const float* __restrict__ grad_conic,
-        float3* __restrict__ grad_means,
-        float3* __restrict__ grad_raw_scales,
-        float4* __restrict__ grad_raw_rotations,
-        float3* __restrict__ grad_sh_coefficients_0,
-        float3* __restrict__ grad_sh_coefficients_rest,
-        float4* __restrict__ grad_w2c,
-        float* __restrict__ densification_info,
+        const float3* means,
+        const float3* raw_scales,
+        const float4* raw_rotations,
+        const float3* sh_coefficients_rest,
+        const float4* w2c,
+        const float3* cam_position,
+        const uint* primitive_n_touched_tiles,
+        const float2* grad_mean2d,
+        const float* grad_conic,
+        float3* grad_means,
+        float3* grad_raw_scales,
+        float4* grad_raw_rotations,
+        float3* grad_sh_coefficients_0,
+        float3* grad_sh_coefficients_rest,
+        float4* grad_w2c,
+        float* densification_info,
         const uint n_primitives,
         const uint active_sh_bases,
         const uint total_bases_sh_rest,
@@ -143,7 +143,7 @@ namespace fast_lfs::rasterization::kernels::backward {
         const float aa = a * a, bb = b * b, cc = c * c;
         const float ac = a * c, ab = a * b, bc = b * c;
         const float determinant = ac - bb;
-        const float determinant_safe = fmaxf(determinant, config::min_cov2d_determinant);
+        const float determinant_safe = fmaxf(determinant, 1e-8f);
         const float determinant_rcp = 1.0f / determinant_safe;
         const float determinant_rcp_sq = determinant_rcp * determinant_rcp;
         const float3 dL_dconic = make_float3(
@@ -181,21 +181,15 @@ namespace fast_lfs::rasterization::kernels::backward {
         const float dL_dj13 = w2c_r3.x * dL_djw_r1.x + w2c_r3.y * dL_djw_r1.y + w2c_r3.z * dL_djw_r1.z;
         const float dL_dj23 = w2c_r3.x * dL_djw_r2.x + w2c_r3.y * dL_djw_r2.y + w2c_r3.z * dL_djw_r2.z;
 
-        // mean3d camera space gradient from J and mean2d (accounts for tx/ty clipping)
+        // mean3d camera space gradient from J and mean2d
+        // TODO: original 3dgs accounts for clamping of tx/ty here, but it seems that this is not necessary
+        float djwr1_dz_helper = dL_dj11 - 2.0f * tx * dL_dj13;
+        float djwr2_dz_helper = dL_dj22 - 2.0f * ty * dL_dj23;
         const float2 dL_dmean2d = grad_mean2d[primitive_idx];
-        float3 dL_dmean3d_cam = make_float3(
-            j11 * dL_dmean2d.x,
-            j22 * dL_dmean2d.y,
-            -j11 * x * dL_dmean2d.x - j22 * y * dL_dmean2d.y);
-        const bool valid_x = x >= clip_left && x <= clip_right;
-        const bool valid_y = y >= clip_top && y <= clip_bottom;
-        if (valid_x)
-            dL_dmean3d_cam.x -= j11 * dL_dj13 / depth_safe;
-        if (valid_y)
-            dL_dmean3d_cam.y -= j22 * dL_dj23 / depth_safe;
-        const float factor_x = 1.0f + static_cast<float>(valid_x);
-        const float factor_y = 1.0f + static_cast<float>(valid_y);
-        dL_dmean3d_cam.z += (j11 * (factor_x * tx * dL_dj13 - dL_dj11) + j22 * (factor_y * ty * dL_dj23 - dL_dj22)) / depth_safe;
+        const float3 dL_dmean3d_cam = make_float3(
+            j11 * (dL_dmean2d.x - dL_dj13 / depth_safe),
+            j22 * (dL_dmean2d.y - dL_dj23 / depth_safe),
+            -j11 * (x * dL_dmean2d.x + djwr1_dz_helper / depth_safe) - j22 * (y * dL_dmean2d.y + djwr2_dz_helper / depth_safe));
 
         if (grad_w2c != nullptr) {
             atomicAdd(&grad_w2c[0].w, dL_dmean3d_cam.x);
@@ -266,29 +260,26 @@ namespace fast_lfs::rasterization::kernels::backward {
     }
 
     // based on https://github.com/humansensinglab/taming-3dgs/blob/fd0f7d9edfe135eb4eefd3be82ee56dada7f2a16/submodules/diff-gaussian-rasterization/cuda_rasterizer/backward.cu#L404
-    template <bool HAS_DENSIFICATION>
     __global__ void blend_backward_cu(
-        const uint2* __restrict__ tile_instance_ranges,
-        const uint* __restrict__ tile_bucket_offsets,
-        const uint* __restrict__ instance_primitive_indices,
-        const float2* __restrict__ primitive_mean2d,
-        const float4* __restrict__ primitive_conic_opacity,
-        const float3* __restrict__ primitive_color,
-        const float* __restrict__ raw_opacities,
-        const float* __restrict__ grad_image,
-        const float* __restrict__ grad_alpha_map,
-        const float* __restrict__ image,
-        const float* __restrict__ alpha_map,
-        const uint* __restrict__ tile_max_n_contributions,
-        const uint* __restrict__ tile_n_contributions,
-        const uint* __restrict__ bucket_tile_index,
-        const uint* __restrict__ bucket_checkpoint_uint8,
-        float2* __restrict__ grad_mean2d,
-        float* __restrict__ grad_conic,
-        float* __restrict__ grad_raw_opacity,
-        float3* __restrict__ grad_color,
-        float* __restrict__ densification_info,
-        const float* __restrict__ densification_error_map,
+        const uint2* tile_instance_ranges,
+        const uint* tile_bucket_offsets,
+        const uint* instance_primitive_indices,
+        const float2* primitive_mean2d,
+        const float4* primitive_conic_opacity,
+        const float3* primitive_color,
+        const float* raw_opacities,
+        const float* grad_image,
+        const float* grad_alpha_map,
+        const float* image,
+        const float* alpha_map,
+        const uint* tile_max_n_contributions,
+        const uint* tile_n_contributions,
+        const uint* bucket_tile_index,
+        const uint* bucket_checkpoint_uint8,
+        float2* grad_mean2d,
+        float* grad_conic,
+        float* grad_raw_opacity,
+        float3* grad_color,
         const uint n_buckets,
         const uint n_primitives,
         const uint width,
@@ -347,8 +338,6 @@ namespace fast_lfs::rasterization::kernels::backward {
         float3 dL_dconic_accum = {0.0f, 0.0f, 0.0f};
         float dL_draw_opacity_partial_accum = 0.0f;
         float3 dL_dcolor_accum = {0.0f, 0.0f, 0.0f};
-        float densification_weight_accum = 0.0f;
-        float densification_error_weighted_accum = 0.0f;
 
         // tile metadata
         const uint2 tile_coords = {tile_idx % grid_width, tile_idx / grid_width};
@@ -458,13 +447,6 @@ namespace fast_lfs::rasterization::kernels::backward {
 
             const float blending_weight = transmittance * alpha;
 
-            if constexpr (HAS_DENSIFICATION) {
-                const uint pixel_idx = width * pixel_coords.y + pixel_coords.x;
-                const float pixel_error = densification_error_map[pixel_idx];
-                densification_weight_accum += blending_weight;
-                densification_error_weighted_accum += blending_weight * pixel_error;
-            }
-
             // color gradient
             const float3 dL_dcolor = blending_weight * grad_color_pixel * color_grad_factor;
             dL_dcolor_accum += dL_dcolor;
@@ -514,11 +496,6 @@ namespace fast_lfs::rasterization::kernels::backward {
             atomicAdd(&grad_color[primitive_idx].x, clamped_color.x);
             atomicAdd(&grad_color[primitive_idx].y, clamped_color.y);
             atomicAdd(&grad_color[primitive_idx].z, clamped_color.z);
-
-            if constexpr (HAS_DENSIFICATION) {
-                atomicAdd(&densification_info[primitive_idx], densification_weight_accum);
-                atomicAdd(&densification_info[n_primitives + primitive_idx], densification_error_weighted_accum);
-            }
         }
     }
 

@@ -34,30 +34,38 @@ set(GSPLAT_SOURCES
 )
 
 # lfs suffix avoids conflict with legacy gsplat_backend
-add_library(gsplat_backend_lfs STATIC ${GSPLAT_SOURCES})
+if(USE_HIP)
+    lfs_hip_add_library(gsplat_backend_lfs STATIC ${GSPLAT_SOURCES})
+else()
+    add_library(gsplat_backend_lfs STATIC ${GSPLAT_SOURCES})
+endif()
 
 set_target_properties(gsplat_backend_lfs PROPERTIES
         CXX_STANDARD 23
         CXX_STANDARD_REQUIRED ON
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION OFF
         POSITION_INDEPENDENT_CODE ON
 )
+if(USE_CUDA)
+    set_target_properties(gsplat_backend_lfs PROPERTIES
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 target_include_directories(gsplat_backend_lfs
         PUBLIC
         ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_link_libraries(gsplat_backend_lfs
         PUBLIC
-        CUDA::cudart
-        CUDA::curand
+        ${GPU_RUNTIME_LIBRARY}
+        ${GPU_RAND_LIBRARY}
         glm::glm
 )
 
@@ -98,5 +106,9 @@ message(STATUS "gsplat_backend_lfs configuration:")
 message(STATUS "  - Sources: ${GSPLAT_SOURCES}")
 message(STATUS "  - Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  - C++ Standard: 23")
-message(STATUS "  - CUDA Standard: 20")
-message(STATUS "  - CUDA include dirs: ${CUDAToolkit_INCLUDE_DIRS}")
+if(USE_CUDA)
+    message(STATUS "  - CUDA Standard: 20")
+elseif(USE_HIP)
+    message(STATUS "  - HIP backend enabled")
+endif()
+message(STATUS "  - GPU include dirs: ${GPU_INCLUDE_DIRS}")

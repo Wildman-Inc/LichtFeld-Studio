@@ -2,8 +2,8 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# CUDA library for IO-specific kernels (morton encoding, k-means)
-add_library(lfs_io_cuda STATIC
+# CUDA/HIP library for IO-specific kernels (morton encoding, k-means)
+set(LFS_IO_CUDA_SOURCES
         cuda/morton_encoding.hpp
         cuda/morton_encoding.cu
         cuda/kmeans.hpp
@@ -11,6 +11,11 @@ add_library(lfs_io_cuda STATIC
         cuda/image_format_kernels.cuh
         cuda/image_format_kernels.cu
 )
+if(USE_HIP)
+    lfs_hip_add_library(lfs_io_cuda STATIC ${LFS_IO_CUDA_SOURCES})
+else()
+    add_library(lfs_io_cuda STATIC ${LFS_IO_CUDA_SOURCES})
+endif()
 
 target_include_directories(lfs_io_cuda
         PUBLIC
@@ -24,15 +29,21 @@ target_link_libraries(lfs_io_cuda
         INTERFACE
         lfs_core      # Propagate to consumers, not linked during device linking
         PRIVATE
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
 )
 
-set_target_properties(lfs_io_cuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
-)
+if(USE_CUDA)
+    set_target_properties(lfs_io_cuda PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(lfs_io_cuda PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
 # CUDA compiler options for lfs_io_cuda
 target_compile_options(lfs_io_cuda PRIVATE
@@ -71,13 +82,18 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
         libavutil
 )
 
-add_library(lfs_video STATIC
+set(LFS_VIDEO_SOURCES
         video/video_export_options.hpp
         video/video_encoder.hpp
         video/video_encoder.cpp
         video/color_convert.cuh
         video/color_convert.cu
 )
+if(USE_HIP)
+    lfs_hip_add_library(lfs_video STATIC ${LFS_VIDEO_SOURCES})
+else()
+    add_library(lfs_video STATIC ${LFS_VIDEO_SOURCES})
+endif()
 
 target_include_directories(lfs_video
         PUBLIC
@@ -90,17 +106,23 @@ target_link_libraries(lfs_video
         PRIVATE
         PkgConfig::FFMPEG
         spdlog::spdlog
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
 )
 
 target_compile_features(lfs_video PUBLIC cxx_std_23)
 
-set_target_properties(lfs_video PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
-)
+if(USE_CUDA)
+    set_target_properties(lfs_video PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(lfs_video PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
 target_compile_options(lfs_video PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} --extended-lambda -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8>
@@ -108,6 +130,18 @@ target_compile_options(lfs_video PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} --extended-lambda>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda>
 )
+
+if(USE_CUDA AND LFS_ENABLE_NVIMAGECODEC)
+    set(IO_NVIMAGECODEC_SOURCES
+        nvcodec_image_loader.hpp
+        nvcodec_image_loader.cpp
+    )
+else()
+    set(IO_NVIMAGECODEC_SOURCES
+        nvcodec_image_loader.hpp
+        nvcodec_image_loader_stub.cpp
+    )
+endif()
 
 # Main IO library
 add_library(lfs_io STATIC
@@ -156,8 +190,7 @@ add_library(lfs_io STATIC
         mesh/texture_loader.hpp
         mesh/texture_loader.cpp
         cache_image_loader.cpp
-        nvcodec_image_loader.hpp
-        nvcodec_image_loader.cpp
+        ${IO_NVIMAGECODEC_SOURCES}
         pipelined_image_loader.cpp
         stb_image_impl.cpp
         tinyply.cpp
@@ -181,9 +214,14 @@ target_include_directories(lfs_io
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/external
-        ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include
         ${CMAKE_SOURCE_DIR}/external/spz
 )
+
+if(USE_CUDA AND LFS_ENABLE_NVIMAGECODEC)
+    target_include_directories(lfs_io PRIVATE
+        ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include
+    )
+endif()
 
 # Find the actual WebP library targets
 if(TARGET WebP::webpdecoder)
@@ -234,7 +272,7 @@ target_link_libraries(lfs_io
         ${WEBP_DECODE_LIB}     # WebP for SOG decompression
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
-        CUDA::cudart           # CUDA runtime for nvImageCodec
+        ${GPU_RUNTIME_LIBRARY}
         lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
         lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
@@ -243,13 +281,18 @@ target_link_libraries(lfs_io
         PkgConfig::FFMPEG
 )
 
-# Link nvImageCodec if available
-if(TARGET nvimgcodec)
-    target_link_libraries(lfs_io PRIVATE nvimgcodec)
-    add_dependencies(lfs_io nvimgcodec)
-    message(STATUS "Linking nvImageCodec to lfs_io")
+if(USE_CUDA AND LFS_ENABLE_NVIMAGECODEC)
+    target_compile_definitions(lfs_io PRIVATE LFS_ENABLE_NVIMAGECODEC=1)
+    if(TARGET nvimgcodec)
+        target_link_libraries(lfs_io PRIVATE nvimgcodec)
+        add_dependencies(lfs_io nvimgcodec)
+        message(STATUS "Linking nvImageCodec to lfs_io")
+    else()
+        message(WARNING "nvImageCodec target not found - JPEG hardware decode will not work")
+    endif()
 else()
-    message(WARNING "nvImageCodec target not found - JPEG hardware decode will not work")
+    target_compile_definitions(lfs_io PRIVATE LFS_ENABLE_NVIMAGECODEC=0)
+    message(STATUS "nvImageCodec disabled for backend ${LFS_GPU_BACKEND}; CPU decode fallback enabled")
 endif()
 
 # Set C++ standard

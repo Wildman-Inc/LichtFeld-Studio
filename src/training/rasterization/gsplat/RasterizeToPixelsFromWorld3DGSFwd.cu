@@ -2,12 +2,18 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+// Include Common.h first for HIP/CUDA compatibility
+#include "Common.h"
+#include "core/cuda/hip_runtime_compat.h"
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(USE_HIP) && USE_HIP)
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cooperative_groups.h>
+#endif
 #include <cstdio>
-#include <cuda_runtime.h>
 
 #include "Cameras.cuh"
-#include "Common.h"
 #include "Rasterization.h"
 #include "Utils.cuh"
 
@@ -379,26 +385,26 @@ namespace gsplat_lfs {
             tile_size * tile_size *
             (sizeof(int32_t) + sizeof(vec4) + sizeof(mat3));
 
-        if (n_isects == 0) {
-            // Skip kernel launch if no intersections
-            // Still need to clear output buffers
-            cudaMemsetAsync(renders, 0, C * image_height * image_width * CDIM * sizeof(float), stream);
-            cudaMemsetAsync(alphas, 0, C * image_height * image_width * sizeof(float), stream);
-            cudaMemsetAsync(last_ids, 0, C * image_height * image_width * sizeof(int32_t), stream);
-            return;
-        }
+    if (n_isects == 0) {
+        // Skip kernel launch if no intersections
+        // Still need to clear output buffers
+        cudaMemsetAsync(renders, 0, C * image_height * image_width * CDIM * sizeof(float), stream);
+        cudaMemsetAsync(alphas, 0, C * image_height * image_width * sizeof(float), stream);
+        cudaMemsetAsync(last_ids, 0, C * image_height * image_width * sizeof(int32_t), stream);
+        return;
+    }
 
-        auto err = cudaFuncSetAttribute(
-            rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shmem_size);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    "GSPLAT ERROR: Failed to set maximum shared memory size "
-                    "(requested %ld bytes), try lowering tile_size. CUDA error: %s\n",
-                    shmem_size, cudaGetErrorString(err));
-            return;
-        }
+    auto err = cudaFuncSetAttribute(
+        rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+            "GSPLAT ERROR: Failed to set maximum shared memory size "
+            "(requested %ld bytes), try lowering tile_size. CUDA error: %s\n",
+            shmem_size, cudaGetErrorString(err));
+        return;
+    }
 
         rasterize_to_pixels_from_world_3dgs_fwd_kernel<CDIM, float>
             <<<grid, threads, shmem_size, stream>>>(

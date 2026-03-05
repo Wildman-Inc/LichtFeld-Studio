@@ -27,22 +27,30 @@ set(GSPLAT_FWD_SOURCES
 )
 
 # Forward-only gsplat backend for rendering
-add_library(gsplat_fwd STATIC ${GSPLAT_FWD_SOURCES})
+if(USE_HIP)
+    lfs_hip_add_library(gsplat_fwd STATIC ${GSPLAT_FWD_SOURCES})
+else()
+    add_library(gsplat_fwd STATIC ${GSPLAT_FWD_SOURCES})
+endif()
 
 set_target_properties(gsplat_fwd PROPERTIES
         CXX_STANDARD 23
         CXX_STANDARD_REQUIRED ON
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION OFF
         POSITION_INDEPENDENT_CODE ON
 )
+if(USE_CUDA)
+    set_target_properties(gsplat_fwd PROPERTIES
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 target_include_directories(gsplat_fwd
         PUBLIC
         ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../utils
@@ -50,7 +58,7 @@ target_include_directories(gsplat_fwd
 
 target_link_libraries(gsplat_fwd
         PUBLIC
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         glm::glm
 )
 

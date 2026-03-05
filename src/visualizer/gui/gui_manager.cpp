@@ -8,6 +8,7 @@
 // clang-format on
 
 #include "gui/gui_manager.hpp"
+#include "config.h"
 #include "control/command_api.hpp"
 #include "core/cuda_version.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
@@ -173,11 +174,15 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::checkCudaVersionAndNotify() {
+#if LFS_USE_CUDA
         using namespace lfs::core;
         const auto info = check_cuda_version();
         if (!info.query_failed && !info.supported) {
             pending_cuda_warning_ = info;
         }
+#else
+        pending_cuda_warning_.reset();
+#endif
     }
 
     GuiManager::~GuiManager() = default;

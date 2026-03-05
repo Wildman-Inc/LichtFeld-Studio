@@ -278,11 +278,18 @@ endforeach()
 # Create test executable
 add_executable(lichtfeld_tests ${TEST_SOURCES})
 
-# Set CUDA architectures
+if(USE_CUDA)
+    set_target_properties(lichtfeld_tests PROPERTIES
+        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+elseif(USE_HIP)
+    set_target_properties(lichtfeld_tests PROPERTIES
+        HIP_ARCHITECTURES "${HIP_ARCHITECTURES}"
+    )
+endif()
 set_target_properties(lichtfeld_tests PROPERTIES
-    CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
@@ -333,10 +340,10 @@ target_link_libraries(lichtfeld_tests PRIVATE
     OpenMeshCore
     assimp::assimp
 
-    # CUDA libraries
-    CUDA::cudart
-    CUDA::curand
-    CUDA::cupti
+    # GPU backend runtime
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
+    $<$<BOOL:${USE_CUDA}>:CUDA::cupti>
 
     # System libraries
     spdlog::spdlog
@@ -354,10 +361,18 @@ target_compile_options(lichtfeld_tests PRIVATE
 # =============================================================================
 add_executable(lichtfeld_benchmarks ${BENCHMARK_SOURCES})
 
+if(USE_CUDA)
+    set_target_properties(lichtfeld_benchmarks PROPERTIES
+        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+elseif(USE_HIP)
+    set_target_properties(lichtfeld_benchmarks PROPERTIES
+        HIP_ARCHITECTURES "${HIP_ARCHITECTURES}"
+    )
+endif()
 set_target_properties(lichtfeld_benchmarks PROPERTIES
-    CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
@@ -394,9 +409,9 @@ target_link_libraries(lichtfeld_benchmarks PRIVATE
     ${TORCH_LIBRARIES}
     ${OPENGL_LIBRARIES}
     OpenImageIO::OpenImageIO
-    CUDA::cudart
-    CUDA::curand
-    CUDA::cupti
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
+    $<$<BOOL:${USE_CUDA}>:CUDA::cupti>
     spdlog::spdlog
 )
 
@@ -425,6 +440,25 @@ gtest_discover_tests(lichtfeld_benchmarks
     DISCOVERY_MODE PRE_TEST
     TEST_PREFIX "benchmark."
 )
+
+if(USE_HIP AND NOT WIN32)
+    add_executable(hip_backend_smoke hip_backend_smoke.cu)
+    set_target_properties(hip_backend_smoke PROPERTIES
+        HIP_ARCHITECTURES "${HIP_ARCHITECTURES}"
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    target_include_directories(hip_backend_smoke PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}/include
+        ${GPU_INCLUDE_DIRS}
+    )
+    target_link_libraries(hip_backend_smoke PRIVATE
+        ${GPU_RUNTIME_LIBRARY}
+        spdlog::spdlog
+    )
+    add_test(NAME hip_backend_smoke COMMAND hip_backend_smoke)
+endif()
 
 # Custom targets for convenience
 add_custom_target(run_tests
