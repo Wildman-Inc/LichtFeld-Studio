@@ -37,7 +37,12 @@ target_include_directories(lfs_core_cuda
         ${CMAKE_SOURCE_DIR}/src/core/tensor/internal  # For memory_pool.hpp and other internal headers
 )
 
-find_package(OpenMP REQUIRED COMPONENTS CXX)
+if(USE_HIP AND WIN32)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+else()
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+endif()
+
 target_link_libraries(lfs_core_cuda
     PUBLIC
         ${GPU_RUNTIME_LIBRARY}
@@ -45,8 +50,13 @@ target_link_libraries(lfs_core_cuda
         ${GPU_RAND_LIBRARY}
         spdlog::spdlog
         glm::glm
-        OpenMP::OpenMP_CXX
 )
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(lfs_core_cuda PUBLIC OpenMP::OpenMP_CXX)
+else()
+    message(WARNING "OpenMP CXX not found; building lfs_core_cuda without OpenMP support")
+endif()
 
 if(USE_CUDA)
     set_target_properties(lfs_core_cuda PROPERTIES

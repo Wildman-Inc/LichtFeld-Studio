@@ -24,8 +24,21 @@
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/transform.h>
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+#include <thrust/system/hip/execution_policy.h>
+#else
+#include <thrust/system/cuda/execution_policy.h>
+#endif
 
 namespace lfs::core::tensor_ops {
+
+    inline auto thrust_exec(cudaStream_t stream) {
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+        return thrust::hip::par.on(stream);
+#else
+        return thrust::cuda::par.on(stream);
+#endif
+    }
 
     // ============= OPTIMIZED FULL REDUCTION TO SCALAR =============
 
@@ -1535,21 +1548,21 @@ namespace lfs::core::tensor_ops {
             column_reduce_sum_kernel<<<grid, BLOCK, 0, stream>>>(input, output, M, N);
             if (op == ReduceOp::Mean) {
                 float inv_M = 1.0f / static_cast<float>(M);
-                thrust::transform(thrust::cuda::par.on(stream),
+                thrust::transform(thrust_exec(stream),
                                   thrust::device_ptr<float>(output), thrust::device_ptr<float>(output + N),
                                   thrust::device_ptr<float>(output), [inv_M] __device__(float x) { return x * inv_M; });
             }
             break;
         case ReduceOp::Max:
             if (grid_y > 1) {
-                thrust::fill(thrust::cuda::par.on(stream),
+                thrust::fill(thrust_exec(stream),
                              thrust::device_ptr<float>(output), thrust::device_ptr<float>(output + N), -FLT_MAX);
             }
             column_reduce_max_kernel<<<grid, BLOCK, 0, stream>>>(input, output, M, N);
             break;
         case ReduceOp::Min:
             if (grid_y > 1) {
-                thrust::fill(thrust::cuda::par.on(stream),
+                thrust::fill(thrust_exec(stream),
                              thrust::device_ptr<float>(output), thrust::device_ptr<float>(output + N), FLT_MAX);
             }
             column_reduce_min_kernel<<<grid, BLOCK, 0, stream>>>(input, output, M, N);

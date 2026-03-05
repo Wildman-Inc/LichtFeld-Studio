@@ -682,6 +682,20 @@ elseif(USE_HIP)
     # Many Windows-specific code paths in this project use #ifdef WIN32.
     if(WIN32)
         add_definitions(-DWIN32)
+        add_definitions(-D_USE_MATH_DEFINES)
+    endif()
+endif()
+
+# PyTorch's ROCm CMake logic tries to auto-detect GPU arch via rocm_agent_enumerator.
+# In some environments (notably Windows HIP SDK), this probe fails, so propagate
+# the configured LFS_AMDGPU_ARCH as PYTORCH_ROCM_ARCH unless user already set it.
+if(USE_HIP)
+    if(NOT DEFINED ENV{PYTORCH_ROCM_ARCH} OR "$ENV{PYTORCH_ROCM_ARCH}" STREQUAL "")
+        string(REPLACE ";" " " _lfs_pytorch_rocm_arch "${LFS_AMDGPU_ARCH}")
+        set(ENV{PYTORCH_ROCM_ARCH} "${_lfs_pytorch_rocm_arch}")
+        message(STATUS "Setting PYTORCH_ROCM_ARCH from LFS_AMDGPU_ARCH: $ENV{PYTORCH_ROCM_ARCH}")
+    else()
+        message(STATUS "Using pre-set PYTORCH_ROCM_ARCH: $ENV{PYTORCH_ROCM_ARCH}")
     endif()
 endif()
 
@@ -720,11 +734,14 @@ find_package(Torch REQUIRED)
 if(USE_HIP AND WIN32)
     set(MSVC_FLAG_FILTER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/filter_msvc_flags.ps1")
 
-    # Set compiler launcher to filter MSVC flags from PyTorch
-    set(CMAKE_CXX_COMPILER_LAUNCHER "pwsh" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "${MSVC_FLAG_FILTER_SCRIPT}")
-    set(CMAKE_C_COMPILER_LAUNCHER "pwsh" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "${MSVC_FLAG_FILTER_SCRIPT}")
-
-    message(STATUS "Windows HIP build: Using MSVC flag filter: ${MSVC_FLAG_FILTER_SCRIPT}")
+    # Filter MSVC-style flags from PyTorch when helper script is available.
+    if(EXISTS "${MSVC_FLAG_FILTER_SCRIPT}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "pwsh" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "${MSVC_FLAG_FILTER_SCRIPT}")
+        set(CMAKE_C_COMPILER_LAUNCHER "pwsh" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "${MSVC_FLAG_FILTER_SCRIPT}")
+        message(STATUS "Windows HIP build: Using MSVC flag filter: ${MSVC_FLAG_FILTER_SCRIPT}")
+    else()
+        message(WARNING "MSVC flag filter script not found (${MSVC_FLAG_FILTER_SCRIPT}); building without compiler launcher")
+    endif()
 
     # For Windows HIP builds, set the ROCm path for clang to find device libraries
     # Use 8.3 short path format to avoid issues with spaces
@@ -736,14 +753,9 @@ if(USE_HIP AND WIN32)
     # with MSVC STL type_traits (causes vectorcall redefinition errors)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --rocm-path=${HIP_ROCM_PATH} --rocm-device-lib-path=${HIP_DEVICE_LIB_PATH} -fno-openmp")
 
-    # Add global compile options for HIP builds
-    # Force include hip_runtime_compat.h to intercept cuda_runtime.h includes
-    # and provide CUDA->HIP API mappings for all translation units
-    # Note: hip_runtime_compat.h includes hip_warp_override.h to handle warp sync functions
-    add_compile_options(
-        "-Wno-unused-command-line-argument"
-        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/src/core/include/core/cuda/hip_runtime_compat.h"
-    )
+    # Add global compile option for HIP builds.
+    # Avoid forcing HIP headers into third-party host-only files.
+    add_compile_options("-Wno-unused-command-line-argument")
 
     # Add cuda_shim directory as highest priority include path
     # This intercepts #include <cuda_runtime.h> etc. and redirects to HIP equivalents
@@ -762,6 +774,8 @@ find_package(glad REQUIRED)
 find_package(glfw3 REQUIRED)
 find_package(glm REQUIRED)
 find_package(imgui REQUIRED)
+find_package(implot REQUIRED)
+find_package(assimp REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(args REQUIRED)
 
@@ -789,14 +803,26 @@ find_package(OpenImageIO REQUIRED)
 find_package(Boost REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# Set GPU_RUNTIME_LIBRARY after find_package(Torch) for HIP builds
-# PyTorch's LoadHIP.cmake creates the hip::device target
+# Normalize third-party target names across package variants.
+if(NOT TARGET assimp::assimp AND TARGET assimp)
+    add_library(assimp::assimp ALIAS assimp)
+endif()
+if(NOT TARGET implot::implot AND TARGET implot)
+    add_library(implot::implot ALIAS implot)
+endif()
+
+# Set GPU runtime linkage target after find_package(Torch) for HIP builds.
+# On Windows, prefer hip::host so regular C++ translation units are not forced
+# into device compilation mode via hip::device usage requirements.
 if(USE_HIP AND WIN32)
-    if(TARGET hip::device)
+    if(TARGET hip::host)
+        set(GPU_RUNTIME_LIBRARY hip::host)
+        message(STATUS "Using hip::host target for Windows HIP runtime linkage")
+    elseif(TARGET hip::device)
         set(GPU_RUNTIME_LIBRARY hip::device)
-        message(STATUS "Using hip::device target from PyTorch")
+        message(WARNING "hip::host target not found; falling back to hip::device (may force -x hip on host files)")
     else()
-        message(WARNING "hip::device target not found after loading Torch. HIP linking may fail.")
+        message(WARNING "Neither hip::host nor hip::device target found after loading Torch. HIP linking may fail.")
     endif()
 endif()
 
@@ -906,6 +932,18 @@ else()
     message(STATUS "GPU-OpenGL interop support: DISABLED (by user option)")
     set(CUDA_GL_INTEROP_FOUND FALSE)
     set(CUDA_GL_INTEROP_ENABLED 0)
+endif()
+
+# Values consumed by config.h.in via #cmakedefine01.
+if(USE_CUDA)
+    set(LFS_USE_CUDA 1)
+    set(LFS_USE_HIP 0)
+elseif(USE_HIP)
+    set(LFS_USE_CUDA 0)
+    set(LFS_USE_HIP 1)
+else()
+    set(LFS_USE_CUDA 0)
+    set(LFS_USE_HIP 0)
 endif()
 
 # Create configuration header (static options)
@@ -1210,6 +1248,11 @@ endif()
 
 # Build type configuration function
 function(configure_build_type target)
+    if(NOT TARGET ${target})
+        message(STATUS "Skipping build-type config for missing target: ${target}")
+        return()
+    endif()
+
     get_target_property(target_type ${target} TYPE)
 
     if(target_type STREQUAL "INTERFACE_LIBRARY")

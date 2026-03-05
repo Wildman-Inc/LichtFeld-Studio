@@ -33,11 +33,32 @@
 #include <thrust/sort.h>
 #include <thrust/transform.h>
 #include <thrust/tuple.h>
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+#include <thrust/system/hip/execution_policy.h>
+#else
+#include <thrust/system/cuda/execution_policy.h>
+#endif
 #include <unordered_map>
 
 // CHECK_CUDA provided by core/cuda_debug.hpp
 
 namespace lfs::core::tensor_ops {
+
+    inline auto thrust_par_nosync(cudaStream_t stream) {
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+        return thrust::hip::par.on(stream);
+#else
+        return thrust::cuda::par_nosync.on(stream);
+#endif
+    }
+
+    inline auto thrust_par_nosync() {
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+        return thrust::hip::par;
+#else
+        return thrust::cuda::par_nosync;
+#endif
+    }
 
     // Pooled CUB temp storage - grows as needed, never shrinks
     class CubTempStoragePool {
@@ -347,7 +368,17 @@ namespace lfs::core::tensor_ops {
     template <typename SrcT, typename DstT>
     struct ConvertFunctor {
         __device__ DstT operator()(SrcT x) const {
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+            if constexpr (std::is_same_v<DstT, __half>) {
+                return __float2half(static_cast<float>(x));
+            } else if constexpr (std::is_same_v<SrcT, __half>) {
+                return static_cast<DstT>(__half2float(x));
+            } else {
+                return static_cast<DstT>(x);
+            }
+#else
             return static_cast<DstT>(x);
+#endif
         }
     };
 
@@ -406,10 +437,10 @@ namespace lfs::core::tensor_ops {
             auto in_ptr = thrust::device_pointer_cast(input);
             auto out_ptr = thrust::device_pointer_cast(output);
             if (stream) {
-                thrust::copy(thrust::cuda::par_nosync.on(stream),
+                thrust::copy(thrust_par_nosync(stream),
                              in_ptr, in_ptr + output_size, out_ptr);
             } else {
-                thrust::copy(thrust::cuda::par_nosync,
+                thrust::copy(thrust_par_nosync(),
                              in_ptr, in_ptr + output_size, out_ptr);
             }
             return;
@@ -417,19 +448,17 @@ namespace lfs::core::tensor_ops {
 
         // OPTIMIZED PATH: Contiguous segments - use CUB's segmented reduce
         if (inner_size == 1) {
+            auto offset_from_segment = [reduce_size] __host__ __device__(int i) -> int {
+                return i * static_cast<int>(reduce_size);
+            };
+
             // begin_offsets: [0, N, 2N, 3N, ...]
             auto begin_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(0),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+                thrust::counting_iterator<int>(0), offset_from_segment);
 
             // end_offsets: [N, 2N, 3N, 4N, ...]
             auto end_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(1),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+                thrust::counting_iterator<int>(1), offset_from_segment);
 
             void* d_temp_storage = nullptr;
             size_t temp_storage_bytes = 0;
@@ -481,7 +510,7 @@ namespace lfs::core::tensor_ops {
         //
         // TODO: Implement optimized strided reduction kernel or use CUB with proper setup
         if (stream) {
-            thrust::for_each(thrust::cuda::par_nosync.on(stream),
+            thrust::for_each(thrust_par_nosync(stream),
                              thrust::counting_iterator<size_t>(0),
                              thrust::counting_iterator<size_t>(output_size),
                              [=] __device__(size_t out_idx) {
@@ -496,7 +525,7 @@ namespace lfs::core::tensor_ops {
                                  output[out_idx] = result;
                              });
         } else {
-            thrust::for_each(thrust::cuda::par_nosync,
+            thrust::for_each(thrust_par_nosync(),
                              thrust::counting_iterator<size_t>(0),
                              thrust::counting_iterator<size_t>(output_size),
                              [=] __device__(size_t out_idx) {
@@ -1044,7 +1073,7 @@ namespace lfs::core::tensor_ops {
                     // Divide by count for mean - use Thrust directly
                     auto out_ptr = thrust::device_pointer_cast(d_out);
                     const int count = static_cast<int>(n);
-                    thrust::transform(thrust::cuda::par_nosync.on(stream), out_ptr, out_ptr + 1, out_ptr,
+                    thrust::transform(thrust_par_nosync(stream), out_ptr, out_ptr + 1, out_ptr,
                                       [count] __device__(int val) { return val / count; });
                 }
                 break;
@@ -1151,7 +1180,7 @@ namespace lfs::core::tensor_ops {
                 if (op == ReduceOp::Mean) {
                     const int64_t count = static_cast<int64_t>(n);
                     auto out_ptr = thrust::device_pointer_cast(d_out_int64);
-                    thrust::transform(thrust::cuda::par_nosync.on(stream), out_ptr, out_ptr + 1, out_ptr,
+                    thrust::transform(thrust_par_nosync(stream), out_ptr, out_ptr + 1, out_ptr,
                                       [count] __device__(int64_t val) { return val / count; });
                 }
                 cudaFreeAsync(d_temp_storage, stream);
@@ -1172,7 +1201,7 @@ namespace lfs::core::tensor_ops {
                                        transform_iter, d_temp_result, n, stream);
 
                 if (op == ReduceOp::Any) {
-                    thrust::transform(thrust::cuda::par_nosync.on(stream),
+                    thrust::transform(thrust_par_nosync(stream),
                                       thrust::device_pointer_cast(d_temp_result),
                                       thrust::device_pointer_cast(d_temp_result) + 1,
                                       thrust::device_pointer_cast(d_out_bool),
@@ -1200,7 +1229,7 @@ namespace lfs::core::tensor_ops {
                                        transform_iter, d_temp_result, n, stream);
 
                 if (op == ReduceOp::All) {
-                    thrust::transform(thrust::cuda::par_nosync.on(stream),
+                    thrust::transform(thrust_par_nosync(stream),
                                       thrust::device_pointer_cast(d_temp_result),
                                       thrust::device_pointer_cast(d_temp_result) + 1,
                                       thrust::device_pointer_cast(d_out_bool),
@@ -1346,7 +1375,7 @@ namespace lfs::core::tensor_ops {
             thrust::device_vector<int> keys(total_elements);
 
             if (stream) {
-                thrust::transform(thrust::cuda::par_nosync.on(stream),
+                thrust::transform(thrust_par_nosync(stream),
                                   thrust::counting_iterator<size_t>(0),
                                   thrust::counting_iterator<size_t>(total_elements),
                                   keys.begin(),
@@ -1354,11 +1383,11 @@ namespace lfs::core::tensor_ops {
                                       return static_cast<int>(idx / dim_size);
                                   });
 
-                thrust::inclusive_scan_by_key(thrust::cuda::par_nosync.on(stream),
+                thrust::inclusive_scan_by_key(thrust_par_nosync(stream),
                                               keys.begin(), keys.end(),
                                               data_ptr, data_ptr);
             } else {
-                thrust::transform(thrust::cuda::par_nosync,
+                thrust::transform(thrust_par_nosync(),
                                   thrust::counting_iterator<size_t>(0),
                                   thrust::counting_iterator<size_t>(total_elements),
                                   keys.begin(),
@@ -1366,7 +1395,7 @@ namespace lfs::core::tensor_ops {
                                       return static_cast<int>(idx / dim_size);
                                   });
 
-                thrust::inclusive_scan_by_key(thrust::cuda::par_nosync,
+                thrust::inclusive_scan_by_key(thrust_par_nosync(),
                                               keys.begin(), keys.end(),
                                               data_ptr, data_ptr);
             }
@@ -1393,16 +1422,16 @@ namespace lfs::core::tensor_ops {
             if (dtype == DataType::Float32) {
                 auto data_ptr = thrust::device_pointer_cast(static_cast<float*>(data));
                 if (stream) {
-                    thrust::inclusive_scan(thrust::cuda::par_nosync.on(stream), data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(thrust_par_nosync(stream), data_ptr, data_ptr + total, data_ptr);
                 } else {
-                    thrust::inclusive_scan(thrust::cuda::par_nosync, data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(thrust_par_nosync(), data_ptr, data_ptr + total, data_ptr);
                 }
             } else if (dtype == DataType::Int32) {
                 auto data_ptr = thrust::device_pointer_cast(static_cast<int*>(data));
                 if (stream) {
-                    thrust::inclusive_scan(thrust::cuda::par_nosync.on(stream), data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(thrust_par_nosync(stream), data_ptr, data_ptr + total, data_ptr);
                 } else {
-                    thrust::inclusive_scan(thrust::cuda::par_nosync, data_ptr, data_ptr + total, data_ptr);
+                    thrust::inclusive_scan(thrust_par_nosync(), data_ptr, data_ptr + total, data_ptr);
                 }
             }
             return;
@@ -1651,18 +1680,18 @@ namespace lfs::core::tensor_ops {
 
         if (stream) {
             if (descending) {
-                thrust::sort_by_key(thrust::cuda::par_nosync.on(stream), values_ptr, values_ptr + n,
+                thrust::sort_by_key(thrust_par_nosync(stream), values_ptr, values_ptr + n,
                                     indices_ptr, thrust::greater<float>());
             } else {
-                thrust::sort_by_key(thrust::cuda::par_nosync.on(stream), values_ptr, values_ptr + n,
+                thrust::sort_by_key(thrust_par_nosync(stream), values_ptr, values_ptr + n,
                                     indices_ptr, thrust::less<float>());
             }
         } else {
             if (descending) {
-                thrust::sort_by_key(thrust::cuda::par_nosync, values_ptr, values_ptr + n,
+                thrust::sort_by_key(thrust_par_nosync(), values_ptr, values_ptr + n,
                                     indices_ptr, thrust::greater<float>());
             } else {
-                thrust::sort_by_key(thrust::cuda::par_nosync, values_ptr, values_ptr + n,
+                thrust::sort_by_key(thrust_par_nosync(), values_ptr, values_ptr + n,
                                     indices_ptr, thrust::less<float>());
             }
         }
@@ -1706,14 +1735,14 @@ namespace lfs::core::tensor_ops {
                     values, thrust::raw_pointer_cast(temp_vals.data()),
                     outer_size, dim_size, inner_size, outer, inner);
 
-                thrust::sequence(thrust::cuda::par_nosync.on(stream), temp_idx.begin(), temp_idx.end(), 0LL);
+                thrust::sequence(thrust_par_nosync(stream), temp_idx.begin(), temp_idx.end(), 0LL);
 
                 if (descending) {
-                    thrust::sort_by_key(thrust::cuda::par_nosync.on(stream),
+                    thrust::sort_by_key(thrust_par_nosync(stream),
                                         temp_vals.begin(), temp_vals.end(), temp_idx.begin(),
                                         thrust::greater<float>());
                 } else {
-                    thrust::sort_by_key(thrust::cuda::par_nosync.on(stream),
+                    thrust::sort_by_key(thrust_par_nosync(stream),
                                         temp_vals.begin(), temp_vals.end(), temp_idx.begin(),
                                         thrust::less<float>());
                 }
@@ -2971,3 +3000,4 @@ namespace lfs::core::tensor_ops {
     }
 
 } // namespace lfs::core::tensor_ops
+

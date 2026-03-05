@@ -15,6 +15,7 @@
       ]
     },
     "freetype",
+    "glfw3",
     "glad",
     "sdl3",
     "glm",

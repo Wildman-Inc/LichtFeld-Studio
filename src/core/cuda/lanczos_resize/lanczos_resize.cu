@@ -9,7 +9,6 @@
 
 #include <cmath>
 #include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>

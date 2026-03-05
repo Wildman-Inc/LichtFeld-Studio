@@ -9,6 +9,24 @@
 set(LIBVTERM_SOURCE_DIR ${CMAKE_SOURCE_DIR}/external/libvterm)
 set(LIBVTERM_ENC_DIR ${LIBVTERM_SOURCE_DIR}/src/encoding)
 
+# If the submodule is not present, fetch libvterm directly.
+if(NOT EXISTS "${LIBVTERM_SOURCE_DIR}/include/vterm.h" OR NOT EXISTS "${LIBVTERM_SOURCE_DIR}/src/vterm.c")
+    message(STATUS "libvterm submodule missing; fetching https://github.com/neovim/libvterm")
+    include(FetchContent)
+    FetchContent_Declare(
+        lfs_libvterm
+        GIT_REPOSITORY https://github.com/neovim/libvterm.git
+        GIT_TAG v0.3.3
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(lfs_libvterm)
+    if(NOT DEFINED lfs_libvterm_SOURCE_DIR OR "${lfs_libvterm_SOURCE_DIR}" STREQUAL "")
+        message(FATAL_ERROR "Failed to fetch libvterm source directory via FetchContent")
+    endif()
+    set(LIBVTERM_SOURCE_DIR ${lfs_libvterm_SOURCE_DIR})
+    set(LIBVTERM_ENC_DIR ${LIBVTERM_SOURCE_DIR}/src/encoding)
+endif()
+
 # Generate encoding tables if not present (pre-generated in submodule)
 if(NOT EXISTS ${LIBVTERM_ENC_DIR}/DECdrawing.inc OR NOT EXISTS ${LIBVTERM_ENC_DIR}/uk.inc)
     find_package(Perl REQUIRED)
@@ -19,7 +37,12 @@ if(NOT EXISTS ${LIBVTERM_ENC_DIR}/DECdrawing.inc)
         COMMAND ${PERL_EXECUTABLE} -CSD ${LIBVTERM_SOURCE_DIR}/tbl2inc_c.pl ${LIBVTERM_ENC_DIR}/DECdrawing.tbl
         OUTPUT_FILE ${LIBVTERM_ENC_DIR}/DECdrawing.inc
         WORKING_DIRECTORY ${LIBVTERM_SOURCE_DIR}
+        RESULT_VARIABLE _decdrawing_gen_result
+        ERROR_VARIABLE _decdrawing_gen_error
     )
+    if(NOT _decdrawing_gen_result EQUAL 0)
+        message(FATAL_ERROR "Failed to generate DECdrawing.inc via tbl2inc_c.pl: ${_decdrawing_gen_error}")
+    endif()
 endif()
 
 if(NOT EXISTS ${LIBVTERM_ENC_DIR}/uk.inc)
@@ -27,7 +50,12 @@ if(NOT EXISTS ${LIBVTERM_ENC_DIR}/uk.inc)
         COMMAND ${PERL_EXECUTABLE} -CSD ${LIBVTERM_SOURCE_DIR}/tbl2inc_c.pl ${LIBVTERM_ENC_DIR}/uk.tbl
         OUTPUT_FILE ${LIBVTERM_ENC_DIR}/uk.inc
         WORKING_DIRECTORY ${LIBVTERM_SOURCE_DIR}
+        RESULT_VARIABLE _uk_gen_result
+        ERROR_VARIABLE _uk_gen_error
     )
+    if(NOT _uk_gen_result EQUAL 0)
+        message(FATAL_ERROR "Failed to generate uk.inc via tbl2inc_c.pl: ${_uk_gen_error}")
+    endif()
 endif()
 
 set(LIBVTERM_SOURCES

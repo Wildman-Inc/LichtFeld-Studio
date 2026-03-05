@@ -303,7 +303,7 @@ namespace lfs::core {
 
         cudaDeviceSynchronize();
         lfs::core::Tensor::trim_memory_pool();
-        lfs::core::GlobalArenaManager::instance().get_arena().full_reset();
+        lfs::core::GlobalArenaManager::instance().get_arena().emergency_cleanup();
 
         notifyMutation(MutationType::CLEARED);
     }

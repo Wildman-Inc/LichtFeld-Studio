@@ -368,9 +368,9 @@ using cudaGraphNode_t = hipGraphNode_t;
 using CUresult = cudaError_t;
 using CUdeviceptr = char*;
 using CUcontext = hipCtx_t;
-using CUmemGenericAllocationHandle = cudaMemGenericAllocationHandle_t;
-using CUmemAllocationProp = cudaMemAllocationProp;
-using CUmemAccessDesc = cudaMemAccessDesc;
+using CUmemGenericAllocationHandle = hipMemGenericAllocationHandle_t;
+using CUmemAllocationProp = hipMemAllocationProp;
+using CUmemAccessDesc = hipMemAccessDesc;
 
 #ifndef CUDA_SUCCESS
 #define CUDA_SUCCESS cudaSuccess

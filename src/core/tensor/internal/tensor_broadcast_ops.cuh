@@ -99,7 +99,7 @@ namespace lfs::core::tensor_ops {
     // SPECIALIZED BROADCAST KERNELS (tiny-cuda-nn style vectorized)
     // ============================================================================
 
-#ifdef __CUDACC__ // Only compile CUDA kernels with nvcc
+#if defined(__CUDACC__) || defined(__HIPCC__) // Compile GPU kernels with CUDA or HIP compiler
 
     // Scalar broadcast: (M×N) op scalar, vectorized with float4
     template <typename BinaryOp>
@@ -785,7 +785,7 @@ namespace lfs::core::tensor_ops {
         c[idx] = op(a[a_idx], b[b_idx]);
     }
 
-#endif // __CUDACC__
+#endif // defined(__CUDACC__) || defined(__HIPCC__)
 
     // ============================================================================
     // BINARY BROADCAST HOST LAUNCHER TEMPLATE (INLINE FOR CORRECT INSTANTIATION)
@@ -839,7 +839,7 @@ namespace lfs::core::tensor_ops {
                     grid = dim3(grid_x, grid_y, grid_z);
                 }
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 broadcast_row_comparison_kernel<<<grid, block_size, 0, stream>>>(
                     a, b, c, M, N, a_is_row, op);
 #else
@@ -873,7 +873,7 @@ namespace lfs::core::tensor_ops {
                 const int num_vecs = (c_elements + 3) / 4;
                 const int grid_size = (num_vecs + block_size - 1) / block_size;
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 broadcast_scalar_kernel_float<<<grid_size, block_size, 0, stream>>>(
                     a, b, c, a_size, b_size, c_elements, op);
 #else
@@ -905,7 +905,7 @@ namespace lfs::core::tensor_ops {
                     grid = dim3(grid_x, grid_y, grid_z);
                 }
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 broadcast_row_kernel_float<<<grid, block_size, 0, stream>>>(
                     a, b, c, M, N, a_is_row, op);
 #else
@@ -936,7 +936,7 @@ namespace lfs::core::tensor_ops {
                     grid = dim3(grid_x, grid_y, grid_z);
                 }
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 broadcast_column_kernel_float<<<grid, block_size, 0, stream>>>(
                     a, b, c, M, N, a_is_col, op);
 #else
@@ -975,7 +975,7 @@ namespace lfs::core::tensor_ops {
                 // Our kernel is optimized for small C (3,4,8) which are most common in rendering
                 // For C=64, we're ~20% slower than PyTorch, but 10-12× faster for C=3,4!
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 broadcast_channel3d_kernel_float<<<grid, block_size, 0, stream>>>(
                     a, b, c, H, W, C, a_is_broadcast, op);
 #else
@@ -1009,7 +1009,7 @@ namespace lfs::core::tensor_ops {
                     grid = dim3(grid_x, grid_y, grid_z);
                 }
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 broadcast_batch3d_kernel_float<<<grid, block_size, 0, stream>>>(
                     a, b, c, B, H, W, a_is_broadcast, op);
 #else
@@ -1057,7 +1057,7 @@ namespace lfs::core::tensor_ops {
 
         const int grid_size = (c_elements + block_size - 1) / block_size;
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
         broadcast_binary_kernel<<<grid_size, block_size, 0, stream>>>(
             a, b, c, d_a_shape, d_b_shape, d_c_shape,
             a_rank, b_rank, c_rank, c_elements, op);

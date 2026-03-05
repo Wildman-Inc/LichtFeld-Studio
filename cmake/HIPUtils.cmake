@@ -23,6 +23,7 @@ macro(lfs_hip_add_library target_name lib_type)
         
         # First, copy .cu files to .hip in the binary directory
         set(_hip_sources "")
+        set(_hip_device_sources "")
         foreach(_source ${_sources})
             get_filename_component(_source_ext ${_source} EXT)
             get_filename_component(_source_name ${_source} NAME_WE)
@@ -44,12 +45,13 @@ macro(lfs_hip_add_library target_name lib_type)
                 # Then include hip_runtime.h for HIP intrinsics
                 file(WRITE "${_hip_file}" 
                     "// Auto-generated HIP wrapper for ${_source}\n"
-                    "#include \"core/cuda/hip_runtime_compat.h\"\n"
+                    "#include \"${CMAKE_SOURCE_DIR}/src/core/include/core/cuda/hip_runtime_compat.h\"\n"
                     "#include <hip/hip_runtime.h>\n"
                     "#include \"${_source_abs}\"\n"
                 )
                 
                 list(APPEND _hip_sources "${_hip_file}")
+                list(APPEND _hip_device_sources "${_hip_file}")
             else()
                 # Keep non-CUDA sources as-is
                 list(APPEND _hip_sources "${_source}")
@@ -84,22 +86,24 @@ macro(lfs_hip_add_library target_name lib_type)
             endforeach()
         endif()
         
-        # Add HIP compile options directly - without -x c++ flag
-        # Use COMPILE_OPTIONS to add flags that work with clang for HIP
-        target_compile_options(${target_name} PRIVATE
-            # Tell clang this is HIP code
-            "SHELL:-x hip"
-            # GPU architectures
-            ${_arch_flags}
-            # Disable OpenMP to avoid conflicts between clang's openmp_wrappers headers and MSVC STL
-            # The openmp_wrappers/math.h causes type_traits to have vectorcall redefinition errors
-            -fno-openmp
-        )
+        # Apply HIP device compilation flags only to generated HIP wrapper sources.
+        # Keep regular .cpp files in normal host C++ mode to avoid HIP runtime wrapper conflicts.
+        foreach(_hip_src ${_hip_device_sources})
+            set_property(SOURCE "${_hip_src}" APPEND PROPERTY COMPILE_OPTIONS "-x" "hip")
+            foreach(_arch_flag ${_arch_flags})
+                set_property(SOURCE "${_hip_src}" APPEND PROPERTY COMPILE_OPTIONS "${_arch_flag}")
+            endforeach()
+            set_property(SOURCE "${_hip_src}" APPEND PROPERTY COMPILE_OPTIONS "-fno-openmp")
+        endforeach()
         
         # Parse HIP_HIPCC_FLAGS if set
         if(DEFINED HIP_HIPCC_FLAGS)
             separate_arguments(_hipcc_flags NATIVE_COMMAND "${HIP_HIPCC_FLAGS}")
-            target_compile_options(${target_name} PRIVATE ${_hipcc_flags})
+            foreach(_hip_src ${_hip_device_sources})
+                foreach(_hipcc_flag ${_hipcc_flags})
+                    set_property(SOURCE "${_hip_src}" APPEND PROPERTY COMPILE_OPTIONS "${_hipcc_flag}")
+                endforeach()
+            endforeach()
         endif()
         
         # Add HIP include directories

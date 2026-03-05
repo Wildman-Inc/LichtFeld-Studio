@@ -979,6 +979,8 @@ namespace lfs::core {
                 dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(src[i]), 0, 255));                                                 \
             } else if constexpr (std::is_same_v<FROM_TYPE, int64_t> && std::is_same_v<TO_TYPE, uint8_t>) {                                   \
                 dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int64_t>(src[i]), static_cast<int64_t>(0), static_cast<int64_t>(255))); \
+            } else if constexpr (std::is_same_v<TO_TYPE, __half>) {                                                                           \
+                dst[i] = __float2half(static_cast<float>(src[i]));                                                                            \
             } else {                                                                                                                         \
                 dst[i] = static_cast<TO_TYPE>(src[i]);                                                                                       \
             }                                                                                                                                \
