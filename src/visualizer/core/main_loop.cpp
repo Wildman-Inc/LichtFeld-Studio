@@ -27,8 +27,16 @@ namespace lfs::vis {
         std::signal(SIGTERM, signal_handler);
 
         if (init_callback_) {
-            if (!init_callback_()) {
-                LOG_ERROR("Initialization failed");
+            try {
+                if (!init_callback_()) {
+                    LOG_ERROR("Initialization failed");
+                    return;
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR("Initialization threw exception: {}", e.what());
+                return;
+            } catch (...) {
+                LOG_ERROR("Initialization threw unknown exception");
                 return;
             }
         }
@@ -46,12 +54,20 @@ namespace lfs::vis {
                 break;
             }
 
-            if (update_callback_) {
-                update_callback_();
-            }
+            try {
+                if (update_callback_) {
+                    update_callback_();
+                }
 
-            if (render_callback_) {
-                render_callback_();
+                if (render_callback_) {
+                    render_callback_();
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR("Unhandled exception in main loop: {}", e.what());
+                break;
+            } catch (...) {
+                LOG_ERROR("Unhandled unknown exception in main loop");
+                break;
             }
         }
 

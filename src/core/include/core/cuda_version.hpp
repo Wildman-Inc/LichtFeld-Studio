@@ -21,7 +21,17 @@ namespace lfs::core {
         bool query_failed = false;
     };
 
+    struct GpuRuntimeProbe {
+        bool available = false;
+        int device_count = 0;
+        int selected_device = -1;
+        std::string error;
+    };
+
     LFS_CORE_API CudaVersionInfo check_cuda_version();
+    LFS_CORE_API GpuRuntimeProbe ensure_gpu_runtime_ready();
+    LFS_CORE_API bool bind_selected_gpu_device();
+    LFS_CORE_API int selected_gpu_device();
 
     // PyTorch CUDA wheel tags
     enum class PytorchCudaTag {

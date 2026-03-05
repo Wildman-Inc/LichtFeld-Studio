@@ -11,6 +11,7 @@
 #include "control/command_api.hpp"
 #include "control/control_boundary.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/cuda_version.hpp"
 #include "core/events.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
@@ -403,11 +404,9 @@ namespace lfs::training {
         : base_dataset_(std::move(dataset)),
           strategy_(std::move(strategy)),
           provided_splits_(std::move(provided_splits)) {
-        // Check CUDA availability
-        int device_count = 0;
-        cudaError_t error = cudaGetDeviceCount(&device_count);
-        if (error != cudaSuccess || device_count == 0) {
-            throw std::runtime_error("CUDA is not available – aborting.");
+        const auto probe = lfs::core::ensure_gpu_runtime_ready();
+        if (!probe.available || !lfs::core::bind_selected_gpu_device()) {
+            throw std::runtime_error("GPU runtime is not available: " + probe.error);
         }
 
         cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking);
@@ -417,10 +416,9 @@ namespace lfs::training {
 
     Trainer::Trainer(lfs::core::Scene& scene)
         : scene_(&scene) {
-        int device_count = 0;
-        cudaError_t error = cudaGetDeviceCount(&device_count);
-        if (error != cudaSuccess || device_count == 0) {
-            throw std::runtime_error("CUDA is not available – aborting.");
+        const auto probe = lfs::core::ensure_gpu_runtime_ready();
+        if (!probe.available || !lfs::core::bind_selected_gpu_device()) {
+            throw std::runtime_error("GPU runtime is not available: " + probe.error);
         }
 
         cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking);

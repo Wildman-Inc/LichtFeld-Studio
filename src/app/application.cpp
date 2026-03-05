@@ -24,6 +24,7 @@
 
 #include "python/runner.hpp"
 #include "visualizer/gui/panels/python_scripts_panel.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <rasterization_api.h>
@@ -37,6 +38,7 @@ namespace lfs::app {
     namespace {
 
         bool checkGpuRuntimeVersion();
+        bool warmupGpuRuntime();
 
         int runHeadless(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
             if (params->dataset.data_path.empty() && !params->resume_checkpoint) {
@@ -44,10 +46,14 @@ namespace lfs::app {
                 return 1;
             }
 
-            checkGpuRuntimeVersion();
+            if (!checkGpuRuntimeVersion()) {
+                return 1;
+            }
+            lfs::core::bind_selected_gpu_device();
             cudaDeviceProp prop;
-            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
-                LOG_INFO("Backend: {} | GPU: {} | arch {}.{}", LFS_GPU_BACKEND, prop.name, prop.major, prop.minor);
+            const int selected_device = std::max(0, lfs::core::selected_gpu_device());
+            if (cudaGetDeviceProperties(&prop, selected_device) == cudaSuccess) {
+                LOG_INFO("Backend: {} | GPU[{}]: {} | arch {}.{}", LFS_GPU_BACKEND, selected_device, prop.name, prop.major, prop.minor);
             } else {
                 LOG_INFO("Backend: {}", LFS_GPU_BACKEND);
             }
@@ -203,6 +209,17 @@ namespace lfs::app {
             } else {
                 LOG_WARN("Failed to query HIP runtime version");
             }
+
+            const auto probe = lfs::core::ensure_gpu_runtime_ready();
+            if (!probe.available) {
+                LOG_ERROR("HIP device query failed: {}", probe.error);
+                LOG_ERROR("Verify ROCm install and runtime visibility (hipInfo / rocminfo).");
+                return false;
+            }
+            if (!lfs::core::bind_selected_gpu_device()) {
+                LOG_ERROR("Failed to bind HIP device {}", probe.selected_device);
+                return false;
+            }
             return true;
 #else
             const auto info = lfs::core::check_cuda_version();
@@ -216,27 +233,38 @@ namespace lfs::app {
                 LOG_WARN("CUDA {}.{} unsupported. Requires 12.8+ (driver 570+)", info.major, info.minor);
                 return false;
             }
+            const auto probe = lfs::core::ensure_gpu_runtime_ready();
+            if (!probe.available) {
+                LOG_ERROR("CUDA device query failed: {}", probe.error);
+                return false;
+            }
+            if (!lfs::core::bind_selected_gpu_device()) {
+                LOG_ERROR("Failed to bind CUDA device {}", probe.selected_device);
+                return false;
+            }
             return true;
 #endif
         }
 
-        void warmupGpuRuntime() {
-            checkGpuRuntimeVersion();
+        bool warmupGpuRuntime() {
+            if (!checkGpuRuntimeVersion()) {
+                return false;
+            }
+            if (!lfs::core::bind_selected_gpu_device()) {
+                LOG_ERROR("Failed to activate selected GPU device");
+                return false;
+            }
 
             cudaDeviceProp prop;
-            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
-                LOG_INFO("GPU: {} (arch {}.{}, {} MB)", prop.name, prop.major, prop.minor,
+            const int selected_device = std::max(0, lfs::core::selected_gpu_device());
+            if (cudaGetDeviceProperties(&prop, selected_device) == cudaSuccess) {
+                LOG_INFO("GPU[{}]: {} (arch {}.{}, {} MB)", selected_device, prop.name, prop.major, prop.minor,
                          prop.totalGlobalMem / (1024 * 1024));
             }
 
             LOG_INFO("Initializing {} backend...", LFS_GPU_BACKEND);
-#if LFS_USE_HIP && defined(_WIN32)
-            // HIP on Windows can crash in fastgs startup warmup on some RDNA3 paths
-            // (e.g. gfx1151). Skip eager warmup and let kernels initialize lazily.
-            LOG_WARN("Skipping fastgs warmup on Windows HIP (stability workaround)");
-#else
             fast_lfs::rasterization::warmup_kernels();
-#endif
+            return true;
         }
 
         int runGui(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
@@ -250,9 +278,16 @@ namespace lfs::app {
             }
 
             if (params->optimization.no_splash) {
-                warmupGpuRuntime();
+                if (!warmupGpuRuntime()) {
+                    return 1;
+                }
             } else {
-                SplashScreen::runWithDelay([]() { warmupGpuRuntime(); return 0; });
+                const int warmup_result = SplashScreen::runWithDelay([]() {
+                    return warmupGpuRuntime() ? 0 : 1;
+                });
+                if (warmup_result != 0) {
+                    return warmup_result;
+                }
             }
 
             lfs::event::CommandCenterBridge::instance().set(&lfs::training::CommandCenter::instance());

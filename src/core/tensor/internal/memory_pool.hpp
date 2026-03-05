@@ -6,6 +6,7 @@
 #include "allocation_profiler.hpp"
 #include "core/export.hpp"
 #include "core/logger.hpp"
+#include "core/cuda_version.hpp"
 #include "deferred_free_queue.hpp"
 #include "gpu_slab_allocator.hpp"
 #include "size_bucketed_pool.hpp"
@@ -47,6 +48,12 @@ namespace lfs::core {
 
             if (shutdown_.load(std::memory_order_acquire)) {
                 LOG_ERROR("Attempted to allocate CUDA memory after shutdown!");
+                return nullptr;
+            }
+
+            if (!lfs::core::bind_selected_gpu_device()) {
+                const auto probe = lfs::core::ensure_gpu_runtime_ready();
+                LOG_ERROR("[MEM] GPU device bind failed: {}", probe.error);
                 return nullptr;
             }
 
@@ -221,6 +228,13 @@ namespace lfs::core {
         }
 
         void configure() {
+            if (!lfs::core::bind_selected_gpu_device()) {
+                const auto probe = lfs::core::ensure_gpu_runtime_ready();
+                LOG_WARN("GPU memory pool disabled: {}", probe.error);
+                slab_enabled_ = false;
+                return;
+            }
+
 #if CUDART_VERSION >= 12080
             int device;
             cudaError_t err = cudaGetDevice(&device);
@@ -241,7 +255,11 @@ namespace lfs::core {
 
             LOG_DEBUG("CUDA memory pool configured for device " + std::to_string(device) + " (CUDA " + std::to_string(CUDART_VERSION) + ")");
 #else
+#if LFS_USE_HIP
+            LOG_WARN("GPU async memory pooling not available on HIP in this build");
+#else
             LOG_WARN("CUDA memory pooling not available (requires CUDA >= 12.8)");
+#endif
 #endif
 
             slab_enabled_ = GPUSlabAllocator::instance().is_enabled();
@@ -348,7 +366,11 @@ namespace lfs::core {
 
             cudaError_t err = cudaMalloc(&ptr, bytes);
             if (err != cudaSuccess) {
+#if LFS_USE_HIP
+                LOG_WARN(std::string("[MEM] hipMalloc failed: ") + cudaGetErrorString(err) + ", trimming...");
+#else
                 LOG_WARN(std::string("[MEM] cudaMalloc failed: ") + cudaGetErrorString(err) + ", trimming...");
+#endif
                 cudaDeviceSynchronize();
                 SizeBucketedPool::instance().trim_cache();
 #if CUDART_VERSION >= 12080
@@ -360,7 +382,14 @@ namespace lfs::core {
 #endif
                 err = cudaMalloc(&ptr, bytes);
                 if (err != cudaSuccess) {
-                    LOG_ERROR(std::string("[MEM] cudaMalloc retry failed: ") + cudaGetErrorString(err));
+                    const auto probe = lfs::core::ensure_gpu_runtime_ready();
+#if LFS_USE_HIP
+                    LOG_ERROR(std::string("[MEM] hipMalloc retry failed: ") + cudaGetErrorString(err) +
+                              " | runtime probe: " + probe.error);
+#else
+                    LOG_ERROR(std::string("[MEM] cudaMalloc retry failed: ") + cudaGetErrorString(err) +
+                              " | runtime probe: " + probe.error);
+#endif
                     cudaGetLastError(); // Clear sticky error state for clean recovery
                     return nullptr;
                 }

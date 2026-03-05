@@ -4,6 +4,7 @@
 
 #include "control/control_boundary.hpp"
 
+#include "core/cuda_version.hpp"
 #include "core/logger.hpp"
 #include <cuda_runtime.h>
 
@@ -82,10 +83,9 @@ namespace lfs::training {
             local.swap(pending_callbacks_);
         }
 
-        const cudaError_t err = cudaSetDevice(0);
-        if (err != cudaSuccess) {
-            LOG_ERROR("ControlBoundary: cudaSetDevice(0) failed: {}",
-                      cudaGetErrorString(err));
+        if (!lfs::core::bind_selected_gpu_device()) {
+            const auto probe = lfs::core::ensure_gpu_runtime_ready();
+            LOG_ERROR("ControlBoundary: failed to bind selected GPU device: {}", probe.error);
             return;
         }
 

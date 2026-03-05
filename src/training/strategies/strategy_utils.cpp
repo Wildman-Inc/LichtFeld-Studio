@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "strategy_utils.hpp"
+#include "core/cuda_version.hpp"
 #include "core/logger.hpp"
+#include <stdexcept>
 
 namespace lfs::training {
 
@@ -90,9 +92,11 @@ namespace lfs::training {
         lfs::core::SplatData& splat_data,
         std::vector<size_t> param_idxs) {
 
-        // CRITICAL: Ensure CUDA device is set for this thread
-        // Some operations might spawn TBB threads, and those need CUDA context
-        cudaSetDevice(0);
+        // Ensure GPU device is set for this thread. Some operations can run from worker threads.
+        if (!lfs::core::bind_selected_gpu_device()) {
+            const auto probe = lfs::core::ensure_gpu_runtime_ready();
+            throw std::runtime_error("GPU device bind failed: " + probe.error);
+        }
 
         // Map param index to ParamType
         auto index_to_param_type = [](size_t idx) -> ParamType {

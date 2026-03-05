@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/logger.hpp"
+#include "core/cuda_version.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -156,10 +157,9 @@ namespace lfs::core {
         };
 
         GPUSlabAllocator() {
-            int device_count = 0;
-            cudaError_t err = cudaGetDeviceCount(&device_count);
-            if (err != cudaSuccess || device_count == 0) {
-                LOG_DEBUG("GPUSlabAllocator: No CUDA devices available");
+            const auto probe = lfs::core::ensure_gpu_runtime_ready();
+            if (!probe.available || !lfs::core::bind_selected_gpu_device()) {
+                LOG_DEBUG("GPUSlabAllocator: GPU runtime unavailable ({})", probe.error);
                 enabled_.store(false, std::memory_order_release);
                 return;
             }
@@ -193,6 +193,10 @@ namespace lfs::core {
 
         bool allocate_slab(size_t size_class) {
             const size_t block_size = get_block_size(size_class);
+
+            if (!lfs::core::bind_selected_gpu_device()) {
+                return false;
+            }
 
             void* slab_base = nullptr;
             if (cudaMalloc(&slab_base, SLAB_SIZE) != cudaSuccess) {
