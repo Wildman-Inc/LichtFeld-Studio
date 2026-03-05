@@ -753,7 +753,16 @@ namespace lfs::io {
             }
 
             try {
-                auto& nvcodec = get_nvcodec_loader();
+                const bool nvcodec_available = is_nvcodec_available();
+                NvCodecImageLoader* nvcodec = nullptr;
+                if (nvcodec_available) {
+                    try {
+                        nvcodec = &get_nvcodec_loader();
+                    } catch (const std::exception& e) {
+                        LOG_WARN("[PipelinedImageLoader] nvImageCodec init failed, falling back to CPU path: {}",
+                                 e.what());
+                    }
+                }
 
                 if (item.alpha_as_mask) {
                     auto [img_data, width, height, channels] = lfs::core::load_image_with_alpha(
@@ -799,14 +808,14 @@ namespace lfs::io {
                         alpha = lfs::core::undistort_mask(alpha, scaled, nullptr);
                     }
 
-                    if (is_nvcodec_available()) {
+                    if (nvcodec) {
                         try {
-                            auto rgb_jpeg = nvcodec.encode_to_jpeg(rgb, config_.cache_jpeg_quality, nullptr);
+                            auto rgb_jpeg = nvcodec->encode_to_jpeg(rgb, config_.cache_jpeg_quality, nullptr);
                             put_in_jpeg_cache(item.cache_key,
                                               std::make_shared<std::vector<uint8_t>>(std::move(rgb_jpeg)));
 
                             const auto alpha_key = make_mask_cache_key(item.path, item.params);
-                            auto alpha_jpeg = nvcodec.encode_grayscale_to_jpeg(
+                            auto alpha_jpeg = nvcodec->encode_grayscale_to_jpeg(
                                 alpha, config_.cache_jpeg_quality, nullptr);
                             put_in_jpeg_cache(alpha_key,
                                               std::make_shared<std::vector<uint8_t>>(std::move(alpha_jpeg)));
@@ -824,9 +833,9 @@ namespace lfs::io {
                     lfs::core::Tensor mask_tensor;
                     bool used_gpu = false;
 
-                    if (is_nvcodec_available()) {
+                    if (nvcodec) {
                         try {
-                            mask_tensor = nvcodec.load_image_gpu(
+                            mask_tensor = nvcodec->load_image_gpu(
                                 item.path, item.params.resize_factor, item.params.max_width,
                                 nullptr, DecodeFormat::Grayscale);
                             used_gpu = true;
@@ -891,9 +900,9 @@ namespace lfs::io {
                         mask_tensor = lfs::core::undistort_mask(mask_tensor, scaled, nullptr);
                     }
 
-                    if (is_nvcodec_available()) {
+                    if (nvcodec) {
                         try {
-                            auto jpeg_bytes = nvcodec.encode_grayscale_to_jpeg(
+                            auto jpeg_bytes = nvcodec->encode_grayscale_to_jpeg(
                                 mask_tensor, config_.cache_jpeg_quality, nullptr);
                             put_in_jpeg_cache(item.cache_key,
                                               std::make_shared<std::vector<uint8_t>>(std::move(jpeg_bytes)));
@@ -911,9 +920,9 @@ namespace lfs::io {
                     lfs::core::Tensor decoded;
                     bool used_gpu = false;
 
-                    if (is_nvcodec_available() && item.is_original_jpeg) {
+                    if (nvcodec && item.is_original_jpeg) {
                         try {
-                            decoded = nvcodec.load_image_gpu(
+                            decoded = nvcodec->load_image_gpu(
                                 item.path, item.params.resize_factor, item.params.max_width);
                             used_gpu = true;
                         } catch (const std::exception&) {
@@ -961,9 +970,9 @@ namespace lfs::io {
                         decoded = lfs::core::undistort_image(decoded, scaled, nullptr);
                     }
 
-                    if (is_nvcodec_available()) {
+                    if (nvcodec) {
                         try {
-                            auto jpeg_bytes = nvcodec.encode_to_jpeg(
+                            auto jpeg_bytes = nvcodec->encode_to_jpeg(
                                 decoded, config_.cache_jpeg_quality, nullptr);
                             put_in_jpeg_cache(item.cache_key,
                                               std::make_shared<std::vector<uint8_t>>(std::move(jpeg_bytes)));
