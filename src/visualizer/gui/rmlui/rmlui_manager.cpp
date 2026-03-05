@@ -135,6 +135,7 @@ namespace lfs::vis::gui {
         }
 
         ctx->SetDensityIndependentPixelRatio(dp_ratio_);
+        ctx->SetDefaultScrollBehavior(Rml::ScrollBehavior::Instant, 1.0f);
         contexts_[name] = ctx;
         return ctx;
     }
