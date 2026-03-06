@@ -45,6 +45,7 @@ namespace lfs::python {
     static std::atomic<bool> g_python_bridge_ready{false};
     static std::atomic<bool> g_plugin_preload_scheduled{false};
     static std::thread g_plugin_preload_thread;
+    static std::atomic<bool> g_python_module_missing_logged{false};
 
     // Python C extension for capturing output
     static PyObject* capture_write(PyObject* self, PyObject* args) {
@@ -134,21 +135,47 @@ sys.stderr = OutputCapture(True)
 
         std::string add_dll_code = std::format(R"(
 import os
+import glob
 def _add_dll_dirs():
-    dirs_to_add = [
+    dirs_to_add = set([
         r'{}',  # Executable directory
-    ]
+    ])
     # Also add CUDA path if available
     cuda_path = os.environ.get('CUDA_PATH')
     if cuda_path:
-        dirs_to_add.append(os.path.join(cuda_path, 'bin'))
+        dirs_to_add.add(cuda_path)
+        dirs_to_add.add(os.path.join(cuda_path, 'bin'))
+
+    # Add ROCm/HIP runtime paths (needed for amdhip64/hiprand/rocrand)
+    rocm_roots = []
+    for key in ('HIP_PATH', 'ROCM_PATH'):
+        value = os.environ.get(key)
+        if value:
+            rocm_roots.append(value)
+
+    # Windows default installation path fallback
+    if not rocm_roots:
+        rocm_root = r'C:\Program Files\AMD\ROCm'
+        if os.path.isdir(rocm_root):
+            versions = sorted(
+                [p for p in glob.glob(os.path.join(rocm_root, '*')) if os.path.isdir(p)],
+                reverse=True,
+            )
+            if versions:
+                rocm_roots.append(versions[0])
+
+    for root in rocm_roots:
+        dirs_to_add.add(root)
+        dirs_to_add.add(os.path.join(root, 'bin'))
+        dirs_to_add.add(os.path.join(root, 'lib'))
+        dirs_to_add.add(os.path.join(root, 'lib', 'llvm', 'bin'))
 
     # Add vcpkg bin if it exists
     vcpkg_bin = os.path.join(r'{}', 'vcpkg_installed', 'x64-windows', 'bin')
     if os.path.isdir(vcpkg_bin):
-        dirs_to_add.append(vcpkg_bin)
+        dirs_to_add.add(vcpkg_bin)
 
-    for d in dirs_to_add:
+    for d in sorted(dirs_to_add):
         if os.path.isdir(d):
             try:
                 os.add_dll_directory(d)
@@ -184,6 +211,15 @@ _add_dll_dirs()
         bool ensure_python_bridge_ready_locked() {
             if (g_python_bridge_ready.load(std::memory_order_acquire)) {
                 return true;
+            }
+
+            const auto python_module_dir = lfs::core::getPythonModuleDir();
+            if (python_module_dir.empty()) {
+                bool expected = false;
+                if (g_python_module_missing_logged.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                    LOG_WARN("Python bridge disabled: lichtfeld module not found in runtime paths");
+                }
+                return false;
             }
 
             add_dll_directories();
@@ -392,6 +428,7 @@ _add_dll_dirs()
                 PyConfig config;
                 PyConfig_InitPythonConfig(&config);
                 config.user_site_directory = 0;
+                config.pathconfig_warnings = 0;
 
                 const auto python_home = lfs::core::getPythonHome();
                 if (!python_home.empty()) {
