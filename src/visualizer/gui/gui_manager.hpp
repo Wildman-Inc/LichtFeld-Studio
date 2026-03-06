@@ -117,6 +117,9 @@ namespace lfs::vis {
             void updateInputOverrides(bool mouse_in_viewport);
             void applyUiScale(float scale);
             void rebuildFonts(float scale);
+            void loadImGuiSettings();
+            void saveImGuiSettings() const;
+            void persistImGuiSettingsIfNeeded();
 
             // Core dependencies
             VisualizerImpl* viewer_;
@@ -153,6 +156,7 @@ namespace lfs::vis {
             ImFont* font_monospace_ = nullptr;
             ImFont* mono_fonts_[FontSet::MONO_SIZE_COUNT] = {};
             float mono_font_scales_[FontSet::MONO_SIZE_COUNT] = {};
+            std::filesystem::path imgui_ini_path_;
             FontSet buildFontSet() const;
 
             // Async task management

@@ -50,9 +50,11 @@
 #include <chrono>
 #include <cmath>
 #include <format>
+#include <fstream>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_internal.h>
+#include <iterator>
 #include <ImGuizmo.h>
 
 namespace lfs::vis::gui {
@@ -422,6 +424,70 @@ namespace lfs::vis::gui {
         LOG_INFO("UI scale applied: {:.2f}", scale);
     }
 
+    void GuiManager::loadImGuiSettings() {
+        if (imgui_ini_path_.empty())
+            return;
+
+        try {
+            if (!std::filesystem::exists(imgui_ini_path_))
+                return;
+
+            std::ifstream file;
+            if (!lfs::core::open_file_for_read(imgui_ini_path_, std::ios::binary, file)) {
+                LOG_WARN("Failed to open ImGui settings file: {}", lfs::core::path_to_utf8(imgui_ini_path_));
+                return;
+            }
+
+            const std::string ini_data((std::istreambuf_iterator<char>(file)),
+                                       std::istreambuf_iterator<char>());
+            ImGui::LoadIniSettingsFromMemory(ini_data.c_str(), ini_data.size());
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to load ImGui settings: {}", e.what());
+        } catch (...) {
+            LOG_WARN("Failed to load ImGui settings: unknown error");
+        }
+    }
+
+    void GuiManager::saveImGuiSettings() const {
+        if (imgui_ini_path_.empty() || !ImGui::GetCurrentContext())
+            return;
+
+        try {
+            std::filesystem::create_directories(imgui_ini_path_.parent_path());
+
+            size_t ini_size = 0;
+            const char* ini_data = ImGui::SaveIniSettingsToMemory(&ini_size);
+
+            std::ofstream file;
+            if (!lfs::core::open_file_for_write(imgui_ini_path_,
+                                                std::ios::binary | std::ios::trunc,
+                                                file)) {
+                LOG_WARN("Failed to open ImGui settings for writing: {}",
+                         lfs::core::path_to_utf8(imgui_ini_path_));
+                return;
+            }
+
+            file.write(ini_data, static_cast<std::streamsize>(ini_size));
+            if (!file) {
+                LOG_WARN("Failed to write ImGui settings: {}",
+                         lfs::core::path_to_utf8(imgui_ini_path_));
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to save ImGui settings: {}", e.what());
+        } catch (...) {
+            LOG_WARN("Failed to save ImGui settings: unknown error");
+        }
+    }
+
+    void GuiManager::persistImGuiSettingsIfNeeded() {
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.WantSaveIniSettings)
+            return;
+
+        saveImGuiSettings();
+        io.WantSaveIniSettings = false;
+    }
+
     void GuiManager::init() {
         // ImGui initialization
         IMGUI_CHECKVERSION();
@@ -493,10 +559,13 @@ namespace lfs::vis::gui {
             });
 
         ImGuiIO& io = ImGui::GetIO();
+        imgui_ini_path_ = LayoutState::getConfigDir() / "imgui.ini";
+        io.IniFilename = nullptr;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // Enable Docking
         io.ConfigWindowsMoveFromTitleBarOnly = true;
+        loadImGuiSettings();
 
         // Platform/Renderer initialization
         ImGui_ImplSDL3_InitForOpenGL(viewer_->getWindow(), SDL_GL_GetCurrentContext());
@@ -759,6 +828,7 @@ namespace lfs::vis::gui {
         drag_drop_.shutdown();
 
         if (ImGui::GetCurrentContext()) {
+            saveImGuiSettings();
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplSDL3_Shutdown();
             ImPlot::DestroyContext();
@@ -1244,6 +1314,8 @@ namespace lfs::vis::gui {
 
         if (!ui_layout_changed && ui_layout_settle_frames_ > 0)
             --ui_layout_settle_frames_;
+
+        persistImGuiSettingsIfNeeded();
     }
 
     void GuiManager::renderSelectionOverlays(const UIContext& ctx) {
