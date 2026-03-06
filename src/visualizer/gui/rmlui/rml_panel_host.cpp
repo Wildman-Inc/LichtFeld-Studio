@@ -22,6 +22,7 @@
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_scancode.h>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -94,6 +95,15 @@ namespace lfs::vis::gui {
     using rml_theme::colorToRml;
 
     namespace {
+        const char* textFocusModeName(const TextFocusMode mode) {
+            switch (mode) {
+            case TextFocusMode::None: return "none";
+            case TextFocusMode::NativeTextInput: return "native";
+            case TextFocusMode::AsciiTextInput: return "ascii";
+            default: return "unknown";
+            }
+        }
+
         Rml::Input::KeyIdentifier sdlScancodeToRml(int scancode) {
             // clang-format off
             switch (scancode) {
@@ -153,6 +163,81 @@ namespace lfs::vis::gui {
                 mods |= Rml::Input::KM_META;
             return mods;
         }
+
+        TextFocusMode classifyTextFocus(Rml::Element* focused) {
+            if (!focused || focused->GetTagName() != "input")
+                return TextFocusMode::None;
+
+            if (focused->IsClassSet("number-input"))
+                return TextFocusMode::AsciiTextInput;
+
+            return TextFocusMode::NativeTextInput;
+        }
+
+        Rml::Element* findNumberInputElement(Rml::Element* element) {
+            for (auto* el = element; el; el = el->GetParentNode()) {
+                if (el->GetTagName() == "input" && el->IsClassSet("number-input"))
+                    return el;
+            }
+            return nullptr;
+        }
+
+        std::vector<uint32_t> buildAsciiTextInput(const PanelInputState& input) {
+            std::vector<uint32_t> chars;
+            if (input.key_ctrl || input.key_alt || input.key_super)
+                return chars;
+
+            chars.reserve(input.keys_pressed.size());
+
+            const bool shift = input.key_shift;
+            for (int sc : input.keys_pressed) {
+                if (shift && sc == SDL_SCANCODE_3) {
+                    chars.push_back(static_cast<uint32_t>('#'));
+                    continue;
+                }
+                if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) {
+                    chars.push_back(static_cast<uint32_t>('1' + (sc - SDL_SCANCODE_1)));
+                    continue;
+                }
+                if (sc == SDL_SCANCODE_0) {
+                    chars.push_back(static_cast<uint32_t>('0'));
+                    continue;
+                }
+                if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) {
+                    chars.push_back(static_cast<uint32_t>('1' + (sc - SDL_SCANCODE_KP_1)));
+                    continue;
+                }
+                if (sc == SDL_SCANCODE_KP_0) {
+                    chars.push_back(static_cast<uint32_t>('0'));
+                    continue;
+                }
+
+                switch (sc) {
+                case SDL_SCANCODE_PERIOD:
+                case SDL_SCANCODE_KP_DECIMAL:
+                    chars.push_back(static_cast<uint32_t>('.'));
+                    break;
+                case SDL_SCANCODE_MINUS:
+                case SDL_SCANCODE_KP_MINUS:
+                    chars.push_back(static_cast<uint32_t>('-'));
+                    break;
+                case SDL_SCANCODE_KP_PLUS:
+                    chars.push_back(static_cast<uint32_t>('+'));
+                    break;
+                case SDL_SCANCODE_EQUALS:
+                    if (shift)
+                        chars.push_back(static_cast<uint32_t>('+'));
+                    break;
+                case SDL_SCANCODE_E:
+                    chars.push_back(static_cast<uint32_t>(shift ? 'E' : 'e'));
+                    break;
+                default:
+                    break;
+                }
+            }
+
+            return chars;
+        }
     } // namespace
 
     RmlPanelHost::RmlPanelHost(RmlUIManager* manager, std::string context_name,
@@ -164,6 +249,29 @@ namespace lfs::vis::gui {
     }
 
     RmlPanelHost::~RmlPanelHost() = default;
+
+    void RmlPanelHost::syncTextFocus() {
+        const auto new_mode = classifyTextFocus(rml_context_->GetFocusElement());
+        if (new_mode == text_focus_mode_) {
+            has_text_focus_ = new_mode != TextFocusMode::None;
+            return;
+        }
+
+        LOG_INFO("RmlPanelHost[{}]: text focus {} -> {}", context_name_,
+                 textFocusModeName(text_focus_mode_), textFocusModeName(new_mode));
+
+        auto* win = manager_->getWindow();
+        if (new_mode == TextFocusMode::NativeTextInput)
+            SDL_StartTextInput(win);
+        else
+            SDL_StopTextInput(win);
+
+        if (new_mode == TextFocusMode::None)
+            drainTextInput();
+
+        text_focus_mode_ = new_mode;
+        has_text_focus_ = (new_mode != TextFocusMode::None);
+    }
 
     std::string RmlPanelHost::generateThemeRCSS() const {
         const auto& p = lfs::vis::theme().palette;
@@ -419,10 +527,34 @@ namespace lfs::vis::gui {
         if (hovered) {
             rml_context_->ProcessMouseMove(rml_mx, rml_my, 0);
 
-            if (input.mouse_clicked[0])
+            if (input.mouse_clicked[0]) {
+                auto* clicked = rml_context_->GetElementAtPoint(
+                    Rml::Vector2f(static_cast<float>(rml_mx), static_cast<float>(rml_my)));
+                if (auto* num_input = findNumberInputElement(clicked)) {
+                    LOG_INFO("RmlPanelHost[{}]: synthetic click for number input id='{}' classes='{}'",
+                             context_name_, num_input->GetId(), num_input->GetClassNames());
+                    Rml::Dictionary params;
+                    params["mouse_x"] = rml_mx;
+                    params["mouse_y"] = rml_my;
+                    num_input->DispatchEvent(Rml::EventId::Click, params);
+                    suppress_next_left_release_ = true;
+                    had_input = true;
+                } else {
+                LOG_INFO("RmlPanelHost[{}]: left click down at ({}, {}) hovered=1", context_name_, rml_mx, rml_my);
                 rml_context_->ProcessMouseButtonDown(0, 0);
-            if (input.mouse_released[0])
+                LOG_INFO("RmlPanelHost[{}]: left click down processed", context_name_);
+                }
+            }
+            if (input.mouse_released[0]) {
+                if (suppress_next_left_release_) {
+                    LOG_INFO("RmlPanelHost[{}]: suppressed left click up", context_name_);
+                    suppress_next_left_release_ = false;
+                } else {
+                LOG_INFO("RmlPanelHost[{}]: left click up at ({}, {}) hovered=1", context_name_, rml_mx, rml_my);
                 rml_context_->ProcessMouseButtonUp(0, 0);
+                LOG_INFO("RmlPanelHost[{}]: left click up processed", context_name_);
+                }
+            }
 
             if (input.mouse_clicked[1])
                 rml_context_->ProcessMouseButtonDown(1, 0);
@@ -431,24 +563,27 @@ namespace lfs::vis::gui {
 
             if (input.mouse_wheel != 0.0f)
                 rml_context_->ProcessMouseWheel(Rml::Vector2f(0, -input.mouse_wheel), 0);
-
-            if (input.mouse_clicked[0]) {
-                auto* focused = rml_context_->GetFocusElement();
-                bool want_text = focused && focused->GetTagName() == "input";
-                if (want_text != has_text_focus_) {
-                    has_text_focus_ = want_text;
-                    auto* win = manager_->getWindow();
-                    if (has_text_focus_)
-                        SDL_StartTextInput(win);
-                    else
-                        SDL_StopTextInput(win);
-                }
-            }
         } else if (input.mouse_clicked[0]) {
-            if (has_text_focus_) {
-                drainTextInput();
-                has_text_focus_ = false;
-                SDL_StopTextInput(manager_->getWindow());
+            LOG_INFO("RmlPanelHost[{}]: left click outside hovered area", context_name_);
+            suppress_next_left_release_ = false;
+            if (auto* focused = rml_context_->GetFocusElement()) {
+                LOG_INFO("RmlPanelHost[{}]: blurring focused tag='{}' id='{}'", context_name_,
+                         focused->GetTagName(), focused->GetId());
+                focused->Blur();
+            }
+        }
+
+        syncTextFocus();
+
+        if (input.mouse_clicked[0]) {
+            auto* focused = rml_context_->GetFocusElement();
+            if (focused) {
+                LOG_INFO("RmlPanelHost[{}]: focused after click tag='{}' id='{}' classes='{}' mode={}",
+                         context_name_, focused->GetTagName(), focused->GetId(),
+                         focused->GetClassNames(), textFocusModeName(text_focus_mode_));
+            } else {
+                LOG_INFO("RmlPanelHost[{}]: no focused element after click mode={}",
+                         context_name_, textFocusModeName(text_focus_mode_));
             }
         }
 
@@ -498,9 +633,18 @@ namespace lfs::vis::gui {
         }
 
         if (has_text_focus_) {
-            auto chars = drainTextInput();
+            std::vector<uint32_t> chars;
+            if (text_focus_mode_ == TextFocusMode::NativeTextInput)
+                chars = drainTextInput();
+            else if (text_focus_mode_ == TextFocusMode::AsciiTextInput)
+                chars = buildAsciiTextInput(input);
+
             if (!chars.empty())
                 had_input = true;
+            if (!chars.empty()) {
+                LOG_INFO("RmlPanelHost[{}]: forwarding {} text codepoint(s) in {} mode",
+                         context_name_, chars.size(), textFocusModeName(text_focus_mode_));
+            }
             for (uint32_t cp : chars)
                 rml_context_->ProcessTextInput(static_cast<Rml::Character>(cp));
         }

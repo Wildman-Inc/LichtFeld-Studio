@@ -43,6 +43,7 @@
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
+#include "core/path_utils.hpp"
 #include "gui/rmlui/elements/loss_graph_element.hpp"
 #include "internal/resource_paths.hpp"
 #include "io/filesystem_utils.hpp"
@@ -71,8 +72,13 @@
 #include <functional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
+
+#ifdef WIN32
+#include <windows.h>
+#endif
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
@@ -114,6 +120,208 @@ namespace {
         }
         return *cc;
     }
+
+    constexpr bool should_use_external_training_launcher() {
+#if defined(WIN32) && LFS_USE_HIP
+        return true;
+#else
+        return false;
+#endif
+    }
+
+#if defined(WIN32) && LFS_USE_HIP
+    std::string format_external_training_timestamp() {
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        return std::format("{:04}{:02}{:02}_{:02}{:02}{:02}",
+                           now.wYear, now.wMonth, now.wDay,
+                           now.wHour, now.wMinute, now.wSecond);
+    }
+
+    std::string format_win32_error(const DWORD error) {
+        return std::format("{} ({})", std::system_category().message(static_cast<int>(error)), error);
+    }
+
+    std::filesystem::path current_executable_path() {
+        std::wstring buffer(MAX_PATH, L'\0');
+        for (;;) {
+            const DWORD copied = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (copied == 0) {
+                throw std::runtime_error("GetModuleFileNameW failed: " + format_win32_error(GetLastError()));
+            }
+            if (copied < buffer.size() - 1) {
+                buffer.resize(copied);
+                return std::filesystem::path(buffer);
+            }
+            buffer.resize(buffer.size() * 2);
+        }
+    }
+
+    std::wstring quote_windows_arg(std::wstring_view arg) {
+        if (arg.empty()) {
+            return L"\"\"";
+        }
+
+        if (arg.find_first_of(L" \t\"") == std::wstring_view::npos) {
+            return std::wstring(arg);
+        }
+
+        std::wstring quoted;
+        quoted.push_back(L'"');
+        std::size_t backslashes = 0;
+        for (const wchar_t ch : arg) {
+            if (ch == L'\\') {
+                ++backslashes;
+                continue;
+            }
+            if (ch == L'"') {
+                quoted.append(backslashes * 2 + 1, L'\\');
+                quoted.push_back(L'"');
+                backslashes = 0;
+                continue;
+            }
+            quoted.append(backslashes, L'\\');
+            backslashes = 0;
+            quoted.push_back(ch);
+        }
+        quoted.append(backslashes * 2, L'\\');
+        quoted.push_back(L'"');
+        return quoted;
+    }
+
+    std::wstring build_windows_command_line(const std::vector<std::wstring>& args) {
+        std::wstring command_line;
+        bool first = true;
+        for (const auto& arg : args) {
+            if (!first) {
+                command_line.push_back(L' ');
+            }
+            first = false;
+            command_line += quote_windows_arg(arg);
+        }
+        return command_line;
+    }
+
+    std::filesystem::path derive_default_output_path(
+        const std::filesystem::path& dataset_path,
+        const std::string& stamp) {
+
+        const auto dataset_name = dataset_path.filename().empty() ? std::string("dataset")
+                                                                  : lfs::core::path_to_utf8(dataset_path.filename());
+        const auto output_name = std::format("lfs_{}_{}", dataset_name, stamp);
+        const auto parent = dataset_path.parent_path().empty() ? std::filesystem::current_path()
+                                                               : dataset_path.parent_path();
+        return parent / lfs::core::utf8_to_path(output_name);
+    }
+
+    nb::dict start_training_external_impl() {
+        auto* const param_manager = lfs::vis::services().paramsOrNull();
+        if (!param_manager) {
+            throw std::runtime_error("No parameter manager available");
+        }
+
+        if (auto* const trainer_manager = lfs::vis::services().trainerOrNull();
+            trainer_manager && trainer_manager->isTrainingActive()) {
+            throw std::runtime_error("Training is already active in this session");
+        }
+
+        lfs::core::param::TrainingParameters params;
+        params.dataset = param_manager->getDatasetConfig();
+        params.optimization = param_manager->copyActiveParams();
+
+        if (params.dataset.data_path.empty()) {
+            if (auto* const scene_manager = lfs::vis::services().sceneOrNull()) {
+                params.dataset.data_path = scene_manager->getDatasetPath();
+            }
+        }
+
+        if (params.dataset.data_path.empty()) {
+            throw std::runtime_error("Dataset path is not set");
+        }
+        if (!std::filesystem::exists(params.dataset.data_path)) {
+            throw std::runtime_error(
+                "Dataset path does not exist: " + lfs::core::path_to_utf8(params.dataset.data_path));
+        }
+
+        const std::string stamp = format_external_training_timestamp();
+        if (params.dataset.output_path.empty()) {
+            params.dataset.output_path = derive_default_output_path(params.dataset.data_path, stamp);
+            LOG_WARN("Output path not set; using {}", lfs::core::path_to_utf8(params.dataset.output_path));
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(params.dataset.output_path, ec);
+        if (ec) {
+            throw std::runtime_error(
+                std::format("Failed to create output directory '{}': {}",
+                            lfs::core::path_to_utf8(params.dataset.output_path), ec.message()));
+        }
+
+        params.optimization.headless = true;
+        params.optimization.auto_train = true;
+        params.optimization.no_splash = true;
+        params.optimization.no_interop = true;
+
+        const auto config_path = params.dataset.output_path / std::format("gui_headless_launch_{}.json", stamp);
+        const auto log_path = params.dataset.output_path / std::format("gui_headless_launch_{}.log", stamp);
+
+        if (const auto result = lfs::core::param::save_training_parameters_to_json(params, config_path); !result) {
+            throw std::runtime_error("Failed to save config: " + result.error());
+        }
+
+        const auto exe_path = current_executable_path();
+        const std::vector<std::wstring> args = {
+            exe_path.wstring(),
+            L"--config", config_path.wstring(),
+            L"--data-path", params.dataset.data_path.wstring(),
+            L"--output-path", params.dataset.output_path.wstring(),
+            L"--headless",
+            L"--train",
+            L"--no-splash",
+            L"--no-interop",
+            L"--log-level", L"info",
+            L"--log-file", log_path.wstring(),
+        };
+
+        std::wstring command_line = build_windows_command_line(args);
+        std::vector<wchar_t> command_buffer(command_line.begin(), command_line.end());
+        command_buffer.push_back(L'\0');
+
+        STARTUPINFOW startup_info{};
+        startup_info.cb = sizeof(startup_info);
+        PROCESS_INFORMATION process_info{};
+        const auto working_directory = exe_path.parent_path().wstring();
+        const DWORD creation_flags = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS;
+
+        if (!CreateProcessW(exe_path.c_str(),
+                            command_buffer.data(),
+                            nullptr,
+                            nullptr,
+                            FALSE,
+                            creation_flags,
+                            nullptr,
+                            working_directory.c_str(),
+                            &startup_info,
+                            &process_info)) {
+            throw std::runtime_error("CreateProcessW failed: " + format_win32_error(GetLastError()));
+        }
+
+        const DWORD pid = process_info.dwProcessId;
+        CloseHandle(process_info.hThread);
+        CloseHandle(process_info.hProcess);
+
+        LOG_INFO("Launched external headless training process {} with log {}",
+                 pid, lfs::core::path_to_utf8(log_path));
+
+        nb::dict result;
+        result["pid"] = nb::int_(pid);
+        result["config_path"] = lfs::core::path_to_utf8(config_path);
+        result["log_path"] = lfs::core::path_to_utf8(log_path);
+        result["output_path"] = lfs::core::path_to_utf8(params.dataset.output_path);
+        result["dataset_path"] = lfs::core::path_to_utf8(params.dataset.data_path);
+        return result;
+    }
+#endif
 
     class PyControlSession {
     public:
@@ -617,11 +825,25 @@ NB_MODULE(lichtfeld, m) {
         },
         "Initialize trainer from existing scene cameras and point cloud");
     m.def(
+        "should_use_external_training_launcher", []() {
+            return should_use_external_training_launcher();
+        },
+        "Return true when GUI training should be launched in a separate headless process");
+    m.def(
         "start_training", []() {
             nb::gil_scoped_release release;
             lfs::core::events::cmd::StartTraining{}.emit();
         },
         "Start training with current parameters");
+    m.def(
+        "start_training_external", []() -> nb::dict {
+#if defined(WIN32) && LFS_USE_HIP
+            return start_training_external_impl();
+#else
+            throw std::runtime_error("External training launcher is only available on Windows HIP builds");
+#endif
+        },
+        "Launch training in a detached headless process and return output metadata");
     m.def(
         "pause_training", []() {
             nb::gil_scoped_release release;

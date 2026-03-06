@@ -24,6 +24,9 @@ namespace lfs::vis::gui {
 
     enum class HeightMode { Fill,
                             Content };
+    enum class TextFocusMode { None,
+                               NativeTextInput,
+                               AsciiTextInput };
 
     class LFS_VIS_API RmlPanelHost {
     public:
@@ -64,6 +67,7 @@ namespace lfs::vis::gui {
 
     private:
         static std::vector<uint32_t> drainTextInput();
+        void syncTextFocus();
         bool forwardInput(float panel_x, float panel_y);
         bool syncThemeProperties();
         std::string generateThemeRCSS() const;
@@ -87,6 +91,7 @@ namespace lfs::vis::gui {
         float last_synced_text_[4]{};
         bool has_text_focus_ = false;
         bool wants_keyboard_ = false;
+        TextFocusMode text_focus_mode_ = TextFocusMode::None;
 
         bool foreground_ = false;
         float clip_y_min_ = -1.0f;
@@ -101,6 +106,7 @@ namespace lfs::vis::gui {
         int last_forwarded_mx_ = -1;
         int last_forwarded_my_ = -1;
         bool last_hovered_ = false;
+        bool suppress_next_left_release_ = false;
     };
 
 } // namespace lfs::vis::gui

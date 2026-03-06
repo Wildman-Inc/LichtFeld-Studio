@@ -36,6 +36,13 @@
 namespace lfs::app {
 
     namespace {
+        constexpr bool shouldForceWindowsHipGuiNoInterop() {
+#if defined(WIN32) && LFS_USE_HIP
+            return true;
+#else
+            return false;
+#endif
+        }
 
         bool checkGpuRuntimeVersion();
         bool warmupGpuRuntime();
@@ -276,6 +283,11 @@ namespace lfs::app {
         }
 
         int runGui(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
+            if (shouldForceWindowsHipGuiNoInterop() && !params->optimization.no_interop) {
+                params->optimization.no_interop = true;
+                LOG_WARN("Forcing GPU-OpenGL interop off for Windows HIP GUI");
+            }
+
             if (params->optimization.no_interop) {
                 LOG_INFO("GPU-OpenGL interop disabled");
                 lfs::rendering::disableInterop();
@@ -305,7 +317,7 @@ namespace lfs::app {
                 .width = 1280,
                 .height = 720,
                 .antialiasing = false,
-                .enable_cuda_interop = true,
+                .enable_cuda_interop = !params->optimization.no_interop,
                 .gut = params->optimization.gut,
             });
 

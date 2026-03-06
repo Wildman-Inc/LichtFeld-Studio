@@ -106,11 +106,23 @@ namespace lfs::core {
         if (!means.is_valid() || means.size(0) == 0) {
             return glm::vec3(0.0f);
         }
-        const auto centroid_tensor = means.mean({0}, false);
+        auto means_cpu = means.cpu();
+        auto acc = means_cpu.accessor<float, 2>();
+        const size_t count = means_cpu.size(0);
+
+        double sum_x = 0.0;
+        double sum_y = 0.0;
+        double sum_z = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            sum_x += acc(i, 0);
+            sum_y += acc(i, 1);
+            sum_z += acc(i, 2);
+        }
+
         glm::vec3 result(
-            centroid_tensor.slice(0, 0, 1).item<float>(),
-            centroid_tensor.slice(0, 1, 2).item<float>(),
-            centroid_tensor.slice(0, 2, 3).item<float>());
+            static_cast<float>(sum_x / static_cast<double>(count)),
+            static_cast<float>(sum_y / static_cast<double>(count)),
+            static_cast<float>(sum_z / static_cast<double>(count)));
         if (std::isnan(result.x) || std::isnan(result.y) || std::isnan(result.z)) {
             return glm::vec3(0.0f);
         }

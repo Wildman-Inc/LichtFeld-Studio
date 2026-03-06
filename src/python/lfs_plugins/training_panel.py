@@ -244,6 +244,7 @@ class TrainingPanel(RmlPanel):
         self._collapsed = set(INITIALLY_COLLAPSED)
         self._last_iteration = -1
         self._last_num_gaussians = -1
+        self._external_training_launch = None
         self._last_progress_frac = -1.0
         self._last_bg_color = None
         self._doc = None
@@ -588,6 +589,8 @@ class TrainingPanel(RmlPanel):
         self._popup_el = doc.get_element_by_id("color-picker-popup")
         if self._popup_el:
             self._popup_el.add_event_listener("click", self._on_popup_click)
+        for el in doc.query_selector_all(".number-input"):
+            el.add_event_listener("click", self._on_number_input_click)
         body = doc.get_element_by_id("body")
         if body:
             body.add_event_listener("click", self._on_body_click)
@@ -683,6 +686,7 @@ class TrainingPanel(RmlPanel):
             swatch.set_property("background-color", f"rgb({r},{g},{b})")
 
     def on_scene_changed(self, doc):
+        self._external_training_launch = None
         if self._handle:
             self._sync_text_bufs()
             self._handle.dirty_all()
@@ -690,6 +694,7 @@ class TrainingPanel(RmlPanel):
     def on_unload(self, doc):
         doc.remove_data_model("training")
         self._handle = None
+        self._external_training_launch = None
 
     def _update_loss_graph(self):
         if not self._loss_graph_el:
@@ -724,6 +729,57 @@ class TrainingPanel(RmlPanel):
 
     def _on_popup_click(self, event):
         self._picker_click_handled = True
+
+    def _on_number_input_click(self, event):
+        if event:
+            event.stop_propagation()
+        target = event.current_target() if event else None
+        if not target:
+            return
+
+        key = target.get_attribute("data-value", "")
+        if not key:
+            return
+
+        default_value = target.get_attribute("value", "")
+        if not default_value:
+            default_value = self._text_bufs.get(key, "")
+
+        prop = key[:-4] if key.endswith("_str") else key
+        title_key = LOCALE_KEYS.get(prop)
+        title = tr(title_key) if title_key else "Edit Value"
+
+        lf.ui.input_dialog(
+            title,
+            "",
+            default_value,
+            lambda result, k=key: self._on_number_input_result(k, result),
+        )
+
+    def _on_number_input_result(self, key, result):
+        if result is None:
+            return
+
+        value = str(result).strip()
+        self._text_bufs[key] = value
+
+        if key == "ppisp_activation_step_str":
+            self._set_ppisp_activation_step(value)
+        elif key == "max_width_str":
+            self._set_max_width(value)
+        elif key == "new_step_str":
+            self._set_new_step_val(value)
+        else:
+            prop = key[:-4] if key.endswith("_str") else key
+            entry = _NUM_PROP_LOOKUP.get(prop)
+            if not entry:
+                return
+            dtype, _fmt, min_v, max_v, _step = entry
+            self._set_num_prop(prop, value, dtype, min_v, max_v)
+
+        if self._handle:
+            self._sync_text_bufs()
+            self._handle.dirty_all()
 
     def _on_body_click(self, event):
         if hasattr(self, '_picker_click_handled') and self._picker_click_handled:
@@ -1018,8 +1074,10 @@ class TrainingPanel(RmlPanel):
         elif action == "stop":
             lf.stop_training()
         elif action == "reset":
+            self._external_training_launch = None
             lf.reset_training()
         elif action == "clear":
+            self._external_training_launch = None
             lf.clear_scene()
         elif action == "switch_edit":
             lf.switch_to_edit_mode()
@@ -1048,6 +1106,58 @@ class TrainingPanel(RmlPanel):
                 params.add_save_step(self._new_save_step)
                 self._last_save_steps = []
 
+    def _show_external_training_dialog(self, launch):
+        if not launch:
+            return
+
+        message = (
+            "Windows HIP training was launched in a separate headless process.\n\n"
+            f"Dataset: {launch.get('dataset_path', '')}\n"
+            f"Output: {launch.get('output_path', '')}\n"
+            f"Config: {launch.get('config_path', '')}\n"
+            f"Log: {launch.get('log_path', '')}\n"
+            f"PID: {launch.get('pid', '')}"
+        )
+        lf.ui.confirm_dialog("Headless Training Started", message, ["OK"])
+
+    def _prompt_external_training_relaunch(self):
+        launch = self._external_training_launch or {}
+        message = (
+            "A headless training process has already been launched from this panel.\n\n"
+            f"Output: {launch.get('output_path', '')}\n"
+            f"Log: {launch.get('log_path', '')}\n"
+            "Choose 'Launch Again' only if you intentionally want another training process."
+        )
+
+        def _on_result(button):
+            if button == "Launch Again":
+                try:
+                    launched = dict(lf.start_training_external())
+                except Exception as exc:
+                    lf.ui.confirm_dialog("Headless Training Failed", str(exc), ["OK"])
+                    return
+                self._external_training_launch = launched
+                self._show_external_training_dialog(launched)
+
+        lf.ui.confirm_dialog("Headless Training Already Launched", message, ["OK", "Launch Again"], _on_result)
+
+    def _start_training_impl(self):
+        if hasattr(lf, "should_use_external_training_launcher") and lf.should_use_external_training_launcher():
+            if self._external_training_launch:
+                self._prompt_external_training_relaunch()
+                return
+
+            try:
+                launched = dict(lf.start_training_external())
+            except Exception as exc:
+                lf.ui.confirm_dialog("Headless Training Failed", str(exc), ["OK"])
+                return
+            self._external_training_launch = launched
+            self._show_external_training_dialog(launched)
+            return
+
+        lf.start_training()
+
     def _action_start(self):
         params = lf.optimization_params()
         error = params.validate() if params and params.has_params() else ""
@@ -1060,10 +1170,10 @@ class TrainingPanel(RmlPanel):
                 p = lf.optimization_params()
                 if button == _mcmc:
                     p.set_strategy("mcmc")
-                    lf.start_training()
+                    self._start_training_impl()
                 elif button == _gut:
                     p.gut = False
-                    lf.start_training()
+                    self._start_training_impl()
 
             lf.ui.confirm_dialog(
                 tr("training.error.adc_gut_title"),
@@ -1071,7 +1181,7 @@ class TrainingPanel(RmlPanel):
                 [btn_mcmc, btn_gut, btn_cancel],
                 _on_conflict)
         else:
-            lf.start_training()
+            self._start_training_impl()
 
     def _on_remove_step_event(self, handle, event, args):
         if not args:

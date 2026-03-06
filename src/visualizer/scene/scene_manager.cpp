@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "scene/scene_manager.hpp"
+#include "config.h"
 #include "core/checkpoint_format.hpp"
 #include "core/editor_context.hpp"
 #include "core/logger.hpp"
@@ -37,6 +38,23 @@
 namespace lfs::vis {
 
     namespace {
+        constexpr bool shouldDisableWindowsHipLiveTrainingViewport() {
+#if defined(WIN32) && LFS_USE_HIP
+            return true;
+#else
+            return false;
+#endif
+        }
+
+        bool shouldSuppressTrainingModelDuringViewportRendering() {
+#if defined(WIN32) && LFS_USE_HIP
+            if (auto* trainer_manager = services().trainerOrNull()) {
+                return trainer_manager->isRunning();
+            }
+#endif
+            return false;
+        }
+
         // Voxel size for point cloud rendering (in scene units)
         constexpr float DEFAULT_VOXEL_SIZE = 0.01f;
     } // namespace
@@ -1861,6 +1879,9 @@ namespace lfs::vis {
         case ContentType::SplatFiles:
             return scene_.getCombinedModel();
         case ContentType::Dataset:
+            if (shouldDisableWindowsHipLiveTrainingViewport() && shouldSuppressTrainingModelDuringViewportRendering()) {
+                return nullptr;
+            }
             return scene_.getTrainingModel();
         case ContentType::Empty:
             return scene_.hasNodes() ? scene_.getCombinedModel() : nullptr;
@@ -1877,7 +1898,9 @@ namespace lfs::vis {
         if (content_type_ == ContentType::SplatFiles) {
             state.combined_model = scene_.getCombinedModel();
         } else if (content_type_ == ContentType::Dataset) {
-            state.combined_model = scene_.getTrainingModel();
+            if (!(shouldDisableWindowsHipLiveTrainingViewport() && shouldSuppressTrainingModelDuringViewportRendering())) {
+                state.combined_model = scene_.getTrainingModel();
+            }
         }
 
         // Always try to get point cloud if no model (supports plugin-added point clouds)

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "visualizer_impl.hpp"
+#include "config.h"
 #include "core/animatable_property.hpp"
 #include "core/data_loading_service.hpp"
 #include "core/event_bus.hpp"
@@ -39,6 +40,59 @@
 #endif
 
 namespace lfs::vis {
+
+    namespace {
+        constexpr bool shouldDisableLiveTrainingVisualization() {
+#if defined(WIN32) && LFS_USE_HIP
+            return true;
+#else
+            return false;
+#endif
+        }
+
+        void applyWindowsHipGuiSafeDefaults(lfs::core::param::TrainingParameters& params) {
+#if defined(WIN32) && LFS_USE_HIP
+            if (params.optimization.headless) {
+                return;
+            }
+
+            const auto mcmc_defaults = lfs::core::param::OptimizationParameters::mcmc_defaults();
+            bool changed = false;
+
+            if (params.optimization.strategy == "mcmc") {
+                if (params.optimization.max_cap == mcmc_defaults.max_cap) {
+                    params.optimization.max_cap = 140000;
+                    changed = true;
+                }
+                if (params.optimization.tile_mode == mcmc_defaults.tile_mode) {
+                    params.optimization.tile_mode = 4;
+                    changed = true;
+                }
+            }
+
+            if (params.dataset.resize_factor <= 1) {
+                params.dataset.resize_factor = 8;
+                changed = true;
+            }
+
+            if (!params.optimization.no_interop) {
+                params.optimization.no_interop = true;
+                changed = true;
+            }
+
+            if (changed) {
+                LOG_INFO("Applying Windows HIP GUI safe defaults: strategy={}, max_cap={}, tile_mode={}, resize_factor={}, no_interop={}",
+                         params.optimization.strategy,
+                         params.optimization.max_cap,
+                         params.optimization.tile_mode,
+                         params.dataset.resize_factor,
+                         params.optimization.no_interop);
+            }
+#else
+            (void)params;
+#endif
+        }
+    } // namespace
 
     using namespace lfs::core::events;
 
@@ -630,6 +684,14 @@ namespace lfs::vis {
 
         // Training started - switch to splat rendering and select training model
         state::TrainingStarted::when([this](const auto&) {
+            if (shouldDisableLiveTrainingVisualization()) {
+                LOG_WARN("Live training visualization is disabled on Windows HIP; keeping dataset view active");
+                if (window_manager_) {
+                    window_manager_->requestRedraw();
+                }
+                return;
+            }
+
             ui::PointCloudModeChanged{
                 .enabled = false,
                 .voxel_size = 0.01f}
@@ -1063,13 +1125,16 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::setParameters(const lfs::core::param::TrainingParameters& params) {
-        data_loader_->setParameters(params);
+        auto effective_params = params;
+        applyWindowsHipGuiSafeDefaults(effective_params);
+
+        data_loader_->setParameters(effective_params);
         if (parameter_manager_) {
-            parameter_manager_->setSessionDefaults(params);
+            parameter_manager_->setSessionDefaults(effective_params);
         }
-        pending_auto_train_ = params.optimization.auto_train;
-        pending_view_paths_ = params.view_paths;
-        pending_dataset_path_ = params.dataset.data_path;
+        pending_auto_train_ = effective_params.optimization.auto_train;
+        pending_view_paths_ = effective_params.view_paths;
+        pending_dataset_path_ = effective_params.dataset.data_path;
     }
 
     std::expected<void, std::string> VisualizerImpl::loadPLY(const std::filesystem::path& path) {

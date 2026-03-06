@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "trainer.hpp"
+#include "config.h"
 #include "components/bilateral_grid.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
@@ -65,6 +66,14 @@ namespace lfs::training {
             r.crf_toe = ov.crf_toe;
             r.crf_shoulder = ov.crf_shoulder;
             return r;
+        }
+
+        constexpr bool should_serialize_gui_training_rendering() {
+#if defined(WIN32) && LFS_USE_HIP
+            return true;
+#else
+            return false;
+#endif
         }
     } // namespace
 
@@ -1105,6 +1114,14 @@ namespace lfs::training {
             const int tile_height = full_height / tile_rows;
             const int num_tiles = tile_rows * tile_cols;
 
+            std::optional<std::unique_lock<std::shared_mutex>> training_render_lock;
+            if (!params_.optimization.headless && should_serialize_gui_training_rendering()) {
+                if (iter == 1) {
+                    LOG_INFO("Serializing GUI rendering with training step on Windows HIP");
+                }
+                training_render_lock.emplace(render_mutex_);
+            }
+
             if (!loss_accumulator_.is_valid()) {
                 loss_accumulator_ = core::Tensor::zeros({1}, core::Device::CUDA);
             } else {
@@ -1648,7 +1665,10 @@ namespace lfs::training {
             {
                 DeferredEvents deferred;
                 {
-                    std::unique_lock<std::shared_mutex> lock(render_mutex_);
+                    std::optional<std::unique_lock<std::shared_mutex>> step_render_lock;
+                    if (!training_render_lock.has_value()) {
+                        step_render_lock.emplace(render_mutex_);
+                    }
 
                     // Python hook: pre-optimizer-step (post-backward, pre-step)
                     {

@@ -353,19 +353,30 @@ namespace lfs::training {
             lfs::core::random_choose(*splat_result, max_cap);
         }
 
-        if (point_cloud_node_id != lfs::core::NULL_NODE) {
-            if (const auto* pc_node = scene.getNodeById(point_cloud_node_id)) {
-                scene.removeNode(pc_node->name, false);
-            }
-        }
+        {
+            lfs::core::Scene::Transaction txn(scene);
 
-        auto model = std::make_unique<lfs::core::SplatData>(std::move(*splat_result));
-        LOG_INFO("Created training model with {} gaussians", model->size());
-        scene.addSplat("Model", std::move(model), parent_id);
-        if (node_transform != glm::mat4{1.0f}) {
-            scene.setNodeTransform("Model", node_transform);
+            if (point_cloud_node_id != lfs::core::NULL_NODE) {
+                if (const auto* pc_node = scene.getNodeById(point_cloud_node_id)) {
+                    if (params.optimization.headless) {
+                        LOG_INFO("Removing source point cloud node '{}'", pc_node->name);
+                        scene.removeNode(pc_node->name, false);
+                    } else {
+                        LOG_INFO("Keeping source point cloud node '{}' alive during GUI training startup", pc_node->name);
+                    }
+                }
+            }
+
+            auto model = std::make_unique<lfs::core::SplatData>(std::move(*splat_result));
+            LOG_INFO("Created training model with {} gaussians", model->size());
+            scene.addSplat("Model", std::move(model), parent_id);
+            LOG_INFO("Inserted training model node into scene");
+            if (node_transform != glm::mat4{1.0f}) {
+                scene.setNodeTransform("Model", node_transform);
+            }
+            scene.setTrainingModelNode("Model");
+            LOG_INFO("Training model node marked active");
         }
-        scene.setTrainingModelNode("Model");
 
         return {};
     }
