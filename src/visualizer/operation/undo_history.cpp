@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "undo_history.hpp"
-#include "core/services.hpp"
 #include "core/logger.hpp"
+#include "core/services.hpp"
 #include "operator/operator_registry.hpp"
 #include "rendering/dirty_flags.hpp"
 #include "rendering/rendering_manager.hpp"
