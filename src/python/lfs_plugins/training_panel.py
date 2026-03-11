@@ -349,6 +349,8 @@ class TrainingPanel(RmlPanel):
                          lambda: p() is not None and p().has_params() and p().use_bilateral_grid)
         model.bind_func("dep_adc",
                          lambda: p() is not None and p().has_params() and p().strategy == "adc")
+        model.bind_func("dep_igs",
+                         lambda: p() is not None and p().has_params() and p().strategy == "igs+")
         model.bind_func("dep_sparsity",
                          lambda: p() is not None and p().has_params() and p().enable_sparsity)
         model.bind_func("dep_random",

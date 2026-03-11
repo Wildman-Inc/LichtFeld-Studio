@@ -516,6 +516,7 @@ namespace lfs::training {
             }
 
             // Re-initialize strategy with new parameters
+            strategy_->set_training_dataset(train_dataset_);
             strategy_->initialize(params.optimization);
             LOG_DEBUG("Strategy initialized");
 
