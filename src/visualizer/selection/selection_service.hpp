@@ -147,7 +147,7 @@ namespace lfs::vis {
         [[nodiscard]] bool buildSelectionMaskForInteractiveSession(core::Tensor& selection_out,
                                                                    bool include_polygon_cursor = false);
         [[nodiscard]] bool buildBrushSelection(const std::vector<glm::vec2>& points, float radius,
-                                              core::Tensor& selection_out) const;
+                                               core::Tensor& selection_out) const;
         [[nodiscard]] bool buildRectangleSelection(glm::vec2 start, glm::vec2 end,
                                                    core::Tensor& selection_out) const;
         [[nodiscard]] bool buildPolygonSelection(const std::vector<glm::vec2>& points,

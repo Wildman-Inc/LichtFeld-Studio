@@ -357,9 +357,7 @@ namespace lfs::python {
                 configure_depth_filter(settings, enabled, depth_near, depth_far, frustum_half_width);
                 rm->updateSettings(settings);
             },
-            nb::arg("enabled"), nb::arg("depth_far") = 100.0f, nb::arg("frustum_half_width") = 50.0f,
-            nb::arg("depth_near") = 0.0f,
-            "Set selection depth filter in camera space. The first three positional arguments remain backward-compatible.");
+            nb::arg("enabled"), nb::arg("depth_far") = 100.0f, nb::arg("frustum_half_width") = 50.0f, nb::arg("depth_near") = 0.0f, "Set selection depth filter in camera space. The first three positional arguments remain backward-compatible.");
 
         sel.def(
             "set_depth_filter_range", [](bool enabled, float depth_near, float depth_far, float frustum_half_width) {
@@ -370,9 +368,7 @@ namespace lfs::python {
                 configure_depth_filter(settings, enabled, depth_near, depth_far, frustum_half_width);
                 rm->updateSettings(settings);
             },
-            nb::arg("enabled"), nb::arg("depth_near") = 0.0f, nb::arg("depth_far") = 100.0f,
-            nb::arg("frustum_half_width") = 50.0f,
-            "Set selection depth filter range in camera space as (near, far, width).");
+            nb::arg("enabled"), nb::arg("depth_near") = 0.0f, nb::arg("depth_far") = 100.0f, nb::arg("frustum_half_width") = 50.0f, "Set selection depth filter range in camera space as (near, far, width).");
 
         sel.def(
             "get_depth_filter", []() -> std::tuple<bool, float, float> {

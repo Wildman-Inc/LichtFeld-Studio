@@ -41,7 +41,7 @@ namespace lfs::vis {
 
     namespace {
 
-        template<typename TRenderable>
+        template <typename TRenderable>
         [[nodiscard]] const TRenderable* findRenderableByNodeId(const std::vector<TRenderable>& renderables,
                                                                 const core::NodeId node_id) {
             const auto it = std::ranges::find_if(renderables, [node_id](const auto& item) {

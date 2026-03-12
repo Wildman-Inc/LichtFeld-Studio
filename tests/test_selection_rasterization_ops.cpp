@@ -151,10 +151,14 @@ TEST_F(SelectionRasterizationOpsTest, RemoveRespectsNodeMask) {
 TEST_F(SelectionRasterizationOpsTest, BrushSelectMarksPointsInsideRadius) {
     const auto screen_positions = make_float32_values(
         {
-            0.0f, 0.0f,
-            0.75f, 0.0f,
-            1.5f, 0.0f,
-            0.0f, 2.0f,
+            0.0f,
+            0.0f,
+            0.75f,
+            0.0f,
+            1.5f,
+            0.0f,
+            0.0f,
+            2.0f,
         },
         {4, 2});
     auto selection = Tensor::zeros({4}, Device::CUDA, DataType::UInt8);
@@ -167,11 +171,16 @@ TEST_F(SelectionRasterizationOpsTest, BrushSelectMarksPointsInsideRadius) {
 TEST_F(SelectionRasterizationOpsTest, RectSelectMarksPointsInsideBox) {
     const auto screen_positions = make_float32_values(
         {
-            0.0f, 0.0f,
-            2.0f, 2.0f,
-            -0.1f, 1.0f,
-            1.0f, 2.1f,
-            3.0f, 3.0f,
+            0.0f,
+            0.0f,
+            2.0f,
+            2.0f,
+            -0.1f,
+            1.0f,
+            1.0f,
+            2.1f,
+            3.0f,
+            3.0f,
         },
         {5, 2});
     auto selection = Tensor::zeros({5}, Device::CUDA, DataType::Bool);
@@ -184,18 +193,26 @@ TEST_F(SelectionRasterizationOpsTest, RectSelectMarksPointsInsideBox) {
 TEST_F(SelectionRasterizationOpsTest, PolygonSelectMarksPointsInsideTriangle) {
     const auto screen_positions = make_float32_values(
         {
-            0.5f, 0.5f,
-            1.0f, 1.0f,
-            3.0f, 1.5f,
-            -0.1f, 0.5f,
-            0.5f, 3.0f,
+            0.5f,
+            0.5f,
+            1.0f,
+            1.0f,
+            3.0f,
+            1.5f,
+            -0.1f,
+            0.5f,
+            0.5f,
+            3.0f,
         },
         {5, 2});
     const auto polygon = make_float32_values(
         {
-            0.0f, 0.0f,
-            4.0f, 0.0f,
-            0.0f, 4.0f,
+            0.0f,
+            0.0f,
+            4.0f,
+            0.0f,
+            0.0f,
+            4.0f,
         },
         {3, 2});
     auto selection = Tensor::zeros({5}, Device::CUDA, DataType::Bool);
@@ -209,19 +226,39 @@ TEST_F(SelectionRasterizationOpsTest, CropFilterKeepsOnlyPointsInsideCropBox) {
     auto selection = make_bool_mask({1, 1, 1, 1});
     const auto means = make_float32_values(
         {
-            0.0f, 0.0f, 0.0f,
-            2.0f, 0.0f, 0.0f,
-            0.5f, 0.5f, 0.5f,
-            -0.25f, 0.0f, 0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            2.0f,
+            0.0f,
+            0.0f,
+            0.5f,
+            0.5f,
+            0.5f,
+            -0.25f,
+            0.0f,
+            0.0f,
         },
         {4, 3});
 
     const auto crop_transform = make_float32_values(
         {
-            1.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 1.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 1.0f, 0.0f,
-            0.0f, 0.0f, 0.0f, 1.0f,
+            1.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
         },
         {4, 4});
     const auto crop_min = make_float32_values({-0.5f, -0.5f, -0.5f}, {3});
@@ -245,20 +282,42 @@ TEST_F(SelectionRasterizationOpsTest, DepthFilterKeepsOnlyPointsInsideCameraSpac
     auto selection = make_bool_mask({1, 1, 1, 1, 1});
     const auto means = make_float32_values(
         {
-            0.0f, 0.0f, 0.5f,
-            0.0f, 0.0f, 2.0f,
-            0.6f, 0.0f, 2.0f,
-            0.0f, 0.0f, 5.0f,
-            -0.25f, 0.0f, 3.0f,
+            0.0f,
+            0.0f,
+            0.5f,
+            0.0f,
+            0.0f,
+            2.0f,
+            0.6f,
+            0.0f,
+            2.0f,
+            0.0f,
+            0.0f,
+            5.0f,
+            -0.25f,
+            0.0f,
+            3.0f,
         },
         {5, 3});
 
     const auto depth_transform = make_float32_values(
         {
-            1.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 1.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 1.0f, 0.0f,
-            0.0f, 0.0f, 0.0f, 1.0f,
+            1.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
         },
         {4, 4});
     const auto depth_min = make_float32_values({-0.5f, -10000.0f, 1.0f}, {3});

@@ -22,10 +22,10 @@
 using lfs::core::DataType;
 using lfs::core::Device;
 using lfs::core::Tensor;
+using lfs::vis::KeyEvent;
 using lfs::vis::MouseButtonEvent;
 using lfs::vis::MouseMoveEvent;
 using lfs::vis::MouseScrollEvent;
-using lfs::vis::KeyEvent;
 using lfs::vis::op::ModalEvent;
 using lfs::vis::op::OperatorContext;
 using lfs::vis::op::OperatorProperties;
@@ -140,8 +140,12 @@ protected:
         scene_manager_->getScene().addNode(
             "test",
             make_test_splat({
-                0.0f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                1.0f,
+                0.0f,
+                0.0f,
             }));
         scene_manager_->initSelectionService();
 
@@ -189,8 +193,10 @@ protected:
 
 TEST_F(SelectionOperatorModalTest, RectangleOperatorCommitsOnLeftRelease) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
 
     SelectionStrokeOperator op;
@@ -217,8 +223,10 @@ TEST_F(SelectionOperatorModalTest, RectangleOperatorCommitsOnLeftRelease) {
 TEST_F(SelectionOperatorModalTest, RectangleOperatorCancelsOnRightPress) {
     set_initial_selection({1, 0});
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
 
     SelectionStrokeOperator op;
@@ -243,8 +251,10 @@ TEST_F(SelectionOperatorModalTest, RectangleOperatorCancelsOnRightPress) {
 TEST_F(SelectionOperatorModalTest, PolygonOperatorPassesThroughNavigationAndCommitsWithShiftEnterAddMode) {
     set_initial_selection({1, 0});
     service().setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     SelectionStrokeOperator op;
@@ -281,8 +291,10 @@ TEST_F(SelectionOperatorModalTest, PolygonOperatorPassesThroughNavigationAndComm
 TEST_F(SelectionOperatorModalTest, PolygonOperatorRightClickUndoesAndEscapeCancels) {
     set_initial_selection({1, 0});
     service().setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     SelectionStrokeOperator op;

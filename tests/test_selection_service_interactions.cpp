@@ -1,8 +1,8 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core/event_bus.hpp"
 #include "core/event_bridge/event_bridge.hpp"
+#include "core/event_bus.hpp"
 #include "core/services.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
@@ -84,8 +84,12 @@ protected:
         scene_manager_->getScene().addNode(
             "test",
             make_test_splat({
-                0.0f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                1.0f,
+                0.0f,
+                0.0f,
             }));
 
         service_ = std::make_unique<lfs::vis::SelectionService>(scene_manager_.get(), rendering_manager_.get());
@@ -120,8 +124,10 @@ protected:
 
 TEST_F(SelectionServiceInteractionsTest, PolygonCommitUsesCurrentScreenPositionsAfterCameraMove) {
     service_->setTestingScreenPositions(make_screen_positions({
-        70.0f, 70.0f,
-        80.0f, 80.0f,
+        70.0f,
+        70.0f,
+        80.0f,
+        80.0f,
     }));
 
     ASSERT_TRUE(service_->beginInteractiveSelection(
@@ -134,8 +140,10 @@ TEST_F(SelectionServiceInteractionsTest, PolygonCommitUsesCurrentScreenPositions
 
     // Simulate camera motion by changing projected positions while the polygon stays in screen space.
     service_->setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     const auto result = service_->finishInteractiveSelection();
@@ -147,8 +155,10 @@ TEST_F(SelectionServiceInteractionsTest, PolygonCommitUsesCurrentScreenPositions
 TEST_F(SelectionServiceInteractionsTest, CancelInteractiveSelectionLeavesSelectionAndUndoUntouched) {
     set_initial_selection({1, 0});
     service_->setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     ASSERT_TRUE(service_->beginInteractiveSelection(
@@ -169,8 +179,10 @@ TEST_F(SelectionServiceInteractionsTest, CancelInteractiveSelectionLeavesSelecti
 
 TEST_F(SelectionServiceInteractionsTest, RectangleCommitSelectsDraggedArea) {
     service_->setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
 
     ASSERT_TRUE(service_->beginInteractiveSelection(
@@ -189,8 +201,10 @@ TEST_F(SelectionServiceInteractionsTest, RectangleCommitSelectsDraggedArea) {
 
 TEST_F(SelectionServiceInteractionsTest, LassoCommitUsesDraggedScreenSpacePath) {
     service_->setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     ASSERT_TRUE(service_->beginInteractiveSelection(
@@ -210,8 +224,10 @@ TEST_F(SelectionServiceInteractionsTest, LassoCommitUsesDraggedScreenSpacePath) 
 
 TEST_F(SelectionServiceInteractionsTest, BrushCommitInterpolatesAcrossDraggedStroke) {
     service_->setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
 
     ASSERT_TRUE(service_->beginInteractiveSelection(
@@ -255,13 +271,17 @@ TEST_F(SelectionServiceInteractionsTest, CommandRingSelectionUsesHoveredGaussian
 
 TEST_F(SelectionServiceInteractionsTest, CommandSelectionUsesCameraSpecificScreenPositions) {
     service_->setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
     service_->setTestingScreenPositionsForCamera(3, make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
-    }));
+                                                        80.0f,
+                                                        80.0f,
+                                                        10.0f,
+                                                        10.0f,
+                                                    }));
 
     const auto result = service_->selectRect(0.0f, 0.0f, 30.0f, 30.0f, lfs::vis::SelectionMode::Replace, 3);
     ASSERT_TRUE(result.success);
@@ -272,8 +292,10 @@ TEST_F(SelectionServiceInteractionsTest, CommandSelectionUsesCameraSpecificScree
 TEST_F(SelectionServiceInteractionsTest, CommitCreatesUndoEntryAndUndoRedoRestoreSelection) {
     set_initial_selection({1, 0});
     service_->setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     ASSERT_TRUE(service_->beginInteractiveSelection(

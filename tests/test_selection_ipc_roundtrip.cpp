@@ -89,8 +89,12 @@ protected:
         scene_manager_->getScene().addNode(
             "test",
             make_test_splat({
-                0.0f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                1.0f,
+                0.0f,
+                0.0f,
             }));
         scene_manager_->initSelectionService();
 
@@ -107,7 +111,8 @@ protected:
 
         const auto unique_id = std::chrono::steady_clock::now().time_since_epoch().count();
         socket_path_ = (std::filesystem::temp_directory_path() /
-                        ("lichtfeld-selection-test-" + std::to_string(unique_id) + ".sock")).string();
+                        ("lichtfeld-selection-test-" + std::to_string(unique_id) + ".sock"))
+                           .string();
         server_ = std::make_unique<lfs::vis::SelectionServer>();
         ASSERT_TRUE(server_->start(socket_path_));
 
@@ -164,8 +169,10 @@ protected:
 
 TEST_F(SelectionIpcRoundTripTest, RectRoundTripUsesQueuedCommandProcessing) {
     service().setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     auto result = client_->select_rect(0.0f, 0.0f, 30.0f, 30.0f, "replace", 0);
@@ -178,19 +185,27 @@ TEST_F(SelectionIpcRoundTripTest, RectRoundTripUsesQueuedCommandProcessing) {
 
 TEST_F(SelectionIpcRoundTripTest, PolygonRoundTripUsesCameraSpecificProjection) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
     service().setTestingScreenPositionsForCamera(7, make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
-    }));
+                                                        80.0f,
+                                                        80.0f,
+                                                        10.0f,
+                                                        10.0f,
+                                                    }));
 
     auto result = client_->select_polygon({
-        0.0f, 0.0f,
-        30.0f, 0.0f,
-        0.0f, 30.0f,
-    }, "replace", 7);
+                                              0.0f,
+                                              0.0f,
+                                              30.0f,
+                                              0.0f,
+                                              0.0f,
+                                              30.0f,
+                                          },
+                                          "replace", 7);
     ASSERT_TRUE(result.has_value()) << result.error();
 
     process_server_queue();
@@ -200,15 +215,21 @@ TEST_F(SelectionIpcRoundTripTest, PolygonRoundTripUsesCameraSpecificProjection) 
 
 TEST_F(SelectionIpcRoundTripTest, LassoRoundTripUsesQueuedCommandProcessing) {
     service().setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     auto result = client_->select_lasso({
-        0.0f, 0.0f,
-        30.0f, 0.0f,
-        0.0f, 30.0f,
-    }, "replace", 0);
+                                            0.0f,
+                                            0.0f,
+                                            30.0f,
+                                            0.0f,
+                                            0.0f,
+                                            30.0f,
+                                        },
+                                        "replace", 0);
     ASSERT_TRUE(result.has_value()) << result.error();
 
     process_server_queue();
@@ -218,9 +239,12 @@ TEST_F(SelectionIpcRoundTripTest, LassoRoundTripUsesQueuedCommandProcessing) {
 
 TEST_F(SelectionIpcRoundTripTest, PolygonRoundTripRejectsMalformedPointLists) {
     auto result = client_->select_polygon({
-        0.0f, 0.0f,
-        30.0f, 0.0f,
-    }, "replace", 0);
+                                              0.0f,
+                                              0.0f,
+                                              30.0f,
+                                              0.0f,
+                                          },
+                                          "replace", 0);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), "Polygon requires at least 3 points");
@@ -229,11 +253,15 @@ TEST_F(SelectionIpcRoundTripTest, PolygonRoundTripRejectsMalformedPointLists) {
 
 TEST_F(SelectionIpcRoundTripTest, LassoRoundTripRejectsOddLengthPointLists) {
     auto result = client_->select_lasso({
-        0.0f, 0.0f,
-        30.0f, 0.0f,
-        0.0f, 30.0f,
-        5.0f,
-    }, "replace", 0);
+                                            0.0f,
+                                            0.0f,
+                                            30.0f,
+                                            0.0f,
+                                            0.0f,
+                                            30.0f,
+                                            5.0f,
+                                        },
+                                        "replace", 0);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), "Lasso points must be x/y pairs");
@@ -253,8 +281,10 @@ TEST_F(SelectionIpcRoundTripTest, RingRoundTripUsesQueuedCommandProcessing) {
 
 TEST_F(SelectionIpcRoundTripTest, BrushAndDeselectAllRoundTrip) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
 
     auto brush_result = client_->select_brush(10.0f, 10.0f, 8.0f, "replace", 0);
@@ -281,8 +311,10 @@ TEST_F(SelectionIpcRoundTripTest, ApplyMaskRoundTripReplacesSelection) {
 
 TEST_F(SelectionIpcRoundTripTest, RectRoundTripRespectsDepthFilterSettings) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        20.0f, 20.0f,
+        10.0f,
+        10.0f,
+        20.0f,
+        20.0f,
     }));
 
     auto settings = rendering_manager_->getSettings();
@@ -301,8 +333,10 @@ TEST_F(SelectionIpcRoundTripTest, RectRoundTripRespectsDepthFilterSettings) {
 
 TEST_F(SelectionIpcRoundTripTest, RectRoundTripRespectsCropFilterSettings) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        20.0f, 20.0f,
+        10.0f,
+        10.0f,
+        20.0f,
+        20.0f,
     }));
 
     const auto splat_id = scene_manager_->getScene().getNodeIdByName("test");

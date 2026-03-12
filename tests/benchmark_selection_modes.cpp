@@ -1,8 +1,8 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core/event_bus.hpp"
 #include "core/event_bridge/event_bridge.hpp"
+#include "core/event_bus.hpp"
 #include "core/services.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
@@ -142,14 +142,19 @@ protected:
         brush_selection_ = Tensor::zeros({POINT_COUNT}, Device::CUDA, DataType::UInt8);
         bool_selection_ = Tensor::zeros({POINT_COUNT}, Device::CUDA, DataType::Bool);
         polygon_ = Tensor::from_vector(
-            {
-                256.0f, 256.0f,
-                1792.0f, 384.0f,
-                1600.0f, 1600.0f,
-                384.0f, 1728.0f,
-            },
-            {4, 2},
-            Device::CUDA).to(DataType::Float32);
+                       {
+                           256.0f,
+                           256.0f,
+                           1792.0f,
+                           384.0f,
+                           1600.0f,
+                           1600.0f,
+                           384.0f,
+                           1728.0f,
+                       },
+                       {4, 2},
+                       Device::CUDA)
+                       .to(DataType::Float32);
     }
 
     Tensor screen_positions_;
@@ -213,14 +218,19 @@ protected:
         service_->setTestingScreenPositions(screen_positions_);
 
         polygon_ = Tensor::from_vector(
-            {
-                256.0f, 256.0f,
-                1792.0f, 384.0f,
-                1600.0f, 1600.0f,
-                384.0f, 1728.0f,
-            },
-            {4, 2},
-            Device::CUDA).to(DataType::Float32);
+                       {
+                           256.0f,
+                           256.0f,
+                           1792.0f,
+                           384.0f,
+                           1600.0f,
+                           1600.0f,
+                           384.0f,
+                           1728.0f,
+                       },
+                       {4, 2},
+                       Device::CUDA)
+                       .to(DataType::Float32);
     }
 
     void TearDown() override {

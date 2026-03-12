@@ -314,7 +314,7 @@ namespace lfs::vis {
         selection_before_stroke_ =
             (existing && existing->is_valid()) ? std::make_shared<core::Tensor>(existing->clone()) : nullptr;
 
-        (void) resetBoolScratchBuffer(stroke_selection_, n);
+        (void)resetBoolScratchBuffer(stroke_selection_, n);
         stroke_active_ = true;
     }
 
@@ -426,7 +426,7 @@ namespace lfs::vis {
         interactive_selection_.brush_radius = brush_radius;
         interactive_selection_.start_pos = start_pos;
         interactive_selection_.cursor_pos = start_pos;
-        (void) resetBoolScratchBuffer(interactive_selection_.working_selection, total);
+        (void)resetBoolScratchBuffer(interactive_selection_.working_selection, total);
 
         switch (shape) {
         case SelectionShape::Brush:

@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "tools/selection_tool.hpp"
-#include "gui/gui_focus_state.hpp"
 #include "geometry/euclidean_transform.hpp"
+#include "gui/gui_focus_state.hpp"
 #include "input/input_bindings.hpp"
 #include "input/key_codes.hpp"
 #include "rendering/rendering_manager.hpp"
@@ -14,8 +14,8 @@
 #include <SDL3/SDL.h>
 #include <cmath>
 #include <glm/gtc/quaternion.hpp>
-#include <imgui.h>
 #include <string>
+#include <imgui.h>
 
 namespace lfs::vis::tools {
 

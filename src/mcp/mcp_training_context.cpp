@@ -172,39 +172,39 @@ namespace lfs::mcp {
                     camera,
                     model,
                     bg,
-                    false,    // show_rings
-                    0.01f,    // ring_width
-                    nullptr,  // model_transforms
-                    nullptr,  // transform_indices
-                    nullptr,  // selection_mask
-                    nullptr,  // screen_positions_out
-                    true,     // brush_active
+                    false,   // show_rings
+                    0.01f,   // ring_width
+                    nullptr, // model_transforms
+                    nullptr, // transform_indices
+                    nullptr, // selection_mask
+                    nullptr, // screen_positions_out
+                    true,    // brush_active
                     x,
                     y,
-                    0.0f,     // brush_radius
-                    true,     // brush_add_mode
-                    nullptr,  // brush_selection_out
-                    false,    // brush_saturation_mode
-                    0.0f,     // brush_saturation_amount
-                    true,     // selection_mode_rings
-                    false,    // show_center_markers
-                    nullptr,  // crop_box_transform
-                    nullptr,  // crop_box_min
-                    nullptr,  // crop_box_max
-                    false,    // crop_inverse
-                    false,    // crop_desaturate
-                    -1,       // crop_parent_node_index
-                    nullptr,  // ellipsoid_transform
-                    nullptr,  // ellipsoid_radii
-                    false,    // ellipsoid_inverse
-                    false,    // ellipsoid_desaturate
-                    -1,       // ellipsoid_parent_node_index
-                    nullptr,  // depth_filter_transform
-                    nullptr,  // depth_filter_min
-                    nullptr,  // depth_filter_max
-                    nullptr,  // deleted_mask
+                    0.0f,    // brush_radius
+                    true,    // brush_add_mode
+                    nullptr, // brush_selection_out
+                    false,   // brush_saturation_mode
+                    0.0f,    // brush_saturation_amount
+                    true,    // selection_mode_rings
+                    false,   // show_center_markers
+                    nullptr, // crop_box_transform
+                    nullptr, // crop_box_min
+                    nullptr, // crop_box_max
+                    false,   // crop_inverse
+                    false,   // crop_desaturate
+                    -1,      // crop_parent_node_index
+                    nullptr, // ellipsoid_transform
+                    nullptr, // ellipsoid_radii
+                    false,   // ellipsoid_inverse
+                    false,   // ellipsoid_desaturate
+                    -1,      // ellipsoid_parent_node_index
+                    nullptr, // depth_filter_transform
+                    nullptr, // depth_filter_min
+                    nullptr, // depth_filter_max
+                    nullptr, // deleted_mask
                     hovered_depth_id_device,
-                    -1);      // highlight_gaussian_id
+                    -1); // highlight_gaussian_id
                 (void)image;
                 (void)alpha;
             } catch (const std::exception& e) {
@@ -832,11 +832,11 @@ namespace lfs::mcp {
                 }
 
                 auto result = apply_headless_selection(*scene,
-                                                      ctx.selection_locked_groups_device_mask(),
-                                                      ctx.selection_output_buffers(),
-                                                      ctx.selection_output_buffer_index(),
-                                                      selection,
-                                                      mode);
+                                                       ctx.selection_locked_groups_device_mask(),
+                                                       ctx.selection_output_buffers(),
+                                                       ctx.selection_output_buffer_index(),
+                                                       selection,
+                                                       mode);
                 if (!result) {
                     return json{{"error", result.error()}};
                 }
@@ -909,11 +909,11 @@ namespace lfs::mcp {
                 }
 
                 auto result = apply_headless_selection(*scene,
-                                                      ctx.selection_locked_groups_device_mask(),
-                                                      ctx.selection_output_buffers(),
-                                                      ctx.selection_output_buffer_index(),
-                                                      selection,
-                                                      mode);
+                                                       ctx.selection_locked_groups_device_mask(),
+                                                       ctx.selection_output_buffers(),
+                                                       ctx.selection_output_buffer_index(),
+                                                       selection,
+                                                       mode);
                 if (!result) {
                     return json{{"error", result.error()}};
                 }
@@ -986,11 +986,11 @@ namespace lfs::mcp {
                 }
 
                 auto result = apply_headless_selection(*scene,
-                                                      ctx.selection_locked_groups_device_mask(),
-                                                      ctx.selection_output_buffers(),
-                                                      ctx.selection_output_buffer_index(),
-                                                      selection,
-                                                      mode);
+                                                       ctx.selection_locked_groups_device_mask(),
+                                                       ctx.selection_output_buffers(),
+                                                       ctx.selection_output_buffer_index(),
+                                                       selection,
+                                                       mode);
                 if (!result) {
                     return json{{"error", result.error()}};
                 }
@@ -1058,11 +1058,11 @@ namespace lfs::mcp {
                 rendering::set_selection_element(selection.ptr<bool>(), *hovered_id, true);
 
                 auto result = apply_headless_selection(*scene,
-                                                      ctx.selection_locked_groups_device_mask(),
-                                                      ctx.selection_output_buffers(),
-                                                      ctx.selection_output_buffer_index(),
-                                                      selection,
-                                                      mode);
+                                                       ctx.selection_locked_groups_device_mask(),
+                                                       ctx.selection_output_buffers(),
+                                                       ctx.selection_output_buffer_index(),
+                                                       selection,
+                                                       mode);
                 if (!result) {
                     return json{{"error", result.error()}};
                 }
@@ -1118,11 +1118,11 @@ namespace lfs::mcp {
                 rendering::brush_select_tensor(screen_positions, x, y, radius, selection);
 
                 auto result = apply_headless_selection(*scene,
-                                                      ctx.selection_locked_groups_device_mask(),
-                                                      ctx.selection_output_buffers(),
-                                                      ctx.selection_output_buffer_index(),
-                                                      selection,
-                                                      mode);
+                                                       ctx.selection_locked_groups_device_mask(),
+                                                       ctx.selection_output_buffers(),
+                                                       ctx.selection_output_buffer_index(),
+                                                       selection,
+                                                       mode);
                 if (!result) {
                     return json{{"error", result.error()}};
                 }
@@ -1341,11 +1341,11 @@ namespace lfs::mcp {
                 rendering::rect_select_tensor(screen_positions, x0, y0, x1, y1, selection);
 
                 auto selection_result = apply_headless_selection(*scene,
-                                                                ctx.selection_locked_groups_device_mask(),
-                                                                ctx.selection_output_buffers(),
-                                                                ctx.selection_output_buffer_index(),
-                                                                selection,
-                                                                "replace");
+                                                                 ctx.selection_locked_groups_device_mask(),
+                                                                 ctx.selection_output_buffers(),
+                                                                 ctx.selection_output_buffer_index(),
+                                                                 selection,
+                                                                 "replace");
                 if (!selection_result) {
                     return json{{"error", selection_result.error()}};
                 }

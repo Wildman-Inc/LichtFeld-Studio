@@ -39,7 +39,7 @@ namespace lfs::vis {
     namespace {
         constexpr float DEFAULT_VOXEL_SIZE = 0.01f;
 
-        template<typename TRenderable>
+        template <typename TRenderable>
         [[nodiscard]] bool containsRenderableNode(const std::vector<TRenderable>& renderables, const core::NodeId node_id) {
             return std::ranges::any_of(renderables, [node_id](const auto& item) { return item.node_id == node_id; });
         }

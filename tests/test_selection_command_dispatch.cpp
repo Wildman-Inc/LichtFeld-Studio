@@ -90,8 +90,12 @@ protected:
         scene_manager_->getScene().addNode(
             "test",
             make_test_splat({
-                0.0f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                1.0f,
+                0.0f,
+                0.0f,
             }));
         scene_manager_->initSelectionService();
 
@@ -130,13 +134,17 @@ protected:
 
 TEST_F(SelectionCommandDispatchTest, SelectRectCommandUsesCameraSpecificProjection) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
     service().setTestingScreenPositionsForCamera(7, make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
-    }));
+                                                        80.0f,
+                                                        80.0f,
+                                                        10.0f,
+                                                        10.0f,
+                                                    }));
 
     SelectRect{
         .x0 = 0.0f,
@@ -145,15 +153,18 @@ TEST_F(SelectionCommandDispatchTest, SelectRectCommandUsesCameraSpecificProjecti
         .y1 = 30.0f,
         .camera_index = 7,
         .mode = "replace",
-    }.emit();
+    }
+        .emit();
 
     EXPECT_EQ(selection_values(*scene_manager_), (std::vector<uint8_t>{0, 1}));
 }
 
 TEST_F(SelectionCommandDispatchTest, SelectBrushCommandsRespectReplaceAddAndRemoveModes) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        80.0f, 80.0f,
+        10.0f,
+        10.0f,
+        80.0f,
+        80.0f,
     }));
 
     SelectBrush{.x = 10.0f, .y = 10.0f, .radius = 8.0f, .camera_index = 0, .mode = "replace"}.emit();
@@ -168,30 +179,36 @@ TEST_F(SelectionCommandDispatchTest, SelectBrushCommandsRespectReplaceAddAndRemo
 
 TEST_F(SelectionCommandDispatchTest, SelectPolygonCommandRoutesThroughSceneManager) {
     service().setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     SelectPolygon{
         .points = {0.0f, 0.0f, 30.0f, 0.0f, 0.0f, 30.0f},
         .camera_index = 0,
         .mode = "replace",
-    }.emit();
+    }
+        .emit();
 
     EXPECT_EQ(selection_values(*scene_manager_), (std::vector<uint8_t>{0, 1}));
 }
 
 TEST_F(SelectionCommandDispatchTest, SelectLassoCommandRoutesThroughSceneManager) {
     service().setTestingScreenPositions(make_screen_positions({
-        80.0f, 80.0f,
-        10.0f, 10.0f,
+        80.0f,
+        80.0f,
+        10.0f,
+        10.0f,
     }));
 
     SelectLasso{
         .points = {0.0f, 0.0f, 30.0f, 0.0f, 0.0f, 30.0f},
         .camera_index = 0,
         .mode = "replace",
-    }.emit();
+    }
+        .emit();
 
     EXPECT_EQ(selection_values(*scene_manager_), (std::vector<uint8_t>{0, 1}));
 }
@@ -204,15 +221,18 @@ TEST_F(SelectionCommandDispatchTest, SelectRingCommandRoutesThroughSceneManager)
         .y = 50.0f,
         .camera_index = 0,
         .mode = "replace",
-    }.emit();
+    }
+        .emit();
 
     EXPECT_EQ(selection_values(*scene_manager_), (std::vector<uint8_t>{0, 1}));
 }
 
 TEST_F(SelectionCommandDispatchTest, SelectRectCommandRespectsDepthFilterSettings) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        20.0f, 20.0f,
+        10.0f,
+        10.0f,
+        20.0f,
+        20.0f,
     }));
 
     auto settings = rendering_manager_->getSettings();
@@ -228,15 +248,18 @@ TEST_F(SelectionCommandDispatchTest, SelectRectCommandRespectsDepthFilterSetting
         .y1 = 30.0f,
         .camera_index = 0,
         .mode = "replace",
-    }.emit();
+    }
+        .emit();
 
     EXPECT_EQ(selection_values(*scene_manager_), (std::vector<uint8_t>{1, 0}));
 }
 
 TEST_F(SelectionCommandDispatchTest, SelectRectCommandRespectsCropFilterSettings) {
     service().setTestingScreenPositions(make_screen_positions({
-        10.0f, 10.0f,
-        20.0f, 20.0f,
+        10.0f,
+        10.0f,
+        20.0f,
+        20.0f,
     }));
 
     const auto splat_id = scene_manager_->getScene().getNodeIdByName("test");
@@ -260,7 +283,8 @@ TEST_F(SelectionCommandDispatchTest, SelectRectCommandRespectsCropFilterSettings
         .y1 = 30.0f,
         .camera_index = 0,
         .mode = "replace",
-    }.emit();
+    }
+        .emit();
 
     EXPECT_EQ(selection_values(*scene_manager_), (std::vector<uint8_t>{1, 0}));
 }
