@@ -69,7 +69,7 @@ class PluginMarketplacePanel(Panel):
         self._url_plugin_names: Dict[str, str] = {}
         self._manual_url = ""
         self._install_filter_idx = 0
-        self._sort_idx = 0
+        self._sort_idx = 2
 
         self._card_ops: Dict[str, CardOpState] = {}
         self._lock = threading.RLock()
@@ -193,6 +193,7 @@ class PluginMarketplacePanel(Panel):
         if snapshot_key != self._prev_snapshot_key:
             self._prev_snapshot_key = snapshot_key
             self._entries_dirty = True
+            self._needs_resort = True
 
         if self._entries_dirty:
             self._entries_dirty = False
@@ -597,7 +598,9 @@ class PluginMarketplacePanel(Panel):
     # ── Business logic (unchanged) ────────────────────────────
 
     def _ensure_loaded(self):
-        self._catalog.refresh_async()
+        # Alphabetical sorting only needs registry metadata. Popularity sorting depends on
+        # GitHub enrichment for curated entries, so defer that extra fetch until requested.
+        self._catalog.refresh_async(require_github_enrichment=self._sort_idx in (0, 1))
 
     def _invalidate_discover_cache(self):
         self._discover_cache = None

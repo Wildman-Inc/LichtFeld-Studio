@@ -53,18 +53,25 @@ class PluginMarketplaceCatalog:
         self._lock = threading.Lock()
         self._entries: List[MarketplacePluginEntry] = _build_curated_fallback()
         self._loading = False
-        self._loaded_once = False
+        self._registry_loaded = False
+        self._github_enriched = False
         self._last_attempt: float = 0.0
 
-    def refresh_async(self, force: bool = False) -> None:
-        """Fetch registry entries in a background thread and merge with curated list."""
+    def refresh_async(self, force: bool = False, require_github_enrichment: bool = False) -> None:
+        """Fetch registry entries, optionally enriching curated entries with GitHub metadata."""
         with self._lock:
             if self._loading:
                 return
-            if self._loaded_once and not force:
+            needs_github_upgrade = require_github_enrichment and not self._github_enriched
+            if self._registry_loaded and not needs_github_upgrade and not force:
                 return
             now = time.monotonic()
-            if not force and self._last_attempt > 0 and (now - self._last_attempt) < REFRESH_RETRY_COOLDOWN_SEC:
+            if (
+                not force
+                and not needs_github_upgrade
+                and self._last_attempt > 0
+                and (now - self._last_attempt) < REFRESH_RETRY_COOLDOWN_SEC
+            ):
                 return
             self._loading = True
             self._last_attempt = now
@@ -82,12 +89,17 @@ class PluginMarketplaceCatalog:
             except Exception as exc:
                 _log.debug("Registry search failed: %s", exc)
 
-            curated_resolved = _resolve_curated_from_github()
-            merged = _merge_entries(registry_entries, curated_resolved)
+            curated_entries = (
+                _resolve_curated_from_github()
+                if require_github_enrichment
+                else _build_curated_fallback()
+            )
+            merged = _merge_entries(registry_entries, curated_entries)
             with self._lock:
                 self._entries = merged
                 self._loading = False
-                self._loaded_once = registry_ok
+                self._registry_loaded = registry_ok
+                self._github_enriched = self._github_enriched or require_github_enrichment
 
         threading.Thread(target=worker, daemon=True).start()
 
