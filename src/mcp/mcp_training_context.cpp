@@ -613,13 +613,13 @@ namespace lfs::mcp {
             .render_capture =
                 [](std::optional<int> camera_index, int width, int height)
                 -> std::expected<std::string, std::string> {
-                    if (!camera_index) {
-                        return std::unexpected(
-                            "camera_index is required in the training runtime; "
-                            "live viewport capture is only available in the GUI runtime");
-                    }
-                    return TrainingContext::instance().render_to_base64(*camera_index, width, height);
-                },
+                if (!camera_index) {
+                    return std::unexpected(
+                        "camera_index is required in the training runtime; "
+                        "live viewport capture is only available in the GUI runtime");
+                }
+                return TrainingContext::instance().render_to_base64(*camera_index, width, height);
+            },
             .gaussian_count =
                 []() -> std::expected<int64_t, std::string> {
                 auto scene = TrainingContext::instance().scene();
