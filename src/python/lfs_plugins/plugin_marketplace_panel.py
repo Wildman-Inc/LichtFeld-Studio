@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Unified plugin marketplace floating panel."""
 
+from html import escape
 import threading
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,13 @@ from .types import Panel
 
 MAX_OUTPUT_LINES = 100
 SUCCESS_DISMISS_SEC = 3.0
+_CARD_GAP_DP = 12
+_CARD_MIN_WIDTH_DP = 220
+_LAYOUT_HYSTERESIS_DP = 60
+_COLUMN_GROW_HEADROOM_DP = 120
+_GRID_SIDE_MARGIN_DP = 20
+_LAYOUT_WIDTH_QUANTUM_DP = 32
+_SCROLLBAR_GUTTER_DP = 16
 
 _PHASE_MILESTONES: List[Tuple[str, float]] = [
     ("cloning", 0.05),
@@ -61,8 +69,8 @@ class PluginMarketplacePanel(Panel):
     space = lf.ui.PanelSpace.FLOATING
     order = 91
     template = "rmlui/plugin_marketplace.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
-    size = (770, 0)
+    height_mode = lf.ui.PanelHeightMode.FILL
+    size = (770, 560)
     update_interval_ms = 100
 
     def __init__(self):
@@ -86,12 +94,15 @@ class PluginMarketplacePanel(Panel):
         self._needs_resort = True
         self._prev_snapshot_key: Optional[Tuple] = None
         self._cached_entries: List[MarketplacePluginEntry] = []
+        self._cached_card_records: List[Dict[str, object]] = []
         self._cached_card_ids: List[str] = []
         self._cached_installed_lookup: Dict[str, str] = {}
         self._cached_installed_versions: Dict[str, str] = {}
         self._cached_installed_names: Set[str] = set()
         self._formats_open = False
         self._last_lang = ""
+        self._last_grid_signature: Optional[Tuple] = None
+        self._stable_layout_width: Optional[int] = None
 
     # ── Data model ────────────────────────────────────────────
 
@@ -124,7 +135,6 @@ class PluginMarketplacePanel(Panel):
         model.bind_event("confirm_yes", self._on_confirm_yes)
         model.bind_event("confirm_no", self._on_confirm_no)
 
-        model.bind_record_list("plugins")
         self._handle = model.get_handle()
 
     def _set_filter_idx(self, v):
@@ -155,6 +165,8 @@ class PluginMarketplacePanel(Panel):
         self._last_lang = lf.ui.get_current_language()
         self._entries_dirty = True
         self._last_card_phases.clear()
+        self._last_grid_signature = None
+        self._stable_layout_width = None
 
         formats_header = doc.get_element_by_id("formats-header")
         if formats_header:
@@ -216,20 +228,19 @@ class PluginMarketplacePanel(Panel):
             ]
 
             self._cached_entries = entries
-            self._cached_card_ids = card_ids
-            self._cached_installed_lookup = installed_lookup
-            self._cached_installed_versions = installed_versions
-            self._cached_installed_names = installed_names
-
-            records = [
+            self._cached_card_records = records = [
                 self._build_card_record(
                     entry, card_ids[i], mgr,
                     installed_lookup, installed_versions, installed_names,
                 )
                 for i, entry in enumerate(entries)
             ]
+            self._cached_card_ids = card_ids
+            self._cached_installed_lookup = installed_lookup
+            self._cached_installed_versions = installed_versions
+            self._cached_installed_names = installed_names
             self._last_card_phases.clear()
-            self._handle.update_record_list("plugins", records)
+            self._render_card_grid(doc, records, force=True)
 
             empty_el = doc.get_element_by_id("empty-state")
             grid_el = doc.get_element_by_id("card-grid")
@@ -237,6 +248,8 @@ class PluginMarketplacePanel(Panel):
                 empty_el.set_class("hidden", len(entries) > 0)
             if grid_el:
                 grid_el.set_class("hidden", len(entries) == 0)
+        else:
+            self._render_card_grid(doc, self._cached_card_records)
 
         self._update_card_states(
             doc, self._cached_entries, self._cached_card_ids, mgr,
@@ -344,6 +357,230 @@ class PluginMarketplacePanel(Panel):
             "show_startup": show_startup,
             "startup_checked": startup_checked,
         }
+
+    def _render_card_grid(self, doc, records: List[Dict[str, object]], force: bool = False):
+        grid_el = doc.get_element_by_id("card-grid")
+        if not grid_el:
+            return
+
+        viewport_width = self._grid_viewport_width(doc, grid_el)
+        layout_width = self._stabilize_layout_width(viewport_width)
+        columns, row_width = self._compute_grid_layout(layout_width)
+        card_ids = tuple(str(r.get("card_id", "")) for r in records)
+        signature = (card_ids, columns, row_width)
+        if not force and signature == self._last_grid_signature:
+            return
+        self._last_grid_signature = signature
+
+        if not records:
+            grid_el.set_inner_rml("")
+            return
+
+        rows: List[str] = []
+        for i in range(0, len(records), columns):
+            chunk = list(records[i:i + columns])
+            row_class = "card-row card-row--single" if columns == 1 else "card-row"
+            row_parts = [
+                f'<div class="{row_class}" style="width: {row_width}dp; margin-left: {_GRID_SIDE_MARGIN_DP}dp; margin-right: {_GRID_SIDE_MARGIN_DP}dp;">'
+            ]
+            for record in chunk:
+                row_parts.append(self._build_card_markup(record))
+            for _ in range(columns - len(chunk)):
+                row_parts.append(
+                    f'<div class="plugin-card plugin-card--placeholder" style="width: {_CARD_MIN_WIDTH_DP}dp;"></div>'
+                )
+            row_parts.append("</div>")
+            rows.append("".join(row_parts))
+        grid_el.set_inner_rml("".join(rows))
+
+    def _grid_viewport_width(self, doc, grid_el) -> int:
+        main_area_el = doc.get_element_by_id("main-area")
+        if main_area_el and getattr(main_area_el, "client_width", 0):
+            return int(max(0.0, float(main_area_el.client_width or 0.0)))
+
+        content_el = doc.get_element_by_id("content")
+        if content_el and getattr(content_el, "client_width", 0):
+            return int(max(0.0, float(content_el.client_width or 0.0)))
+
+        return int(max(0.0, float(grid_el.client_width or 0.0)))
+
+    def _stabilize_layout_width(self, width: int) -> int:
+        effective_width = max(0, width - _SCROLLBAR_GUTTER_DP)
+        if effective_width <= 0:
+            self._stable_layout_width = effective_width
+            return effective_width
+
+        quantum = _LAYOUT_WIDTH_QUANTUM_DP
+        candidate = max(
+            quantum,
+            ((effective_width + (quantum // 2)) // quantum) * quantum,
+        )
+        if self._stable_layout_width is not None and abs(effective_width - self._stable_layout_width) < quantum:
+            return self._stable_layout_width
+        self._stable_layout_width = candidate
+        return candidate
+
+    def _compute_grid_layout(self, width: int) -> Tuple[int, int]:
+        if width <= 0:
+            return 1, _CARD_MIN_WIDTH_DP
+
+        usable_width = max(_CARD_MIN_WIDTH_DP, width - (2 * _GRID_SIDE_MARGIN_DP))
+        max_columns = max(1, int((usable_width + _CARD_GAP_DP) // (_CARD_MIN_WIDTH_DP + _CARD_GAP_DP)))
+        columns = max_columns
+        prev_columns = self._last_grid_signature[1] if self._last_grid_signature else None
+        if prev_columns:
+            if max_columns > prev_columns:
+                grow_threshold = (
+                    self._min_row_width(prev_columns + 1)
+                    + (2 * _GRID_SIDE_MARGIN_DP)
+                    + _COLUMN_GROW_HEADROOM_DP
+                )
+                if width < grow_threshold:
+                    columns = prev_columns
+            elif max_columns < prev_columns:
+                shrink_threshold = (
+                    self._min_row_width(prev_columns)
+                    + (2 * _GRID_SIDE_MARGIN_DP)
+                    - _LAYOUT_HYSTERESIS_DP
+                )
+                if width >= shrink_threshold:
+                    columns = prev_columns
+
+        columns = max(1, min(columns, max_columns))
+        min_row_width = self._min_row_width(columns)
+        while columns > 1 and width < (min_row_width + (2 * _GRID_SIDE_MARGIN_DP)):
+            columns -= 1
+            min_row_width = self._min_row_width(columns)
+
+        row_width = max(min_row_width, width - (2 * _GRID_SIDE_MARGIN_DP))
+        return columns, row_width
+
+    @staticmethod
+    def _min_row_width(columns: int) -> int:
+        return (columns * _CARD_MIN_WIDTH_DP) + ((columns - 1) * _CARD_GAP_DP)
+
+    def _build_card_markup(self, record: Dict[str, object]) -> str:
+        tr = lf.ui.tr
+
+        def esc(key: str) -> str:
+            return escape(str(record.get(key, "")), quote=True)
+
+        def text_span(condition_key: str, body: str) -> str:
+            return body if record.get(condition_key) else ""
+
+        info_attrs = []
+        if record.get("info_action"):
+            info_attrs.append(f'data-action="{esc("info_action")}"')
+        if record.get("github_url"):
+            info_attrs.append(f'data-url="{esc("github_url")}"')
+        info_attr_text = (" " + " ".join(info_attrs)) if info_attrs else ""
+
+        startup_checked = ' checked="checked"' if record.get("startup_checked") else ""
+        startup_row = ""
+        if record.get("show_startup"):
+            startup_row = (
+                '<div class="card-startup-row"><label>'
+                f'<input type="checkbox"{startup_checked} data-action="startup" '
+                f'data-card-id="{esc("card_id")}" data-plugin="{esc("plugin_name")}" />'
+                f'<span class="card-startup-label text-disabled">{escape(tr("plugin_marketplace.load_on_startup"))}</span>'
+                '</label></div>'
+            )
+
+        buttons: List[str] = []
+        if record.get("show_install"):
+            buttons.append(
+                f'<button class="btn btn--success" data-action="install" data-card-id="{esc("card_id")}">'
+                f'{escape(tr("plugin_marketplace.button.install"))}</button>'
+            )
+        if record.get("show_load"):
+            buttons.append(
+                f'<button class="btn btn--success" data-action="load" data-card-id="{esc("card_id")}" '
+                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.load"))}</button>'
+            )
+        if record.get("show_unload"):
+            buttons.append(
+                f'<button class="btn btn--warning" data-action="unload" data-card-id="{esc("card_id")}" '
+                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.unload"))}</button>'
+            )
+        if record.get("show_reload"):
+            buttons.append(
+                f'<button class="btn btn--primary" data-action="reload" data-card-id="{esc("card_id")}" '
+                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.reload"))}</button>'
+            )
+        if record.get("show_update"):
+            buttons.append(
+                f'<button class="btn btn--primary" data-action="update" data-card-id="{esc("card_id")}" '
+                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.update"))}</button>'
+            )
+        if record.get("show_uninstall"):
+            buttons.append(
+                f'<button class="btn btn--error" data-action="uninstall" data-card-id="{esc("card_id")}" '
+                f'data-plugin="{esc("plugin_name")}">{escape(tr("plugin_manager.button.uninstall"))}</button>'
+            )
+
+        status_span = ""
+        if record.get("is_installed"):
+            status_span = (
+                f'<span class="card-status {esc("status_class")}">{esc("status_text")}</span>'
+            )
+
+        invalid_link = (
+            f'<span class="card-error status-error">{escape(tr("plugin_marketplace.invalid_link"))}</span>'
+            if record.get("has_error")
+            else ""
+        )
+        description = (
+            ""
+            if record.get("has_error")
+            else f'<span class="card-description text-disabled">{esc("description")}</span>'
+        )
+        version_span = text_span(
+            "has_version",
+            f'<span class="card-version status-info">{esc("version_label")}</span>',
+        )
+        repo_span = text_span(
+            "has_repo",
+            f'<span class="card-repo text-disabled">{esc("repo_label")}</span>',
+        )
+        metrics_span = text_span(
+            "has_metrics",
+            f'<span class="card-metrics mp-warning-text">{esc("metrics_text")}</span>',
+        )
+        tags_span = text_span(
+            "has_tags",
+            f'<span class="card-tags text-disabled">{esc("tags_text")}</span>',
+        )
+        local_span = (
+            f'<span class="card-local status-info">{escape(tr("plugin_marketplace.local_install"))}</span>'
+            if record.get("is_local")
+            else ""
+        )
+
+        return (
+            f'<div class="plugin-card" id="card-{esc("card_id")}" data-card-id="{esc("card_id")}" '
+            f'style="width: {_CARD_MIN_WIDTH_DP}dp;">'
+            f'<div class="card-info"{info_attr_text}>'
+            f'<span class="card-name">{esc("name")}</span>'
+            f'{version_span}'
+            f'{repo_span}'
+            f'{metrics_span}'
+            f'{tags_span}'
+            f'{local_span}'
+            f'{status_span}'
+            f'{invalid_link}'
+            f'{description}'
+            '<div class="separator"></div>'
+            '</div>'
+            f'<div class="card-feedback hidden" id="feedback-{esc("card_id")}">'
+            f'<progress class="card-progress hidden" id="feedback-{esc("card_id")}-progress" max="1" value="0"></progress>'
+            f'<span class="card-progress-text hidden" id="feedback-{esc("card_id")}-progress-text"></span>'
+            f'<span class="status-text status-success hidden" id="feedback-{esc("card_id")}-success"></span>'
+            f'<span class="status-text status-error hidden" id="feedback-{esc("card_id")}-error"></span>'
+            '</div>'
+            f'{startup_row}'
+            f'<div class="card-buttons" id="btns-{esc("card_id")}">{"".join(buttons)}</div>'
+            '</div>'
+        )
 
     # ── Card state updates (per-frame, minimal DOM touches) ───
 
