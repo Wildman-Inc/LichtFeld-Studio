@@ -7,6 +7,7 @@
 
   <span class="status-text status-info">@tr:plugin_marketplace.title_line</span>
   <span class="mp-warning-text">@tr:plugin_marketplace.warning_body</span>
+  <span id="catalog-status" class="status-text status-info">@tr:plugin_marketplace.loading</span>
 
   <div class="separator"></div>
 

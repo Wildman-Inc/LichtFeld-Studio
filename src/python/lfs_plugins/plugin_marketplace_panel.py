@@ -188,9 +188,10 @@ class PluginMarketplacePanel(Panel):
             self._entries_dirty = True
             self._last_card_phases.clear()
 
-        entries_raw, is_loading = self._catalog.snapshot()
+        entries_raw, is_loading, registry_loaded = self._catalog.snapshot()
+        self._update_catalog_status(doc, len(entries_raw), is_loading, registry_loaded)
 
-        snapshot_key = (tuple(entries_raw), is_loading)
+        snapshot_key = (tuple(entries_raw), is_loading, registry_loaded)
         if snapshot_key != self._prev_snapshot_key:
             self._prev_snapshot_key = snapshot_key
             self._entries_dirty = True
@@ -403,6 +404,28 @@ class PluginMarketplacePanel(Panel):
             self._manual_url = ""
             if self._handle:
                 self._handle.dirty("manual_url")
+
+    def _update_catalog_status(self, doc, entry_count: int, is_loading: bool, registry_loaded: bool):
+        status_el = doc.get_element_by_id("catalog-status")
+        if not status_el:
+            return
+
+        if is_loading and entry_count == 0:
+            text = "Fetching plugin registry..."
+            tone = "status-info"
+        elif registry_loaded:
+            noun = "plugin" if entry_count == 1 else "plugins"
+            text = f"Registry loaded: {entry_count} {noun} in the marketplace catalog."
+            tone = "status-success" if entry_count > 0 else "status-info"
+        else:
+            noun = "plugin" if entry_count == 1 else "plugins"
+            text = f"Registry unavailable: showing {entry_count} fallback {noun}."
+            tone = "status-warning"
+
+        status_el.set_text(text)
+        status_el.set_class("status-info", tone == "status-info")
+        status_el.set_class("status-success", tone == "status-success")
+        status_el.set_class("status-warning", tone == "status-warning")
 
     def _sync_feedback_state(self, doc, element_prefix: str, state: CardOpState, working_text: str):
         feedback_el = doc.get_element_by_id(element_prefix)

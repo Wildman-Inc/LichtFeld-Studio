@@ -9,6 +9,11 @@
     margin-bottom: 4dp;
 }
 
+#catalog-status {
+    display: block;
+    margin-top: 2dp;
+}
+
 /* ── Controls row ─────────────────────────────────────── */
 
 .mp-controls {
@@ -70,6 +75,7 @@
 .card-grid {
     display: flex;
     flex-wrap: wrap;
+    align-items: flex-start;
     gap: 12dp;
 }
 
@@ -77,7 +83,7 @@
 
 .plugin-card {
     width: 220dp;
-    min-height: 180dp;
+    height: 220dp;
     border-width: 1dp;
     padding: 8dp;
     display: flex;
@@ -100,6 +106,8 @@
     cursor: pointer;
     flex: 1;
     min-height: 0;
+    height: 144dp;
+    overflow: hidden;
 }
 
 .card-name {
@@ -149,6 +157,8 @@
 .card-description {
     display: block;
     margin-top: 2dp;
+    max-height: 42dp;
+    overflow: hidden;
 }
 
 /* ── Card buttons ─────────────────────────────────────── */
@@ -157,6 +167,7 @@
     display: flex;
     gap: 6dp;
     margin-top: 4dp;
+    min-height: 22dp;
 }
 
 .card-buttons .btn {
@@ -169,6 +180,7 @@
     display: flex;
     align-items: center;
     margin-top: 4dp;
+    min-height: 18dp;
 }
 
 .card-startup-label {
