@@ -147,6 +147,16 @@ body {
     min-height: 0;
 }
 
+#tree-container scrollbarvertical,
+#history-container scrollbarvertical {
+    width: 14dp;
+}
+
+#tree-container scrollbarvertical sliderbar,
+#history-container scrollbarvertical sliderbar {
+    min-height: 40dp;
+}
+
 #history-container {
     flex: 1;
     min-height: 0;

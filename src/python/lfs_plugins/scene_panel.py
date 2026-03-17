@@ -13,6 +13,10 @@ from .ui.state import AppState
 TREE_ROW_HEIGHT_DP = 20
 TREE_HEADER_HEIGHT_DP = 24
 TREE_OVERSCAN_ROWS = 10
+TREE_SCROLL_STEP_ROWS = 5
+TREE_SCROLL_FAST_STEP_ROWS = 16
+TREE_SCROLL_PAGE_FRACTION = 0.9
+AUTO_COLLAPSE_CAMERA_GROUP_THRESHOLD = 25
 SCENE_MODEL_NAME = "scene_panel"
 SCENE_TAB_SCENE = "scene"
 SCENE_TAB_HISTORY = "history"
@@ -246,6 +250,7 @@ class ScenePanel(Panel):
             self.container.add_event_listener("click", self._on_tree_click)
             self.container.add_event_listener("dblclick", self._on_tree_dblclick)
             self.container.add_event_listener("mousedown", self._on_tree_mousedown)
+            self.container.add_event_listener("mousescroll", self._on_tree_scroll)
             self.container.add_event_listener("dragstart", self._on_tree_dragstart)
             self.container.add_event_listener("dragover", self._on_tree_dragover)
             self.container.add_event_listener("dragout", self._on_tree_dragout)
@@ -304,9 +309,8 @@ class ScenePanel(Panel):
         current = set(lf.get_selected_node_names())
         if current != self._prev_selected:
             self._prev_selected = current
+            # Mirror external selection changes without stealing the tree scroll position.
             self._selected_nodes = current
-            if current and self._restore_scroll_top is None:
-                self._scroll_to_node = next(iter(current))
             dirty |= self._render_tree_window(force=True)
 
         if self.container:
@@ -785,6 +789,38 @@ class ScenePanel(Panel):
     def _preserve_scroll_for_local_selection(self):
         self._restore_scroll_top = self.container.scroll_top if self.container else None
 
+    def _on_tree_scroll(self, event):
+        scroll_el = event.current_target()
+        if not scroll_el:
+            return
+
+        try:
+            wheel_delta = float(event.get_parameter("wheel_delta_y", "0"))
+        except (RuntimeError, TypeError, ValueError):
+            return
+
+        max_scroll = max(0.0, scroll_el.scroll_height - scroll_el.client_height)
+        if max_scroll <= 0.0:
+            event.stop_propagation()
+            return
+
+        row_height = self._row_height_px()
+        if lf.ui.is_ctrl_down():
+            scroll_step = max(scroll_el.client_height * TREE_SCROLL_PAGE_FRACTION, row_height)
+        elif lf.ui.is_shift_down():
+            scroll_step = row_height * TREE_SCROLL_FAST_STEP_ROWS
+        else:
+            scroll_step = row_height * TREE_SCROLL_STEP_ROWS
+
+        new_scroll = min(
+            max(scroll_el.scroll_top + wheel_delta * scroll_step, 0.0),
+            max_scroll,
+        )
+        if abs(new_scroll - scroll_el.scroll_top) > 0.01:
+            scroll_el.scroll_top = new_scroll
+
+        event.stop_propagation()
+
     def _ui_scale(self):
         try:
             return max(float(lf.get_ui_scale()), 1.0)
@@ -866,6 +902,9 @@ class ScenePanel(Panel):
         for node in nodes:
             snapshots[node.id] = self._make_node_snapshot(node)
 
+        self._collapsed_ids.intersection_update(snapshots.keys())
+        previous_ids = set(self._node_snapshots)
+
         for snapshot in snapshots.values():
             parent = snapshots.get(snapshot["parent_id"])
             parent_is_dataset = bool(parent and parent["node_type"] == "DATASET")
@@ -873,6 +912,10 @@ class ScenePanel(Panel):
                 snapshot["node_type"], parent_is_dataset)
             snapshot["deletable"] = _is_deletable(
                 snapshot["node_type"], parent_is_dataset)
+            if (snapshot["id"] not in previous_ids and
+                    snapshot["node_type"] == "CAMERA_GROUP" and
+                    len(snapshot["children"]) >= AUTO_COLLAPSE_CAMERA_GROUP_THRESHOLD):
+                self._collapsed_ids.add(snapshot["id"])
 
         root_ids = [node.id for node in nodes if node.parent_id == -1]
         return snapshots, root_ids

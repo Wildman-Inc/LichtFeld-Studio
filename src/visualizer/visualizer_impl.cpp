@@ -744,22 +744,12 @@ namespace lfs::vis {
             internal::TrainingReadyToStart{}.emit();
         });
 
-        // Training started - switch to splat rendering and select training model
+        // Training started - switch to splat rendering without hijacking scene selection
         state::TrainingStarted::when([this](const auto&) {
             ui::PointCloudModeChanged{
                 .enabled = false,
                 .voxel_size = 0.01f}
                 .emit();
-
-            // Select the training model so it's visible
-            if (scene_manager_) {
-                const auto& scene = scene_manager_->getScene();
-                const auto& model_name = scene.getTrainingModelNodeName();
-                if (!model_name.empty()) {
-                    scene_manager_->selectNode(model_name);
-                    LOG_INFO("Selected training model '{}' for training", model_name);
-                }
-            }
 
             LOG_INFO("Switched to splat rendering mode (training started)");
         });
