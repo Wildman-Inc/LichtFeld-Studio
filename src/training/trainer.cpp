@@ -271,23 +271,32 @@ namespace lfs::training {
             return {};
         }
 
-        const bool alpha_available = scene_ && scene_->imagesHaveAlpha();
-        if (opt.use_alpha_as_mask && alpha_available) {
-            LOG_INFO("Using alpha channel as mask source{}", opt.invert_masks ? " (inverted)" : "");
+        size_t alpha_count = 0;
+        size_t masks_found = 0;
+        for (const auto& cam : train_dataset_->get_cameras()) {
+            if (cam && cam->has_alpha())
+                ++alpha_count;
+            if (cam && cam->has_mask())
+                ++masks_found;
+        }
+
+        if (opt.use_alpha_as_mask && alpha_count > 0) {
+            LOG_INFO("Using alpha channel as mask source ({}/{} cameras){}",
+                     alpha_count, train_dataset_->get_cameras().size(),
+                     opt.invert_masks ? " (inverted)" : "");
             return {};
         }
 
-        size_t masks_found = 0;
-        for (const auto& cam : train_dataset_->get_cameras()) {
-            if (cam && cam->has_mask()) {
-                ++masks_found;
-            }
-        }
-
         if (masks_found == 0) {
+            const auto path_str = lfs::core::path_to_utf8(params_.dataset.data_path);
+            if (opt.use_alpha_as_mask) {
+                return std::unexpected(std::format(
+                    "Mask mode enabled with use_alpha_as_mask but no images have alpha and no mask files found in {}/masks/",
+                    path_str));
+            }
             return std::unexpected(std::format(
                 "Mask mode enabled but no masks found in {}/masks/",
-                lfs::core::path_to_utf8(params_.dataset.data_path)));
+                path_str));
         }
 
         LOG_INFO("Found {} masks{}", masks_found, opt.invert_masks ? " (inverted)" : "");
@@ -1371,7 +1380,7 @@ namespace lfs::training {
                     lfs::core::Tensor tile_grad;
 
                     const bool use_mask = params_.optimization.mask_mode != lfs::core::param::MaskMode::None &&
-                                          (cam->has_mask() || (params_.optimization.use_alpha_as_mask && scene_ && scene_->imagesHaveAlpha()));
+                                          (cam->has_mask() || (params_.optimization.use_alpha_as_mask && cam->has_alpha()));
                     if (use_mask) {
                         lfs::core::Tensor mask;
                         if (pipelined_mask_.is_valid() && pipelined_mask_.numel() > 0) {
@@ -1456,7 +1465,7 @@ namespace lfs::training {
 
                     // 1) Compute photometric loss (populates ssim_map in workspace)
                     const bool use_mask = params_.optimization.mask_mode != lfs::core::param::MaskMode::None &&
-                                          (cam->has_mask() || (params_.optimization.use_alpha_as_mask && scene_ && scene_->imagesHaveAlpha()));
+                                          (cam->has_mask() || (params_.optimization.use_alpha_as_mask && cam->has_alpha()));
                     const bool used_masked_fused =
                         use_mask &&
                         (params_.optimization.mask_mode == lfs::core::param::MaskMode::Segment ||
@@ -1773,12 +1782,10 @@ namespace lfs::training {
                 // Clean evaluation - let the evaluator handle everything
                 if (evaluator_->is_enabled() && evaluator_->should_evaluate(iter)) {
                     evaluator_->print_evaluation_header(iter);
-                    const bool alpha_available = scene_ && scene_->imagesHaveAlpha();
                     auto metrics = evaluator_->evaluate(iter,
                                                         strategy_->get_model(),
                                                         val_dataset_,
-                                                        background_,
-                                                        alpha_available);
+                                                        background_);
                     LOG_INFO("{}", metrics.to_string());
                 }
 
@@ -1934,6 +1941,7 @@ namespace lfs::training {
                 mask_pipeline_config.mask_threshold = params_.optimization.mask_threshold;
                 if (params_.optimization.use_alpha_as_mask && alpha_available) {
                     mask_pipeline_config.use_alpha_as_mask = true;
+                    mask_pipeline_config.load_masks = true;
                     LOG_INFO("Alpha-as-mask enabled (invert={}, threshold={})",
                              mask_pipeline_config.invert_masks, mask_pipeline_config.mask_threshold);
                 } else {
