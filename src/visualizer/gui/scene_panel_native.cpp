@@ -407,7 +407,7 @@ namespace lfs::vis::gui {
         changed |= setCachedText(history_summary_value_el_, formatHistorySummary(history));
         changed |= setCachedText(history_transaction_el_, formatHistoryTransaction(history));
         changed |= setCachedProperty(history_transaction_el_, "display",
-                                    history.hasActiveTransaction() ? "block" : "none");
+                                     history.hasActiveTransaction() ? "block" : "none");
         changed |= setCachedText(history_undo_btn_el_,
                                  has_undo ? std::format("Undo: {}", undo_items.front().metadata.label)
                                           : std::string("Undo"));

@@ -8,8 +8,8 @@
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
-#include "gui/gui_manager.hpp"
 #include "gui/global_context_menu.hpp"
+#include "gui/gui_manager.hpp"
 #include "gui/panel_registry.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/utils/native_file_dialog.hpp"
@@ -26,8 +26,8 @@
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <format>
 #include <functional>
@@ -1650,8 +1650,7 @@ namespace lfs::vis::gui {
             core::NodeId parent_id = core::NULL_NODE;
             if (parseNodeId(parts[1], parent_id)) {
                 const std::string parent_name =
-                    parent_id == core::NULL_NODE ? std::string{} :
-                                                   (scene->getNodeById(parent_id) ? scene->getNodeById(parent_id)->name : std::string{});
+                    parent_id == core::NULL_NODE ? std::string{} : (scene->getNodeById(parent_id) ? scene->getNodeById(parent_id)->name : std::string{});
                 cmd::AddGroup{.name = tr("scene.new_group_name"), .parent_name = parent_name}.emit();
             }
         } else if (kind == "merge_group" && parts.size() >= 2) {
@@ -1694,7 +1693,8 @@ namespace lfs::vis::gui {
             cmd::SequencerSetKeyframeEasing{
                 .keyframe_index = static_cast<size_t>(std::stoul(parts[1])),
                 .easing_type = std::stoi(parts[2]),
-            }.emit();
+            }
+                .emit();
         } else if (kind == "reparent" && parts.size() >= 3) {
             core::NodeId node_id = core::NULL_NODE;
             core::NodeId parent_id = core::NULL_NODE;
