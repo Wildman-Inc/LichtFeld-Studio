@@ -217,6 +217,7 @@ namespace lfs::vis::input {
         void startCapture(ToolMode mode, Action action);
         void cancelCapture();
         void captureKey(int key, int mods);
+        void captureKey(int physical_key, int logical_key, int mods);
         void captureMouseButton(int button, int mods);
         void updateCapture();
         bool isCapturing() const { return capture_state_.active; }

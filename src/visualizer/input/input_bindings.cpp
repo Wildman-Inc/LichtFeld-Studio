@@ -22,6 +22,20 @@ namespace lfs::vis::input {
 
         constexpr int PROFILE_VERSION = 5; // Version 5 collapses depth-box wheel controls to a single Alt+Scroll adjustment.
 
+        [[nodiscard]] bool actionUsesPhysicalKeyBinding(const Action action) {
+            switch (action) {
+            case Action::CAMERA_MOVE_FORWARD:
+            case Action::CAMERA_MOVE_BACKWARD:
+            case Action::CAMERA_MOVE_LEFT:
+            case Action::CAMERA_MOVE_RIGHT:
+            case Action::CAMERA_MOVE_UP:
+            case Action::CAMERA_MOVE_DOWN:
+                return true;
+            default:
+                return false;
+            }
+        }
+
         [[nodiscard]] bool isSelectionDepthAction(const Action action) {
             switch (action) {
             case Action::TOGGLE_DEPTH_MODE:
@@ -778,8 +792,17 @@ namespace lfs::vis::input {
     }
 
     void InputBindings::captureKey(int key, int mods) {
+        captureKey(key, key, mods);
+    }
+
+    void InputBindings::captureKey(const int physical_key, const int logical_key, const int mods) {
         if (!capture_state_.active)
             return;
+
+        int key = actionUsesPhysicalKeyBinding(capture_state_.action) ? physical_key : logical_key;
+        if (key == KEY_UNKNOWN) {
+            key = (logical_key != KEY_UNKNOWN) ? logical_key : physical_key;
+        }
 
         if (key == KEY_ESCAPE) {
             cancelCapture();

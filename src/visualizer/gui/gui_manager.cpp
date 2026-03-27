@@ -2028,9 +2028,9 @@ namespace lfs::vis::gui {
                rml_modal_overlay_->isOpen();
     }
 
-    void GuiManager::captureKey(int key, int mods) {
+    void GuiManager::captureKey(int physical_key, int logical_key, int mods) {
         if (auto* input_controller = viewer_->getInputController()) {
-            input_controller->getBindings().captureKey(key, mods);
+            input_controller->getBindings().captureKey(physical_key, logical_key, mods);
         }
     }
 

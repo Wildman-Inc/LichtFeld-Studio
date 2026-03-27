@@ -1042,15 +1042,21 @@ namespace lfs::vis {
         publishCameraMove(&target_viewport);
     }
 
-    void InputController::handleKey(int key, int action, [[maybe_unused]] int mods) {
+    void InputController::handleKey(const int key, const int action, const int mods) {
+        // Compatibility path for tests and callers that don't split physical vs layout-aware keys.
+        handleKey(key, key, 0, action, mods);
+    }
+
+    void InputController::handleKey(const int physical_key, const int logical_key,
+                                    const int scancode, int action, [[maybe_unused]] int mods) {
         // Track modifier keys (always, even if GUI has focus)
-        if (key == input::KEY_LEFT_CONTROL || key == input::KEY_RIGHT_CONTROL) {
+        if (physical_key == input::KEY_LEFT_CONTROL || physical_key == input::KEY_RIGHT_CONTROL) {
             key_ctrl_pressed_ = (action != input::ACTION_RELEASE);
         }
-        if (key == input::KEY_LEFT_ALT || key == input::KEY_RIGHT_ALT) {
+        if (physical_key == input::KEY_LEFT_ALT || physical_key == input::KEY_RIGHT_ALT) {
             key_alt_pressed_ = (action != input::ACTION_RELEASE);
         }
-        if (key == input::KEY_R) {
+        if (logical_key == input::KEY_R) {
             key_r_pressed_ = (action != input::ACTION_RELEASE);
         }
 
@@ -1063,7 +1069,7 @@ namespace lfs::vis {
         SDL_GetMouseState(&mx_f, &my_f);
         double mx = mx_f, my = my_f;
         const bool over_gui_hover = isPointerOverUiHover(mx, my);
-        if (dispatchKeyToModals(key, 0, action, mods, mx, my, over_gui_hover)) {
+        if (dispatchKeyToModals(logical_key, scancode, action, mods, mx, my, over_gui_hover)) {
             return;
         }
 
@@ -1071,7 +1077,7 @@ namespace lfs::vis {
 
         // Forward to GUI for key capture (rebinding)
         if (action == input::ACTION_PRESS && gui && gui->isCapturingInput()) {
-            gui->captureKey(key, mods);
+            gui->captureKey(physical_key, logical_key, mods);
             return;
         }
 
@@ -1079,12 +1085,12 @@ namespace lfs::vis {
         if (gui && gui->gizmo().isPieMenuOpen()) {
             if (action == input::ACTION_RELEASE) {
                 const auto pie_key = bindings_.getKeyForAction(input::Action::PIE_MENU, getCurrentToolMode());
-                if (pie_key >= 0 && key == pie_key) {
+                if (pie_key >= 0 && logical_key == pie_key) {
                     gui->gizmo().onPieMenuKeyRelease();
                     return;
                 }
             }
-            if (action == input::ACTION_PRESS && key == input::KEY_ESCAPE) {
+            if (action == input::ACTION_PRESS && logical_key == input::KEY_ESCAPE) {
                 gui->gizmo().closePieMenu();
                 return;
             }
@@ -1104,7 +1110,7 @@ namespace lfs::vis {
             return;
 
         const auto tool_mode = getCurrentToolMode();
-        const auto bound_action = bindings_.getActionForKey(tool_mode, key, mods);
+        const auto bound_action = bindings_.getActionForKey(tool_mode, logical_key, mods);
 
         if (modal_open)
             return;
@@ -1328,17 +1334,17 @@ namespace lfs::vis {
 
         // Use cached movement key bindings
         const bool pressed = (action != input::ACTION_RELEASE);
-        if (key == movement_keys_.forward) {
+        if (physical_key == movement_keys_.forward) {
             keys_movement_[0] = pressed;
-        } else if (key == movement_keys_.left) {
+        } else if (physical_key == movement_keys_.left) {
             keys_movement_[1] = pressed;
-        } else if (key == movement_keys_.backward) {
+        } else if (physical_key == movement_keys_.backward) {
             keys_movement_[2] = pressed;
-        } else if (key == movement_keys_.right) {
+        } else if (physical_key == movement_keys_.right) {
             keys_movement_[3] = pressed;
-        } else if (key == movement_keys_.down) {
+        } else if (physical_key == movement_keys_.down) {
             keys_movement_[4] = pressed;
-        } else if (key == movement_keys_.up) {
+        } else if (physical_key == movement_keys_.up) {
             keys_movement_[5] = pressed;
         }
     }
