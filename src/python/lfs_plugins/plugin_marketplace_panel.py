@@ -401,15 +401,17 @@ class PluginMarketplacePanel(Panel):
         grid_el.set_inner_rml("".join(rows))
 
     def _grid_viewport_width(self, doc, grid_el) -> int:
+        dp_ratio = max(1.0, lf.ui.get_ui_scale())
+
         main_area_el = doc.get_element_by_id("main-area")
         if main_area_el and getattr(main_area_el, "client_width", 0):
-            return int(max(0.0, float(main_area_el.client_width or 0.0)))
+            return int(max(0.0, float(main_area_el.client_width or 0.0) / dp_ratio))
 
         content_el = doc.get_element_by_id("content")
         if content_el and getattr(content_el, "client_width", 0):
-            return int(max(0.0, float(content_el.client_width or 0.0)))
+            return int(max(0.0, float(content_el.client_width or 0.0) / dp_ratio))
 
-        return int(max(0.0, float(grid_el.client_width or 0.0)))
+        return int(max(0.0, float(grid_el.client_width or 0.0) / dp_ratio))
 
     def _stabilize_layout_width(self, width: int) -> int:
         return max(0, width - _SCROLLBAR_GUTTER_DP)
