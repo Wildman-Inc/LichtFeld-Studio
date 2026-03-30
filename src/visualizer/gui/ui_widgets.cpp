@@ -20,9 +20,9 @@
 #include <glad/glad.h>
 #include <imgui_internal.h>
 #include <implot.h>
-#include <imgui.h>
 #include <string>
 #include <unordered_map>
+#include <imgui.h>
 
 namespace lfs::vis::gui::widgets {
 

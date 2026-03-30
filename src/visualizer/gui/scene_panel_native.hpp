@@ -5,8 +5,8 @@
 #pragma once
 
 #include "gui/panel_registry.hpp"
-#include "gui/rmlui/rml_panel_host.hpp"
 #include "gui/rmlui/rml_input_utils.hpp"
+#include "gui/rmlui/rml_panel_host.hpp"
 
 #include <RmlUi/Core/EventListener.h>
 #include <cstdint>
