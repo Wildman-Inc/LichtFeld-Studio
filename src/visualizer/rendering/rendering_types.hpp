@@ -5,11 +5,13 @@
 #pragma once
 
 #include "geometry/euclidean_transform.hpp"
+#include "rendering/frame_contract.hpp"
 #include "rendering/render_constants.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <glm/glm.hpp>
+#include <optional>
 #include <string>
 
 namespace lfs::vis {
@@ -240,6 +242,13 @@ namespace lfs::vis {
         float x, y, width, height;
     };
 
+    struct GTRenderCamera {
+        glm::mat3 rotation{1.0f};
+        glm::vec3 translation{0.0f};
+        std::optional<lfs::rendering::CameraIntrinsics> intrinsics;
+        bool equirectangular = false;
+    };
+
     struct GTComparisonContext {
         unsigned int gt_texture_id = 0;
         glm::ivec2 dimensions{0, 0};
@@ -247,6 +256,7 @@ namespace lfs::vis {
         glm::vec2 render_texcoord_scale{1.0f, 1.0f};
         glm::vec2 gt_texcoord_scale{1.0f, 1.0f};
         bool gt_needs_flip = false;
+        std::optional<GTRenderCamera> render_camera;
 
         [[nodiscard]] bool valid() const { return gt_texture_id != 0 && dimensions.x > 0 && dimensions.y > 0; }
     };

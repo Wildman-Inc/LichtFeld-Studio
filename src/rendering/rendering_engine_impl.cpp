@@ -160,6 +160,17 @@ namespace lfs::rendering {
                    equalMat4(a.transform, b.transform);
         }
 
+        [[nodiscard]] bool equalIntrinsics(
+            const std::optional<CameraIntrinsics>& a,
+            const std::optional<CameraIntrinsics>& b) {
+            return (!a && !b) ||
+                   (a && b &&
+                    a->focal_x == b->focal_x &&
+                    a->focal_y == b->focal_y &&
+                    a->center_x == b->center_x &&
+                    a->center_y == b->center_y);
+        }
+
         [[nodiscard]] bool equalEllipsoid(const Ellipsoid& a, const Ellipsoid& b) {
             return equalVec3(a.radii, b.radii) &&
                    equalMat4(a.transform, b.transform);
@@ -213,6 +224,10 @@ namespace lfs::rendering {
                 return "gut";
             if (a.equirectangular != b.equirectangular)
                 return "equirectangular";
+            if (a.frame_view.focal_length_mm != b.frame_view.focal_length_mm)
+                return "frame_view.focal_length_mm";
+            if (!equalIntrinsics(a.frame_view.intrinsics_override, b.frame_view.intrinsics_override))
+                return "frame_view.intrinsics_override";
             if (!equalVec3(a.frame_view.background_color, b.frame_view.background_color))
                 return "frame_view.background_color";
             if (a.frame_view.far_plane != b.frame_view.far_plane)
@@ -257,6 +272,7 @@ namespace lfs::rendering {
                 .view_translation = request.frame_view.translation,
                 .viewport_size = request.frame_view.size,
                 .focal_length_mm = request.frame_view.focal_length_mm,
+                .intrinsics_override = request.frame_view.intrinsics_override,
                 .scaling_modifier = request.scaling_modifier,
                 .antialiasing = request.antialiasing,
                 .mip_filter = request.mip_filter,
@@ -301,6 +317,7 @@ namespace lfs::rendering {
                 .view_translation = request.frame_view.translation,
                 .viewport_size = request.frame_view.size,
                 .focal_length_mm = request.frame_view.focal_length_mm,
+                .intrinsics_override = request.frame_view.intrinsics_override,
                 .scaling_modifier = request.scaling_modifier,
                 .antialiasing = false,
                 .mip_filter = request.mip_filter,
@@ -357,6 +374,7 @@ namespace lfs::rendering {
                 .view_translation = request.frame_view.translation,
                 .viewport_size = request.frame_view.size,
                 .focal_length_mm = request.frame_view.focal_length_mm,
+                .intrinsics_override = request.frame_view.intrinsics_override,
                 .scaling_modifier = request.render.scaling_modifier,
                 .antialiasing = false,
                 .mip_filter = false,
@@ -876,6 +894,7 @@ namespace lfs::rendering {
             .view_translation = request.frame_view.translation,
             .viewport_size = request.frame_view.size,
             .focal_length_mm = request.frame_view.focal_length_mm,
+            .intrinsics_override = request.frame_view.intrinsics_override,
             .scaling_modifier = 1.0f,
             .antialiasing = false,
             .mip_filter = false,

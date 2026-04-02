@@ -170,6 +170,7 @@ namespace lfs::vis::gui {
             .translation = cam_state.position,
             .size = {width, height},
             .focal_length_mm = cam_state.focal_length_mm,
+            .intrinsics_override = std::nullopt,
             .far_plane = render_settings.depth_clip_enabled ? render_settings.depth_clip_far
                                                             : rendering::DEFAULT_FAR_PLANE,
             .orthographic = render_settings.orthographic,

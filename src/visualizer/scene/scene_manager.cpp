@@ -258,7 +258,6 @@ namespace lfs::vis {
         // Handle node selection from scene panel (both PLYs and Groups)
         ui::NodeSelected::when([this](const auto& event) {
             if (services().trainerOrNull() && services().trainerOrNull()->isRunning()) {
-                LOG_INFO("Selection blocked while training is active");
                 return;
             }
 
@@ -277,7 +276,6 @@ namespace lfs::vis {
         // Handle node deselection (but not during training)
         ui::NodeDeselected::when([this](const auto&) {
             if (services().trainerOrNull() && services().trainerOrNull()->isRunning()) {
-                LOG_INFO("Selection blocked while training is active");
                 return;
             }
             selection_.clearNodeSelection();

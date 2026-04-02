@@ -110,7 +110,11 @@ namespace lfs::vis {
             point_cloud_transform = scene_state.model_transforms[0];
         }
         const std::vector<glm::mat4> pc_transforms = {point_cloud_transform};
-        const auto pc_request = buildPointCloudRenderRequest(ctx, ctx.render_size, pc_transforms);
+        auto pc_request = buildPointCloudRenderRequest(ctx, ctx.render_size, pc_transforms);
+        applyGTComparisonRenderCamera(
+            pc_request.frame_view,
+            pc_request.render.equirectangular,
+            res.gt_context);
 
         if (splitViewUsesGTComparison(ctx.settings.split_view_mode) &&
             res.gt_context && res.gt_context->valid()) {

@@ -8,8 +8,67 @@
 #include "scene/scene_manager.hpp"
 #include "training/trainer.hpp"
 #include "training/training_manager.hpp"
+#include <algorithm>
 
 namespace lfs::vis {
+
+    namespace {
+        [[nodiscard]] std::optional<GTRenderCamera> buildGTRenderCamera(
+            SceneManager* const scene_manager,
+            const lfs::core::Camera& cam,
+            const glm::ivec2 render_size) {
+            if (render_size.x <= 0 || render_size.y <= 0) {
+                return std::nullopt;
+            }
+
+            auto R_tensor = cam.R().cpu();
+            auto T_tensor = cam.T().cpu();
+            const float* const R_data = R_tensor.ptr<float>();
+            const float* const T_data = T_tensor.ptr<float>();
+            if (!R_data || !T_data) {
+                return std::nullopt;
+            }
+
+            glm::mat3 world_to_cam_R(1.0f);
+            for (int row = 0; row < 3; ++row) {
+                for (int col = 0; col < 3; ++col) {
+                    world_to_cam_R[col][row] = R_data[row * 3 + col];
+                }
+            }
+
+            const glm::vec3 world_to_cam_T(T_data[0], T_data[1], T_data[2]);
+            const glm::mat3 cam_to_world_R = glm::transpose(world_to_cam_R);
+            const glm::vec3 cam_to_world_T = -cam_to_world_R * world_to_cam_T;
+
+            glm::mat4 scene_transform(1.0f);
+            if (scene_manager) {
+                auto visible_transforms = scene_manager->getScene().getVisibleNodeTransforms();
+                if (!visible_transforms.empty()) {
+                    scene_transform = visible_transforms[0];
+                }
+            }
+
+            GTRenderCamera render_camera;
+            render_camera.rotation = glm::mat3(scene_transform) * cam_to_world_R;
+            render_camera.translation = glm::mat3(scene_transform) * cam_to_world_T + glm::vec3(scene_transform[3]);
+            render_camera.equirectangular =
+                cam.camera_model_type() == lfs::core::CameraModelType::EQUIRECTANGULAR;
+
+            if (!render_camera.equirectangular) {
+                const float x_scale =
+                    static_cast<float>(render_size.x) / static_cast<float>(std::max(cam.camera_width(), 1));
+                const float y_scale =
+                    static_cast<float>(render_size.y) / static_cast<float>(std::max(cam.camera_height(), 1));
+                render_camera.intrinsics = lfs::rendering::CameraIntrinsics{
+                    .focal_x = cam.focal_x() * x_scale,
+                    .focal_y = cam.focal_y() * y_scale,
+                    .center_x = cam.center_x() * x_scale,
+                    .center_y = cam.center_y() * y_scale};
+            }
+
+            return render_camera;
+        }
+    } // namespace
 
     bool SplitViewService::hasValidGTContext() const {
         return gt_context_ && gt_context_->valid();
@@ -245,7 +304,8 @@ namespace lfs::vis {
             .gpu_aligned_dims = aligned,
             .render_texcoord_scale = glm::vec2(dims) / glm::vec2(aligned),
             .gt_texcoord_scale = gt_info.texcoord_scale,
-            .gt_needs_flip = gt_info.needs_flip};
+            .gt_needs_flip = gt_info.needs_flip,
+            .render_camera = buildGTRenderCamera(scene_manager, *cam, dims)};
 
         request_viewport_prerender = hasValidGTContext() && !has_viewport_output;
     }

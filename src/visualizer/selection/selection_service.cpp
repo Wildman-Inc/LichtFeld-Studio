@@ -226,6 +226,7 @@ namespace lfs::vis {
                 .translation = viewport.translation,
                 .size = viewport.size,
                 .focal_length_mm = viewport.focal_length_mm,
+                .intrinsics_override = std::nullopt,
                 .far_plane = far_plane,
                 .orthographic = viewport.orthographic,
                 .ortho_scale = viewport.ortho_scale,

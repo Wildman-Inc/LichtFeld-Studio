@@ -1640,22 +1640,13 @@ namespace lfs::vis {
         }
 
         // Get camera intrinsics using the proper method
-        auto [focal_x, focal_y, center_x, center_y] = cam_data->get_intrinsics();
-        const float width = static_cast<float>(cam_data->image_width());
+        const auto [focal_x, focal_y, center_x, center_y] = cam_data->get_intrinsics();
+        (void)focal_x;
         const float height = static_cast<float>(cam_data->image_height());
 
         // Calculate vertical FOV using the actual focal length
         const float fov_y_rad = 2.0f * std::atan(height / (2.0f * focal_y));
         const float fov_y_deg = glm::degrees(fov_y_rad);
-
-        // Check for principal point offset (should be near center)
-        const float cx_expected = width / 2.0f;
-        const float cy_expected = height / 2.0f;
-
-        if (std::abs(center_x - cx_expected) > 1.0f || std::abs(center_y - cy_expected) > 1.0f) {
-            LOG_WARN("Camera has non-centered principal point: ({:.1f}, {:.1f}) vs expected ({:.1f}, {:.1f})",
-                     center_x, center_y, cx_expected, cy_expected);
-        }
 
         const bool is_equirectangular =
             cam_data->camera_model_type() == lfs::core::CameraModelType::EQUIRECTANGULAR;
