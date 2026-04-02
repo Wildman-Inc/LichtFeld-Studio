@@ -19,8 +19,8 @@
 #include "optimizer/scheduler.hpp"
 #include "progress.hpp"
 #include "strategies/istrategy.hpp"
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <functional>

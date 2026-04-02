@@ -15,8 +15,8 @@
 #include "operator/operator_id.hpp"
 #include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
-#include "rendering/rendering_manager.hpp"
 #include "rendering/ppisp_overrides_utils.hpp"
+#include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
 #include "tools/align_tool.hpp"
 #include "tools/brush_tool.hpp"
@@ -1709,12 +1709,11 @@ namespace lfs::vis {
                         if (metrics->ssim.has_value()) {
                             metrics_suffix += std::format(", ssim={:.4f}", *metrics->ssim);
                         }
-                        rendering_manager->setLatestCameraMetrics({
-                            .camera_id = event.cam_id,
-                            .iteration = trainer_mgr->getCurrentIteration(),
-                            .psnr = metrics->psnr,
-                            .ssim = metrics->ssim,
-                            .used_mask = metrics->used_mask});
+                        rendering_manager->setLatestCameraMetrics({.camera_id = event.cam_id,
+                                                                   .iteration = trainer_mgr->getCurrentIteration(),
+                                                                   .psnr = metrics->psnr,
+                                                                   .ssim = metrics->ssim,
+                                                                   .used_mask = metrics->used_mask});
                     } else {
                         rendering_manager->clearLatestCameraMetrics();
                         LOG_WARN("Camera {} metrics unavailable: {}", event.cam_id, metrics.error());

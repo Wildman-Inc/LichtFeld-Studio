@@ -34,9 +34,9 @@ namespace lfs::vis {
 
         [[nodiscard]] std::expected<RenderingManager::CameraMetricsOverlayState, std::string>
         computeCameraMetricsForCurrentView(TrainerManager& trainer_mgr,
-                                          const int camera_id,
-                                          const int iteration,
-                                          const RenderSettings& settings) {
+                                           const int camera_id,
+                                           const int iteration,
+                                           const RenderSettings& settings) {
             const bool include_ssim =
                 settings.camera_metrics_mode == RenderSettings::CameraMetricsMode::PSNRSSIM;
             lfs::training::Trainer::CameraMetricsAppearanceConfig appearance{};
