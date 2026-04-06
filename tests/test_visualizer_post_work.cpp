@@ -7,8 +7,8 @@
 #include "core/event_bus.hpp"
 #include "core/services.hpp"
 #include "visualizer/core/data_loading_service.hpp"
-#include "visualizer/visualizer_impl.hpp"
 #include "visualizer/include/visualizer/visualizer.hpp"
+#include "visualizer/visualizer_impl.hpp"
 
 #include <filesystem>
 #include <gtest/gtest.h>
@@ -52,28 +52,28 @@ protected:
 
 namespace lfs::vis {
 
-TEST_F(VisualizerImplResetTest, ResetTrainingPreservesExplicitInitPath) {
-    ViewerOptions options;
-    options.show_startup_overlay = false;
+    TEST_F(VisualizerImplResetTest, ResetTrainingPreservesExplicitInitPath) {
+        ViewerOptions options;
+        options.show_startup_overlay = false;
 
-    const auto dataset_path = std::filesystem::temp_directory_path() / "lfs_reset_preserves_init_dataset";
-    std::filesystem::create_directories(dataset_path);
+        const auto dataset_path = std::filesystem::temp_directory_path() / "lfs_reset_preserves_init_dataset";
+        std::filesystem::create_directories(dataset_path);
 
-    VisualizerImpl viewer(options);
-    viewer.getSceneManager()->changeContentType(SceneManager::ContentType::Dataset);
-    viewer.getSceneManager()->setDatasetPath(dataset_path);
+        VisualizerImpl viewer(options);
+        viewer.getSceneManager()->changeContentType(SceneManager::ContentType::Dataset);
+        viewer.getSceneManager()->setDatasetPath(dataset_path);
 
-    lfs::core::param::TrainingParameters params;
-    params.init_path = "seed_points.ply";
-    viewer.getDataLoader()->setParameters(params);
+        lfs::core::param::TrainingParameters params;
+        params.init_path = "seed_points.ply";
+        viewer.getDataLoader()->setParameters(params);
 
-    viewer.performReset();
+        viewer.performReset();
 
-    ASSERT_TRUE(viewer.getDataLoader()->getParameters().init_path.has_value());
-    EXPECT_EQ(*viewer.getDataLoader()->getParameters().init_path, "seed_points.ply");
+        ASSERT_TRUE(viewer.getDataLoader()->getParameters().init_path.has_value());
+        EXPECT_EQ(*viewer.getDataLoader()->getParameters().init_path, "seed_points.ply");
 
-    std::error_code ec;
-    std::filesystem::remove_all(dataset_path, ec);
-}
+        std::error_code ec;
+        std::filesystem::remove_all(dataset_path, ec);
+    }
 
 } // namespace lfs::vis

@@ -58,9 +58,9 @@
 #include "input/input_controller.hpp"
 #include "python/runner.hpp"
 #include "rendering/rendering_manager.hpp"
-#include "training/training_state.hpp"
 #include "training/strategies/istrategy.hpp"
 #include "training/trainer.hpp"
+#include "training/training_state.hpp"
 #include "visualizer/core/editor_context.hpp"
 #include "visualizer/core/parameter_manager.hpp"
 #include "visualizer/core/services.hpp"
@@ -69,8 +69,8 @@
 #include "visualizer/operator/operator_registry.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
-#include "visualizer/visualizer.hpp"
 #include "visualizer/training/training_manager.hpp"
+#include "visualizer/visualizer.hpp"
 #include "visualizer/window/window_manager.hpp"
 
 #include <atomic>

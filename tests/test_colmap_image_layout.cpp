@@ -303,10 +303,10 @@ TEST_F(ColmapImageLayoutTest, ValidationCanBeCancelledDuringFilesystemScan) {
 
     int cancel_checks = 0;
     auto result = lfs::io::validate_colmap_dataset_layout(dataset_dir, "images", {
-                                                                                  .cancel_requested = [&cancel_checks]() {
-                                                                                      return ++cancel_checks >= 1;
-                                                                                  },
-                                                                              });
+                                                                                     .cancel_requested = [&cancel_checks]() {
+                                                                                         return ++cancel_checks >= 1;
+                                                                                     },
+                                                                                 });
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code, lfs::io::ErrorCode::CANCELLED);
@@ -321,10 +321,10 @@ TEST_F(ColmapImageLayoutTest, LoadCanBeCancelledDuringMetadataParse) {
     int cancel_checks = 0;
     lfs::io::ColmapLoader loader;
     auto result = loader.load(dataset_dir, {
-                                              .cancel_requested = [&cancel_checks]() {
-                                                  return ++cancel_checks >= 2;
-                                              },
-                                          });
+                                               .cancel_requested = [&cancel_checks]() {
+                                                   return ++cancel_checks >= 2;
+                                               },
+                                           });
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code, lfs::io::ErrorCode::CANCELLED);
@@ -343,11 +343,11 @@ TEST_F(ColmapImageLayoutTest, LoadCancelsInsteadOfFallingBackFromCustomPointClou
 
     lfs::io::ColmapLoader loader;
     auto result = loader.load(dataset_dir, {
-                                              .cancel_requested = [&cancel_requested, &cancel_checks]() {
-                                                  const int check_count = cancel_checks.fetch_add(1, std::memory_order_relaxed) + 1;
-                                                  return cancel_requested.load(std::memory_order_relaxed) && check_count >= 50;
-                                              },
-                                          });
+                                               .cancel_requested = [&cancel_requested, &cancel_checks]() {
+                                                   const int check_count = cancel_checks.fetch_add(1, std::memory_order_relaxed) + 1;
+                                                   return cancel_requested.load(std::memory_order_relaxed) && check_count >= 50;
+                                               },
+                                           });
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code, lfs::io::ErrorCode::CANCELLED);

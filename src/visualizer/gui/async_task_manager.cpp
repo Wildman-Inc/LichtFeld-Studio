@@ -873,8 +873,7 @@ namespace lfs::vis::gui {
                             return;
                         import_state_.progress.store(pct / 100.0f);
                         const std::lock_guard lock(import_state_.mutex);
-                        import_state_.stage = msg;
-                    },
+                        import_state_.stage = msg; },
                     .cancel_requested = [&stop_token]() { return stop_token.stop_requested(); }};
 
                 auto loader = lfs::io::Loader::create();
