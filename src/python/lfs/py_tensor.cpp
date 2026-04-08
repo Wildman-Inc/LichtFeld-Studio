@@ -1781,8 +1781,7 @@ namespace lfs::python {
             .def("masked_fill", &PyTensor::masked_fill, nb::arg("mask"), nb::arg("value"), "Fill elements where mask is true")
             .def("masked_fill_", &PyTensor::masked_fill_, nb::arg("mask"), nb::arg("value"), nb::rv_policy::reference, "In-place fill elements where mask is true")
             .def("nonzero", &PyTensor::nonzero, "Indices of non-zero elements")
-            .def("index_add_", &PyTensor::index_add_, nb::arg("dim"), nb::arg("indices"), nb::arg("src"),
-                 nb::rv_policy::reference, "Add src into this tensor at indices along a dimension")
+            .def("index_add_", &PyTensor::index_add_, nb::arg("dim"), nb::arg("indices"), nb::arg("src"), nb::rv_policy::reference, "Add src into this tensor at indices along a dimension")
 
             // Linear algebra
             .def("matmul", &PyTensor::matmul, nb::arg("other"), "Matrix multiplication")
