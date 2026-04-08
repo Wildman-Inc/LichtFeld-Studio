@@ -16,6 +16,8 @@
 #include <glm/glm.hpp>
 #include <memory>
 #include <optional>
+#include <string>
+#include <vector>
 
 struct SDL_Window;
 struct SDL_Cursor;
@@ -162,6 +164,11 @@ namespace lfs::vis {
         std::pair<glm::vec3, glm::vec3> computePickRay(double x, double y) const;
         input::ToolMode getCurrentToolMode() const;
         void clearViewportDragState();
+        void clearSelectedCameraContextMenuGesture();
+        void beginPanDrag(const PanelInteractionState& interaction, int button, double x, double y);
+        [[nodiscard]] bool canOpenSelectedCameraContextMenu(int hovered_camera_uid) const;
+        void openSelectedCameraContextMenu(int hovered_camera_uid, float screen_x, float screen_y);
+        void applyCameraTrainingStateToSelection(const std::vector<std::string>& selected_names, bool enabled);
         bool snapViewportToNearestAxis(Viewport& target_viewport, SplitViewPanelId panel);
 
         // Training pause/resume helpers
@@ -207,6 +214,12 @@ namespace lfs::vis {
         Viewport* drag_viewport_ = nullptr;
         SplitViewPanelId drag_split_panel_ = SplitViewPanelId::Left;
         SplitViewPanelId node_rect_panel_ = SplitViewPanelId::Left;
+        struct PendingCameraContextMenuGesture {
+            bool active = false;
+            int camera_uid = -1;
+            glm::dvec2 press_pos{0.0, 0.0};
+            PanelInteractionState interaction{};
+        } pending_camera_context_menu_;
 
         // Key states
         bool key_r_pressed_ = false;
