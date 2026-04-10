@@ -16,11 +16,51 @@
         <select id="metric-select" class="histogram-select" data-value="metric_id">
           <option data-for="option : metric_options" data-attr-value="option.value">{{ option.label }}</option>
         </select>
+        <span class="control-label">{{ compare_with_label }}</span>
+        <select id="compare-metric-select" class="histogram-select" data-value="compare_metric_id">
+          <option data-for="option : compare_metric_options" data-attr-value="option.value">{{ option.label }}</option>
+        </select>
         <div class="histogram-toggle-row">
           <span class="histogram-toggle-label">{{ log_scale_label }}</span>
           <label class="histogram-toggle-control">
             <input type="checkbox" data-checked="log_scale_enabled" />
           </label>
+        </div>
+        <div class="histogram-slider-group hidden" data-class-hidden="!show_histogram_bins_control">
+          <div class="histogram-slider-header">
+            <span class="control-label">{{ histogram_bins_label }}</span>
+            <span class="slider-value histogram-slider-value">{{ histogram_bin_count }}</span>
+          </div>
+          <input type="range"
+                 class="setting-slider histogram-setting-slider"
+                 data-value="histogram_bin_count"
+                 min="16"
+                 max="128"
+                 step="1" />
+        </div>
+        <div class="histogram-slider-group hidden" data-class-hidden="!show_compare_bins_controls">
+          <div class="histogram-slider-header">
+            <span class="control-label">{{ compare_x_bins_label }}</span>
+            <span class="slider-value histogram-slider-value">{{ compare_x_bin_count }}</span>
+          </div>
+          <input type="range"
+                 class="setting-slider histogram-setting-slider"
+                 data-value="compare_x_bin_count"
+                 min="8"
+                 max="48"
+                 step="1" />
+        </div>
+        <div class="histogram-slider-group hidden" data-class-hidden="!show_compare_bins_controls">
+          <div class="histogram-slider-header">
+            <span class="control-label">{{ compare_y_bins_label }}</span>
+            <span class="slider-value histogram-slider-value">{{ compare_y_bin_count }}</span>
+          </div>
+          <input type="range"
+                 class="setting-slider histogram-setting-slider"
+                 data-value="compare_y_bin_count"
+                 min="8"
+                 max="48"
+                 step="1" />
         </div>
       </div>
     </div>
@@ -32,7 +72,8 @@
       </div>
     </div>
 
-    <div id="histogram-content" data-class-hidden="!show_chart">
+    <div id="histogram-content"
+         data-class-hidden="!show_chart">
       <div id="histogram-stats">
         <div class="stat-card">
           <span class="stat-label">{{ samples_label }}</span>
@@ -60,7 +101,7 @@
         </div>
       </div>
 
-      <div id="histogram-card">
+      <div id="histogram-card" class="hidden" data-class-hidden="!show_histogram_card">
         <div id="histogram-card-header">
           <span id="histogram-summary">{{ summary_text }}</span>
           <span id="histogram-bin-count">{{ bin_count_text }}</span>
@@ -72,7 +113,7 @@
           <div class="histogram-grid-line" style="top: 56%;"></div>
           <div class="histogram-grid-line" style="top: 76%;"></div>
 
-          <div id="histogram-bars">
+          <div id="histogram-bars" data-style-gap="histogram_bar_gap_style">
             <div id="histogram-selection"
                  data-class-hidden="!show_selection_overlay"
                  data-style-left="selection_left_style"
@@ -91,6 +132,60 @@
         <div id="histogram-axis">
           <span class="axis-label">{{ axis_min }}</span>
           <span class="axis-label">{{ axis_max }}</span>
+        </div>
+      </div>
+
+      <div id="compare-card" class="hidden" data-class-hidden="!show_compare_card">
+        <div id="compare-empty" class="hidden" data-class-hidden="!show_compare_empty_state">
+          <div class="empty-card compare-empty-card">
+            <span class="empty-title">{{ compare_empty_title }}</span>
+            <span class="empty-message">{{ compare_empty_message }}</span>
+          </div>
+        </div>
+
+        <div id="compare-content" class="hidden" data-class-hidden="!show_compare_chart">
+          <div id="compare-card-header">
+            <span id="compare-summary">{{ compare_summary_text }}</span>
+            <span id="compare-bin-count">{{ compare_bin_count_text }}</span>
+          </div>
+
+          <div id="compare-chart-shell">
+            <div id="compare-y-axis">
+              <span class="axis-metric">{{ compare_y_metric_label }}</span>
+              <div id="compare-y-axis-values">
+                <span class="axis-label">{{ compare_y_axis_max }}</span>
+                <span class="axis-label">{{ compare_y_axis_min }}</span>
+              </div>
+            </div>
+
+            <div id="compare-chart-column">
+              <div id="compare-chart">
+                <div id="compare-cells">
+                  <div id="compare-selection" class="hidden"
+                       data-class-hidden="!show_compare_selection_overlay"
+                       data-style-left="compare_selection_left_style"
+                       data-style-top="compare_selection_top_style"
+                       data-style-width="compare_selection_width_style"
+                       data-style-height="compare_selection_height_style"></div>
+                  <div class="compare-cell"
+                       style="left: 0%; top: 0%; width: 0%; height: 0%;"
+                       data-for="bin : compare_bins"
+                       data-class-selected="bin.selected"
+                       data-attr-style="bin.style_attr"
+                       data-attr-title="bin.tooltip">
+                    <div class="compare-cell-fill"
+                         data-style-opacity="bin.opacity_style"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div id="compare-axis">
+                <span class="axis-label">{{ compare_x_axis_min }}</span>
+                <span class="axis-metric">{{ compare_x_metric_label }}</span>
+                <span class="axis-label">{{ compare_x_axis_max }}</span>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>

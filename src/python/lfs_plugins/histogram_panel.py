@@ -14,7 +14,14 @@ from .types import Panel
 from .ui.state import AppState
 
 
-BIN_COUNT = 56
+DEFAULT_HISTOGRAM_BIN_COUNT = 56
+MIN_HISTOGRAM_BIN_COUNT = 16
+MAX_HISTOGRAM_BIN_COUNT = 128
+DEFAULT_COMPARE_X_BIN_COUNT = 20
+DEFAULT_COMPARE_Y_BIN_COUNT = 20
+MIN_COMPARE_BIN_COUNT = 8
+MAX_COMPARE_BIN_COUNT = 48
+HISTOGRAM_BAR_GAP = 2.0
 
 
 def _tr(key: str, fallback: str) -> str:
@@ -37,20 +44,32 @@ class HistogramPanel(Panel):
     def __init__(self):
         self._doc = None
         self._chart_el = None
+        self._compare_chart_el = None
         self._close_btn = None
         self._handle = None
 
         self._metric_id = METRICS[0].id
+        self._compare_metric_id = ""
         self._log_scale_enabled = False
+        self._histogram_bin_count = DEFAULT_HISTOGRAM_BIN_COUNT
+        self._compare_x_bin_count = DEFAULT_COMPARE_X_BIN_COUNT
+        self._compare_y_bin_count = DEFAULT_COMPARE_Y_BIN_COUNT
         self._scene_generation = -1
         self._history_generation = -1
         self._last_lang = ""
         self._trainer_state = ""
         self._show_chart = False
+        self._show_compare_card = False
+        self._show_compare_chart = False
         self._empty_title = _tr("histogram.empty.unavailable.title", "Histogram unavailable")
         self._empty_message = _tr(
             "histogram.empty.unavailable.message",
             "Switch to a view or edit scene with Gaussian splats to inspect a distribution.",
+        )
+        self._compare_empty_title = _tr("histogram.compare.empty.title", "Compare unavailable")
+        self._compare_empty_message = _tr(
+            "histogram.compare.empty.message",
+            "Choose a second metric to see how two Gaussian properties cluster together.",
         )
         self._sample_count = "--"
         self._range_text = "--"
@@ -61,17 +80,46 @@ class HistogramPanel(Panel):
         self._axis_min = "--"
         self._axis_max = "--"
         self._summary_text = ""
+        self._compare_summary_text = ""
+        self._compare_x_metric_label = ""
+        self._compare_y_metric_label = ""
+        self._compare_x_axis_min = "--"
+        self._compare_x_axis_max = "--"
+        self._compare_y_axis_min = "--"
+        self._compare_y_axis_max = "--"
+        self._primary_values: lf.Tensor | None = None
+        self._primary_finite_mask: lf.Tensor | None = None
+        self._primary_valid_values: lf.Tensor | None = None
+        self._primary_histogram_min = 0.0
+        self._primary_histogram_max = 1.0
+        self._compare_values: lf.Tensor | None = None
+        self._compare_finite_mask: lf.Tensor | None = None
+        self._compare_valid_x_values: lf.Tensor | None = None
+        self._compare_valid_y_values: lf.Tensor | None = None
+        self._compare_x_min = 0.0
+        self._compare_x_max = 1.0
+        self._compare_y_min = 0.0
+        self._compare_y_max = 1.0
 
         self._selection_bin_indices: lf.Tensor | None = None
         self._hist_counts: list[int] | None = None
         self._hist_prefix_counts: list[int] | None = None
         self._hist_edges: list[float] | None = None
+        self._compare_x_bin_indices: lf.Tensor | None = None
+        self._compare_y_bin_indices: lf.Tensor | None = None
+        self._compare_counts: list[int] | None = None
+        self._compare_x_edges: list[float] | None = None
+        self._compare_y_edges: list[float] | None = None
         self._selection_owned = False
         self._pending_selection_commit = False
+        self._active_mark_source: str | None = None
 
         self._dragging_mark = False
         self._marked_bin_start: int | None = None
         self._marked_bin_end: int | None = None
+        self._dragging_compare_mark = False
+        self._compare_mark_start: tuple[int, int] | None = None
+        self._compare_mark_end: tuple[int, int] | None = None
         self._marked_count = 0
         self._marked_range_text = _tr("histogram.no_marked_range", "No marked range")
         self._marked_count_text = _trf("histogram.gaussian_count", "{count} Gaussians", count="0")
@@ -81,6 +129,10 @@ class HistogramPanel(Panel):
         )
         self._selection_left_style = "0%"
         self._selection_width_style = "0%"
+        self._compare_selection_left_style = "0%"
+        self._compare_selection_top_style = "0%"
+        self._compare_selection_width_style = "0%"
+        self._compare_selection_height_style = "0%"
 
     @classmethod
     def poll(cls, context):
@@ -94,6 +146,7 @@ class HistogramPanel(Panel):
         model.bind_func("panel_label", lambda: _tr("window.histogram", "Histogram"))
         model.bind_func("analysis_label", lambda: _tr("histogram.title_eyebrow", "Gaussian Analysis"))
         model.bind_func("field_label", lambda: _tr("histogram.field", "Field"))
+        model.bind_func("compare_with_label", lambda: _tr("histogram.compare_with", "Compare With"))
         model.bind_func("log_scale_label", lambda: _tr("histogram.log_scale", "Log Scale"))
         model.bind_func("samples_label", lambda: _tr("histogram.samples", "Samples"))
         model.bind_func("range_label", lambda: _tr("histogram.range", "Range"))
@@ -101,7 +154,14 @@ class HistogramPanel(Panel):
         model.bind_func("median_label", lambda: _tr("histogram.median", "Median"))
         model.bind_func("p95_label", lambda: _tr("histogram.p95", "P95"))
         model.bind_func("peak_bin_label", lambda: _tr("histogram.peak_bin", "Peak Bin"))
-        model.bind_func("bin_count_text", lambda: _trf("histogram.bin_count", "{count} bins", count=BIN_COUNT))
+        model.bind_func(
+            "bin_count_text",
+            lambda: _trf("histogram.bin_count", "{count} bins", count=self._histogram_bin_count),
+        )
+        model.bind_func("histogram_bins_label", lambda: _tr("histogram.bins", "Bins"))
+        model.bind_func("compare_x_bins_label", lambda: _tr("histogram.compare_x_bins", "X Bins"))
+        model.bind_func("compare_y_bins_label", lambda: _tr("histogram.compare_y_bins", "Y Bins"))
+        model.bind_func("histogram_bar_gap_style", lambda: f"{HISTOGRAM_BAR_GAP:.2f}px")
         model.bind_func("marked_label", lambda: _tr("histogram.marked", "Marked"))
         model.bind_func("count_label", lambda: _tr("histogram.count", "Count"))
         model.bind_func("undo_tooltip", self._undo_tooltip)
@@ -123,24 +183,54 @@ class HistogramPanel(Panel):
         model.bind_func("axis_min", lambda: self._axis_min)
         model.bind_func("axis_max", lambda: self._axis_max)
         model.bind_func("summary_text", lambda: self._summary_text)
+        model.bind_func("show_histogram_card", lambda: self._show_chart and not self._show_compare_card)
+        model.bind_func("show_histogram_bins_control", lambda: not bool(self._compare_metric_id))
+        model.bind_func("show_compare_bins_controls", lambda: bool(self._compare_metric_id))
+        model.bind_func("show_compare_card", lambda: self._show_compare_card)
+        model.bind_func("show_compare_chart", lambda: self._show_compare_chart)
+        model.bind_func("show_compare_empty_state", lambda: self._show_compare_card and not self._show_compare_chart)
+        model.bind_func("compare_empty_title", lambda: self._compare_empty_title)
+        model.bind_func("compare_empty_message", lambda: self._compare_empty_message)
+        model.bind_func("compare_summary_text", lambda: self._compare_summary_text)
+        model.bind_func(
+            "compare_bin_count_text",
+            self._format_compare_bin_count_text,
+        )
+        model.bind_func("compare_x_metric_label", lambda: self._compare_x_metric_label)
+        model.bind_func("compare_y_metric_label", lambda: self._compare_y_metric_label)
+        model.bind_func("compare_x_axis_min", lambda: self._compare_x_axis_min)
+        model.bind_func("compare_x_axis_max", lambda: self._compare_x_axis_max)
+        model.bind_func("compare_y_axis_min", lambda: self._compare_y_axis_min)
+        model.bind_func("compare_y_axis_max", lambda: self._compare_y_axis_max)
         model.bind_func("show_selection_overlay", self._has_marked_range)
         model.bind_func("selection_left_style", lambda: self._selection_left_style)
         model.bind_func("selection_width_style", lambda: self._selection_width_style)
+        model.bind_func("show_compare_selection_overlay", self._has_compare_marked_range)
+        model.bind_func("compare_selection_left_style", lambda: self._compare_selection_left_style)
+        model.bind_func("compare_selection_top_style", lambda: self._compare_selection_top_style)
+        model.bind_func("compare_selection_width_style", lambda: self._compare_selection_width_style)
+        model.bind_func("compare_selection_height_style", lambda: self._compare_selection_height_style)
         model.bind_func("marked_range_text", lambda: self._marked_range_text)
         model.bind_func("marked_count_text", lambda: self._marked_count_text)
         model.bind_func("status_hint", lambda: self._status_hint)
         model.bind_func("undo_enabled", self._can_undo)
         model.bind_func("redo_enabled", self._can_redo)
-        model.bind_func("clear_enabled", self._has_marked_range)
-        model.bind_func("delete_enabled", lambda: self._has_marked_range() and self._marked_count > 0)
+        model.bind_func("clear_enabled", self._has_any_mark)
+        model.bind_func("delete_enabled", lambda: self._has_any_mark() and self._marked_count > 0)
         model.bind("metric_id", lambda: self._metric_id, self._set_metric_id)
+        model.bind("compare_metric_id", lambda: self._compare_metric_id, self._set_compare_metric_id)
         model.bind("log_scale_enabled", lambda: self._log_scale_enabled, self._set_log_scale_enabled)
+        model.bind("histogram_bin_count", lambda: self._histogram_bin_count, self._set_histogram_bin_count)
+        model.bind("compare_x_bin_count", lambda: self._compare_x_bin_count, self._set_compare_x_bin_count)
+        model.bind("compare_y_bin_count", lambda: self._compare_y_bin_count, self._set_compare_y_bin_count)
         model.bind_event("undo_history", self._on_undo_history)
         model.bind_event("redo_history", self._on_redo_history)
         model.bind_event("clear_mark", self._on_clear_mark)
         model.bind_event("delete_marked", self._on_delete_marked)
         model.bind_record_list("metric_options")
+        model.bind_record_list("compare_metric_options")
         model.bind_record_list("bins")
+        model.bind_record_list("compare_bins")
 
         self._handle = model.get_handle()
         self._rebuild_metric_options()
@@ -149,9 +239,12 @@ class HistogramPanel(Panel):
         super().on_mount(doc)
         self._doc = doc
         self._chart_el = doc.get_element_by_id("histogram-bars")
+        self._compare_chart_el = doc.get_element_by_id("compare-cells")
         self._close_btn = doc.get_element_by_id("close-btn")
         if self._chart_el:
             self._chart_el.add_event_listener("mousedown", self._on_chart_mousedown)
+        if self._compare_chart_el:
+            self._compare_chart_el.add_event_listener("mousedown", self._on_compare_chart_mousedown)
         if self._close_btn:
             self._close_btn.add_event_listener("click", self._on_close_click)
         doc.add_event_listener("mousemove", self._on_document_mousemove)
@@ -205,6 +298,7 @@ class HistogramPanel(Panel):
         self._clear_owned_scene_selection()
         self._doc = None
         self._chart_el = None
+        self._compare_chart_el = None
         self._close_btn = None
         self._handle = None
         doc.remove_data_model("histogram_panel")
@@ -213,9 +307,22 @@ class HistogramPanel(Panel):
         metric_id = str(value)
         if metric_id not in METRIC_BY_ID or metric_id == self._metric_id:
             return
-        self._clear_marked_range(clear_scene=True)
+        self._clear_all_marks(clear_scene=True)
         self._metric_id = metric_id
+        if self._compare_metric_id == metric_id:
+            self._compare_metric_id = ""
         self._rebuild_metric_options()
+        self._refresh()
+
+    def _set_compare_metric_id(self, value):
+        metric_id = str(value)
+        valid_ids = {metric.id for metric in METRICS if metric.id != self._metric_id}
+        metric_id = metric_id if metric_id in valid_ids else ""
+        if metric_id == self._compare_metric_id:
+            return
+        self._clear_compare_mark(clear_scene=self._active_mark_source == "compare")
+        self._compare_metric_id = metric_id
+        self._rebuild_compare_metric_options()
         self._refresh()
 
     def _set_log_scale_enabled(self, value):
@@ -224,6 +331,37 @@ class HistogramPanel(Panel):
             return
         self._log_scale_enabled = enabled
         self._update_bin_records()
+        self._update_compare_bin_records()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _set_histogram_bin_count(self, value):
+        bin_count = self._clamp_int(value, MIN_HISTOGRAM_BIN_COUNT, MAX_HISTOGRAM_BIN_COUNT)
+        if bin_count == self._histogram_bin_count:
+            return
+        self._histogram_bin_count = bin_count
+        if self._show_chart:
+            self._rebuild_histogram_from_cache()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _set_compare_x_bin_count(self, value):
+        bin_count = self._clamp_int(value, MIN_COMPARE_BIN_COUNT, MAX_COMPARE_BIN_COUNT)
+        if bin_count == self._compare_x_bin_count:
+            return
+        self._compare_x_bin_count = bin_count
+        if self._show_compare_card:
+            self._rebuild_compare_from_cache()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _set_compare_y_bin_count(self, value):
+        bin_count = self._clamp_int(value, MIN_COMPARE_BIN_COUNT, MAX_COMPARE_BIN_COUNT)
+        if bin_count == self._compare_y_bin_count:
+            return
+        self._compare_y_bin_count = bin_count
+        if self._show_compare_card:
+            self._rebuild_compare_from_cache()
         if self._handle:
             self._handle.dirty_all()
 
@@ -234,6 +372,20 @@ class HistogramPanel(Panel):
             "metric_options",
             [{"value": metric.id, "label": metric.label()} for metric in METRICS],
         )
+        self._rebuild_compare_metric_options()
+
+    def _rebuild_compare_metric_options(self):
+        if not self._handle:
+            return
+        if self._compare_metric_id == self._metric_id:
+            self._compare_metric_id = ""
+        options = [{"value": "", "label": _tr("histogram.compare.off", "Off")}]
+        options.extend(
+            {"value": metric.id, "label": metric.label()}
+            for metric in METRICS
+            if metric.id != self._metric_id
+        )
+        self._handle.update_record_list("compare_metric_options", options)
 
     def _refresh(self):
         if not self._handle:
@@ -258,7 +410,7 @@ class HistogramPanel(Panel):
             )
             return
 
-        values = self._extract_metric_values(scene, model)
+        values = self._extract_metric_values(scene, model, self._metric_id)
         if values is None:
             self._set_empty(
                 _tr("histogram.empty.metric_unavailable.title", "Metric unavailable"),
@@ -287,17 +439,13 @@ class HistogramPanel(Panel):
         valid_values = values[finite_mask]
         finite_values = valid_values.contiguous().cpu().to("float32")
         metric = METRIC_BY_ID[self._metric_id]
-        histogram_min, histogram_max = self._histogram_bounds(finite_values)
-        selection_bin_indices = self._build_selection_bin_indices(values, finite_mask, histogram_min, histogram_max)
-        valid_bin_indices = self._bin_indices_for_values(valid_values, histogram_min, histogram_max)
-        counts, edges = self._build_histogram(valid_bin_indices, int(finite_values.shape[0]), histogram_min, histogram_max)
-        peak_count = max(counts, default=0)
+        histogram_min, histogram_max = self._histogram_bounds(finite_values, self._metric_id)
         sorted_values, _ = finite_values.sort(0, False)
-
-        self._selection_bin_indices = selection_bin_indices
-        self._hist_counts = counts
-        self._hist_prefix_counts = self._prefix_counts(counts)
-        self._hist_edges = edges
+        self._primary_values = values
+        self._primary_finite_mask = finite_mask
+        self._primary_valid_values = valid_values
+        self._primary_histogram_min = histogram_min
+        self._primary_histogram_max = histogram_max
 
         self._show_chart = True
         self._sample_count = f"{int(finite_values.shape[0]):,}"
@@ -305,9 +453,6 @@ class HistogramPanel(Panel):
         self._mean_text = self._format_value(finite_values.mean_scalar())
         self._median_text = self._format_value(self._percentile_from_sorted(sorted_values, 50.0))
         self._p95_text = self._format_value(self._percentile_from_sorted(sorted_values, 95.0))
-        self._peak_text = f"{peak_count:,}"
-        self._axis_min = self._format_value(edges[0])
-        self._axis_max = self._format_value(edges[-1])
         self._summary_text = _trf(
             "histogram.summary",
             "{metric} distribution across {count} Gaussians",
@@ -315,12 +460,8 @@ class HistogramPanel(Panel):
             count=f"{int(finite_values.shape[0]):,}",
         )
 
-        if self._has_marked_range():
-            self._sync_marked_range(apply_scene=False)
-        else:
-            self._reset_marked_state(clear_scene=False)
-
-        self._update_bin_records()
+        self._rebuild_histogram_from_cache(reset_footer=self._active_mark_source != "compare")
+        self._refresh_compare(scene, model, values, visible_mask)
         self._handle.dirty_all()
 
     def _set_empty(self, title: str, message: str):
@@ -336,14 +477,145 @@ class HistogramPanel(Panel):
         self._axis_min = "--"
         self._axis_max = "--"
         self._summary_text = ""
+        self._primary_values = None
+        self._primary_finite_mask = None
+        self._primary_valid_values = None
+        self._primary_histogram_min = 0.0
+        self._primary_histogram_max = 1.0
         self._selection_bin_indices = None
         self._hist_counts = None
         self._hist_prefix_counts = None
         self._hist_edges = None
+        self._hide_compare(clear_scene=self._active_mark_source == "compare")
         self._reset_marked_state(clear_scene=True)
         if self._handle:
             self._handle.update_record_list("bins", [])
             self._handle.dirty_all()
+
+    def _rebuild_histogram_from_cache(self, reset_footer: bool = False):
+        if self._primary_values is None or self._primary_finite_mask is None or self._primary_valid_values is None:
+            self._selection_bin_indices = None
+            self._hist_counts = None
+            self._hist_prefix_counts = None
+            self._hist_edges = None
+            self._peak_text = "--"
+            self._axis_min = "--"
+            self._axis_max = "--"
+            if self._handle:
+                self._handle.update_record_list("bins", [])
+            return
+
+        mark_ratios = self._capture_histogram_mark_ratios()
+        selection_bin_indices = self._build_selection_bin_indices(
+            self._primary_values,
+            self._primary_finite_mask,
+            self._primary_histogram_min,
+            self._primary_histogram_max,
+            self._histogram_bin_count,
+        )
+        valid_bin_indices = self._bin_indices_for_values(
+            self._primary_valid_values,
+            self._primary_histogram_min,
+            self._primary_histogram_max,
+            self._histogram_bin_count,
+        )
+        counts, edges = self._build_histogram(
+            valid_bin_indices,
+            int(self._primary_valid_values.shape[0]),
+            self._primary_histogram_min,
+            self._primary_histogram_max,
+            self._histogram_bin_count,
+        )
+
+        self._selection_bin_indices = selection_bin_indices
+        self._hist_counts = counts
+        self._hist_prefix_counts = self._prefix_counts(counts)
+        self._hist_edges = edges
+        self._peak_text = f"{max(counts, default=0):,}"
+        self._axis_min = self._format_value(edges[0])
+        self._axis_max = self._format_value(edges[-1])
+
+        if mark_ratios is not None:
+            self._restore_histogram_mark_from_ratios(*mark_ratios)
+            self._sync_marked_range(apply_scene=False)
+        elif reset_footer:
+            self._reset_footer_mark_state(clear_scene=False)
+
+        self._update_bin_records()
+
+    def _rebuild_compare_from_cache(self):
+        if (
+            self._primary_values is None or
+            self._compare_values is None or
+            self._compare_finite_mask is None or
+            self._compare_valid_x_values is None or
+            self._compare_valid_y_values is None
+        ):
+            self._compare_x_bin_indices = None
+            self._compare_y_bin_indices = None
+            self._compare_counts = None
+            self._compare_x_edges = None
+            self._compare_y_edges = None
+            if self._handle:
+                self._handle.update_record_list("compare_bins", [])
+            return
+
+        mark_ratios = self._capture_compare_mark_ratios()
+        x_bin_indices = self._build_selection_bin_indices(
+            self._primary_values,
+            self._compare_finite_mask,
+            self._compare_x_min,
+            self._compare_x_max,
+            self._compare_x_bin_count,
+        )
+        y_bin_indices = self._build_selection_bin_indices(
+            self._compare_values,
+            self._compare_finite_mask,
+            self._compare_y_min,
+            self._compare_y_max,
+            self._compare_y_bin_count,
+        )
+        valid_x_bins = self._bin_indices_for_values(
+            self._compare_valid_x_values,
+            self._compare_x_min,
+            self._compare_x_max,
+            self._compare_x_bin_count,
+        )
+        valid_y_bins = self._bin_indices_for_values(
+            self._compare_valid_y_values,
+            self._compare_y_min,
+            self._compare_y_max,
+            self._compare_y_bin_count,
+        )
+        compare_counts, x_edges, y_edges = self._build_compare_heatmap(
+            valid_x_bins,
+            valid_y_bins,
+            int(self._compare_valid_x_values.shape[0]),
+            self._compare_x_min,
+            self._compare_x_max,
+            self._compare_y_min,
+            self._compare_y_max,
+            self._compare_x_bin_count,
+            self._compare_y_bin_count,
+        )
+
+        self._compare_x_bin_indices = x_bin_indices
+        self._compare_y_bin_indices = y_bin_indices
+        self._compare_counts = compare_counts
+        self._compare_x_edges = x_edges
+        self._compare_y_edges = y_edges
+        self._compare_x_axis_min = self._format_value(x_edges[0])
+        self._compare_x_axis_max = self._format_value(x_edges[-1])
+        self._compare_y_axis_min = self._format_value(y_edges[0])
+        self._compare_y_axis_max = self._format_value(y_edges[-1])
+
+        if mark_ratios is not None:
+            self._restore_compare_mark_from_ratios(*mark_ratios)
+            self._sync_compare_mark(apply_scene=False)
+        elif self._active_mark_source == "compare":
+            self._reset_footer_mark_state(clear_scene=False)
+
+        self._update_compare_bin_records()
 
     def _build_bin_records(self, counts: list[int], edges: list[float]) -> Iterable[dict[str, object]]:
         if self._log_scale_enabled:
@@ -381,37 +653,38 @@ class HistogramPanel(Panel):
             list(self._build_bin_records(self._hist_counts, self._hist_edges)),
         )
 
-    def _extract_metric_values(self, scene, model) -> lf.Tensor | None:
+    def _extract_metric_values(self, scene, model, metric_id: str | None = None) -> lf.Tensor | None:
+        metric_id = self._metric_id if metric_id is None else metric_id
         try:
-            if self._metric_id == "opacity":
+            if metric_id == "opacity":
                 return self._float_tensor(model.get_opacity()).reshape([-1])
 
-            if self._metric_id in {"position_x", "position_y", "position_z", "distance"}:
+            if metric_id in {"position_x", "position_y", "position_z", "distance"}:
                 world_means = self._extract_world_space_means(scene, model)
-                if self._metric_id == "position_x":
+                if metric_id == "position_x":
                     return world_means[:, 0]
-                if self._metric_id == "position_y":
+                if metric_id == "position_y":
                     return world_means[:, 1]
-                if self._metric_id == "position_z":
+                if metric_id == "position_z":
                     return world_means[:, 2]
                 return self._distance_from_positions(scene, world_means)
 
             scaling = self._float_tensor(model.get_scaling()).reshape([-1, 3])
-            if self._metric_id == "scale_x":
+            if metric_id == "scale_x":
                 return scaling[:, 0]
-            if self._metric_id == "scale_y":
+            if metric_id == "scale_y":
                 return scaling[:, 1]
-            if self._metric_id == "scale_z":
+            if metric_id == "scale_z":
                 return scaling[:, 2]
-            if self._metric_id == "scale_max":
+            if metric_id == "scale_max":
                 return scaling.max(1).reshape([-1])
-            if self._metric_id == "volume":
+            if metric_id == "volume":
                 return scaling.prod(1).reshape([-1]) * (4.0 * math.pi / 3.0)
-            if self._metric_id == "anisotropy":
+            if metric_id == "anisotropy":
                 scale_min = scaling.min(1).reshape([-1])
                 scale_max = scaling.max(1).reshape([-1])
                 return scale_max / (scale_min + 1e-12)
-            if self._metric_id == "erank":
+            if metric_id == "erank":
                 return self._effective_rank_from_scaling(scaling)
             return None
         except Exception:
@@ -570,10 +843,11 @@ class HistogramPanel(Panel):
         entropy = -(probabilities * (probabilities + 1e-12).log()).sum(1)
         return entropy.exp().reshape([-1])
 
-    def _histogram_bounds(self, values: lf.Tensor) -> tuple[float, float]:
-        if self._metric_id == "opacity":
+    def _histogram_bounds(self, values: lf.Tensor, metric_id: str | None = None) -> tuple[float, float]:
+        metric_id = self._metric_id if metric_id is None else metric_id
+        if metric_id == "opacity":
             return 0.0, 1.0
-        if self._metric_id == "anisotropy":
+        if metric_id == "anisotropy":
             lo = 1.0
             hi = values.max_scalar()
             if not math.isfinite(hi):
@@ -583,7 +857,7 @@ class HistogramPanel(Panel):
             if math.isclose(hi, lo, rel_tol=1e-6, abs_tol=1e-9):
                 return lo, lo + 1e-3
             return lo, hi
-        if self._metric_id == "erank":
+        if metric_id == "erank":
             return 1.0, 3.0
 
         lo = values.min_scalar()
@@ -603,21 +877,22 @@ class HistogramPanel(Panel):
         value_count: int,
         histogram_min: float,
         histogram_max: float,
+        bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
     ) -> tuple[list[int], list[float]]:
         edges = [
-            histogram_min + (histogram_max - histogram_min) * (index / BIN_COUNT)
-            for index in range(BIN_COUNT + 1)
+            histogram_min + (histogram_max - histogram_min) * (index / bin_count)
+            for index in range(bin_count + 1)
         ]
 
         span = histogram_max - histogram_min
         if not math.isfinite(span) or span <= 0.0:
-            counts = [0] * BIN_COUNT
+            counts = [0] * bin_count
             if value_count > 0:
                 counts[-1] = value_count
             return counts, edges
 
         device = self._device_string(bin_indices)
-        counts_tensor = lf.Tensor.zeros([BIN_COUNT], dtype="int32", device=device)
+        counts_tensor = lf.Tensor.zeros([bin_count], dtype="int32", device=device)
         if value_count > 0:
             ones = lf.Tensor.ones([value_count], dtype="int32", device=device)
             counts_tensor.index_add_(0, bin_indices.contiguous().to("int32"), ones)
@@ -626,7 +901,12 @@ class HistogramPanel(Panel):
         return counts, edges
 
     @staticmethod
-    def _bin_indices_for_values(values: lf.Tensor, histogram_min: float, histogram_max: float) -> lf.Tensor:
+    def _bin_indices_for_values(
+        values: lf.Tensor,
+        histogram_min: float,
+        histogram_max: float,
+        bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
+    ) -> lf.Tensor:
         value_count = int(values.shape[0]) if values.ndim > 0 else int(values.numel)
         device = HistogramPanel._device_string(values)
         if value_count <= 0:
@@ -634,12 +914,12 @@ class HistogramPanel(Panel):
 
         span = histogram_max - histogram_min
         if not math.isfinite(span) or span <= 0.0:
-            return lf.Tensor.full([value_count], BIN_COUNT - 1, dtype="int32", device=device)
+            return lf.Tensor.full([value_count], bin_count - 1, dtype="int32", device=device)
 
         return (
-            (((values - histogram_min) / span) * BIN_COUNT)
+            (((values - histogram_min) / span) * bin_count)
             .floor()
-            .clamp(0.0, float(BIN_COUNT - 1))
+            .clamp(0.0, float(bin_count - 1))
             .reshape([-1])
             .to("int32")
         )
@@ -650,6 +930,7 @@ class HistogramPanel(Panel):
         finite_mask: lf.Tensor,
         histogram_min: float,
         histogram_max: float,
+        bin_count: int = DEFAULT_HISTOGRAM_BIN_COUNT,
     ) -> lf.Tensor:
         value_count = int(values.shape[0]) if values.ndim > 0 else int(values.numel)
         device = self._device_string(values)
@@ -661,6 +942,7 @@ class HistogramPanel(Panel):
             values[finite_mask],
             histogram_min,
             histogram_max,
+            bin_count,
         )
         return selection_bin_indices
 
@@ -672,6 +954,251 @@ class HistogramPanel(Panel):
             running += int(count)
             prefix.append(running)
         return prefix
+
+    def _refresh_compare(self, scene, model, primary_values: lf.Tensor, visible_mask: lf.Tensor | None):
+        if not self._compare_metric_id:
+            self._hide_compare(clear_scene=self._active_mark_source == "compare")
+            return
+
+        compare_values = self._extract_metric_values(scene, model, self._compare_metric_id)
+        if compare_values is None or compare_values.shape != primary_values.shape:
+            self._set_compare_empty(
+                _tr("histogram.compare.empty.metric_unavailable.title", "Compare metric unavailable"),
+                _tr(
+                    "histogram.compare.empty.metric_unavailable.message",
+                    "The comparison metric could not be read from the combined Gaussian model.",
+                ),
+                clear_scene=self._active_mark_source == "compare",
+            )
+            return
+
+        finite_mask = primary_values.isfinite() & compare_values.isfinite()
+        if visible_mask is not None and visible_mask.shape == primary_values.shape:
+            finite_mask = finite_mask & visible_mask
+
+        if not self._any_true(finite_mask):
+            self._set_compare_empty(
+                _tr("histogram.compare.empty.no_visible_values.title", "No comparable values"),
+                _tr(
+                    "histogram.compare.empty.no_visible_values.message",
+                    "The selected metric pair does not contain any visible finite samples to visualize.",
+                ),
+                clear_scene=self._active_mark_source == "compare",
+            )
+            return
+
+        x_valid = primary_values[finite_mask]
+        y_valid = compare_values[finite_mask]
+        x_finite = x_valid.contiguous().cpu().to("float32")
+        y_finite = y_valid.contiguous().cpu().to("float32")
+        x_min, x_max = self._histogram_bounds(x_finite, self._metric_id)
+        y_min, y_max = self._histogram_bounds(y_finite, self._compare_metric_id)
+        self._show_compare_card = True
+        self._show_compare_chart = True
+        self._compare_empty_title = ""
+        self._compare_empty_message = ""
+        self._primary_values = primary_values
+        self._compare_values = compare_values
+        self._compare_finite_mask = finite_mask
+        self._compare_valid_x_values = x_valid
+        self._compare_valid_y_values = y_valid
+        self._compare_x_min = x_min
+        self._compare_x_max = x_max
+        self._compare_y_min = y_min
+        self._compare_y_max = y_max
+        self._compare_summary_text = _trf(
+            "histogram.compare.summary",
+            "{x_metric} vs {y_metric} across {count} Gaussians",
+            x_metric=METRIC_BY_ID[self._metric_id].label(),
+            y_metric=METRIC_BY_ID[self._compare_metric_id].label(),
+            count=f"{int(x_finite.shape[0]):,}",
+        )
+        self._compare_x_metric_label = METRIC_BY_ID[self._metric_id].label()
+        self._compare_y_metric_label = METRIC_BY_ID[self._compare_metric_id].label()
+        self._rebuild_compare_from_cache()
+
+    def _build_compare_heatmap(
+        self,
+        x_bin_indices: lf.Tensor,
+        y_bin_indices: lf.Tensor,
+        value_count: int,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        x_bin_count: int,
+        y_bin_count: int,
+    ) -> tuple[list[int], list[float], list[float]]:
+        x_edges = [
+            x_min + (x_max - x_min) * (index / x_bin_count)
+            for index in range(x_bin_count + 1)
+        ]
+        y_edges = [
+            y_min + (y_max - y_min) * (index / y_bin_count)
+            for index in range(y_bin_count + 1)
+        ]
+
+        device = self._device_string(x_bin_indices)
+        counts_tensor = lf.Tensor.zeros([x_bin_count * y_bin_count], dtype="int32", device=device)
+        if value_count > 0:
+            flat_indices = (y_bin_indices * x_bin_count + x_bin_indices).reshape([-1]).to("int32")
+            ones = lf.Tensor.ones([value_count], dtype="int32", device=device)
+            counts_tensor.index_add_(0, flat_indices.contiguous(), ones)
+        counts = counts_tensor.cpu().tolist() if counts_tensor.is_cuda else counts_tensor.tolist()
+        return [int(count) for count in counts], x_edges, y_edges
+
+    def _set_compare_empty(self, title: str, message: str, clear_scene: bool):
+        self._show_compare_card = bool(self._compare_metric_id)
+        self._show_compare_chart = False
+        self._compare_empty_title = title
+        self._compare_empty_message = message
+        self._compare_summary_text = ""
+        self._compare_x_metric_label = METRIC_BY_ID[self._metric_id].label() if self._metric_id in METRIC_BY_ID else ""
+        self._compare_y_metric_label = (
+            METRIC_BY_ID[self._compare_metric_id].label() if self._compare_metric_id in METRIC_BY_ID else ""
+        )
+        self._compare_x_axis_min = "--"
+        self._compare_x_axis_max = "--"
+        self._compare_y_axis_min = "--"
+        self._compare_y_axis_max = "--"
+        self._clear_compare_cache()
+        self._clear_compare_mark(clear_scene=clear_scene)
+        if self._handle:
+            self._handle.update_record_list("compare_bins", [])
+
+    def _hide_compare(self, clear_scene: bool):
+        self._show_compare_card = False
+        self._show_compare_chart = False
+        self._compare_empty_title = ""
+        self._compare_empty_message = ""
+        self._compare_summary_text = ""
+        self._compare_x_metric_label = ""
+        self._compare_y_metric_label = ""
+        self._compare_x_axis_min = "--"
+        self._compare_x_axis_max = "--"
+        self._compare_y_axis_min = "--"
+        self._compare_y_axis_max = "--"
+        self._clear_compare_cache()
+        self._clear_compare_mark(clear_scene=clear_scene)
+        if self._handle:
+            self._handle.update_record_list("compare_bins", [])
+
+    def _clear_compare_cache(self):
+        self._compare_values = None
+        self._compare_finite_mask = None
+        self._compare_valid_x_values = None
+        self._compare_valid_y_values = None
+        self._compare_x_min = 0.0
+        self._compare_x_max = 1.0
+        self._compare_y_min = 0.0
+        self._compare_y_max = 1.0
+        self._compare_x_bin_indices = None
+        self._compare_y_bin_indices = None
+        self._compare_counts = None
+        self._compare_x_edges = None
+        self._compare_y_edges = None
+
+    def _build_compare_bin_records(self) -> Iterable[dict[str, object]]:
+        if self._compare_counts is None or self._compare_x_edges is None or self._compare_y_edges is None:
+            return []
+
+        if self._log_scale_enabled:
+            display_counts = [math.log1p(float(count)) for count in self._compare_counts]
+        else:
+            display_counts = [float(count) for count in self._compare_counts]
+
+        peak = max(max(display_counts, default=0.0), 1.0)
+        x_lo, x_hi, y_lo, y_hi = self._compare_marked_bounds()
+        records = []
+        cell_width = 100.0 / max(self._compare_x_bin_count, 1)
+        cell_height = 100.0 / max(self._compare_y_bin_count, 1)
+        for row_index, y_bin in enumerate(range(self._compare_y_bin_count - 1, -1, -1)):
+            for x_bin in range(self._compare_x_bin_count):
+                index = y_bin * self._compare_x_bin_count + x_bin
+                count = self._compare_counts[index]
+                ratio = display_counts[index] / peak
+                opacity = 0.08 if count <= 0 else (0.20 + ratio * 0.80)
+                left = self._format_range_text(self._compare_x_edges[x_bin], self._compare_x_edges[x_bin + 1])
+                right = self._format_range_text(self._compare_y_edges[y_bin], self._compare_y_edges[y_bin + 1])
+                records.append(
+                    {
+                        "style_attr": (
+                            f"left: {x_bin * cell_width:.4f}%; "
+                            f"top: {row_index * cell_height:.4f}%; "
+                            f"width: {cell_width:.4f}%; "
+                            f"height: {cell_height:.4f}%;"
+                        ),
+                        "opacity_style": f"{opacity:.3f}",
+                        "selected": (
+                            x_lo is not None and y_lo is not None and
+                            x_lo <= x_bin <= x_hi and
+                            y_lo <= y_bin <= y_hi
+                        ),
+                        "tooltip": _trf(
+                            "histogram.compare.bin_tooltip",
+                            "X {x_range} | Y {y_range} | {count} Gaussians",
+                            x_range=left,
+                            y_range=right,
+                            count=f"{int(count):,}",
+                        ),
+                    }
+                )
+        return records
+
+    def _update_compare_bin_records(self):
+        if self._handle is None:
+            return
+        self._handle.update_record_list("compare_bins", list(self._build_compare_bin_records()))
+
+    def _compare_count_for_bounds(self, x_lo: int, x_hi: int, y_lo: int, y_hi: int) -> int:
+        if self._compare_counts is None:
+            return 0
+        total = 0
+        for y_bin in range(y_lo, y_hi + 1):
+            row_offset = y_bin * self._compare_x_bin_count
+            for x_bin in range(x_lo, x_hi + 1):
+                total += int(self._compare_counts[row_offset + x_bin])
+        return total
+
+    def _capture_histogram_mark_ratios(self) -> tuple[float, float] | None:
+        old_bin_count = len(self._hist_counts) if self._hist_counts else self._histogram_bin_count
+        lo, hi = self._marked_bounds(old_bin_count)
+        if lo is None or hi is None:
+            return None
+        return lo / old_bin_count, (hi + 1) / old_bin_count
+
+    def _restore_histogram_mark_from_ratios(self, start_ratio: float, end_ratio: float):
+        self._marked_bin_start = self._lower_bin_from_ratio(start_ratio, self._histogram_bin_count)
+        self._marked_bin_end = self._upper_bin_from_ratio(end_ratio, self._histogram_bin_count)
+
+    def _capture_compare_mark_ratios(self) -> tuple[float, float, float, float] | None:
+        old_x_count = len(self._compare_x_edges) - 1 if self._compare_x_edges is not None else self._compare_x_bin_count
+        old_y_count = len(self._compare_y_edges) - 1 if self._compare_y_edges is not None else self._compare_y_bin_count
+        x_lo, x_hi, y_lo, y_hi = self._compare_marked_bounds(old_x_count, old_y_count)
+        if x_lo is None or x_hi is None or y_lo is None or y_hi is None:
+            return None
+        return (
+            x_lo / old_x_count,
+            (x_hi + 1) / old_x_count,
+            y_lo / old_y_count,
+            (y_hi + 1) / old_y_count,
+        )
+
+    def _restore_compare_mark_from_ratios(
+        self,
+        x_start_ratio: float,
+        x_end_ratio: float,
+        y_start_ratio: float,
+        y_end_ratio: float,
+    ):
+        self._compare_mark_start = (
+            self._lower_bin_from_ratio(x_start_ratio, self._compare_x_bin_count),
+            self._lower_bin_from_ratio(y_start_ratio, self._compare_y_bin_count),
+        )
+        self._compare_mark_end = (
+            self._upper_bin_from_ratio(x_end_ratio, self._compare_x_bin_count),
+            self._upper_bin_from_ratio(y_end_ratio, self._compare_y_bin_count),
+        )
 
     def _marked_count_for_bins(self, lo: int, hi: int) -> int:
         if self._hist_prefix_counts is None:
@@ -703,6 +1230,7 @@ class HistogramPanel(Panel):
         if int(event.get_parameter("button", "0")) != 0:
             return
 
+        self._clear_compare_mark(clear_scene=False)
         bin_index = self._bin_index_for_mouse_x(self._event_mouse_x(event))
         self._dragging_mark = True
         self._marked_bin_start = bin_index
@@ -710,24 +1238,52 @@ class HistogramPanel(Panel):
         self._sync_marked_range(apply_scene=False)
         event.stop_propagation()
 
-    def _on_document_mousemove(self, event):
-        if not self._dragging_mark or self._chart_el is None:
+    def _on_compare_chart_mousedown(self, event):
+        if not self._show_compare_chart or self._compare_chart_el is None:
+            return
+        if int(event.get_parameter("button", "0")) != 0:
             return
 
-        bin_index = self._bin_index_for_mouse_x(self._event_mouse_x(event))
-        if bin_index == self._marked_bin_end:
-            return
-        self._marked_bin_end = bin_index
-        self._sync_marked_range(apply_scene=False)
+        self._clear_histogram_mark(clear_scene=False)
+        x_bin, y_bin = self._compare_bin_indices_for_mouse(
+            self._event_mouse_x(event),
+            self._event_mouse_y(event),
+        )
+        self._dragging_compare_mark = True
+        self._compare_mark_start = (x_bin, y_bin)
+        self._compare_mark_end = (x_bin, y_bin)
+        self._sync_compare_mark(apply_scene=False)
         event.stop_propagation()
+
+    def _on_document_mousemove(self, event):
+        if self._dragging_compare_mark and self._compare_chart_el is not None:
+            bins = self._compare_bin_indices_for_mouse(self._event_mouse_x(event), self._event_mouse_y(event))
+            if bins == self._compare_mark_end:
+                return
+            self._compare_mark_end = bins
+            self._sync_compare_mark(apply_scene=False)
+            event.stop_propagation()
+            return
+
+        if self._dragging_mark and self._chart_el is not None:
+            bin_index = self._bin_index_for_mouse_x(self._event_mouse_x(event))
+            if bin_index == self._marked_bin_end:
+                return
+            self._marked_bin_end = bin_index
+            self._sync_marked_range(apply_scene=False)
+            event.stop_propagation()
 
     def _on_document_mouseup(self, event):
-        if not self._dragging_mark:
+        if self._dragging_compare_mark:
+            self._dragging_compare_mark = False
+            self._sync_compare_mark(apply_scene=True)
+            event.stop_propagation()
             return
 
-        self._dragging_mark = False
-        self._sync_marked_range(apply_scene=True)
-        event.stop_propagation()
+        if self._dragging_mark:
+            self._dragging_mark = False
+            self._sync_marked_range(apply_scene=True)
+            event.stop_propagation()
 
     def _event_mouse_x(self, event) -> float:
         try:
@@ -735,39 +1291,69 @@ class HistogramPanel(Panel):
         except Exception:
             return 0.0
 
+    def _event_mouse_y(self, event) -> float:
+        try:
+            return float(event.get_parameter("mouse_y", "0"))
+        except Exception:
+            return 0.0
+
     def _bin_index_for_mouse_x(self, mouse_x: float) -> int:
         if self._chart_el is None:
             return 0
         left = float(self._chart_el.absolute_left)
-        width = max(float(self._chart_el.absolute_width), 1.0)
-        norm = min(1.0, max(0.0, (mouse_x - left) / width))
-        return min(BIN_COUNT - 1, max(0, int(math.floor(norm * BIN_COUNT))))
+        total_width, bar_width, gap_width = self._histogram_bar_geometry(self._histogram_bin_count)
+        local_x = min(max(mouse_x - left, 0.0), max(total_width - 1e-6, 0.0))
+        step = max(bar_width + gap_width, 1e-6)
+        return min(self._histogram_bin_count - 1, max(0, int(math.floor(local_x / step))))
 
-    def _marked_bounds(self) -> tuple[int | None, int | None]:
+    def _marked_bounds(self, bin_count: int | None = None) -> tuple[int | None, int | None]:
         if self._marked_bin_start is None or self._marked_bin_end is None:
             return None, None
+        bin_count = max(1, self._histogram_bin_count if bin_count is None else int(bin_count))
         lo = max(0, min(self._marked_bin_start, self._marked_bin_end))
-        hi = min(BIN_COUNT - 1, max(self._marked_bin_start, self._marked_bin_end))
+        hi = min(bin_count - 1, max(self._marked_bin_start, self._marked_bin_end))
         return lo, hi
 
     def _has_marked_range(self) -> bool:
         lo, hi = self._marked_bounds()
         return lo is not None and hi is not None
 
+    def _compare_marked_bounds(
+        self,
+        x_bin_count: int | None = None,
+        y_bin_count: int | None = None,
+    ) -> tuple[int | None, int | None, int | None, int | None]:
+        if self._compare_mark_start is None or self._compare_mark_end is None:
+            return None, None, None, None
+        x_bin_count = max(1, self._compare_x_bin_count if x_bin_count is None else int(x_bin_count))
+        y_bin_count = max(1, self._compare_y_bin_count if y_bin_count is None else int(y_bin_count))
+        x_lo = max(0, min(self._compare_mark_start[0], self._compare_mark_end[0]))
+        x_hi = min(x_bin_count - 1, max(self._compare_mark_start[0], self._compare_mark_end[0]))
+        y_lo = max(0, min(self._compare_mark_start[1], self._compare_mark_end[1]))
+        y_hi = min(y_bin_count - 1, max(self._compare_mark_start[1], self._compare_mark_end[1]))
+        return x_lo, x_hi, y_lo, y_hi
+
+    def _has_compare_marked_range(self) -> bool:
+        x_lo, x_hi, y_lo, y_hi = self._compare_marked_bounds()
+        return x_lo is not None and x_hi is not None and y_lo is not None and y_hi is not None
+
+    def _has_any_mark(self) -> bool:
+        return self._has_marked_range() or self._has_compare_marked_range()
+
     def _sync_marked_range(self, apply_scene: bool):
         if self._hist_counts is None or self._hist_edges is None:
-            self._reset_marked_state(clear_scene=apply_scene)
+            self._reset_footer_mark_state(clear_scene=apply_scene)
             return
 
         lo, hi = self._marked_bounds()
         if lo is None or hi is None:
-            self._reset_marked_state(clear_scene=apply_scene)
+            self._reset_footer_mark_state(clear_scene=apply_scene)
             return
 
-        left_ratio = lo / BIN_COUNT
-        width_ratio = (hi + 1) / BIN_COUNT - left_ratio
-        self._selection_left_style = f"{left_ratio * 100.0:.2f}%"
-        self._selection_width_style = f"{max(width_ratio * 100.0, 1.0):.2f}%"
+        self._active_mark_source = "histogram"
+        left_px, width_px = self._histogram_selection_geometry(lo, hi)
+        self._selection_left_style = f"{left_px:.2f}px"
+        self._selection_width_style = f"{max(width_px, 1.0):.2f}px"
 
         range_min = float(self._hist_edges[lo])
         range_max = float(self._hist_edges[hi + 1])
@@ -789,9 +1375,78 @@ class HistogramPanel(Panel):
         if self._handle:
             self._handle.dirty_all()
 
-    def _reset_marked_state(self, clear_scene: bool):
+    def _histogram_bar_geometry(self, bin_count: int) -> tuple[float, float, float]:
+        bin_count = max(1, int(bin_count))
+        if self._chart_el is None:
+            return float(bin_count), 1.0, 0.0
+
+        total_width = max(float(self._chart_el.absolute_width), 1.0)
+        gap_width = HISTOGRAM_BAR_GAP
+        total_gap = gap_width * max(bin_count - 1, 0)
+        if total_gap >= total_width:
+            gap_width = 0.0
+            total_gap = 0.0
+        bar_width = max((total_width - total_gap) / bin_count, 1.0 / bin_count)
+        return total_width, bar_width, gap_width
+
+    def _histogram_selection_geometry(self, lo: int, hi: int) -> tuple[float, float]:
+        _, bar_width, gap_width = self._histogram_bar_geometry(self._histogram_bin_count)
+        left = lo * (bar_width + gap_width)
+        width = ((hi - lo) + 1) * bar_width + max(0, hi - lo) * gap_width
+        return left, width
+
+    def _sync_compare_mark(self, apply_scene: bool):
+        if self._compare_counts is None or self._compare_x_edges is None or self._compare_y_edges is None:
+            self._reset_footer_mark_state(clear_scene=apply_scene)
+            return
+
+        x_lo, x_hi, y_lo, y_hi = self._compare_marked_bounds()
+        if x_lo is None or x_hi is None or y_lo is None or y_hi is None:
+            self._reset_footer_mark_state(clear_scene=apply_scene)
+            return
+
+        self._active_mark_source = "compare"
+        left_ratio = x_lo / self._compare_x_bin_count
+        width_ratio = (x_hi + 1) / self._compare_x_bin_count - left_ratio
+        top_ratio = (self._compare_y_bin_count - 1 - y_hi) / self._compare_y_bin_count
+        height_ratio = (y_hi - y_lo + 1) / self._compare_y_bin_count
+        self._compare_selection_left_style = f"{left_ratio * 100.0:.2f}%"
+        self._compare_selection_top_style = f"{top_ratio * 100.0:.2f}%"
+        self._compare_selection_width_style = f"{max(width_ratio * 100.0, 1.0):.2f}%"
+        self._compare_selection_height_style = f"{max(height_ratio * 100.0, 1.0):.2f}%"
+
+        x_min = float(self._compare_x_edges[x_lo])
+        x_max = float(self._compare_x_edges[x_hi + 1])
+        y_min = float(self._compare_y_edges[y_lo])
+        y_max = float(self._compare_y_edges[y_hi + 1])
+        self._marked_count = self._compare_count_for_bounds(x_lo, x_hi, y_lo, y_hi)
+        self._marked_range_text = _trf(
+            "histogram.compare.range_value",
+            "X {x_range} | Y {y_range}",
+            x_range=self._format_range_text(x_min, x_max),
+            y_range=self._format_range_text(y_min, y_max),
+        )
+        self._marked_count_text = _trf(
+            "histogram.gaussian_count",
+            "{count} Gaussians",
+            count=f"{self._marked_count:,}",
+        )
+        self._status_hint = _tr(
+            "histogram.compare.status_selection",
+            "Marked compare region becomes the active Gaussian selection.",
+        )
+
+        self._update_compare_bin_records()
+        if apply_scene:
+            self._apply_compare_scene_selection(x_lo, x_hi, y_lo, y_hi)
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _reset_footer_mark_state(self, clear_scene: bool):
         self._marked_bin_start = None
         self._marked_bin_end = None
+        self._compare_mark_start = None
+        self._compare_mark_end = None
         self._marked_count = 0
         self._marked_range_text = _tr("histogram.no_marked_range", "No marked range")
         self._marked_count_text = _trf("histogram.gaussian_count", "{count} Gaussians", count="0")
@@ -801,17 +1456,50 @@ class HistogramPanel(Panel):
         )
         self._selection_left_style = "0%"
         self._selection_width_style = "0%"
+        self._compare_selection_left_style = "0%"
+        self._compare_selection_top_style = "0%"
+        self._compare_selection_width_style = "0%"
+        self._compare_selection_height_style = "0%"
+        self._active_mark_source = None
         if clear_scene:
             self._clear_owned_scene_selection()
         else:
             self._selection_owned = False
             self._pending_selection_commit = False
 
-    def _clear_marked_range(self, clear_scene: bool):
-        self._reset_marked_state(clear_scene=clear_scene)
+    def _reset_marked_state(self, clear_scene: bool):
+        self._reset_footer_mark_state(clear_scene=clear_scene)
+        self._update_bin_records()
+        self._update_compare_bin_records()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _clear_histogram_mark(self, clear_scene: bool):
+        self._marked_bin_start = None
+        self._marked_bin_end = None
+        self._selection_left_style = "0%"
+        self._selection_width_style = "0%"
+        if self._active_mark_source == "histogram":
+            self._reset_footer_mark_state(clear_scene=clear_scene)
         self._update_bin_records()
         if self._handle:
             self._handle.dirty_all()
+
+    def _clear_compare_mark(self, clear_scene: bool):
+        self._compare_mark_start = None
+        self._compare_mark_end = None
+        self._compare_selection_left_style = "0%"
+        self._compare_selection_top_style = "0%"
+        self._compare_selection_width_style = "0%"
+        self._compare_selection_height_style = "0%"
+        if self._active_mark_source == "compare":
+            self._reset_footer_mark_state(clear_scene=clear_scene)
+        self._update_compare_bin_records()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _clear_all_marks(self, clear_scene: bool):
+        self._reset_marked_state(clear_scene=clear_scene)
 
     def _selection_mask_for_bins(self, lo: int, hi: int) -> lf.Tensor | None:
         if self._selection_bin_indices is None:
@@ -819,6 +1507,16 @@ class HistogramPanel(Panel):
 
         mask = self._selection_bin_indices >= lo
         mask = mask & (self._selection_bin_indices <= hi)
+        return mask
+
+    def _selection_mask_for_compare_bounds(self, x_lo: int, x_hi: int, y_lo: int, y_hi: int) -> lf.Tensor | None:
+        if self._compare_x_bin_indices is None or self._compare_y_bin_indices is None:
+            return None
+
+        mask = self._compare_x_bin_indices >= x_lo
+        mask = mask & (self._compare_x_bin_indices <= x_hi)
+        mask = mask & (self._compare_y_bin_indices >= y_lo)
+        mask = mask & (self._compare_y_bin_indices <= y_hi)
         return mask
 
     def _apply_scene_selection(self, lo: int, hi: int):
@@ -842,6 +1540,44 @@ class HistogramPanel(Panel):
         except Exception:
             self._selection_owned = False
             self._pending_selection_commit = False
+
+    def _apply_compare_scene_selection(self, x_lo: int, x_hi: int, y_lo: int, y_hi: int):
+        scene = lf.get_scene()
+        if scene is None or not scene.is_valid():
+            self._selection_owned = False
+            self._pending_selection_commit = False
+            return
+
+        mask = self._selection_mask_for_compare_bounds(x_lo, x_hi, y_lo, y_hi)
+        if mask is None or not self._any_true(mask):
+            scene.clear_selection()
+            self._selection_owned = False
+            self._pending_selection_commit = False
+            return
+
+        try:
+            scene.set_selection_mask(mask.contiguous())
+            self._selection_owned = True
+            self._pending_selection_commit = True
+        except Exception:
+            self._selection_owned = False
+            self._pending_selection_commit = False
+
+    def _compare_bin_indices_for_mouse(self, mouse_x: float, mouse_y: float) -> tuple[int, int]:
+        if self._compare_chart_el is None:
+            return 0, 0
+        left = float(self._compare_chart_el.absolute_left)
+        top = float(self._compare_chart_el.absolute_top)
+        width = max(float(self._compare_chart_el.absolute_width), 1.0)
+        height = max(float(self._compare_chart_el.absolute_height), 1.0)
+        norm_x = min(1.0, max(0.0, (mouse_x - left) / width))
+        norm_y = min(1.0, max(0.0, (mouse_y - top) / height))
+        x_bin = min(self._compare_x_bin_count - 1, max(0, int(math.floor(norm_x * self._compare_x_bin_count))))
+        y_bin = min(
+            self._compare_y_bin_count - 1,
+            max(0, int(math.floor((1.0 - norm_y) * self._compare_y_bin_count))),
+        )
+        return x_bin, y_bin
 
     def _clear_owned_scene_selection(self):
         scene = lf.get_scene()
@@ -891,7 +1627,7 @@ class HistogramPanel(Panel):
         return _tr("histogram.redo", "Redo")
 
     def _on_clear_mark(self, _handle, _event, _args):
-        self._clear_marked_range(clear_scene=True)
+        self._clear_all_marks(clear_scene=True)
 
     def _on_close_click(self, event):
         self._clear_owned_scene_selection()
@@ -945,14 +1681,19 @@ class HistogramPanel(Panel):
         )
 
     def _on_delete_marked(self, _handle, _event, _args):
-        if not self._has_marked_range() or self._marked_count <= 0:
+        if not self._has_any_mark() or self._marked_count <= 0:
             return
 
-        lo, hi = self._marked_bounds()
-        if lo is None or hi is None or self._hist_edges is None:
-            return
-
-        self._apply_scene_selection(lo, hi)
+        if self._active_mark_source == "compare":
+            x_lo, x_hi, y_lo, y_hi = self._compare_marked_bounds()
+            if x_lo is None or x_hi is None or y_lo is None or y_hi is None:
+                return
+            self._apply_compare_scene_selection(x_lo, x_hi, y_lo, y_hi)
+        else:
+            lo, hi = self._marked_bounds()
+            if lo is None or hi is None or self._hist_edges is None:
+                return
+            self._apply_scene_selection(lo, hi)
         error_message = self._execute_delete_pipeline()
         if error_message is not None:
             self._status_hint = _trf(
@@ -972,15 +1713,43 @@ class HistogramPanel(Panel):
                 pass
             return
 
-        self._clear_marked_range(clear_scene=False)
+        self._clear_all_marks(clear_scene=False)
         self._scene_generation = -1
         self._refresh()
+
+    def _format_compare_bin_count_text(self) -> str:
+        return _trf(
+            "histogram.compare_bin_count",
+            "{x_count} x {y_count} bins",
+            x_count=self._compare_x_bin_count,
+            y_count=self._compare_y_bin_count,
+        )
 
     @staticmethod
     def _coerce_bool(value) -> bool:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    @staticmethod
+    def _clamp_int(value, minimum: int, maximum: int) -> int:
+        try:
+            value = int(round(float(value)))
+        except Exception:
+            value = minimum
+        return max(minimum, min(maximum, value))
+
+    @staticmethod
+    def _lower_bin_from_ratio(start_ratio: float, bin_count: int) -> int:
+        bin_count = max(1, int(bin_count))
+        ratio = min(1.0, max(0.0, float(start_ratio)))
+        return min(bin_count - 1, max(0, int(math.floor(ratio * bin_count))))
+
+    @staticmethod
+    def _upper_bin_from_ratio(end_ratio: float, bin_count: int) -> int:
+        bin_count = max(1, int(bin_count))
+        ratio = min(1.0, max(0.0, float(end_ratio)))
+        return min(bin_count - 1, max(0, int(math.ceil(ratio * bin_count) - 1)))
 
     @staticmethod
     def _format_value(value: float) -> str:

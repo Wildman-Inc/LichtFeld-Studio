@@ -1135,6 +1135,9 @@
     "p95": "P95",
     "peak_bin": "Peak Bin",
     "bin_count": "{count} bins",
+    "bins": "Kosze",
+    "compare_x_bins": "Kosze X",
+    "compare_y_bins": "Kosze Y",
     "marked": "Marked",
     "count": "Count",
     "clear": "Clear",
@@ -1146,6 +1149,27 @@
     "status_selection": "Marked range becomes the active Gaussian selection.",
     "summary": "{metric} distribution across {count} Gaussians",
     "bin_tooltip": "Bin {index}: {left} to {right} | {count} Gaussians",
+    "compare_with": "Compare With",
+    "compare_bin_count": "{x_count} x {y_count} koszy",
+    "compare": {
+      "off": "Off",
+      "summary": "{x_metric} vs {y_metric} across {count} Gaussians",
+      "range_value": "X {x_range} | Y {y_range}",
+      "status_selection": "Marked compare region becomes the active Gaussian selection.",
+      "bin_tooltip": "X {x_range} | Y {y_range} | {count} Gaussians",
+      "empty": {
+        "title": "Compare unavailable",
+        "message": "Choose a second metric to see how two Gaussian properties cluster together.",
+        "metric_unavailable": {
+          "title": "Compare metric unavailable",
+          "message": "The comparison metric could not be read from the combined Gaussian model."
+        },
+        "no_visible_values": {
+          "title": "No comparable values",
+          "message": "The selected metric pair does not contain any visible finite samples to visualize."
+        }
+      }
+    },
     "delete_failed": {
       "title": "Delete Failed",
       "status": "Delete failed: {message}",

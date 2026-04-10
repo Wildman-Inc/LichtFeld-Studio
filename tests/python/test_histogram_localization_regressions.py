@@ -36,3 +36,33 @@ def test_erank_locales_are_not_left_as_english_placeholders():
         assert metric["description"] != en_metric["description"], (
             f"{locale_path.name} erank description still uses English placeholder"
         )
+
+
+def test_histogram_compare_locales_define_required_keys():
+    project_root = Path(__file__).parent.parent.parent
+    locale_dir = project_root / "src" / "visualizer" / "gui" / "resources" / "locales"
+
+    for locale_path in sorted(locale_dir.glob("*.json")):
+        histogram = json.loads(locale_path.read_text())["histogram"]
+        assert "bins" in histogram, f"{locale_path.name} missing histogram.bins"
+        assert "compare_x_bins" in histogram, f"{locale_path.name} missing histogram.compare_x_bins"
+        assert "compare_y_bins" in histogram, f"{locale_path.name} missing histogram.compare_y_bins"
+        assert "compare_with" in histogram, f"{locale_path.name} missing histogram.compare_with"
+        assert "compare_bin_count" in histogram, f"{locale_path.name} missing histogram.compare_bin_count"
+        assert "{x_count}" in histogram["compare_bin_count"], f"{locale_path.name} compare_bin_count missing x_count"
+        assert "{y_count}" in histogram["compare_bin_count"], f"{locale_path.name} compare_bin_count missing y_count"
+        assert "compare" in histogram, f"{locale_path.name} missing histogram.compare"
+
+        compare = histogram["compare"]
+        assert "off" in compare, f"{locale_path.name} missing histogram.compare.off"
+        assert "summary" in compare, f"{locale_path.name} missing histogram.compare.summary"
+        assert "range_value" in compare, f"{locale_path.name} missing histogram.compare.range_value"
+        assert "status_selection" in compare, f"{locale_path.name} missing histogram.compare.status_selection"
+        assert "bin_tooltip" in compare, f"{locale_path.name} missing histogram.compare.bin_tooltip"
+        assert "empty" in compare, f"{locale_path.name} missing histogram.compare.empty"
+
+        empty = compare["empty"]
+        assert "title" in empty, f"{locale_path.name} missing histogram.compare.empty.title"
+        assert "message" in empty, f"{locale_path.name} missing histogram.compare.empty.message"
+        assert "metric_unavailable" in empty, f"{locale_path.name} missing histogram.compare.empty.metric_unavailable"
+        assert "no_visible_values" in empty, f"{locale_path.name} missing histogram.compare.empty.no_visible_values"
