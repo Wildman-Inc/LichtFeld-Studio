@@ -1031,24 +1031,27 @@ namespace lfs::vis::gui {
             input.mouse_wheel != 0.0f)
             had_input = true;
 
+        const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
+                                      input.key_alt, input.key_super);
+
         if (mouse_moved) {
             last_forwarded_mx_ = rml_mx;
             last_forwarded_my_ = rml_my;
-            rml_context_->ProcessMouseMove(rml_mx, rml_my, 0);
+            rml_context_->ProcessMouseMove(rml_mx, rml_my, mods);
         }
         if (hovered) {
             if (input.mouse_clicked[0])
-                rml_context_->ProcessMouseButtonDown(0, 0);
+                rml_context_->ProcessMouseButtonDown(0, mods);
             if (input.mouse_released[0])
-                rml_context_->ProcessMouseButtonUp(0, 0);
+                rml_context_->ProcessMouseButtonUp(0, mods);
 
             if (input.mouse_clicked[1])
-                rml_context_->ProcessMouseButtonDown(1, 0);
+                rml_context_->ProcessMouseButtonDown(1, mods);
             if (input.mouse_released[1])
-                rml_context_->ProcessMouseButtonUp(1, 0);
+                rml_context_->ProcessMouseButtonUp(1, mods);
 
             if (input.mouse_wheel != 0.0f)
-                rml_context_->ProcessMouseWheel(Rml::Vector2f(0, -input.mouse_wheel), 0);
+                rml_context_->ProcessMouseWheel(Rml::Vector2f(0, -input.mouse_wheel), mods);
 
             if (input.mouse_clicked[0])
                 sync_text_focus();
@@ -1078,8 +1081,6 @@ namespace lfs::vis::gui {
         };
 
         if (forward_keys) {
-            const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
-                                          input.key_alt, input.key_super);
             for (int sc : input.keys_pressed) {
                 if (!composing && sc == SDL_SCANCODE_ESCAPE) {
                     if (auto* const focused = rml_context_->GetFocusElement();

@@ -51,6 +51,7 @@
 #include "visualizer/input/key_codes.hpp"
 
 #include <SDL3/SDL_clipboard.h>
+#include <SDL3/SDL_keyboard.h>
 
 #include <algorithm>
 #include <atomic>
@@ -3945,12 +3946,12 @@ namespace lfs::python {
 
         m.def(
             "is_ctrl_down",
-            []() { return ImGui::GetIO().KeyCtrl; },
+            []() { return (SDL_GetModState() & SDL_KMOD_CTRL) != 0; },
             "Check if Ctrl is currently held");
 
         m.def(
             "is_shift_down",
-            []() { return ImGui::GetIO().KeyShift; },
+            []() { return (SDL_GetModState() & SDL_KMOD_SHIFT) != 0; },
             "Check if Shift is currently held");
 
         // Localization
