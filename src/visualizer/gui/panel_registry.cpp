@@ -44,6 +44,7 @@ namespace lfs::vis::gui {
             case PanelSpace::ViewportOverlay: return "viewport_overlay";
             case PanelSpace::MainPanelTab: return "main_panel_tab";
             case PanelSpace::SceneHeader: return "scene_header";
+            case PanelSpace::BottomDock: return "bottom_dock";
             case PanelSpace::StatusBar: return "status_bar";
             }
             return "unknown";
@@ -686,6 +687,8 @@ namespace lfs::vis::gui {
                 case PanelSpace::SceneHeader:
                     snap.panel->draw(ctx);
                     break;
+                case PanelSpace::BottomDock:
+                    break;
                 case PanelSpace::StatusBar:
                     with_panel_input(snap.panel, [&] { snap.panel->draw(ctx); });
                     break;
@@ -824,10 +827,10 @@ namespace lfs::vis::gui {
         return y_offset;
     }
 
-    void PanelRegistry::preload_panels_direct(PanelSpace space, float w, float max_h,
-                                              const PanelDrawContext& ctx,
-                                              float clip_y_min, float clip_y_max,
-                                              const PanelInputState* input) {
+    float PanelRegistry::preload_panels_direct(PanelSpace space, float w, float max_h,
+                                               const PanelDrawContext& ctx,
+                                               float clip_y_min, float clip_y_max,
+                                               const PanelInputState* input) {
         std::vector<PanelSnapshot> snapshots;
         {
             std::lock_guard lock(mutex_);
@@ -872,6 +875,7 @@ namespace lfs::vis::gui {
 
             track_draw_result(snap, preload_succeeded);
         }
+        return y_offset;
     }
 
     void PanelRegistry::draw_single_panel(const std::string& id, const PanelDrawContext& ctx) {

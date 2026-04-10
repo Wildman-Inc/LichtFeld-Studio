@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Floating retained panel for Gaussian histogram analysis."""
+"""Docked retained panel for Gaussian histogram analysis."""
 
 from __future__ import annotations
 
@@ -35,18 +35,20 @@ def _trf(key: str, fallback: str, **kwargs) -> str:
 class HistogramPanel(Panel):
     id = "lfs.histogram"
     label = "Histogram"
-    space = lf.ui.PanelSpace.FLOATING
+    space = lf.ui.PanelSpace.BOTTOM_DOCK
     order = 97
     template = "rmlui/histogram_panel.rml"
     size = (860, 660)
+    height_mode = lf.ui.PanelHeightMode.FILL
     update_interval_ms = 250
 
     def __init__(self):
         self._doc = None
         self._chart_el = None
         self._compare_chart_el = None
-        self._close_btn = None
         self._handle = None
+        self._panel_space = lf.ui.PanelSpace.BOTTOM_DOCK
+        self._is_floating = False
 
         self._metric_id = METRICS[0].id
         self._compare_metric_id = ""
@@ -148,6 +150,9 @@ class HistogramPanel(Panel):
         model.bind_func("field_label", lambda: _tr("histogram.field", "Field"))
         model.bind_func("compare_with_label", lambda: _tr("histogram.compare_with", "Compare With"))
         model.bind_func("log_scale_label", lambda: _tr("histogram.log_scale", "Log Scale"))
+        model.bind_func("close_label", lambda: _tr("common.close", "Close"))
+        model.bind_func("is_floating", lambda: self._is_floating)
+        model.bind_func("dock_toggle_label", self._dock_toggle_label)
         model.bind_func("samples_label", lambda: _tr("histogram.samples", "Samples"))
         model.bind_func("range_label", lambda: _tr("histogram.range", "Range"))
         model.bind_func("mean_label", lambda: _tr("histogram.mean", "Mean"))
@@ -227,6 +232,8 @@ class HistogramPanel(Panel):
         model.bind_event("redo_history", self._on_redo_history)
         model.bind_event("clear_mark", self._on_clear_mark)
         model.bind_event("delete_marked", self._on_delete_marked)
+        model.bind_event("toggle_dock_mode", self._on_toggle_dock_mode)
+        model.bind_event("close_panel", self._on_close_panel)
         model.bind_record_list("metric_options")
         model.bind_record_list("compare_metric_options")
         model.bind_record_list("bins")
@@ -240,13 +247,11 @@ class HistogramPanel(Panel):
         self._doc = doc
         self._chart_el = doc.get_element_by_id("histogram-bars")
         self._compare_chart_el = doc.get_element_by_id("compare-cells")
-        self._close_btn = doc.get_element_by_id("close-btn")
+        self._sync_panel_space_state()
         if self._chart_el:
             self._chart_el.add_event_listener("mousedown", self._on_chart_mousedown)
         if self._compare_chart_el:
             self._compare_chart_el.add_event_listener("mousedown", self._on_compare_chart_mousedown)
-        if self._close_btn:
-            self._close_btn.add_event_listener("click", self._on_close_click)
         doc.add_event_listener("mousemove", self._on_document_mousemove)
         doc.add_event_listener("mouseup", self._on_document_mouseup)
 
@@ -260,10 +265,7 @@ class HistogramPanel(Panel):
     def on_update(self, doc):
         del doc
 
-        if not histogram_mode_available():
-            lf.ui.set_panel_enabled(self.id, False)
-            return False
-
+        space_changed = self._sync_panel_space_state()
         scene_generation = lf.get_scene_generation()
         history_generation = self._history_generation_value()
         current_lang = lf.ui.get_current_language()
@@ -273,7 +275,8 @@ class HistogramPanel(Panel):
         if (scene_generation == self._scene_generation and
                 history_generation == self._history_generation and
                 trainer_state == self._trainer_state and
-                current_lang == self._last_lang):
+                current_lang == self._last_lang and
+                not space_changed):
             return False
 
         if scene_changed or history_changed:
@@ -299,7 +302,6 @@ class HistogramPanel(Panel):
         self._doc = None
         self._chart_el = None
         self._compare_chart_el = None
-        self._close_btn = None
         self._handle = None
         doc.remove_data_model("histogram_panel")
 
@@ -1620,22 +1622,50 @@ class HistogramPanel(Panel):
             return _trf("histogram.undo_named", "Undo: {name}", name=name)
         return _tr("histogram.undo", "Undo")
 
+    def _dock_toggle_label(self) -> str:
+        return "Dock" if self._is_floating else "Undock"
+
     def _redo_tooltip(self) -> str:
         name = self._history_name(lf.undo.get_redo_name) if self._can_redo() else ""
         if name:
             return _trf("histogram.redo_named", "Redo: {name}", name=name)
         return _tr("histogram.redo", "Redo")
 
+    def _sync_panel_space_state(self) -> bool:
+        info = None
+        try:
+            info = lf.ui.get_panel(self.id)
+        except Exception:
+            info = None
+
+        panel_space = getattr(info, "space", self._panel_space)
+        is_floating = panel_space == lf.ui.PanelSpace.FLOATING
+        changed = panel_space != self._panel_space or is_floating != self._is_floating
+        self._panel_space = panel_space
+        self._is_floating = is_floating
+        return changed
+
     def _on_clear_mark(self, _handle, _event, _args):
         self._clear_all_marks(clear_scene=True)
 
-    def _on_close_click(self, event):
+    def _on_toggle_dock_mode(self, _handle, _event, _args):
+        target_space = lf.ui.PanelSpace.BOTTOM_DOCK if self._is_floating else lf.ui.PanelSpace.FLOATING
+        try:
+            changed = bool(lf.ui.set_panel_space(self.id, target_space))
+        except Exception:
+            changed = False
+        if not changed:
+            return
+        self._sync_panel_space_state()
+        if self._handle:
+            self._handle.dirty_all()
+
+    def _on_close_panel(self, _handle, _event, _args):
         self._clear_owned_scene_selection()
         try:
             lf.selection.clear_preview()
         except Exception:
             pass
-        event.stop_propagation()
         lf.ui.set_panel_enabled(self.id, False)
 
     def _on_undo_history(self, _handle, _event, _args):

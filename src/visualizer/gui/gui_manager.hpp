@@ -211,9 +211,11 @@ namespace lfs::vis {
             float last_ui_layout_right_panel_w_ = -1.0f;
             float last_ui_layout_scene_ratio_ = -1.0f;
             float last_ui_layout_python_console_w_ = -1.0f;
+            float last_ui_layout_bottom_dock_h_ = -1.0f;
             bool last_ui_layout_show_main_panel_ = false;
             bool last_ui_layout_ui_hidden_ = false;
             bool last_ui_layout_python_console_visible_ = false;
+            bool last_ui_layout_bottom_dock_visible_ = false;
             std::string last_ui_layout_active_tab_;
         };
     } // namespace gui

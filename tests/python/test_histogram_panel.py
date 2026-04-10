@@ -214,3 +214,41 @@ def test_compare_bin_sliders_support_rectangular_grids(histogram_panel_module, l
     assert "width: 8.3333%;" in records[0]["style_attr"]
     assert "height: 11.1111%;" in records[0]["style_attr"]
     assert panel._format_compare_bin_count_text() == "12 x 9 bins"
+
+
+def test_histogram_panel_can_toggle_between_bottom_dock_and_floating(histogram_panel_module, lf):
+    panel = histogram_panel_module.HistogramPanel()
+    state = {"space": lf.ui.PanelSpace.BOTTOM_DOCK}
+
+    def _get_panel(panel_id):
+        assert panel_id == panel.id
+        return SimpleNamespace(space=state["space"])
+
+    def _set_panel_space(panel_id, space):
+        assert panel_id == panel.id
+        state["space"] = space
+        return True
+
+    original_get_panel = lf.ui.get_panel
+    original_set_panel_space = lf.ui.set_panel_space
+    try:
+        lf.ui.get_panel = _get_panel
+        lf.ui.set_panel_space = _set_panel_space
+
+        assert panel._sync_panel_space_state() is False
+        assert panel._is_floating is False
+        assert panel._dock_toggle_label() == "Undock"
+
+        panel._on_toggle_dock_mode(None, None, None)
+
+        assert state["space"] == lf.ui.PanelSpace.FLOATING
+        assert panel._is_floating is True
+        assert panel._dock_toggle_label() == "Dock"
+
+        panel._on_toggle_dock_mode(None, None, None)
+
+        assert state["space"] == lf.ui.PanelSpace.BOTTOM_DOCK
+        assert panel._is_floating is False
+    finally:
+        lf.ui.get_panel = original_get_panel
+        lf.ui.set_panel_space = original_set_panel_space

@@ -227,7 +227,9 @@ class PanelSpace(enum.Enum):
 
     SCENE_HEADER = 4
 
-    STATUS_BAR = 5
+    BOTTOM_DOCK = 5
+
+    STATUS_BAR = 6
 
 class PanelHeightMode(enum.Enum):
     FILL = 0
