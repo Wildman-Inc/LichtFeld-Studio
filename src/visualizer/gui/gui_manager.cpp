@@ -51,8 +51,8 @@
 #include "tools/brush_tool.hpp"
 #include "tools/selection_tool.hpp"
 #include "visualizer_impl.hpp"
-#include <SDL3/SDL.h>
 #include <OpenImageIO/imageio.h>
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
