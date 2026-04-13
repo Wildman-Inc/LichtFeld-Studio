@@ -1182,11 +1182,11 @@ def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, 
     Render scene from arbitrary camera parameters.
 
     Args:
-        rotation: [3, 3] camera rotation matrix
-        translation: [3] camera position
+        rotation: [3, 3] camera-to-world rotation in visualizer coordinates
+        translation: [3] camera position in visualizer world coordinates
         width: Render width in pixels
         height: Render height in pixels
-        fov: Field of view in degrees (default: 60)
+        fov: Vertical field of view in degrees (default: 60)
         bg_color: Optional [3] RGB background color
 
     Returns:
@@ -1198,18 +1198,18 @@ def compute_screen_positions(rotation: Tensor, translation: Tensor, width: int, 
     Compute screen positions of all Gaussians for a given camera view.
 
     Args:
-        rotation: [3, 3] camera rotation matrix
-        translation: [3] camera position
+        rotation: [3, 3] camera-to-world rotation in visualizer coordinates
+        translation: [3] camera position in visualizer world coordinates
         width: Viewport width in pixels
         height: Viewport height in pixels
-        fov: Field of view in degrees (default: 60)
+        fov: Vertical field of view in degrees (default: 60)
 
     Returns:
         Tensor [N, 2] with (x, y) pixel coordinates for each Gaussian
     """
 
 def get_current_view() -> ViewInfo | None:
-    """Get current viewport camera info (None if not available)"""
+    """Get current viewport camera pose (None if not available)"""
 
 class CameraState:
     @property
@@ -1237,7 +1237,7 @@ def set_camera_fov(fov: float) -> None:
 
 def look_at(eye: tuple[float, float, float], target: tuple[float, float, float], up: tuple[float, float, float] = (0.0, 1.0, 0.0)) -> tuple[Tensor, Tensor]:
     """
-    Compute (rotation, translation) camera matrices for render_view from eye/target position.
+    Compute a visualizer camera pose tuple (rotation, translation) for render_view from eye/target.
     """
 
 def render_at(eye: tuple[float, float, float], target: tuple[float, float, float], width: int, height: int, fov: float = 60.0, up: tuple[float, float, float] = (0.0, 1.0, 0.0), bg_color: Tensor | None = None) -> Tensor | None:
