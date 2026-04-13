@@ -7,6 +7,7 @@
 #include "core/logger.hpp"
 #include "core/scene.hpp"
 #include "core/splat_simplify.hpp"
+#include "core/splat_simplify_history.hpp"
 #include "py_splat_data.hpp"
 #include "py_tensor.hpp"
 #include "python/python_runtime.hpp"

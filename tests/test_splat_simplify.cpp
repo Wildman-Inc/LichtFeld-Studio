@@ -3,6 +3,7 @@
 
 #include "core/splat_data.hpp"
 #include "core/splat_simplify.hpp"
+#include "core/splat_simplify_history.hpp"
 #include "core/tensor.hpp"
 
 #include <gtest/gtest.h>

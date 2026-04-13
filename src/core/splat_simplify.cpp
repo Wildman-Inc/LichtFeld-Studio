@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/splat_simplify.hpp"
+#include "core/splat_simplify_history.hpp"
 
 #include "core/logger.hpp"
 #include "core/splat_data.hpp"
