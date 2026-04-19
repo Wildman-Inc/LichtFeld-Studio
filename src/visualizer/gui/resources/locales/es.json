@@ -35,7 +35,6 @@
     "help.about": "Acerca de LichtFeld Studio"
   },
   "window": {
-    "getting_started": "Primeros Pasos",
     "about": "Acerca de LichtFeld Studio",
     "input_settings": "Configuración de Entrada",
     "debug_info": "Información de Depuración",
@@ -47,18 +46,16 @@
     "histogram": "Histogram"
   },
   "getting_started": {
-    "title": "GUÍA DE INICIO RÁPIDO",
+    "title": "Primeros Pasos",
     "description": "Aprenda a preparar datasets y comenzar con LichtFeld Studio:",
     "wiki_section": "WIKI & PREGUNTAS FRECUENTES",
+    "video_automotive": "3dgs for automotive marketing",
     "video_intro": "Entrenamiento con Imágenes Equirectangulares 360",
     "video_latest": "LichtFeld v0.3.0 Resumen de Funciones",
     "video_reality_scan": "Dataset Reality Scan",
     "video_colmap": "Tutorial COLMAP",
     "video_lichtfeld": "Tutorial LichtFeld",
-    "video_masks": "Tutorial de Máscaras",
-    "loading": "Cargando...",
-    "wiki_label": "Wiki:",
-    "watch_tooltip": "Ver: {title}"
+    "video_masks": "Tutorial de Máscaras"
   },
   "about": {
     "title": "LICHTFELD STUDIO",

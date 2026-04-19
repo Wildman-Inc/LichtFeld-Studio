@@ -35,7 +35,6 @@
     "help.about": "Over LichtFeld Studio"
   },
   "window": {
-    "getting_started": "Aan de Slag",
     "about": "Over LichtFeld Studio",
     "input_settings": "Invoerinstellingen",
     "debug_info": "Debug Info",
@@ -47,18 +46,16 @@
     "histogram": "Histogram"
   },
   "getting_started": {
-    "title": "SNELSTARTGIDS",
+    "title": "Aan de Slag",
     "description": "Leer hoe je datasets voorbereidt en aan de slag gaat met LichtFeld Studio:",
     "wiki_section": "WIKI & FAQ",
+    "video_automotive": "3dgs for automotive marketing",
     "video_intro": "Training op 360 Equirectangulaire Afbeeldingen",
     "video_latest": "LichtFeld v0.3.0 Functie Overzicht",
     "video_reality_scan": "Reality Scan Dataset",
     "video_colmap": "COLMAP Tutorial",
     "video_lichtfeld": "LichtFeld Tutorial",
-    "video_masks": "Maskers Tutorial",
-    "loading": "Laden...",
-    "wiki_label": "Wiki:",
-    "watch_tooltip": "Bekijk: {title}"
+    "video_masks": "Maskers Tutorial"
   },
   "about": {
     "title": "LICHTFELD STUDIO",

@@ -35,7 +35,6 @@
     "help.about": "关于LichtFeld Studio"
   },
   "window": {
-    "getting_started": "入门指南",
     "about": "关于LichtFeld Studio",
     "input_settings": "输入设置",
     "debug_info": "调试信息",
@@ -47,18 +46,16 @@
     "histogram": "Histogram"
   },
   "getting_started": {
-    "title": "快速入门指南",
+    "title": "入门指南",
     "description": "学习如何准备数据集并开始使用LichtFeld Studio：",
     "wiki_section": "维基 & 常见问题",
+    "video_automotive": "3dgs for automotive marketing",
     "video_intro": "360度等距柱状投影图像训练",
     "video_latest": "LichtFeld v0.3.0 功能概览",
     "video_reality_scan": "Reality Scan数据集",
     "video_colmap": "COLMAP教程",
     "video_lichtfeld": "LichtFeld教程",
-    "video_masks": "蒙版教程",
-    "loading": "加载中...",
-    "wiki_label": "Wiki:",
-    "watch_tooltip": "观看：{title}"
+    "video_masks": "蒙版教程"
   },
   "about": {
     "title": "LICHTFELD STUDIO",

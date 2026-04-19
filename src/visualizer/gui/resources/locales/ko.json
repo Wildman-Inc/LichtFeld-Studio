@@ -35,7 +35,6 @@
     "help.about": "LichtFeld Studio 정보"
   },
   "window": {
-    "getting_started": "시작하기",
     "about": "LichtFeld Studio 정보",
     "input_settings": "입력 설정",
     "debug_info": "디버그 정보",
@@ -47,18 +46,16 @@
     "histogram": "Histogram"
   },
   "getting_started": {
-    "title": "빠른 시작 가이드",
+    "title": "시작하기",
     "description": "데이터셋 준비 방법과 LichtFeld Studio 사용법을 배워보세요:",
     "wiki_section": "위키 & 자주 묻는 질문",
+    "video_automotive": "3dgs for automotive marketing",
     "video_intro": "360 정방형 이미지 트레이닝",
     "video_latest": "LichtFeld v0.3.0 기능 개요",
     "video_reality_scan": "Reality Scan 데이터셋",
     "video_colmap": "COLMAP 튜토리얼",
     "video_lichtfeld": "LichtFeld 튜토리얼",
-    "video_masks": "마스크 튜토리얼",
-    "loading": "로딩 중...",
-    "wiki_label": "위키:",
-    "watch_tooltip": "시청: {title}"
+    "video_masks": "마스크 튜토리얼"
   },
   "about": {
     "title": "LICHTFELD STUDIO",

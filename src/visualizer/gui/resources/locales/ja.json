@@ -35,7 +35,6 @@
     "help.about": "LichtFeld Studioについて"
   },
   "window": {
-    "getting_started": "はじめに",
     "about": "LichtFeld Studioについて",
     "input_settings": "入力設定",
     "debug_info": "デバッグ情報",
@@ -47,18 +46,16 @@
     "histogram": "Histogram"
   },
   "getting_started": {
-    "title": "クイックスタートガイド",
+    "title": "はじめに",
     "description": "データセットの準備方法とLichtFeld Studioの使い方を学びましょう:",
     "wiki_section": "Wiki & よくある質問",
+    "video_automotive": "3dgs for automotive marketing",
     "video_intro": "360°正距円筒図法画像でのトレーニング",
     "video_latest": "LichtFeld v0.3.0 機能概要",
     "video_reality_scan": "Reality Scanデータセット",
     "video_colmap": "COLMAPチュートリアル",
     "video_lichtfeld": "LichtFeldチュートリアル",
-    "video_masks": "マスクチュートリアル",
-    "loading": "読み込み中...",
-    "wiki_label": "Wiki:",
-    "watch_tooltip": "視聴: {title}"
+    "video_masks": "マスクチュートリアル"
   },
   "about": {
     "title": "LICHTFELD STUDIO",
