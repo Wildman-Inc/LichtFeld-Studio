@@ -3607,7 +3607,8 @@ namespace lfs::python {
                                  {0, 0}, {u1, v1}, t, {0, 0, 0, 0});
                 },
                 nb::arg("texture"), nb::arg("size"), nb::arg("tint") = nb::none(), "Draw a DynamicTexture with automatic UV scaling")
-            .def("image_tensor", [](PyUILayout& /*self*/, const std::string& label, PyTensor& tensor, std::tuple<float, float> size, nb::object tint) {
+            .def(
+                "image_tensor", [](PyUILayout& /*self*/, const std::string& label, PyTensor& tensor, std::tuple<float, float> size, nb::object tint) {
                     PyDynamicTexture* tex_ptr = nullptr;
                     {
                         std::lock_guard lock(g_dynamic_textures_mutex);
@@ -4248,6 +4249,32 @@ namespace lfs::python {
             "go_to_camera_view",
             [](int cam_uid) { lfs::core::events::cmd::GoToCamView{.cam_id = cam_uid}.emit(); },
             nb::arg("cam_uid"), "Go to camera view by UID");
+
+        m.def(
+            "open_camera_preview",
+            [](int cam_uid) { lfs::core::events::cmd::OpenCameraPreview{.cam_id = cam_uid}.emit(); },
+            nb::arg("cam_uid"), "Open the image preview panel for a camera UID");
+
+        m.def(
+            "toggle_gt_comparison",
+            []() { lfs::core::events::cmd::ToggleGTComparison{}.emit(); },
+            "Toggle ground-truth comparison split view");
+
+        m.def(
+            "is_gt_comparison_active",
+            []() {
+                auto* rm = lfs::python::get_rendering_manager();
+                return rm && rm->isGTComparisonActive();
+            },
+            "Returns true if ground-truth comparison split view is currently enabled.");
+
+        m.def(
+            "reveal_in_file_manager",
+            [](const std::string& utf8_path) {
+                return lfs::core::reveal_in_file_manager(lfs::core::utf8_to_path(utf8_path));
+            },
+            nb::arg("path"),
+            "Reveal a file or directory in the OS file manager. Returns true on success.");
 
         m.def(
             "apply_cropbox",

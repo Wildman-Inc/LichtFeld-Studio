@@ -14,6 +14,7 @@
 #include "gui/string_keys.hpp"
 #include "gui/utils/native_file_dialog.hpp"
 #include "io/exporter.hpp"
+#include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
 #include "visualizer/core/parameter_manager.hpp"
 #include "visualizer/core/services.hpp"
@@ -1531,6 +1532,12 @@ namespace lfs::vis::gui {
                 items.push_back(make_action(
                     tr(string_keys::Scene::GO_TO_CAMERA_VIEW),
                     prefixed(std::format("go_to_camera:{}", node->camera_uid))));
+                items.push_back(make_action(
+                    tr(string_keys::Scene::GO_TO_IMAGE),
+                    prefixed(std::format("go_to_image:{}", node->camera_uid))));
+                items.push_back(make_action(
+                    tr(string_keys::Scene::OPEN_IN_GT_COMPARE),
+                    prefixed(std::format("open_in_gt_compare:{}", node->camera_uid))));
                 if (!node->image_path.empty()) {
                     items.push_back(make_action(
                         tr(string_keys::Scene::SHOW_IN_FILE_MANAGER),
@@ -1656,9 +1663,11 @@ namespace lfs::vis::gui {
                     !items.empty()));
             }
 
-            items.push_back(make_action(
-                tr("scene.duplicate"),
-                prefixed(std::format("duplicate:{}", node_id))));
+            if (node->type != core::NodeType::CAMERA) {
+                items.push_back(make_action(
+                    tr("scene.duplicate"),
+                    prefixed(std::format("duplicate:{}", node_id))));
+            }
 
             if (node_snapshots_.at(node_id).draggable) {
                 std::vector<std::pair<core::NodeId, std::string>> groups;
@@ -1714,6 +1723,15 @@ namespace lfs::vis::gui {
         const std::string& kind = parts[0];
         if (kind == "go_to_camera" && parts.size() >= 2) {
             cmd::GoToCamView{.cam_id = std::stoi(parts[1])}.emit();
+            Blur();
+        } else if (kind == "go_to_image" && parts.size() >= 2) {
+            cmd::OpenCameraPreview{.cam_id = std::stoi(parts[1])}.emit();
+        } else if (kind == "open_in_gt_compare" && parts.size() >= 2) {
+            const int cam_uid = std::stoi(parts[1]);
+            cmd::GoToCamView{.cam_id = cam_uid}.emit();
+            auto* const rm = services().renderingOrNull();
+            if (!rm || !rm->isGTComparisonActive())
+                cmd::ToggleGTComparison{}.emit();
             Blur();
         } else if (kind == "show_in_file_manager" && parts.size() >= 2) {
             core::NodeId node_id = core::NULL_NODE;
