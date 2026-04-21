@@ -19,9 +19,9 @@
 #include <core/path_utils.hpp>
 
 #include "gil.hpp"
+#include "python_compat.hpp"
 #include "python_runtime.hpp"
 #include "training/control/control_boundary.hpp"
-#include "python_compat.hpp"
 #include <atomic>
 #include <mutex>
 #ifndef _WIN32
@@ -47,7 +47,7 @@ namespace lfs::python {
     static std::mutex g_python_bridge_failure_mutex;
     static std::string g_python_bridge_failure_detail;
     static std::atomic<bool> g_plugin_preload_scheduled{false};
-    
+
     // RAII wrapper for the plugin preload thread that ensures proper cleanup
     // at static destruction time to avoid crashes from std::thread::~thread()
     // calling std::terminate() on a joinable thread.

@@ -9,10 +9,10 @@
 // and Py_DECREF_DecRefTotal. Since vcpkg provides only release Python,
 // we need to temporarily undefine _DEBUG before including Python.h.
 #if defined(_WIN32) && defined(_DEBUG)
-#  pragma push_macro("_DEBUG")
-#  undef _DEBUG
-#  include <Python.h>
-#  pragma pop_macro("_DEBUG")
+#pragma push_macro("_DEBUG")
+#undef _DEBUG
+#include <Python.h>
+#pragma pop_macro("_DEBUG")
 #else
-#  include <Python.h>
+#include <Python.h>
 #endif
