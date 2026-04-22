@@ -410,16 +410,21 @@ jobs:
           aws s3 cp $checksumFile "s3://$($env:R2_BUCKET)/$checksumKey" `
             --endpoint-url $endpointUrl `
             --content-type text/plain `
-            --only-show-errors
+            --only-show-errors `
+            2>$null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to upload private R2 checksum object."
+          }
           aws s3 cp $env:FILE_NAME "s3://$($env:R2_BUCKET)/$versionedKey" `
             --endpoint-url $endpointUrl `
             --content-type application/zip `
-            --only-show-errors
+            --only-show-errors `
+            2>$null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to upload private R2 package object."
+          }
 
-          "SHA256_CHECKSUM=$checksum" >> $env:GITHUB_ENV
-          "SHA256_OBJECT_KEY=$checksumKey" >> $env:GITHUB_ENV
-
-      # Confirms the zip landed intact before we advertise the URL. Size mismatch
+      # Confirms the zip landed intact before reporting success. Size mismatch
       # is the most likely failure mode on flaky networks; a missing sidecar .sha256
       # would silently break download verification.
       - name: Verify R2 upload
@@ -439,50 +444,46 @@ jobs:
           $checksumKey = "$versionedKey.sha256"
           $localSize = (Get-Item $env:FILE_NAME).Length
 
-          $headJson = aws s3api head-object `
+          $headOutput = aws s3api head-object `
             --bucket $env:R2_BUCKET `
             --key $versionedKey `
-            --endpoint-url $endpointUrl | ConvertFrom-Json
-          if ($headJson.ContentLength -ne $localSize) {
-            throw "R2 object size mismatch for $versionedKey (local=$localSize, remote=$($headJson.ContentLength))"
+            --endpoint-url $endpointUrl `
+            2>$null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to verify private R2 package object."
           }
 
-          aws s3api head-object `
+          $headJson = $headOutput | ConvertFrom-Json
+          if ($headJson.ContentLength -ne $localSize) {
+            throw "Private R2 package object size mismatch (local=$localSize, remote=$($headJson.ContentLength))"
+          }
+
+          $checksumOutput = aws s3api head-object `
             --bucket $env:R2_BUCKET `
             --key $checksumKey `
-            --endpoint-url $endpointUrl | Out-Null
+            --endpoint-url $endpointUrl `
+            2>$null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to verify private R2 checksum object."
+          }
 
-          Write-Host "Verified $versionedKey ($localSize bytes) and $checksumKey on R2."
+          Write-Host "Verified private R2 package upload and checksum sidecar."
 
       - name: Publish summary
         shell: pwsh
         env:
           BUILD_CHANNEL: ${{ steps.package.outputs.build_channel }}
-          FILE_NAME: ${{ steps.package.outputs.package_name }}
-          PACKAGE_VERSION: ${{ steps.package.outputs.package_version }}
           FULL_SHA: ${{ steps.package.outputs.full_sha }}
           BUILT_AT: ${{ steps.package.outputs.built_at }}
-          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $summaryChecksum = if ([string]::IsNullOrWhiteSpace($env:SHA256_CHECKSUM)) { 'not generated' } else { $env:SHA256_CHECKSUM }
-          $summaryChecksumKey = if ([string]::IsNullOrWhiteSpace($env:SHA256_OBJECT_KEY)) { 'not generated' } else { $env:SHA256_OBJECT_KEY }
           $summary = @(
-            '### Package R2 Upload'
+            '### Private Package Upload'
             ''
-            "- Uploaded ``$env:FILE_NAME`` to Cloudflare R2."
+            '- Private R2 upload completed.'
             "- Channel: ``$env:BUILD_CHANNEL``"
-            "- Package version: ``v$env:PACKAGE_VERSION``"
             "- Commit: ``$env:FULL_SHA``"
             "- Built at: ``$env:BUILT_AT``"
-            "- Object key: ``windows/$($env:BUILD_CHANNEL)/$($env:FILE_NAME)``"
-            "- SHA-256: ``$summaryChecksum``"
-            "- SHA-256 object key: ``$summaryChecksumKey``"
+            '- Public download URL: not published.'
           )
-          if (-not [string]::IsNullOrWhiteSpace($env:R2_PUBLIC_BASE_URL)) {
-            $baseUrl = $env:R2_PUBLIC_BASE_URL.TrimEnd('/')
-            $summary += "- Versioned URL: $baseUrl/windows/$($env:BUILD_CHANNEL)/$($env:FILE_NAME)"
-          } else {
-            $summary += '- Set the `R2_PUBLIC_BASE_URL` environment variable to print public download URLs here.'
-          }
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
