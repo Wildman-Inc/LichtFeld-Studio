@@ -178,14 +178,6 @@ jobs:
     needs: precheck
     if: github.repository == 'MrNeRF/LichtFeld-Studio' && needs.precheck.outputs.should_build == 'true'
     runs-on: windows-2022
-    outputs:
-      artifact_name: ${{ steps.package.outputs.artifact_name }}
-      build_channel: ${{ steps.package.outputs.build_channel }}
-      package_name: ${{ steps.package.outputs.package_name }}
-      package_version: ${{ steps.package.outputs.package_version }}
-      short_sha: ${{ steps.package.outputs.short_sha }}
-      full_sha: ${{ steps.package.outputs.full_sha }}
-      built_at: ${{ steps.package.outputs.built_at }}
     env:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
       VCPKG_BUILD_TYPE: release
@@ -311,22 +303,6 @@ jobs:
             }
           }
 
-      - name: Upload failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-nightly-diagnostics-${{ github.run_number }}
-          if-no-files-found: ignore
-          retention-days: 14
-          path: |
-            build/CMakeCache.txt
-            build/CMakeFiles/CMakeConfigureLog.yaml
-            build/CMakeFiles/CMakeError.log
-            build/CMakeFiles/CMakeOutput.log
-            build/vcpkg-manifest-install.log
-            build/vcpkg_installed/vcpkg/issue_body.md
-            build/vcpkg_installed/vcpkg/blds/**/*.log
-
       - name: Package
         id: package
         shell: pwsh
@@ -370,10 +346,8 @@ jobs:
           }
 
           $packageName = "LichtFeld-Studio-windows-v$packageVersion.zip"
-          $artifactName = "windows-portable-$buildChannel-v$($packageVersion -replace '\+', '-')"
           cmake --install build --prefix dist
           Compress-Archive -Path dist\* -DestinationPath $packageName
-          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
           "build_channel=$buildChannel" >> $env:GITHUB_OUTPUT
           "package_name=$packageName" >> $env:GITHUB_OUTPUT
           "package_version=$packageVersion" >> $env:GITHUB_OUTPUT
@@ -381,102 +355,86 @@ jobs:
           "full_sha=$fullSha" >> $env:GITHUB_OUTPUT
           "built_at=$builtAt" >> $env:GITHUB_OUTPUT
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.package.outputs.artifact_name }}
-          path: ${{ steps.package.outputs.package_name }}
-          if-no-files-found: error
-
-  publish-r2:
-    needs:
-      - precheck
-      - build-windows
-    if: needs.precheck.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    environment: nightly-publish
-    permissions:
-      contents: read
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.build-windows.outputs.artifact_name }}
-
+      # Package binaries must not be uploaded as GitHub Actions artifacts.
+      # Keep the generated zip on the runner and publish it directly to R2.
       - name: Ensure AWS CLI is available
-        env:
-          DEBIAN_FRONTEND: noninteractive
+        shell: pwsh
         run: |
-          set -euo pipefail
-          if ! command -v aws >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y awscli
-          fi
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
+            choco install awscli -y --no-progress
+            $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $env:Path = "$env:ProgramFiles\Amazon\AWSCLIV2;$machinePath;$userPath"
+          }
           aws --version
 
       - name: Upload package to Cloudflare R2
+        shell: pwsh
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
-          BUILD_CHANNEL: ${{ needs.build-windows.outputs.build_channel }}
-          FILE_NAME: ${{ needs.build-windows.outputs.package_name }}
+          BUILD_CHANNEL: ${{ steps.package.outputs.build_channel }}
+          FILE_NAME: ${{ steps.package.outputs.package_name }}
           R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
         run: |
-          set -euo pipefail
-          : "${AWS_ACCESS_KEY_ID:?Missing R2_ACCESS_KEY_ID secret}"
-          : "${AWS_SECRET_ACCESS_KEY:?Missing R2_SECRET_ACCESS_KEY secret}"
-          : "${R2_ACCOUNT_ID:?Missing R2_ACCOUNT_ID environment variable}"
-          : "${R2_BUCKET:?Missing R2_BUCKET environment variable}"
-          : "${BUILD_CHANNEL:?Missing build channel}"
-          : "${FILE_NAME:?Missing package name}"
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'R2_ACCOUNT_ID', 'R2_BUCKET', 'BUILD_CHANNEL', 'FILE_NAME')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing $name"
+            }
+          }
 
-          endpoint_url="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          versioned_key="windows/${BUILD_CHANNEL}/${FILE_NAME}"
-          checksum_file="${FILE_NAME}.sha256"
-          checksum_key="${versioned_key}.sha256"
-          sha256sum "$FILE_NAME" > "$checksum_file"
-          checksum="$(cut -d ' ' -f 1 "$checksum_file")"
+          $endpointUrl = "https://$($env:R2_ACCOUNT_ID).r2.cloudflarestorage.com"
+          $versionedKey = "windows/$($env:BUILD_CHANNEL)/$($env:FILE_NAME)"
+          $checksumFile = "$($env:FILE_NAME).sha256"
+          $checksumKey = "$versionedKey.sha256"
+          $checksum = (Get-FileHash -Algorithm SHA256 -Path $env:FILE_NAME).Hash.ToLowerInvariant()
+          Set-Content -Path $checksumFile -Value "$checksum  $($env:FILE_NAME)" -Encoding ascii
 
-          aws s3 cp "$checksum_file" "s3://${R2_BUCKET}/${checksum_key}" \
-            --endpoint-url "$endpoint_url" \
-            --content-type text/plain \
+          aws s3 cp $checksumFile "s3://$($env:R2_BUCKET)/$checksumKey" `
+            --endpoint-url $endpointUrl `
+            --content-type text/plain `
             --only-show-errors
-          aws s3 cp "$FILE_NAME" "s3://${R2_BUCKET}/${versioned_key}" \
-            --endpoint-url "$endpoint_url" \
-            --content-type application/zip \
+          aws s3 cp $env:FILE_NAME "s3://$($env:R2_BUCKET)/$versionedKey" `
+            --endpoint-url $endpointUrl `
+            --content-type application/zip `
             --only-show-errors
 
-          echo "SHA256_CHECKSUM=${checksum}" >> "$GITHUB_ENV"
-          echo "SHA256_OBJECT_KEY=${checksum_key}" >> "$GITHUB_ENV"
+          "SHA256_CHECKSUM=$checksum" >> $env:GITHUB_ENV
+          "SHA256_OBJECT_KEY=$checksumKey" >> $env:GITHUB_ENV
 
       - name: Publish summary
+        shell: pwsh
         env:
-          BUILD_CHANNEL: ${{ needs.build-windows.outputs.build_channel }}
-          FILE_NAME: ${{ needs.build-windows.outputs.package_name }}
-          PACKAGE_VERSION: ${{ needs.build-windows.outputs.package_version }}
-          FULL_SHA: ${{ needs.build-windows.outputs.full_sha }}
-          BUILT_AT: ${{ needs.build-windows.outputs.built_at }}
+          BUILD_CHANNEL: ${{ steps.package.outputs.build_channel }}
+          FILE_NAME: ${{ steps.package.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.package_version }}
+          FULL_SHA: ${{ steps.package.outputs.full_sha }}
+          BUILT_AT: ${{ steps.package.outputs.built_at }}
           R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
         run: |
-          set -euo pipefail
-          {
-            echo "### Package R2 Upload"
-            echo
-            echo "- Uploaded \`${FILE_NAME}\` to Cloudflare R2."
-            echo "- Channel: \`${BUILD_CHANNEL}\`"
-            echo "- Package version: \`v${PACKAGE_VERSION}\`"
-            echo "- Commit: \`${FULL_SHA}\`"
-            echo "- Built at: \`${BUILT_AT}\`"
-            echo "- Object key: \`windows/${BUILD_CHANNEL}/${FILE_NAME}\`"
-            echo "- SHA-256: \`${SHA256_CHECKSUM:-not generated}\`"
-            echo "- SHA-256 object key: \`${SHA256_OBJECT_KEY:-not generated}\`"
-            if [ -n "${R2_PUBLIC_BASE_URL:-}" ]; then
-              base_url="${R2_PUBLIC_BASE_URL%/}"
-              echo "- Versioned URL: ${base_url}/windows/${BUILD_CHANNEL}/${FILE_NAME}"
-            else
-              echo "- Set the \`R2_PUBLIC_BASE_URL\` environment variable to print public download URLs here."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          $ErrorActionPreference = 'Stop'
+          $summaryChecksum = if ([string]::IsNullOrWhiteSpace($env:SHA256_CHECKSUM)) { 'not generated' } else { $env:SHA256_CHECKSUM }
+          $summaryChecksumKey = if ([string]::IsNullOrWhiteSpace($env:SHA256_OBJECT_KEY)) { 'not generated' } else { $env:SHA256_OBJECT_KEY }
+          $summary = @(
+            '### Package R2 Upload'
+            ''
+            "- Uploaded ``$env:FILE_NAME`` to Cloudflare R2."
+            "- Channel: ``$env:BUILD_CHANNEL``"
+            "- Package version: ``v$env:PACKAGE_VERSION``"
+            "- Commit: ``$env:FULL_SHA``"
+            "- Built at: ``$env:BUILT_AT``"
+            "- Object key: ``windows/$($env:BUILD_CHANNEL)/$($env:FILE_NAME)``"
+            "- SHA-256: ``$summaryChecksum``"
+            "- SHA-256 object key: ``$summaryChecksumKey``"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:R2_PUBLIC_BASE_URL)) {
+            $baseUrl = $env:R2_PUBLIC_BASE_URL.TrimEnd('/')
+            $summary += "- Versioned URL: $baseUrl/windows/$($env:BUILD_CHANNEL)/$($env:FILE_NAME)"
+          } else {
+            $summary += '- Set the `R2_PUBLIC_BASE_URL` environment variable to print public download URLs here.'
+          }
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
