@@ -1947,6 +1947,11 @@ def save_html_file_dialog(default_name: str = 'viewer') -> str:
     Open a save file dialog for HTML viewer files. Returns empty string if cancelled.
     """
 
+def save_rad_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for RAD files. Returns empty string if cancelled.
+    """
+
 def open_dataset_folder_dialog() -> str:
     """
     Open a folder dialog to select a dataset. Returns empty string if cancelled.
