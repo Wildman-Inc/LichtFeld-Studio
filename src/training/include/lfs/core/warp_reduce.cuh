@@ -14,6 +14,12 @@
 namespace lfs::core {
     namespace warp_ops {
 
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+        constexpr unsigned long long FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
+#else
+        constexpr unsigned int FULL_WARP_MASK = 0xFFFFFFFFu;
+#endif
+
         // ============= WARP-LEVEL REDUCTIONS (NO SHARED MEMORY!) =============
 
         /**
@@ -33,7 +39,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_sum(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val += __shfl_xor_sync(0xffffffff, val, offset);
+                val += __shfl_xor_sync(FULL_WARP_MASK, val, offset);
             }
             return val;
         }
@@ -45,7 +51,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_max(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = __shfl_xor_sync(FULL_WARP_MASK, val, offset);
                 val = (val > other) ? val : other;
             }
             return val;
@@ -58,7 +64,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_min(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = __shfl_xor_sync(FULL_WARP_MASK, val, offset);
                 val = (val < other) ? val : other;
             }
             return val;
@@ -71,7 +77,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_prod(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val *= __shfl_xor_sync(0xffffffff, val, offset);
+                val *= __shfl_xor_sync(FULL_WARP_MASK, val, offset);
             }
             return val;
         }

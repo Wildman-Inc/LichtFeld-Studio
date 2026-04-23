@@ -18,7 +18,7 @@ set(LFS_CORE_CUDA_SOURCES
     tensor_debug.cu
 )
 
-add_library(lfs_core_cuda STATIC ${LFS_CORE_CUDA_SOURCES})
+lfs_add_gpu_library(lfs_core_cuda STATIC ${LFS_CORE_CUDA_SOURCES})
 
 target_include_directories(lfs_core_cuda
     PUBLIC
@@ -26,30 +26,41 @@ target_include_directories(lfs_core_cuda
         ${CMAKE_SOURCE_DIR}/src  # For core/cuda/* path
         ${CMAKE_SOURCE_DIR}/src/core/include  # For core headers (tensor, logger, etc.)
         ${CMAKE_BINARY_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}  # For local includes within cuda/
         ${CMAKE_SOURCE_DIR}/src/core/tensor  # For internal/ headers
         ${CMAKE_SOURCE_DIR}/src/core/tensor/internal  # For memory_pool.hpp and other internal headers
 )
 
-find_package(OpenMP REQUIRED COMPONENTS CXX)
+if(USE_HIP AND WIN32)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+else()
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+endif()
 target_link_libraries(lfs_core_cuda
     PUBLIC
-        CUDA::cudart
-        CUDA::cuda_driver
-        CUDA::curand
+        ${GPU_RUNTIME_LIBRARY}
+        ${GPU_DRIVER_LIBRARY}
+        ${GPU_RAND_LIBRARY}
         spdlog::spdlog
         glm::glm
-        OpenMP::OpenMP_CXX
 )
 
-set_target_properties(lfs_core_cuda PROPERTIES
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
-    CUDA_SEPARABLE_COMPILATION OFF
-    POSITION_INDEPENDENT_CODE ON
-)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(lfs_core_cuda PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+if(USE_CUDA)
+    set_target_properties(lfs_core_cuda PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_SEPARABLE_COMPILATION OFF
+        POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(lfs_core_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # CUDA compiler options
 target_compile_options(lfs_core_cuda PRIVATE

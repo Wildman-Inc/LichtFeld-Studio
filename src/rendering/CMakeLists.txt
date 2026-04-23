@@ -22,20 +22,20 @@ set(RENDERING_SOURCES
         shader_manager.cpp
         screen_renderer.cpp
         split_view_renderer.cpp
+        cuda_gl_interop.cpp
         camera_frustum_renderer.cpp
         mesh_renderer.cpp
         mesh2splat.cpp
         depth_compositor.cpp
 )
 
-# Conditionally add CUDA GL interop
-if(CUDA_GL_INTEROP_ENABLED)
-    list(APPEND RENDERING_SOURCES
-        cuda_gl_interop.cpp
-        cuda_gl_kernels.cu)
+# CUDA GL interop kernels are optional, but the saturation adjustment kernel is
+# also implemented here and is used by the visualizer whenever a GPU backend is enabled.
+if(USE_CUDA OR USE_HIP)
+    list(APPEND RENDERING_SOURCES cuda_gl_kernels.cu)
 endif()
 
-add_library(lfs_rendering STATIC ${RENDERING_SOURCES})
+lfs_add_gpu_library(lfs_rendering STATIC ${RENDERING_SOURCES})
 
 target_link_libraries(lfs_rendering
         PUBLIC
@@ -48,7 +48,7 @@ target_link_libraries(lfs_rendering
         glm::glm
         glad::glad
         ${OPENGL_LIBRARIES}
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         OpenImageIO::OpenImageIO
         spdlog::spdlog
         Freetype::Freetype

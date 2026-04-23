@@ -103,12 +103,12 @@ namespace lfs::rendering {
         return {};
     }
 
-    Tensor PointCloudRenderer::extractRGBFromSH(const Tensor& shs) {
+    lfs::core::Tensor PointCloudRenderer::extractRGBFromSH(const lfs::core::Tensor& shs) {
         constexpr float SH_C0 = 0.28209479177387814f;
 
-        const Tensor features_dc = shs.slice(1, 0, 1).squeeze(1);
+        const lfs::core::Tensor features_dc = shs.slice(1, 0, 1).squeeze(1);
 
-        const Tensor colors = features_dc * SH_C0 + 0.5f;
+        const lfs::core::Tensor colors = features_dc * SH_C0 + 0.5f;
 
         return colors.clamp(0.0f, 1.0f);
     }
@@ -158,8 +158,8 @@ namespace lfs::rendering {
                               transparent_background);
     }
 
-    Result<void> PointCloudRenderer::renderInternal(const Tensor& positions,
-                                                    const Tensor& colors,
+    Result<void> PointCloudRenderer::renderInternal(const lfs::core::Tensor& positions,
+                                                    const lfs::core::Tensor& colors,
                                                     const glm::mat4& view,
                                                     const glm::mat4& projection,
                                                     const float voxel_size,
@@ -186,7 +186,7 @@ namespace lfs::rendering {
 
         // Build interleaved GPU buffer: [pos(3f), color(3f), transform_index(1f)]
         if (interleaved_cache_.size(0) != static_cast<int64_t>(num_points)) {
-            interleaved_cache_ = Tensor::empty({num_points, 7}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+            interleaved_cache_ = lfs::core::Tensor::empty({num_points, 7}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
         }
         const auto pos_cuda = positions.cuda();
         const auto col_cuda = colors.cuda();
@@ -230,7 +230,7 @@ namespace lfs::rendering {
         if (!use_interop_)
 #endif
         {
-            const Tensor cpu_data = interleaved_cache_.cpu();
+            const lfs::core::Tensor cpu_data = interleaved_cache_.cpu();
             BufferBinder<GL_ARRAY_BUFFER> bind(instance_vbo_);
             glBufferData(GL_ARRAY_BUFFER, buffer_size, cpu_data.data_ptr(), GL_DYNAMIC_DRAW);
         }

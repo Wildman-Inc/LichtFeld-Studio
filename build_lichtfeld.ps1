@@ -12,7 +12,13 @@ param(
     [switch]$SkipVcpkg,
     [switch]$SkipLibTorch,
     [switch]$Clean,
-    [switch]$Help
+    [switch]$Help,
+
+    [ValidateSet('CUDA', 'HIP')]
+    [string]$GpuBackend = 'CUDA',
+
+    [string]$AmdGpuArch = 'auto',
+    [string]$RocmPath = ''
 )
 
 if ($Help) {
@@ -22,23 +28,27 @@ LichtFeld-Studio One-Shot Build Script
 Usage: .\build_lichtfeld.ps1 [options]
 
 This script automatically:
-  1. Verifies build prerequisites (VS 2022, CUDA 12.8, CMake, Git)
+  1. Verifies build prerequisites (VS 2022, CUDA/HIP, CMake, Git)
   2. Sets up vcpkg in the parent directory
-  3. Downloads LibTorch (Debug & Release) if missing
+  3. Downloads CUDA LibTorch when building CUDA
   4. Initializes git submodules
   5. Configures and builds LichtFeld-Studio
 
 Options:
   -Configuration <Debug|Release>  Build configuration (default: Release)
+  -GpuBackend <CUDA|HIP>          GPU backend (default: CUDA)
+  -AmdGpuArch <arch|auto>         HIP target arch (default: auto)
+  -RocmPath <path>                HIP SDK root override, e.g. C:\Program Files\AMD\ROCm\7.2
   -SkipVerification               Skip environment verification
   -SkipVcpkg                      Skip vcpkg setup
-  -SkipLibTorch                   Skip LibTorch download
+  -SkipLibTorch                   Skip CUDA LibTorch download
   -Clean                          Clean build directory before building
   -Help                           Show this help message
 
 Examples:
   .\build_lichtfeld.ps1                            Build Release (default)
   .\build_lichtfeld.ps1 -Configuration Debug       Build Debug
+  .\build_lichtfeld.ps1 -GpuBackend HIP            Build Windows ROCm/HIP
   .\build_lichtfeld.ps1 -Clean                     Clean and rebuild
   .\build_lichtfeld.ps1 -SkipLibTorch              Skip LibTorch download (if already present)
 
@@ -123,6 +133,134 @@ function Write-Warning-Status {
     }
 }
 
+function Add-UniquePath {
+    param(
+        [System.Collections.Generic.List[string]]$List,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    try {
+        $FullPath = [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        $FullPath = $Path
+    }
+
+    if (-not $List.Contains($FullPath)) {
+        $List.Add($FullPath) | Out-Null
+    }
+}
+
+function Get-ROCmRootCandidates {
+    $Candidates = [System.Collections.Generic.List[string]]::new()
+
+    Add-UniquePath $Candidates $RocmPath
+    Add-UniquePath $Candidates $env:HIP_PATH
+    Add-UniquePath $Candidates $env:ROCM_PATH
+
+    foreach ($Name in @('HIP_PATH_722', 'HIP_PATH_721', 'HIP_PATH_72', 'HIP_PATH_71', 'HIP_PATH_70', 'HIP_PATH_64', 'HIP_PATH_62')) {
+        Add-UniquePath $Candidates ([Environment]::GetEnvironmentVariable($Name))
+    }
+
+    Add-UniquePath $Candidates (Find-ROCmRootFromPython)
+
+    $DefaultRoot = Join-Path ${env:ProgramFiles} 'AMD\ROCm'
+    foreach ($Version in @('7.2.2', '7.2.1', '7.2', '7.1')) {
+        Add-UniquePath $Candidates (Join-Path $DefaultRoot $Version)
+    }
+
+    if (Test-Path $DefaultRoot) {
+        Get-ChildItem $DefaultRoot -Directory | Sort-Object {
+            try { [version]$_.Name } catch { [version]'0.0' }
+        } -Descending | ForEach-Object {
+            Add-UniquePath $Candidates $_.FullName
+        }
+    }
+
+    return @($Candidates)
+}
+
+function Find-ROCmRootFromPython {
+    $Code = @'
+import importlib.util
+import pathlib
+spec = importlib.util.find_spec("_rocm_sdk_core")
+print(pathlib.Path(spec.origin).resolve().parent if spec and spec.origin else "")
+'@
+
+    try {
+        $Root = python -c $Code 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($Root)) {
+            return $Root.Trim()
+        }
+    } catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Test-ROCmRoot {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        return $false
+    }
+
+    $Markers = @(
+        'include\hip\hip_runtime.h',
+        'lib\amdhip64.lib',
+        'bin\amdhip64.dll',
+        'bin\hipInfo.exe',
+        'bin\hipinfo.exe'
+    )
+
+    foreach ($Marker in $Markers) {
+        if (Test-Path (Join-Path $Path $Marker)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Find-ROCmRoot {
+    foreach ($Candidate in Get-ROCmRootCandidates) {
+        if (Test-ROCmRoot $Candidate) {
+            return $Candidate
+        }
+    }
+    return $null
+}
+
+function Find-HipClang {
+    param([string]$Root)
+
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        return $null
+    }
+
+    $Candidates = @(
+        'lib\llvm\bin\clang++.exe',
+        'llvm\bin\clang++.exe',
+        'bin\clang++.exe',
+        'bin\hipcc.exe',
+        'bin\hipcc.bat'
+    )
+
+    foreach ($Candidate in $Candidates) {
+        $FullPath = Join-Path $Root $Candidate
+        if (Test-Path $FullPath) {
+            return $FullPath
+        }
+    }
+
+    return $null
+}
+
 # ============================================================================
 # Auto-Launch VS Developer Environment
 # ============================================================================
@@ -182,6 +320,9 @@ function Launch-VSDevEnvironment {
     # Build parameter string for re-launch
     $ParamString = ""
     if ($Configuration -ne 'Release') { $ParamString += " -Configuration $Configuration" }
+    if ($GpuBackend -ne 'CUDA') { $ParamString += " -GpuBackend $GpuBackend" }
+    if ($AmdGpuArch -ne 'auto') { $ParamString += " -AmdGpuArch `"$AmdGpuArch`"" }
+    if ($RocmPath -ne '') { $ParamString += " -RocmPath `"$RocmPath`"" }
     if ($SkipVerification) { $ParamString += " -SkipVerification" }
     if ($SkipVcpkg) { $ParamString += " -SkipVcpkg" }
     if ($SkipLibTorch) { $ParamString += " -SkipLibTorch" }
@@ -286,9 +427,22 @@ function Test-BuildEnvironment {
             "Download CMake 3.30+ from: https://cmake.org/download/"
     }
 
-    # Check 4: CUDA Toolkit
-    Write-Host "[4/$TotalChecks] Checking CUDA Toolkit 12.8..." -ForegroundColor Yellow
-    if (Test-Command "nvcc") {
+    # Check 4: GPU backend toolchain
+    if ($GpuBackend -eq 'HIP') {
+        Write-Host "[4/$TotalChecks] Checking ROCm/HIP SDK..." -ForegroundColor Yellow
+        $DetectedRocm = Find-ROCmRoot
+        $DetectedHipClang = Find-HipClang $DetectedRocm
+        if ($DetectedRocm -and $DetectedHipClang) {
+            Write-Status "ROCm/HIP SDK" $true "$DetectedRocm"
+            Write-Host "  HIP compiler: $DetectedHipClang" -ForegroundColor Gray
+        } else {
+            Write-Status "ROCm/HIP SDK" $false "" `
+                "ROCm/HIP SDK 7.2.x not found" `
+                "Install ROCm/HIP 7.2.x or pass -RocmPath / set HIP_PATH"
+        }
+
+    } elseif (Test-Command "nvcc") {
+        Write-Host "[4/$TotalChecks] Checking CUDA Toolkit 12.8..." -ForegroundColor Yellow
         try {
             $NvccOutput = nvcc --version 2>&1 | Select-String "release"
             $CudaVersion = ($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1
@@ -334,8 +488,14 @@ function Test-BuildEnvironment {
             Write-Status "Ninja" $true "Found"
         }
     } else {
-        Write-Warning-Status "Ninja" "Not found (build will use Visual Studio generator)" `
-            "Install via: choco install ninja OR download from https://github.com/ninja-build/ninja/releases"
+        if ($GpuBackend -eq 'HIP') {
+            Write-Status "Ninja" $false "" `
+                "Ninja is required for Windows HIP builds with HIP clang" `
+                "Install via: choco install ninja OR download from https://github.com/ninja-build/ninja/releases"
+        } else {
+            Write-Warning-Status "Ninja" "Not found (build will use Visual Studio generator)" `
+                "Install via: choco install ninja OR download from https://github.com/ninja-build/ninja/releases"
+        }
     }
 
     # Check 7: Disk Space
@@ -582,6 +742,9 @@ function Copy-RequiredDLLs {
     Write-Host "Copying required DLLs to output directory..." -ForegroundColor Yellow
 
     $OutputDir = Join-Path $BuildDir $Config
+    if (-not (Test-Path $OutputDir) -and (Test-Path (Join-Path $BuildDir 'LichtFeld-Studio.exe'))) {
+        $OutputDir = $BuildDir
+    }
 
     if (-not (Test-Path $OutputDir)) {
         Write-Host "WARNING: Output directory not found: $OutputDir" -ForegroundColor Yellow
@@ -641,8 +804,10 @@ function Build-LichtFeldStudio {
 
     Push-Location $ProjectRoot
     try {
-        $BuildDir = Join-Path $ProjectRoot "build"
+        $BuildDirName = if ($GpuBackend -eq 'HIP') { "build-hip" } else { "build" }
+        $BuildDir = Join-Path $ProjectRoot $BuildDirName
         $VcpkgToolchain = Join-Path $VcpkgPath "scripts\buildsystems\vcpkg.cmake"
+        $Generator = if ($GpuBackend -eq 'HIP') { "Ninja" } else { "Visual Studio 17 2022" }
 
         # Verify vcpkg toolchain exists
         if (-not (Test-Path $VcpkgToolchain)) {
@@ -653,26 +818,48 @@ function Build-LichtFeldStudio {
             exit 1
         }
 
-        # Verify LibTorch exists for the selected configuration
-        $LibTorchDebugPath = Join-Path $ProjectRoot "external\debug\libtorch"
-        $LibTorchReleasePath = Join-Path $ProjectRoot "external\release\libtorch"
+        $HipRocmRoot = $null
+        $HipClang = $null
 
-        $LibTorchPath = if ($Configuration -eq 'Debug') {
-            $LibTorchDebugPath
+        if ($GpuBackend -eq 'HIP') {
+            $HipRocmRoot = Find-ROCmRoot
+            $HipClang = Find-HipClang $HipRocmRoot
+
+            if (-not $HipRocmRoot) {
+                Write-Host "ERROR: ROCm/HIP SDK not found." -ForegroundColor Red
+                Write-Host "Pass -RocmPath or set HIP_PATH/ROCM_PATH to a ROCm 7.2.x SDK root." -ForegroundColor Yellow
+                exit 1
+            }
+            if (-not $HipClang) {
+                Write-Host "ERROR: HIP clang++ not found under $HipRocmRoot" -ForegroundColor Red
+                exit 1
+            }
+            if (-not (Test-Command "ninja")) {
+                Write-Host "ERROR: Ninja is required for Windows HIP builds." -ForegroundColor Red
+                exit 1
+            }
         } else {
-            $LibTorchReleasePath
-        }
+            # Verify LibTorch exists for the selected configuration
+            $LibTorchDebugPath = Join-Path $ProjectRoot "external\debug\libtorch"
+            $LibTorchReleasePath = Join-Path $ProjectRoot "external\release\libtorch"
 
-        if (-not (Test-Path $LibTorchPath)) {
-            Write-Host "ERROR: LibTorch ($Configuration) not found!" -ForegroundColor Red
-            Write-Host "Expected: $LibTorchPath" -ForegroundColor Gray
-            Write-Host ""
-            Write-Host "Please run without -SkipLibTorch to download LibTorch first." -ForegroundColor Yellow
-            exit 1
+            $LibTorchPath = if ($Configuration -eq 'Debug') {
+                $LibTorchDebugPath
+            } else {
+                $LibTorchReleasePath
+            }
+
+            if (-not (Test-Path $LibTorchPath)) {
+                Write-Host "ERROR: LibTorch ($Configuration) not found!" -ForegroundColor Red
+                Write-Host "Expected: $LibTorchPath" -ForegroundColor Gray
+                Write-Host ""
+                Write-Host "Please run without -SkipLibTorch to download LibTorch first." -ForegroundColor Yellow
+                exit 1
+            }
         }
 
         # Warn if using multi-config generator (Visual Studio) without both configurations
-        if ($Generator -like "Visual Studio*") {
+        if ($GpuBackend -eq 'CUDA' -and $Generator -like "Visual Studio*") {
             if (-not (Test-Path $LibTorchDebugPath)) {
                 Write-Host "WARNING: LibTorch Debug not found (multi-config generator requires both)" -ForegroundColor Yellow
                 Write-Host "Expected: $LibTorchDebugPath" -ForegroundColor Gray
@@ -695,12 +882,9 @@ function Build-LichtFeldStudio {
             Write-Host ""
         }
 
-        # Always use Visual Studio generator on Windows for better compatibility
-        $Generator = "Visual Studio 17 2022"
-
         # Verify Visual Studio generator is available (only if cl.exe wasn't found earlier)
         # If we're in a VS dev environment with working cl.exe, the generator should work
-        if (-not (Test-Command "cl")) {
+        if ($GpuBackend -eq 'CUDA' -and -not (Test-Command "cl")) {
             $VSInstallPath = Find-VSInstallPath
             if (-not $VSInstallPath) {
                 Write-Host "ERROR: Visual Studio 2022 not found!" -ForegroundColor Red
@@ -714,28 +898,51 @@ function Build-LichtFeldStudio {
 
         # Build CMake arguments
         $CMakeArgs = @(
-            "-B", "build",
+            "-B", $BuildDirName,
             "-G", $Generator,
-            "-A", "x64",
-            "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
+            "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
+            "-DLFS_GPU_BACKEND=$GpuBackend"
         )
 
-        # Add LibTorch path for CMake (required if tests are built)
-        $TorchConfigPath = if ($Configuration -eq 'Debug') {
-            Join-Path $ProjectRoot "external\debug\libtorch\share\cmake\Torch"
-        } else {
-            Join-Path $ProjectRoot "external\release\libtorch\share\cmake\Torch"
-        }
+        if ($GpuBackend -eq 'CUDA') {
+            $CMakeArgs += "-A"
+            $CMakeArgs += "x64"
 
-        if (Test-Path $TorchConfigPath) {
-            $CMakeArgs += "-DTorch_DIR=$TorchConfigPath"
+            # Add LibTorch path for CMake (required if tests are built)
+            $TorchConfigPath = if ($Configuration -eq 'Debug') {
+                Join-Path $ProjectRoot "external\debug\libtorch\share\cmake\Torch"
+            } else {
+                Join-Path $ProjectRoot "external\release\libtorch\share\cmake\Torch"
+            }
+
+            if (Test-Path $TorchConfigPath) {
+                $CMakeArgs += "-DTorch_DIR=$TorchConfigPath"
+            }
+        } else {
+            $CMakeArgs += "-DCMAKE_BUILD_TYPE=$Configuration"
+            $CMakeArgs += "-DLFS_AMDGPU_ARCH=$AmdGpuArch"
+            $CMakeArgs += "-DLFS_ROCM_PATH=$HipRocmRoot"
+            $CMakeArgs += "-DHIP_PATH=$HipRocmRoot"
+            $CMakeArgs += "-DCMAKE_CXX_COMPILER=$HipClang"
+            $CMakeArgs += "-DCMAKE_PREFIX_PATH=$HipRocmRoot"
+
+            $env:HIP_PATH = $HipRocmRoot
+            $env:ROCM_PATH = $HipRocmRoot
+            $env:HIP_PLATFORM = 'amd'
+            $env:HIP_CLANG_PATH = Split-Path -Parent $HipClang
         }
 
         # Configure
         Write-Host "Configuring CMake..." -ForegroundColor Yellow
         Write-Host "  Generator: $Generator" -ForegroundColor Gray
+        Write-Host "  Backend: $GpuBackend" -ForegroundColor Gray
         Write-Host "  Configuration: $Configuration" -ForegroundColor Gray
         Write-Host "  Toolchain: $VcpkgToolchain" -ForegroundColor Gray
+        if ($GpuBackend -eq 'HIP') {
+            Write-Host "  ROCm: $HipRocmRoot" -ForegroundColor Gray
+            Write-Host "  HIP compiler: $HipClang" -ForegroundColor Gray
+            Write-Host "  AMDGPU arch: $AmdGpuArch" -ForegroundColor Gray
+        }
         Write-Host "  Python Bindings: Enabled" -ForegroundColor Gray
         Write-Host ""
 
@@ -755,9 +962,13 @@ function Build-LichtFeldStudio {
         Write-Host "This may take 10-30 minutes depending on your system..." -ForegroundColor Gray
         Write-Host ""
 
-        # Use msbuild for better Windows compatibility
-        $SolutionFile = Join-Path $BuildDir "LichtFeld-Studio.sln"
-        msbuild $SolutionFile /p:Configuration=$Configuration /p:Platform=x64 /m
+        if ($GpuBackend -eq 'HIP') {
+            cmake --build $BuildDirName --parallel
+        } else {
+            # Use msbuild for better Windows compatibility
+            $SolutionFile = Join-Path $BuildDir "LichtFeld-Studio.sln"
+            msbuild $SolutionFile /p:Configuration=$Configuration /p:Platform=x64 /m
+        }
 
         if ($LASTEXITCODE -ne 0) {
             Write-Host "ERROR: Build failed!" -ForegroundColor Red
@@ -773,11 +984,21 @@ function Build-LichtFeldStudio {
         Write-Host "================================================================" -ForegroundColor Green
         Write-Host ""
         Write-Host "Executable location:" -ForegroundColor Cyan
-        Write-Host "  $BuildDir\$Configuration\LichtFeld-Studio.exe" -ForegroundColor White
+        $ExePath = if ($GpuBackend -eq 'HIP') {
+            Join-Path $BuildDir "LichtFeld-Studio.exe"
+        } else {
+            Join-Path (Join-Path $BuildDir $Configuration) "LichtFeld-Studio.exe"
+        }
+        Write-Host "  $ExePath" -ForegroundColor White
         Write-Host ""
 
         Write-Host "Python module location:" -ForegroundColor Cyan
-        Write-Host "  $BuildDir\src\python\$Configuration\lichtfeld.pyd" -ForegroundColor White
+        $PydPath = if ($GpuBackend -eq 'HIP') {
+            Join-Path $BuildDir "src\python\lichtfeld.pyd"
+        } else {
+            Join-Path $BuildDir "src\python\$Configuration\lichtfeld.pyd"
+        }
+        Write-Host "  $PydPath" -ForegroundColor White
         Write-Host ""
 
     } finally {
@@ -796,6 +1017,7 @@ Write-Host "================================================================" -F
 Write-Host ""
 Write-Host "Project: $ProjectRoot" -ForegroundColor Gray
 Write-Host "Configuration: $Configuration" -ForegroundColor Gray
+Write-Host "GPU Backend: $GpuBackend" -ForegroundColor Gray
 Write-Host "Python Bindings: Enabled" -ForegroundColor Gray
 Write-Host ""
 
@@ -843,7 +1065,10 @@ if (-not $SkipVcpkg) {
 }
 
 # Phase 4: LibTorch Download
-if (-not $SkipLibTorch) {
+if ($GpuBackend -eq 'HIP') {
+    Write-Host "Skipping CUDA LibTorch setup for HIP backend." -ForegroundColor Yellow
+    Write-Host ""
+} elseif (-not $SkipLibTorch) {
     Setup-LibTorch
 } else {
     Write-Host "Skipping LibTorch setup (-SkipLibTorch)" -ForegroundColor Yellow

@@ -8,7 +8,9 @@
 #include "cuda.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
 #include <math_functions.h>
+#endif
 
 #define FILTER_RADIUS_1 1
 #define FILTER_RADIUS_2 2

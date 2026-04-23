@@ -12,6 +12,7 @@
  * Expected: 2-4× speedup on large reductions!
  */
 
+#include "core/logger.hpp"
 #include "internal/gpu_config.hpp"
 #include "internal/packed128.cuh"
 #include "internal/tensor_functors.hpp"

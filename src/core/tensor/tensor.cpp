@@ -943,6 +943,27 @@ namespace lfs::core {
         return t;
     }
 
+    namespace {
+        template <typename FromT, typename ToT>
+        ToT convert_dtype_cpu_value(const FromT& value) {
+            if constexpr (std::is_same_v<FromT, float> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(value), 0.0f, 255.0f)));
+            } else if constexpr (std::is_same_v<FromT, int> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int>(value), 0, 255));
+            } else if constexpr (std::is_same_v<FromT, int64_t> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int64_t>(value), static_cast<int64_t>(0), static_cast<int64_t>(255)));
+            } else if constexpr (std::is_same_v<FromT, __half> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::round(std::clamp(__half2float(value), 0.0f, 255.0f)));
+            } else if constexpr (std::is_same_v<ToT, __half>) {
+                return __float2half(static_cast<float>(value));
+            } else if constexpr (std::is_same_v<FromT, __half>) {
+                return static_cast<ToT>(__half2float(value));
+            } else {
+                return static_cast<ToT>(value);
+            }
+        }
+    } // namespace
+
     // ============= Type Conversion =============
     Tensor Tensor::to(DataType dtype) const {
         materialize_if_deferred();
@@ -976,15 +997,7 @@ namespace lfs::core {
         const FROM_TYPE* src = ptr<FROM_TYPE>();                                                                                             \
         TO_TYPE* dst = result.ptr<TO_TYPE>();                                                                                                \
         for (size_t i = 0; i < numel(); ++i) {                                                                                               \
-            if constexpr (std::is_same_v<FROM_TYPE, float> && std::is_same_v<TO_TYPE, uint8_t>) {                                            \
-                dst[i] = static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(src[i]), 0.0f, 255.0f)));                             \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int> && std::is_same_v<TO_TYPE, uint8_t>) {                                       \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(src[i]), 0, 255));                                                 \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int64_t> && std::is_same_v<TO_TYPE, uint8_t>) {                                   \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int64_t>(src[i]), static_cast<int64_t>(0), static_cast<int64_t>(255))); \
-            } else {                                                                                                                         \
-                dst[i] = static_cast<TO_TYPE>(src[i]);                                                                                       \
-            }                                                                                                                                \
+            dst[i] = convert_dtype_cpu_value<FROM_TYPE, TO_TYPE>(src[i]);                                                                    \
         }                                                                                                                                    \
         return result;                                                                                                                       \
     }

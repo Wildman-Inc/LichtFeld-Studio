@@ -113,7 +113,11 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline Packed128<ElementType> load128cs(const ElementType* address) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+        return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
+#else
         return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
+#endif
     }
 
     /**
@@ -140,7 +144,11 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline void store128cs(ElementType* target, Packed128<ElementType> value) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+        *reinterpret_cast<int4*>(target) = value.get_bits();
+#else
         __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+#endif
     }
 
     /**

@@ -38,12 +38,12 @@ function(lfs_force_python_release_abi target_name)
         string(REGEX REPLACE "python3([0-9]+)_?d\\.lib$"
                              "python3\\1.lib" _py_release_implib "${_py_debug_lib}")
         string(REPLACE "/debug/lib/" "/lib/" _py_release_implib "${_py_release_implib}")
-        
+
         if(EXISTS "${_py_release_implib}")
             # Set the release import library for Debug config
             set_target_properties(${target_name} PROPERTIES
                 IMPORTED_IMPLIB_DEBUG "${_py_release_implib}")
-            
+
             # Also update the DLL location to use release python312.dll
             get_target_property(_py_debug_dll ${target_name} IMPORTED_LOCATION_DEBUG)
             if(_py_debug_dll)
@@ -55,7 +55,7 @@ function(lfs_force_python_release_abi target_name)
                         IMPORTED_LOCATION_DEBUG "${_py_release_dll}")
                 endif()
             endif()
-            
+
             message(STATUS "Python: forced release ABI for ${target_name} (Windows) - using ${_py_release_implib}")
         endif()
     endif()
@@ -204,12 +204,16 @@ nanobind_add_module(
 )
 
 set_target_properties(lfs_py PROPERTIES
-    CUDA_ARCHITECTURES ""
-    CUDA_SEPARABLE_COMPILATION OFF
     LINKER_LANGUAGE CXX
     POSITION_INDEPENDENT_CODE ON
     OUTPUT_NAME lichtfeld
 )
+if(USE_CUDA)
+    set_target_properties(lfs_py PROPERTIES
+        CUDA_ARCHITECTURES ""
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 target_compile_definitions(lfs_py PRIVATE
     LFS_PYTHON_EXECUTABLE="${Python_EXECUTABLE}"
@@ -242,8 +246,8 @@ target_link_libraries(lfs_py PRIVATE
     $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
     $<IF:$<PLATFORM_ID:Windows>,OpenMeshTools,OpenMeshToolsStatic>
     OpenImageIO::OpenImageIO
-    CUDA::cudart
-    CUDA::curand
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
     ${CMAKE_DL_LIBS}
     imgui::imgui
     implot::implot
@@ -282,11 +286,16 @@ if(WIN32)
         COMMENT "Copying project DLLs to Python module directory"
     )
 
-    # Copy CUDA DLLs
-    file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
-    file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
-    set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
-    foreach(DLL ${CUDA_DLLS_FOR_PYD})
+    if(USE_CUDA)
+        file(GLOB GPU_DLLS_FOR_PYD
+            "${CUDAToolkit_BIN_DIR}/cudart64*.dll"
+            "${CUDAToolkit_BIN_DIR}/curand64*.dll"
+            "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll"
+            "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
+    elseif(USE_HIP AND WIN32)
+        lfs_collect_windows_hip_runtime_dlls(GPU_DLLS_FOR_PYD)
+    endif()
+    foreach(DLL ${GPU_DLLS_FOR_PYD})
         if(EXISTS "${DLL}")
             add_custom_command(TARGET lfs_py POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
@@ -304,7 +313,7 @@ if(WIN32)
     )
 
     # Copy nvimgcodec
-    if(TARGET nvimgcodec)
+    if(LFS_ENABLE_NVIMAGECODEC AND TARGET nvimgcodec)
         add_custom_command(TARGET lfs_py POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:nvimgcodec>"
@@ -348,6 +357,14 @@ if(BUILD_PYTHON_STUBS)
         endif()
 
         if(BUILD_PYTHON_STUBS)
+            set(LFS_HIP_STUBGEN_DLL_DIRS_PY "")
+            if(USE_HIP)
+                lfs_get_windows_hip_runtime_search_dirs(_lfs_hip_stubgen_dll_dirs)
+                foreach(_dir IN LISTS _lfs_hip_stubgen_dll_dirs)
+                    string(APPEND LFS_HIP_STUBGEN_DLL_DIRS_PY "    r'${_dir}',\n")
+                endforeach()
+            endif()
+
             # Python 3.8+ on Windows requires os.add_dll_directory() for DLL loading
             # Create a wrapper script that sets up DLL paths before running stubgen
             # Use file(GENERATE) to evaluate generator expressions at generation time
@@ -368,6 +385,7 @@ dll_dirs = [
     r'${CMAKE_BINARY_DIR}/external/nvImageCodec/src',
     r'${CUDAToolkit_BIN_DIR}',
     r'${CUDAToolkit_BIN_DIR}/x64',
+${LFS_HIP_STUBGEN_DLL_DIRS_PY}
 ]
 
 for d in dll_dirs:

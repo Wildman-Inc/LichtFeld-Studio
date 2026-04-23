@@ -4,6 +4,7 @@
 
 #include "core/tensor.hpp"
 #include "mcmc_kernels.hpp"
+#include <cmath>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -18,6 +19,12 @@
 #include <thrust/sort.h>
 
 namespace lfs::training::mcmc {
+
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+    constexpr unsigned long long FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
+#else
+    constexpr unsigned int FULL_WARP_MASK = 0xFFFFFFFFu;
+#endif
 
     // GLM type aliases for CUDA (matching gsplat)
     using vec2 = glm::vec<2, float>;
@@ -35,7 +42,7 @@ namespace lfs::training::mcmc {
             float binom = 1.0f;
             for (int k = 0; k <= n; k++) {
                 const float sign = (k % 2 == 0) ? 1.0f : -1.0f;
-                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * rsqrtf(static_cast<float>(k + 1));
+                coeffs[n * RELOCATION_N_MAX + k] = binom * sign / std::sqrt(static_cast<float>(k + 1));
                 if (k < n)
                     binom *= static_cast<float>(n - k) / static_cast<float>(k + 1);
             }
@@ -640,7 +647,7 @@ namespace lfs::training::mcmc {
 
         // Warp-level reduction to sum counts
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            count += __shfl_down_sync(0xffffffff, count, offset);
+            count += __shfl_down_sync(FULL_WARP_MASK, count, offset, WARP_SIZE);
         }
 
         // First lane writes the result

@@ -417,19 +417,17 @@ namespace lfs::core::tensor_ops {
 
         // OPTIMIZED PATH: Contiguous segments - use CUB's segmented reduce
         if (inner_size == 1) {
+            auto offset_from_segment = [reduce_size] __host__ __device__(int i) -> int {
+                return i * static_cast<int>(reduce_size);
+            };
+
             // begin_offsets: [0, N, 2N, 3N, ...]
             auto begin_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(0),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+                thrust::counting_iterator<int>(0), offset_from_segment);
 
             // end_offsets: [N, 2N, 3N, 4N, ...]
             auto end_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(1),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+                thrust::counting_iterator<int>(1), offset_from_segment);
 
             void* d_temp_storage = nullptr;
             size_t temp_storage_bytes = 0;

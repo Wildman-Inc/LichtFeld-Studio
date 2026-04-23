@@ -32,7 +32,7 @@ set(LFS_TRAINING_KERNEL_SOURCES
 )
 
 # Create CUDA kernels library
-add_library(lfs_training_kernels STATIC ${LFS_TRAINING_KERNEL_SOURCES})
+lfs_add_gpu_library(lfs_training_kernels STATIC ${LFS_TRAINING_KERNEL_SOURCES})
 
 target_include_directories(lfs_training_kernels
     PUBLIC
@@ -43,15 +43,19 @@ target_include_directories(lfs_training_kernels
 target_link_libraries(lfs_training_kernels
     PUBLIC
         lfs_core         # For lfs::core::Tensor (tensor merged into lfs_core)
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
 )
 
-set_target_properties(lfs_training_kernels PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    POSITION_INDEPENDENT_CODE ON
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
-)
+if(USE_CUDA)
+    set_target_properties(lfs_training_kernels PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+    )
+else()
+    set_target_properties(lfs_training_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # CUDA compiler options for lfs_training_kernels
 target_compile_options(lfs_training_kernels PRIVATE
@@ -97,7 +101,7 @@ set(TRAINING_NEW_SOURCES
 )
 
 # lfs_training - Training module with optimizer
-add_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
+lfs_add_gpu_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
 
 target_include_directories(lfs_training
     PUBLIC

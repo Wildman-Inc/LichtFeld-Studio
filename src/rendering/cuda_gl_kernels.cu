@@ -4,10 +4,11 @@
 
 #include "config.h"
 
+#include <cuda_runtime.h>
+
 #ifdef CUDA_GL_INTEROP_ENABLED
 
 #include <cassert>
-#include <cuda_runtime.h>
 
 #include "core/cuda_debug.hpp"
 

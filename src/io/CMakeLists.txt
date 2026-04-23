@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # CUDA library for IO-specific kernels (morton encoding, k-means)
-add_library(lfs_io_cuda STATIC
+lfs_add_gpu_library(lfs_io_cuda STATIC
         cuda/morton_encoding.hpp
         cuda/morton_encoding.cu
         cuda/kmeans.hpp
@@ -18,21 +18,26 @@ target_include_directories(lfs_io_cuda
         PRIVATE
         ${CMAKE_SOURCE_DIR}/src/core/include
         ${CMAKE_SOURCE_DIR}/src
+        ${GPU_INCLUDE_DIRS}
 )
 
 target_link_libraries(lfs_io_cuda
         INTERFACE
         lfs_core      # Propagate to consumers, not linked during device linking
         PRIVATE
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
 )
 
-set_target_properties(lfs_io_cuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
-)
+if(USE_CUDA)
+    set_target_properties(lfs_io_cuda PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(lfs_io_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # CUDA compiler options for lfs_io_cuda
 target_compile_options(lfs_io_cuda PRIVATE
@@ -62,16 +67,28 @@ target_link_libraries(spz_lib PRIVATE ZLIB::ZLIB)
 target_compile_features(spz_lib PUBLIC cxx_std_17)
 set_target_properties(spz_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-        libavcodec
-        libavformat
-        libswscale
-        libavutil
-)
+if(USE_HIP)
+    add_library(lfs_video STATIC
+        include/io/video/video_encoder_interface.hpp
+        include/io/video/video_export_options.hpp
+        video/video_encoder.hpp
+        video/video_encoder_stub.cpp
+        video_frame_extractor.hpp
+        video_frame_extractor_stub.cpp
+        video_player.hpp
+        video_player_stub.cpp
+    )
+else()
+    # Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+            libavcodec
+            libavformat
+            libswscale
+            libavutil
+    )
 
-add_library(lfs_video STATIC
+    lfs_add_gpu_library(lfs_video STATIC
         include/io/video/video_encoder_interface.hpp
         include/io/video/video_export_options.hpp
         video/video_encoder.hpp
@@ -82,7 +99,8 @@ add_library(lfs_video STATIC
         video_frame_extractor.cpp
         video_player.hpp
         video_player.cpp
-)
+    )
+endif()
 
 target_include_directories(lfs_video
         PUBLIC
@@ -93,23 +111,30 @@ target_include_directories(lfs_video
         ${CMAKE_SOURCE_DIR}/src/core/include
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/external
+        ${GPU_INCLUDE_DIRS}
 )
 
 target_link_libraries(lfs_video
         PRIVATE
-        PkgConfig::FFMPEG
         spdlog::spdlog
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
 )
+if(NOT USE_HIP)
+    target_link_libraries(lfs_video PRIVATE PkgConfig::FFMPEG)
+endif()
 
 target_compile_features(lfs_video PUBLIC cxx_std_23)
 
-set_target_properties(lfs_video PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
-)
+if(USE_CUDA)
+    set_target_properties(lfs_video PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(lfs_video PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 target_compile_options(lfs_video PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} --extended-lambda -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8>
@@ -175,12 +200,17 @@ add_library(lfs_io STATIC
         mesh/texture_loader.cpp
         cache_image_loader.cpp
         nvcodec_image_loader.hpp
-        nvcodec_image_loader.cpp
         pipelined_image_loader.cpp
         stb_image_impl.cpp
         tinyply.cpp
 
 )
+
+if(LFS_ENABLE_NVIMAGECODEC)
+    target_sources(lfs_io PRIVATE nvcodec_image_loader.cpp)
+else()
+    target_sources(lfs_io PRIVATE nvcodec_image_loader_stub.cpp)
+endif()
 
 # Set include directories
 target_include_directories(lfs_io
@@ -190,9 +220,11 @@ target_include_directories(lfs_io
         PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/external
-        ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include
         ${CMAKE_SOURCE_DIR}/external/spz
 )
+if(LFS_ENABLE_NVIMAGECODEC)
+    target_include_directories(lfs_io PRIVATE ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include)
+endif()
 
 # Find the actual WebP library targets
 if(TARGET WebP::webpdecoder)
@@ -243,7 +275,7 @@ target_link_libraries(lfs_io
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
         ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
-        CUDA::cudart           # CUDA runtime for nvImageCodec
+        ${GPU_RUNTIME_LIBRARY}
         lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
         lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
@@ -253,11 +285,11 @@ target_link_libraries(lfs_io
 )
 
 # Link nvImageCodec if available
-if(TARGET nvimgcodec)
+if(LFS_ENABLE_NVIMAGECODEC AND TARGET nvimgcodec)
     target_link_libraries(lfs_io PRIVATE nvimgcodec)
     add_dependencies(lfs_io nvimgcodec)
     message(STATUS "Linking nvImageCodec to lfs_io")
-else()
+elseif(LFS_ENABLE_NVIMAGECODEC)
     message(WARNING "nvImageCodec target not found - JPEG hardware decode will not work")
 endif()
 

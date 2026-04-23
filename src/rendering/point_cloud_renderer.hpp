@@ -65,11 +65,11 @@ namespace lfs::rendering {
 
     private:
         Result<void> createCubeGeometry();
-        static Tensor extractRGBFromSH(const Tensor& shs);
+        static lfs::core::Tensor extractRGBFromSH(const lfs::core::Tensor& shs);
 
         // Core rendering implementation (shared by both overloads)
-        Result<void> renderInternal(const Tensor& positions,
-                                    const Tensor& colors,
+        Result<void> renderInternal(const lfs::core::Tensor& positions,
+                                    const lfs::core::Tensor& colors,
                                     const glm::mat4& view,
                                     const glm::mat4& projection,
                                     float voxel_size,
@@ -94,7 +94,7 @@ namespace lfs::rendering {
         size_t current_point_count_ = 0;
 
         // Cached buffer to avoid per-frame allocation
-        Tensor interleaved_cache_;
+        lfs::core::Tensor interleaved_cache_;
 
 #ifdef CUDA_GL_INTEROP_ENABLED
         std::optional<CudaGLInteropBuffer> interop_buffer_;

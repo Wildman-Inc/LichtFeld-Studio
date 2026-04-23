@@ -11,13 +11,17 @@ set(EDGE_RASTERIZER_SOURCES
 )
 
 # One unified library - renamed from fastgs_backend to fastlfs_backend
-add_library(edge_compute_backend STATIC ${EDGE_RASTERIZER_SOURCES})
+lfs_add_gpu_library(edge_compute_backend STATIC ${EDGE_RASTERIZER_SOURCES})
 
-set_target_properties(edge_compute_backend PROPERTIES
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION OFF
-        POSITION_INDEPENDENT_CODE ON
-)
+if(USE_CUDA)
+    set_target_properties(edge_compute_backend PROPERTIES
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION OFF
+            POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(edge_compute_backend PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 target_include_directories(edge_compute_backend
         PUBLIC
@@ -25,16 +29,16 @@ target_include_directories(edge_compute_backend
 	${CMAKE_CURRENT_SOURCE_DIR}/rasterization/src
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
         ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         PRIVATE
 )
 
 # Pure CUDA libraries only
 target_link_libraries(edge_compute_backend
         PUBLIC
-        CUDA::cudart
-        CUDA::curand
-        ${CUDA_CUDA_LIBRARY}
+        ${GPU_RUNTIME_LIBRARY}
+        ${GPU_RAND_LIBRARY}
+        ${GPU_DRIVER_LIBRARY}
         lfs_core_cuda  # CUDA utilities from core module (memory arena)
 )
 

@@ -30,7 +30,46 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
-project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CUDA CXX C)
+set(LFS_GPU_BACKEND "CUDA" CACHE STRING "GPU backend")
+set_property(CACHE LFS_GPU_BACKEND PROPERTY STRINGS CUDA HIP)
+string(TOUPPER "${LFS_GPU_BACKEND}" LFS_GPU_BACKEND)
+if(NOT LFS_GPU_BACKEND MATCHES "^(CUDA|HIP)$")
+    message(FATAL_ERROR "LFS_GPU_BACKEND must be CUDA or HIP")
+endif()
+set(USE_CUDA OFF)
+set(USE_HIP OFF)
+if(LFS_GPU_BACKEND STREQUAL "CUDA")
+    set(USE_CUDA ON)
+else()
+    set(USE_HIP ON)
+endif()
+
+if(USE_HIP AND CMAKE_HOST_WIN32)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsROCm.cmake")
+    lfs_windows_rocm_find_root(_lfs_rocm_root)
+    if(NOT _lfs_rocm_root)
+        message(FATAL_ERROR "Windows ROCm/HIP SDK not found. Set LFS_ROCM_PATH, ROCM_PATH, or HIP_PATH.")
+    endif()
+    set(LFS_ROCM_PATH "${_lfs_rocm_root}" CACHE PATH "ROCm/HIP SDK root" FORCE)
+    lfs_windows_rocm_find_clang("${LFS_ROCM_PATH}" _lfs_hip_clang)
+    if(NOT _lfs_hip_clang)
+        message(FATAL_ERROR "HIP clang++ not found under ${LFS_ROCM_PATH}")
+    endif()
+    set(CMAKE_CXX_COMPILER "${_lfs_hip_clang}" CACHE FILEPATH "HIP clang++" FORCE)
+    get_filename_component(_lfs_hip_clang_dir "${_lfs_hip_clang}" DIRECTORY)
+    if(EXISTS "${_lfs_hip_clang_dir}/clang.exe")
+        set(CMAKE_C_COMPILER "${_lfs_hip_clang_dir}/clang.exe" CACHE FILEPATH "HIP clang" FORCE)
+    endif()
+endif()
+
+project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CXX C)
+
+if(USE_CUDA)
+    enable_language(CUDA)
+elseif(USE_HIP AND NOT WIN32)
+    enable_language(HIP)
+    set(CMAKE_HIP_SOURCE_FILE_EXTENSIONS hip cu)
+endif()
 
 # On Windows with a multi-config generator (MSVC/Visual Studio, Ninja Multi-Config),
 # route all build outputs to build/<Config>/ so Debug and Release binaries are
@@ -98,6 +137,7 @@ file(WRITE "${CMAKE_BINARY_DIR}/include/git_version.h"
 get_filename_component(PROJ_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}" ABSOLUTE)
 
 option(ENABLE_CUDA_GL_INTEROP "Enable CUDA-OpenGL interoperability" ON)
+option(LFS_ENABLE_NVIMAGECODEC "Enable NVIDIA nvImageCodec integration" ON)
 option(BUILD_TESTS "Build tests" OFF)
 option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path test (no CUDA)" OFF)
 option(ENABLE_ALLOCATION_PROFILING "Enable tensor allocation profiling" OFF)
@@ -107,6 +147,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(ENABLE_TENSOR_VALIDATION "Enable runtime tensor NaN/Inf validation" OFF)
 option(ENABLE_CUDA_DEBUG_SYNC "Enable synchronous CUDA kernel checking (slow)" OFF)
 option(ENABLE_TENSOR_OP_TRACING "Enable tensor operation tracing" OFF)
+
+if(USE_HIP)
+    set(LFS_ENABLE_NVIMAGECODEC OFF CACHE BOOL "Enable NVIDIA nvImageCodec integration" FORCE)
+endif()
 
 # Add -rdynamic for backtrace symbol resolution
 if(UNIX AND NOT APPLE)
@@ -161,9 +205,14 @@ endif()
 set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
 
 set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+if(USE_CUDA)
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+elseif(USE_HIP AND NOT WIN32)
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+endif()
 
 # Parallel build
 include(ProcessorCount)
@@ -174,6 +223,7 @@ if(total_cores GREATER 1)
     message(STATUS "Building with ${used_cores} cores")
 endif()
 
+if(USE_CUDA)
 # CUDA setup
 # On Windows, nvidia-smi.exe is in System32, but CMake might be running as 32-bit
 # which causes WOW64 redirection. Explicitly search in Sysnative to avoid this.
@@ -247,7 +297,6 @@ else()
     message(STATUS "CUDA: native (${LichtFeld-Studio_CUDA_ARCH})")
 endif()
 
-enable_language(CUDA)
 find_package(CUDAToolkit 12.8 REQUIRED)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr")
 if(WIN32)
@@ -281,6 +330,172 @@ if(NOT TARGET CUDA::nvToolsExt)
 endif()
 
 message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
+set(GPU_RUNTIME_LIBRARY CUDA::cudart)
+set(GPU_DRIVER_LIBRARY CUDA::cuda_driver)
+set(GPU_RAND_LIBRARY CUDA::curand)
+set(GPU_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
+else()
+    set(_lfs_default_amdgpu_arch "gfx1151")
+    set(LFS_AMDGPU_ARCH "${_lfs_default_amdgpu_arch}" CACHE STRING "AMDGPU target architecture")
+    set(HIP_ARCHITECTURES "${LFS_AMDGPU_ARCH}" CACHE STRING "HIP target architectures" FORCE)
+
+    if(WIN32)
+        lfs_windows_rocm_get_short_path("${LFS_ROCM_PATH}" _lfs_rocm_path)
+        lfs_windows_rocm_find_devel_root("${LFS_ROCM_PATH}" LFS_ROCM_DEVEL_PATH)
+        lfs_windows_rocm_find_runtime_dirs("${LFS_ROCM_PATH}" LFS_ROCM_RUNTIME_DIRS)
+        lfs_windows_rocm_read_hip_version("${LFS_ROCM_PATH}" HIP_VERSION HIP_VERSION_MAJOR HIP_VERSION_MINOR HIP_VERSION_PATCH)
+        lfs_windows_rocm_find_device_lib_path("${LFS_ROCM_PATH}" HIP_DEVICE_LIB_PATH)
+        set(HIP_INCLUDE_DIRS "${_lfs_rocm_path}/include")
+        if(LFS_ROCM_DEVEL_PATH AND NOT LFS_ROCM_DEVEL_PATH STREQUAL LFS_ROCM_PATH)
+            list(APPEND HIP_INCLUDE_DIRS "${LFS_ROCM_DEVEL_PATH}/include")
+        endif()
+        set(CUDAToolkit_INCLUDE_DIRS "${HIP_INCLUDE_DIRS}")
+        set(CUDAToolkit_BIN_DIR "${_lfs_rocm_path}/bin")
+
+        find_library(AMDHIP64_LIBRARY NAMES amdhip64 PATHS "${_lfs_rocm_path}/lib" NO_DEFAULT_PATH)
+        if(NOT AMDHIP64_LIBRARY)
+            message(FATAL_ERROR "amdhip64.lib not found under ${_lfs_rocm_path}/lib")
+        endif()
+
+        set(_lfs_rocm_library_paths "${_lfs_rocm_path}/lib")
+        if(LFS_ROCM_DEVEL_PATH)
+            list(APPEND _lfs_rocm_library_paths
+                "${LFS_ROCM_DEVEL_PATH}/lib"
+                "${LFS_ROCM_DEVEL_PATH}/bin")
+        endif()
+
+        find_library(HIPRAND_LIBRARY NAMES hiprand PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        find_library(ROCRAND_LIBRARY NAMES rocrand PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        file(GLOB _lfs_rocm_builtins_candidates
+            "${LFS_ROCM_PATH}/lib/llvm/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+        if(_lfs_rocm_builtins_candidates)
+            list(GET _lfs_rocm_builtins_candidates 0 CLANG_RT_BUILTINS_LIBRARY)
+        endif()
+
+        set(_lfs_rocm_base_libraries "${AMDHIP64_LIBRARY}")
+        if(CLANG_RT_BUILTINS_LIBRARY)
+            list(APPEND _lfs_rocm_base_libraries "${CLANG_RT_BUILTINS_LIBRARY}")
+        endif()
+
+        set(_lfs_rocm_rand_libraries ${_lfs_rocm_base_libraries})
+        if(HIPRAND_LIBRARY)
+            list(APPEND _lfs_rocm_rand_libraries "${HIPRAND_LIBRARY}")
+        else()
+            message(FATAL_ERROR "hiprand.lib not found in Windows ROCm SDK")
+        endif()
+        if(ROCRAND_LIBRARY)
+            list(APPEND _lfs_rocm_rand_libraries "${ROCRAND_LIBRARY}")
+        endif()
+
+        foreach(_target CUDA::cudart CUDA::cuda_driver CUDA::cupti)
+            if(NOT TARGET ${_target})
+                add_library(${_target} INTERFACE IMPORTED)
+                set_target_properties(${_target} PROPERTIES
+                    INTERFACE_LINK_LIBRARIES "${_lfs_rocm_base_libraries}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${HIP_INCLUDE_DIRS}")
+            endif()
+        endforeach()
+        if(NOT TARGET CUDA::curand)
+            add_library(CUDA::curand INTERFACE IMPORTED)
+            set_target_properties(CUDA::curand PROPERTIES
+                INTERFACE_LINK_LIBRARIES "${_lfs_rocm_rand_libraries}"
+                INTERFACE_INCLUDE_DIRECTORIES "${HIP_INCLUDE_DIRS}")
+        endif()
+
+        set(HIP_HIPCC_FLAGS "--rocm-path=${_lfs_rocm_path} --rocm-device-lib-path=${HIP_DEVICE_LIB_PATH}")
+        set(ENV{HIP_PATH} "${LFS_ROCM_PATH}")
+        set(ENV{ROCM_PATH} "${LFS_ROCM_PATH}")
+        set(ENV{HIP_PLATFORM} "amd")
+        set(ENV{HIP_CLANG_PATH} "${_lfs_hip_clang_dir}")
+        if(LFS_ROCM_RUNTIME_DIRS)
+            message(STATUS "Windows ROCm runtime DLL dirs: ${LFS_ROCM_RUNTIME_DIRS}")
+        endif()
+    else()
+        find_package(hip CONFIG REQUIRED)
+        find_package(hiprand CONFIG QUIET)
+        set(HIP_INCLUDE_DIRS "")
+        if(TARGET hip::device)
+            get_target_property(HIP_INCLUDE_DIRS hip::device INTERFACE_INCLUDE_DIRECTORIES)
+        endif()
+        if(NOT TARGET CUDA::cudart)
+            add_library(CUDA::cudart INTERFACE IMPORTED)
+            set_target_properties(CUDA::cudart PROPERTIES INTERFACE_LINK_LIBRARIES hip::device)
+        endif()
+        if(NOT TARGET CUDA::cuda_driver)
+            add_library(CUDA::cuda_driver INTERFACE IMPORTED)
+            set_target_properties(CUDA::cuda_driver PROPERTIES INTERFACE_LINK_LIBRARIES hip::device)
+        endif()
+        if(NOT TARGET CUDA::curand)
+            add_library(CUDA::curand INTERFACE IMPORTED)
+            set_target_properties(CUDA::curand PROPERTIES INTERFACE_LINK_LIBRARIES hip::device)
+        endif()
+    endif()
+
+    set(GPU_RUNTIME_LIBRARY CUDA::cudart)
+    set(GPU_DRIVER_LIBRARY CUDA::cuda_driver)
+    set(GPU_RAND_LIBRARY CUDA::curand)
+    set(GPU_INCLUDE_DIRS ${HIP_INCLUDE_DIRS})
+    set(CUDA_GL_INTEROP_FOUND FALSE)
+    set(CUDA_GL_INTEROP_ENABLED 0)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HIPUtils.cmake")
+    if(WIN32)
+        add_compile_definitions(WIN32 _USE_MATH_DEFINES NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    endif()
+    message(STATUS "ROCm/HIP ${HIP_VERSION} backend enabled (${HIP_ARCHITECTURES})")
+endif()
+
+function(lfs_add_gpu_library target_name lib_type)
+    if(USE_HIP)
+        lfs_hip_add_library(${target_name} ${lib_type} ${ARGN})
+    else()
+        add_library(${target_name} ${lib_type} ${ARGN})
+    endif()
+endfunction()
+
+function(lfs_get_windows_hip_runtime_search_dirs out_var)
+    set(_dirs "")
+    if(CUDAToolkit_BIN_DIR)
+        list(APPEND _dirs "${CUDAToolkit_BIN_DIR}" "${CUDAToolkit_BIN_DIR}/x64")
+    endif()
+    if(LFS_ROCM_RUNTIME_DIRS)
+        list(APPEND _dirs ${LFS_ROCM_RUNTIME_DIRS})
+    endif()
+    if(LFS_ROCM_DEVEL_PATH)
+        list(APPEND _dirs "${LFS_ROCM_DEVEL_PATH}/bin")
+    endif()
+
+    set(_existing_dirs "")
+    foreach(_dir IN LISTS _dirs)
+        if(_dir AND IS_DIRECTORY "${_dir}")
+            list(APPEND _existing_dirs "${_dir}")
+        endif()
+    endforeach()
+    if(_existing_dirs)
+        list(REMOVE_DUPLICATES _existing_dirs)
+    endif()
+    set(${out_var} "${_existing_dirs}" PARENT_SCOPE)
+endfunction()
+
+function(lfs_collect_windows_hip_runtime_dlls out_var)
+    lfs_get_windows_hip_runtime_search_dirs(_search_dirs)
+    set(_dlls "")
+    foreach(_dir IN LISTS _search_dirs)
+        file(GLOB _dir_dlls CONFIGURE_DEPENDS
+            "${_dir}/amdhip64*.dll"
+            "${_dir}/hiprtc*.dll"
+            "${_dir}/hiprtc-builtins*.dll"
+            "${_dir}/amd_comgr*.dll"
+            "${_dir}/hiprand*.dll"
+            "${_dir}/rocrand*.dll"
+            "${_dir}/rocm-openblas*.dll"
+            "${_dir}/rocm_kpack*.dll")
+        list(APPEND _dlls ${_dir_dlls})
+    endforeach()
+    if(_dlls)
+        list(REMOVE_DUPLICATES _dlls)
+    endif()
+    set(${out_var} "${_dlls}" PARENT_SCOPE)
+endfunction()
 
 # Find packages
 find_package(TBB REQUIRED)
@@ -307,16 +522,16 @@ find_package(RmlUi CONFIG REQUIRED)
 
 # TORCH_CUDA_ARCH_LIST is already defined by Torch
 # use it here as the global default CUDA architecture list too
-if(LichtFeld-Studio_CUDA_ARCH)
+if(USE_CUDA AND LichtFeld-Studio_CUDA_ARCH)
     set(CMAKE_CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}" CACHE STRING "CUDA architectures" FORCE)
 endif()
 
-if(WIN32)
+if(WIN32 AND USE_CUDA)
     set(CMAKE_CUDA_RUNTIME_LIBRARY "Shared") # when using INTEROP in windows static and dynamic symbols are mixed
 endif()
 
 # Check for CUDA-OpenGL interop capability (only if enabled)
-if(ENABLE_CUDA_GL_INTEROP)
+if(USE_CUDA AND ENABLE_CUDA_GL_INTEROP)
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_INCLUDES ${CUDAToolkit_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
     set(CMAKE_REQUIRED_LIBRARIES ${CUDA_LIBRARIES} ${OPENGL_LIBRARIES})
@@ -374,15 +589,20 @@ endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
-    if(CUDA_DEVICE_DEBUG)
+    if(USE_CUDA AND CUDA_DEVICE_DEBUG)
         set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -g -G -O0")
-    else()
+    elseif(USE_CUDA)
         set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -g -O0")
     endif()
 endif()
 
 # External dependencies (EXCLUDE_FROM_ALL to handle install ourselves)
 add_subdirectory(external EXCLUDE_FROM_ALL)
+
+if(USE_HIP)
+    include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_shim")
+    add_compile_definitions(USE_HIP=1 LFS_USE_HIP=1 USE_ROCM=1 __HIP_PLATFORM_AMD__)
+endif()
 
 # =============================================================================
 # LIBRARY MODULES
@@ -419,10 +639,12 @@ add_executable(${PROJECT_NAME}
 )
 
 
-set_target_properties(${PROJECT_NAME} PROPERTIES
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION OFF
-)
+if(USE_CUDA)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 target_include_directories(${PROJECT_NAME}
         PRIVATE
@@ -435,7 +657,7 @@ target_include_directories(${PROJECT_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/external         # For external headers
         ${CMAKE_CURRENT_SOURCE_DIR}/external/imguizmo
 
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         ${OPENGL_INCLUDE_DIRS}
 )
 
@@ -464,7 +686,7 @@ target_link_libraries(${PROJECT_NAME}
         ${LFS_APP_INTERNAL_LINK_LIBS}
 
         ${OPENGL_LIBRARIES}
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         spdlog::spdlog
         taywee::args
         OpenImageIO::OpenImageIO
@@ -526,7 +748,7 @@ if(WIN32)
 endif()
 
 # Copy CUDA runtime DLLs for Windows (needed for Python module loading)
-if(WIN32 AND CUDAToolkit_FOUND)
+if(WIN32 AND USE_CUDA AND CUDAToolkit_FOUND)
     file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
     file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
     set(CUDA_RUNTIME_DLLS ${CUDA_DLLS_1} ${CUDA_DLLS_2})
@@ -543,12 +765,28 @@ if(WIN32 AND CUDAToolkit_FOUND)
     message(STATUS "Post-build: CUDA DLLs will be copied from ${CUDAToolkit_BIN_DIR}")
 endif()
 
+if(WIN32 AND USE_HIP)
+    lfs_get_windows_hip_runtime_search_dirs(HIP_RUNTIME_SEARCH_DIRS)
+    lfs_collect_windows_hip_runtime_dlls(HIP_RUNTIME_DLLS)
+    foreach(HIP_DLL ${HIP_RUNTIME_DLLS})
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${HIP_DLL}"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+            COMMENT "Copying ${HIP_DLL} to executable directory"
+        )
+    endforeach()
+    if(HIP_RUNTIME_DLLS)
+        message(STATUS "Post-build: HIP DLLs will be copied from ${HIP_RUNTIME_SEARCH_DIRS}")
+    endif()
+endif()
+
 # =============================================================================
 # VCPKG DLL COPYING - Ensure all vcpkg DLLs are available at runtime
 # =============================================================================
 # vcpkg's VCPKG_APPLOCAL_DEPS feature may not copy all needed DLLs.
 # This explicitly copies vcpkg DLLs to ensure they're available at runtime.
-# 
+#
 # IMPORTANT: For Release builds, copy ONLY release DLLs to avoid loading debug CRT.
 # For Debug builds, copy both because some vcpkg packages (e.g., zlib) are release-only.
 if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
@@ -556,7 +794,7 @@ if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
     set(_vcpkg_release_bin_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin")
     file(GLOB _vcpkg_release_dlls CONFIGURE_DEPENDS "${_vcpkg_release_bin_dir}/*.dll")
     file(GLOB _vcpkg_debug_dlls CONFIGURE_DEPENDS "${_vcpkg_debug_bin_dir}/*.dll")
-    
+
     # Always copy release DLLs - needed for both Release and Debug builds
     if(_vcpkg_release_dlls)
         add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
@@ -566,7 +804,7 @@ if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
             COMMENT "Copying vcpkg release DLLs"
         )
     endif()
-    
+
     # Only copy debug DLLs for Debug builds (they link to debug CRT which breaks Release)
     # For single-config generators (Ninja, Makefiles): check CMAKE_BUILD_TYPE
     # For multi-config generators (VS, Xcode): use generator expression
@@ -936,8 +1174,14 @@ endif()
 # =============================================================================
 message(STATUS "===========================================")
 message(STATUS "Build Configuration:")
-message(STATUS "  CUDA Version: ${CUDAToolkit_VERSION}")
-message(STATUS "  CUDA Archs: ${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "  GPU Backend: ${LFS_GPU_BACKEND}")
+if(USE_CUDA)
+    message(STATUS "  CUDA Version: ${CUDAToolkit_VERSION}")
+    message(STATUS "  CUDA Archs: ${CMAKE_CUDA_ARCHITECTURES}")
+else()
+    message(STATUS "  HIP Version: ${HIP_VERSION}")
+    message(STATUS "  AMDGPU Archs: ${HIP_ARCHITECTURES}")
+endif()
 message(STATUS "  OpenGL Found: ${OPENGL_FOUND}")
 message(STATUS "  FreeType Found: ${FREETYPE_FOUND}")
 message(STATUS "  WebP Found: ${WebP_FOUND}")
@@ -946,7 +1190,9 @@ message(STATUS "  CUDA-GL Interop Option: ${ENABLE_CUDA_GL_INTEROP}")
 message(STATUS "  CUDA-GL Interop Available: ${CUDA_GL_INTEROP_FOUND}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
-message(STATUS "  CUDA Standard: ${CMAKE_CUDA_STANDARD}")
+if(USE_CUDA)
+    message(STATUS "  CUDA Standard: ${CMAKE_CUDA_STANDARD}")
+endif()
 message(STATUS "  OpenImageIO Found: ${OpenImageIO_FOUND}")
 message(STATUS "  Tests: ${BUILD_TESTS}")
 message(STATUS "  Unicode Test Only: ${BUILD_UNICODE_TEST_ONLY}")

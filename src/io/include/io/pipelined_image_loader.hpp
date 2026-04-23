@@ -20,8 +20,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(LFS_USE_HIP) && !defined(USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
 struct CUstream_st;
 using cudaStream_t = CUstream_st*;
+#endif
 
 namespace lfs::io {
 

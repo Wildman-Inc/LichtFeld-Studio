@@ -9,7 +9,9 @@
 
 #include <cmath>
 #include <cooperative_groups.h>
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
 #include <cooperative_groups/reduce.h>
+#endif
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
