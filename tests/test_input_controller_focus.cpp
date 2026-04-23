@@ -332,6 +332,56 @@ namespace lfs::vis {
         EXPECT_NEAR(std::abs(forward.y), 1.0f, 1e-3f);
     }
 
+    TEST_F(InputControllerFocusTest, TrackballModeCrossesTopViewWithoutLocking) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
+        viewport.camera.setPivot(glm::vec3(0.0f));
+        viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
+            viewport.camera.t, viewport.camera.getPivot());
+        controller.setCameraNavigationMode(InputController::CameraNavigationMode::Trackball);
+
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 40.0, 50.0);
+        controller.handleMouseMove(40.0, 50.0 - glm::half_pi<float>() / 0.002f);
+        controller.handleMouseMove(40.0, 50.0 - (glm::half_pi<float>() + glm::quarter_pi<float>()) / 0.002f);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_RELEASE, 40.0,
+                                     50.0 - (glm::half_pi<float>() + glm::quarter_pi<float>()) / 0.002f);
+
+        const glm::vec3 forward = lfs::rendering::cameraForward(viewport.camera.R);
+        EXPECT_NEAR(glm::length(viewport.camera.getPivot() - viewport.camera.t), 5.0f, 1e-3f);
+        EXPECT_LT(std::abs(forward.y), 0.9f);
+        EXPECT_GT(std::abs(forward.z), 0.5f);
+        EXPECT_NEAR(glm::dot(forward, glm::normalize(viewport.camera.getPivot() - viewport.camera.t)), 1.0f, 1e-5f);
+    }
+
+    TEST_F(InputControllerFocusTest, TrackballModeDoesNotBankOnDiagonalOrbitDrag) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
+        viewport.camera.setPivot(glm::vec3(0.0f));
+        viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
+            viewport.camera.t, viewport.camera.getPivot());
+        controller.setCameraNavigationMode(InputController::CameraNavigationMode::Trackball);
+
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 100.0, 100.0);
+        controller.handleMouseMove(300.0, 220.0);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_RELEASE, 300.0, 220.0);
+
+        constexpr glm::vec3 world_up(0.0f, 1.0f, 0.0f);
+        const glm::vec3 forward = lfs::rendering::cameraForward(viewport.camera.R);
+        const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
+        const glm::vec3 expected_up = glm::normalize(glm::cross(-forward, right));
+        const glm::vec3 actual_up = lfs::rendering::cameraUp(viewport.camera.R);
+
+        EXPECT_NEAR(glm::length(viewport.camera.getPivot() - viewport.camera.t), 5.0f, 1e-4f);
+        EXPECT_NEAR(glm::dot(forward, glm::normalize(viewport.camera.getPivot() - viewport.camera.t)), 1.0f, 1e-5f);
+        EXPECT_GT(glm::dot(actual_up, expected_up), 0.9999f);
+    }
+
     TEST_F(InputControllerFocusTest, TrackballSnapAlignsToNearestAxisView) {
         Viewport viewport(200, 200);
         InputController controller(nullptr, viewport);
