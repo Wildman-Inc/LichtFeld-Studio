@@ -7,7 +7,11 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <imgui.h>
+
+namespace Rml {
+    class Element;
+    class Event;
+} // namespace Rml
 
 namespace lfs::vis {
     struct Theme;
@@ -40,8 +44,9 @@ namespace lfs::vis::editor {
         PythonEditor(const PythonEditor&) = delete;
         PythonEditor& operator=(const PythonEditor&) = delete;
 
-        // Render the editor. Returns true if execution was requested this frame.
-        bool render(const ImVec2& size);
+        // Render the editor inside a RmlUi custom element. Returns true if execution was requested this frame.
+        bool renderRml(Rml::Element& element, float width, float height, float font_size_px = 0.0f);
+        void processRmlEvent(Rml::Element& element, Rml::Event& event);
 
         std::string getText() const;
         std::string getTextStripped() const;
@@ -49,6 +54,7 @@ namespace lfs::vis::editor {
         void clear();
 
         bool shouldExecute() const { return execute_requested_; }
+        bool consumeExecuteRequested();
         bool consumeTextChanged();
         [[nodiscard]] bool hasSyntaxErrors() const;
         [[nodiscard]] bool syntaxDiagnosticsAvailable() const;
@@ -84,6 +90,7 @@ namespace lfs::vis::editor {
         void unfocus();
         bool isFocused() const;
         bool hasActiveCompletion() const;
+        bool needsRmlFrame() const;
         void setVimModeEnabled(bool enabled);
         bool isVimModeEnabled() const;
 

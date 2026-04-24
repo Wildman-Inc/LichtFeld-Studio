@@ -881,7 +881,7 @@ namespace lfs::vis::gui {
         const float mouse_x = input.mouse_x;
         const float mouse_y = input.mouse_y;
         const auto sync_text_focus = [&]() {
-            const bool want_text = rml_input::isTextEditableElement(rml_context_->GetFocusElement());
+            const bool want_text = rml_input::wantsTextInput(rml_context_->GetFocusElement());
             if (want_text == has_text_focus_)
                 return;
 
@@ -891,7 +891,10 @@ namespace lfs::vis::gui {
             if (!has_text_focus_)
                 return;
 
-            if (text_input_handler && input.has_text_editing) {
+            auto* const focused = rml_context_->GetFocusElement();
+            const bool focused_editable = rml_input::isTextEditableElement(focused);
+
+            if (focused_editable && text_input_handler && input.has_text_editing) {
                 had_input |= text_input_handler->handleTextEditing(
                     input.text_editing, input.text_editing_start, input.text_editing_length);
             }
@@ -899,8 +902,15 @@ namespace lfs::vis::gui {
             bool forward_text_codepoints = input.text_inputs.empty();
             for (const auto& text_input : input.text_inputs) {
                 had_input = true;
-                if (!text_input_handler || !text_input_handler->handleTextInput(text_input))
+                if (focused_editable && text_input_handler &&
+                    text_input_handler->handleTextInput(text_input)) {
+                    continue;
+                }
+                if (focused && rml_input::isCustomTextInputElement(focused)) {
+                    rml_context_->ProcessTextInput(text_input);
+                } else {
                     forward_text_codepoints = true;
+                }
             }
 
             if (forward_text_codepoints) {
@@ -915,7 +925,7 @@ namespace lfs::vis::gui {
             if (!focused)
                 return;
 
-            if (rml_input::isTextEditableElement(focused))
+            if (rml_input::wantsTextInput(focused))
                 flush_pending_text_input();
             focused->Blur();
             sync_text_focus();
@@ -1008,34 +1018,39 @@ namespace lfs::vis::gui {
         };
 
         if (forward_keys) {
-            for (int sc : input.keys_pressed) {
+            const auto process_key_down = [&](const int sc) {
                 if (!composing && sc == SDL_SCANCODE_ESCAPE) {
                     if (auto* const focused = rml_context_->GetFocusElement();
                         focused && (rml_input::isTextEditableElement(focused) ||
                                     rml_input::isSelectRelatedElement(focused))) {
                         escape_requested = true;
                         had_input = true;
-                        continue;
+                        return;
                     }
                 }
                 const bool is_submit_key =
                     (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER);
                 if (composing && (is_submit_key || sc == SDL_SCANCODE_ESCAPE))
-                    continue;
+                    return;
                 if (has_text_focus_ && isNumpadTextKey(sc))
-                    continue;
+                    return;
                 auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
                 if (rml_key != Rml::Input::KI_UNKNOWN) {
                     if (text_input_handler && text_input_handler->handleKeyDown(rml_key, mods)) {
                         had_input = true;
-                        continue;
+                        return;
                     }
                     rml_context_->ProcessKeyDown(rml_key, mods);
                     had_input = true;
                 }
                 if (is_submit_key)
                     commit_requested = true;
-            }
+            };
+
+            for (int sc : input.keys_pressed)
+                process_key_down(sc);
+            for (int sc : input.keys_repeated)
+                process_key_down(sc);
             for (int sc : input.keys_released) {
                 if (escape_requested && sc == SDL_SCANCODE_ESCAPE)
                     continue;
