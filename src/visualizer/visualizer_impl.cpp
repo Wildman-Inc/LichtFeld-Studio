@@ -57,13 +57,16 @@ namespace lfs::vis {
         [[nodiscard]] bool shouldDeferLiveTrainingRender(const TrainerManager* const trainer_manager,
                                                          const bool camera_movement_active,
                                                          const bool trainer_pause_pending) {
-            if (!trainer_manager || !trainer_manager->isRunning() || trainer_manager->isTrainerPaused()) {
+            if (!trainer_manager || !trainer_manager->isTrainingActive()) {
                 return false;
             }
 
 #if defined(_WIN32) && (defined(LFS_USE_HIP) || defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__))
-            return true;
+            return trainer_manager->isRunning();
 #else
+            if (!trainer_manager->isRunning() || trainer_manager->isTrainerPaused()) {
+                return false;
+            }
             return camera_movement_active || trainer_pause_pending;
 #endif
         }

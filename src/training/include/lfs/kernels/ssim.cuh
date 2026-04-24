@@ -371,4 +371,9 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& ssim_map,
         lfs::core::Tensor& error_map);
 
+    void launch_normalize_error_map_by_mean(
+        lfs::core::Tensor& error_map,
+        const lfs::core::Tensor& mean,
+        float epsilon = 1e-6f);
+
 } // namespace lfs::training::kernels

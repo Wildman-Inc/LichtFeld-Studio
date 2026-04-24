@@ -2214,6 +2214,42 @@ namespace lfs::training::kernels {
             float err = 1.0f - sum * inv_c;
             error_map[idx] = fmaxf(err, 0.0f);
         }
+
+        __global__ void normalize_error_map_by_mean_kernel(
+            float* __restrict__ error_map,
+            const float* __restrict__ mean,
+            int HW,
+            float epsilon) {
+
+            const float m = mean[0];
+            if (m <= epsilon)
+                return;
+
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= HW)
+                return;
+
+            error_map[idx] /= m;
+        }
+
+        void wait_for_stream(cudaStream_t stream, cudaStream_t dependency) {
+            if (dependency == nullptr || dependency == stream)
+                return;
+
+            cudaEvent_t ready = nullptr;
+            cudaError_t status = cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+            if (status == cudaSuccess) {
+                status = cudaEventRecord(ready, dependency);
+                if (status == cudaSuccess)
+                    status = cudaStreamWaitEvent(stream, ready, 0);
+            }
+
+            if (ready)
+                cudaEventDestroy(ready);
+
+            if (status != cudaSuccess)
+                cudaStreamSynchronize(dependency);
+        }
     } // namespace
 
     void launch_ssim_to_error_map(
@@ -2240,6 +2276,34 @@ namespace lfs::training::kernels {
             ssim_map.ptr<float>(),
             error_map.ptr<float>(),
             C, H, W);
+    }
+
+    void launch_normalize_error_map_by_mean(
+        lfs::core::Tensor& error_map,
+        const lfs::core::Tensor& mean,
+        float epsilon) {
+
+        assert(error_map.ndim() == 2);
+        assert(mean.numel() == 1);
+
+        const int H = static_cast<int>(error_map.shape()[0]);
+        const int W = static_cast<int>(error_map.shape()[1]);
+        const int HW = H * W;
+        if (HW <= 0)
+            return;
+
+        constexpr int THREADS = 256;
+        dim3 grid((HW + THREADS - 1) / THREADS);
+        dim3 block(THREADS);
+        const cudaStream_t stream = error_map.stream();
+
+        wait_for_stream(stream, mean.stream());
+
+        normalize_error_map_by_mean_kernel<<<grid, block, 0, stream>>>(
+            error_map.ptr<float>(),
+            mean.ptr<float>(),
+            HW,
+            epsilon);
     }
 
 } // namespace lfs::training::kernels

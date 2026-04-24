@@ -2824,6 +2824,7 @@ namespace lfs::training {
                     lfs::core::Tensor tile_grad_raw;
                     lfs::core::Tensor tile_grad_alpha;
                     lfs::core::Tensor tile_error_map;
+                    lfs::core::Tensor tile_error_map_mean;
                     lfs::core::Tensor mask_tile;
 
                     // 1) Compute photometric loss (populates ssim_map in workspace)
@@ -2936,9 +2937,9 @@ namespace lfs::training {
                     }
 
                     if (tile_error_map.is_valid() && core::param::is_mrnf_strategy(params_.optimization.strategy)) {
-                        const float map_mean = tile_error_map.mean().item();
-                        if (map_mean > 1e-6f)
-                            tile_error_map.div_(map_mean);
+                        tile_error_map_mean = tile_error_map.mean();
+                        lfs::training::kernels::launch_normalize_error_map_by_mean(
+                            tile_error_map, tile_error_map_mean);
                     }
 
                     if (memory_breakdown_enabled_ && !memory_breakdown_logged_first_raster_ && fast_ctx) {
