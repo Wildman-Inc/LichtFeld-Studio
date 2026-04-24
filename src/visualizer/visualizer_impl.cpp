@@ -1052,10 +1052,18 @@ namespace lfs::vis {
         }
 
         // viewport_region accounts for toolbar offset - required for all render modes
+        const bool trainer_pause_pending =
+            trainer_manager_ && trainer_manager_->isRunning() &&
+            trainer_manager_->isTrainerPauseRequested() &&
+            !trainer_manager_->isTrainerPaused();
+        const bool camera_movement_active =
+            input_controller_ &&
+            (input_controller_->isContinuousInputActive() ||
+             input_controller_->isCameraMovementActive());
         const bool defer_live_training_render =
             trainer_manager_ && trainer_manager_->isRunning() &&
-            input_controller_ && input_controller_->isContinuousInputActive() &&
-            !trainer_manager_->isTrainerPaused();
+            !trainer_manager_->isTrainerPaused() &&
+            (camera_movement_active || trainer_pause_pending);
         RenderingManager::RenderContext context{
             .viewport = viewport_,
             .settings = rendering_manager_->getSettings(),
@@ -1116,7 +1124,11 @@ namespace lfs::vis {
         const bool has_python_redraw = python::consume_redraw_request();
         const bool needs_gui_animation = gui_manager_ && gui_manager_->needsAnimationFrame();
 
-        if (needs_render || continuous_input || has_python_animation || has_python_overlay ||
+        if (defer_live_training_render && !continuous_input && !has_python_animation &&
+            !has_python_overlay && !has_python_redraw && !needs_gui_animation) {
+            constexpr double DEFERRED_TRAINING_RENDER_WAIT_SEC = 0.03;
+            window_manager_->waitEvents(DEFERRED_TRAINING_RENDER_WAIT_SEC);
+        } else if (needs_render || continuous_input || has_python_animation || has_python_overlay ||
             has_python_redraw || needs_gui_animation) {
             window_manager_->pollEvents();
         } else if (is_training) {

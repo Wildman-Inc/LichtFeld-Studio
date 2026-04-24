@@ -2328,6 +2328,7 @@ namespace lfs::vis {
 
     void InputController::onCameraMovementStart() {
         const auto now = std::chrono::steady_clock::now();
+        camera_pause_observed_ = false;
         if (!camera_is_moving_) {
             camera_is_moving_ = true;
             last_camera_movement_time_ = now;
@@ -2358,14 +2359,26 @@ namespace lfs::vis {
 
         auto now = std::chrono::steady_clock::now();
         if (now - last_camera_movement_time_ >= camera_movement_timeout_) {
-            camera_is_moving_ = false;
-
-            // Resume training if we paused it
-            if (training_was_paused_by_camera_ && services().trainerOrNull() && services().trainerOrNull()->isRunning()) {
-                services().trainerOrNull()->resumeTrainingTemporary();
+            // Resume training only after the trainer has reached its pause boundary.
+            if (training_was_paused_by_camera_) {
+                auto* const trainer = services().trainerOrNull();
+                if (trainer && trainer->isRunning()) {
+                    if (!trainer->isTrainerPaused()) {
+                        last_camera_movement_time_ = now;
+                        return;
+                    }
+                    if (!camera_pause_observed_) {
+                        camera_pause_observed_ = true;
+                        last_camera_movement_time_ = now;
+                        return;
+                    }
+                    trainer->resumeTrainingTemporary();
+                }
                 training_was_paused_by_camera_ = false;
+                camera_pause_observed_ = false;
                 LOG_INFO("Camera movement stopped - resuming training temporarily");
             }
+            camera_is_moving_ = false;
         }
     }
 

@@ -196,7 +196,7 @@ namespace lfs::vis {
 
         // Build complete render state from scene graph
         // This is the single source of truth for all rendering data
-        SceneRenderState buildRenderState() const;
+        SceneRenderState buildRenderState(bool include_render_model = true) const;
 
         // Direct info queries
         struct SceneInfo {

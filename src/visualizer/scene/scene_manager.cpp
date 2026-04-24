@@ -2373,32 +2373,34 @@ namespace lfs::vis {
         return nullptr;
     }
 
-    SceneRenderState SceneManager::buildRenderState() const {
+    SceneRenderState SceneManager::buildRenderState(const bool include_render_model) const {
         std::lock_guard<std::mutex> lock(state_mutex_);
 
         SceneRenderState state;
 
         // Get combined model or point cloud
-        if (content_type_ == ContentType::SplatFiles) {
-            state.combined_model = scene_.getCombinedModel();
-        } else if (content_type_ == ContentType::Dataset) {
-            state.combined_model = scene_.getTrainingModel();
-        }
-
-        // Fall back to the visible point cloud whenever the active splat model is absent or empty.
-        // This keeps dataset "ready" scenes renderable before training has produced gaussians.
-        if (!hasRenderableGaussians(state.combined_model)) {
-            const auto visible_point_cloud_nodes = collectVisiblePointCloudNodes(scene_);
-            if (visible_point_cloud_nodes.size() > 1) {
-                state.owned_point_cloud = buildMergedVisiblePointCloud(scene_, visible_point_cloud_nodes);
-                state.point_cloud = state.owned_point_cloud.get();
-                state.point_cloud_transform =
-                    rendering::dataWorldTransformToVisualizerWorld(glm::mat4(1.0f));
+        if (include_render_model) {
+            if (content_type_ == ContentType::SplatFiles) {
+                state.combined_model = scene_.getCombinedModel();
+            } else if (content_type_ == ContentType::Dataset) {
+                state.combined_model = scene_.getTrainingModel();
             }
-            if (visible_point_cloud_nodes.size() == 1) {
-                state.point_cloud = visible_point_cloud_nodes.front()->point_cloud.get();
-                state.point_cloud_transform = rendering::dataWorldTransformToVisualizerWorld(
-                    scene_.getWorldTransform(visible_point_cloud_nodes.front()->id));
+
+            // Fall back to the visible point cloud whenever the active splat model is absent or empty.
+            // This keeps dataset "ready" scenes renderable before training has produced gaussians.
+            if (!hasRenderableGaussians(state.combined_model)) {
+                const auto visible_point_cloud_nodes = collectVisiblePointCloudNodes(scene_);
+                if (visible_point_cloud_nodes.size() > 1) {
+                    state.owned_point_cloud = buildMergedVisiblePointCloud(scene_, visible_point_cloud_nodes);
+                    state.point_cloud = state.owned_point_cloud.get();
+                    state.point_cloud_transform =
+                        rendering::dataWorldTransformToVisualizerWorld(glm::mat4(1.0f));
+                }
+                if (visible_point_cloud_nodes.size() == 1) {
+                    state.point_cloud = visible_point_cloud_nodes.front()->point_cloud.get();
+                    state.point_cloud_transform = rendering::dataWorldTransformToVisualizerWorld(
+                        scene_.getWorldTransform(visible_point_cloud_nodes.front()->id));
+                }
             }
         }
 

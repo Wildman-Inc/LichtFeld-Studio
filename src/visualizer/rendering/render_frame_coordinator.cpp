@@ -170,11 +170,13 @@ namespace lfs::vis {
 
         SceneRenderState scene_state;
         if (context.scene_manager) {
-            scene_state = context.scene_manager->buildRenderState();
+            scene_state = context.scene_manager->buildRenderState(!context.defer_live_training_render);
         }
 
-        const bool has_splats = hasRenderableGaussians(context.model);
-        const bool has_point_cloud = scene_state.point_cloud && scene_state.point_cloud->size() > 0;
+        const bool has_splats =
+            !context.defer_live_training_render && hasRenderableGaussians(context.model);
+        const bool has_point_cloud =
+            !context.defer_live_training_render && scene_state.point_cloud && scene_state.point_cloud->size() > 0;
         if (!has_point_cloud) {
             dependencies_.pass_graph.resetPointCloudCache();
         }
@@ -220,7 +222,7 @@ namespace lfs::vis {
             .additional_dirty = 0,
             .pivot_animation_end = std::nullopt};
 
-        if (!has_splats && !has_point_cloud) {
+        if (!context.defer_live_training_render && !has_splats && !has_point_cloud) {
             const bool had_cached_output = dependencies_.viewport_artifacts.hasOutputArtifacts();
             if (had_cached_output) {
                 resources.cached_metadata = {};

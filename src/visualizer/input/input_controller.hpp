@@ -110,6 +110,7 @@ namespace lfs::vis {
                                      drag_mode_ == DragMode::Rotate;
             return movement_active || camera_drag;
         }
+        [[nodiscard]] bool isCameraMovementActive() const { return camera_is_moving_; }
         [[nodiscard]] bool hasViewportKeyboardFocus() const;
         [[nodiscard]] bool isViewportPoint(double x, double y) const { return isInViewport(x, y); }
         void setInputRouter(input::InputRouter* router) { input_router_ = router; }
@@ -248,6 +249,7 @@ namespace lfs::vis {
         // Camera movement tracking for training pause/resume
         bool camera_is_moving_ = false;
         bool training_was_paused_by_camera_ = false;
+        bool camera_pause_observed_ = false;
         std::chrono::steady_clock::time_point last_camera_movement_time_;
         static constexpr auto camera_movement_timeout_ = std::chrono::milliseconds(500);
 

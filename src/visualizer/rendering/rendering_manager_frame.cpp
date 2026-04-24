@@ -88,21 +88,30 @@ namespace lfs::vis {
         }
         const bool resize_completed = resize_result.completed;
 
-        auto render_lock = acquireLiveModelRenderLock(scene_manager);
+        auto render_lock = context.defer_live_training_render
+                               ? std::optional<std::shared_lock<std::shared_mutex>>{}
+                               : acquireLiveModelRenderLock(scene_manager);
 
-        const lfs::core::SplatData* const model = scene_manager ? scene_manager->getModelForRendering() : nullptr;
-        const bool has_renderable_model = hasRenderableGaussians(model);
+        const lfs::core::SplatData* const model =
+            context.defer_live_training_render || !scene_manager
+                ? nullptr
+                : scene_manager->getModelForRendering();
+        const bool has_renderable_model =
+            !context.defer_live_training_render && hasRenderableGaussians(model);
         const bool has_visible_point_cloud =
+            !context.defer_live_training_render &&
             scene_manager && !has_renderable_model &&
             hasVisibleRenderablePointCloud(scene_manager->getScene());
         const bool has_renderable_content = has_renderable_model || has_visible_point_cloud;
         const size_t model_ptr = reinterpret_cast<size_t>(model);
 
-        if (const auto model_change = frame_lifecycle_service_.handleModelChange(model_ptr, viewport_artifact_service_);
-            model_change.changed) {
-            LOG_DEBUG("Model ptr changed: {} -> {}, size={}",
-                      model_change.previous_model_ptr, model_ptr, model ? model->size() : 0);
-            markDirty(DirtyFlag::ALL);
+        if (!context.defer_live_training_render) {
+            if (const auto model_change = frame_lifecycle_service_.handleModelChange(model_ptr, viewport_artifact_service_);
+                model_change.changed) {
+                LOG_DEBUG("Model ptr changed: {} -> {}, size={}",
+                          model_change.previous_model_ptr, model_ptr, model ? model->size() : 0);
+                markDirty(DirtyFlag::ALL);
+            }
         }
 
         const bool is_training = scene_manager && scene_manager->hasDataset() &&
@@ -190,6 +199,7 @@ namespace lfs::vis {
              .scene_manager = scene_manager,
              .model = model,
              .render_lock_held = render_lock.has_value(),
+             .defer_live_training_render = context.defer_live_training_render,
              .settings = settings_,
              .grid_planes = panel_grid_planes_,
              .frame_dirty = frame_dirty,

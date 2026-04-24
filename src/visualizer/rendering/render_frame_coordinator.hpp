@@ -34,6 +34,7 @@ namespace lfs::vis {
             SceneManager* scene_manager = nullptr;
             const lfs::core::SplatData* model = nullptr;
             bool render_lock_held = false;
+            bool defer_live_training_render = false;
             const RenderSettings& settings;
             std::array<int, 2> grid_planes{{1, 1}};
             DirtyMask frame_dirty = 0;

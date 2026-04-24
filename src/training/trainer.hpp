@@ -135,6 +135,7 @@ namespace lfs::training {
         void request_stop() { stop_requested_ = true; }
 
         bool is_paused() const { return is_paused_.load(); }
+        bool is_pause_requested() const { return pause_requested_.load(); }
         bool is_running() const { return is_running_.load(); }
         bool is_training_complete() const { return training_complete_.load(); }
         bool has_stopped() const { return stop_requested_.load(); }
