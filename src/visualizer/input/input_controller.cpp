@@ -2338,10 +2338,7 @@ namespace lfs::vis {
                 cmd::ToggleGTComparison{}.emit();
             }
 
-            if (auto* trainer = services().trainerOrNull(); trainer && trainer->isRunning()) {
-                trainer->pauseTrainingTemporary();
-                training_was_paused_by_camera_ = true;
-            }
+            training_was_paused_by_camera_ = false;
         } else {
             last_camera_movement_time_ = now;
         }
@@ -2359,25 +2356,30 @@ namespace lfs::vis {
 
         auto now = std::chrono::steady_clock::now();
         if (now - last_camera_movement_time_ >= camera_movement_timeout_) {
-            // Resume training only after the trainer has reached its pause boundary.
-            if (training_was_paused_by_camera_) {
-                auto* const trainer = services().trainerOrNull();
-                if (trainer && trainer->isRunning()) {
-                    if (!trainer->isTrainerPaused()) {
-                        last_camera_movement_time_ = now;
-                        return;
-                    }
-                    if (!camera_pause_observed_) {
-                        camera_pause_observed_ = true;
-                        last_camera_movement_time_ = now;
-                        return;
-                    }
-                    trainer->resumeTrainingTemporary();
+            auto* const trainer = services().trainerOrNull();
+            if (trainer && trainer->isRunning()) {
+                if (!training_was_paused_by_camera_) {
+                    trainer->pauseTrainingTemporary();
+                    training_was_paused_by_camera_ = true;
+                    camera_pause_observed_ = false;
+                    return;
                 }
-                training_was_paused_by_camera_ = false;
-                camera_pause_observed_ = false;
+
+                // Resume training only after one render frame had a chance to use the pause boundary.
+                if (!trainer->isTrainerPaused()) {
+                    return;
+                }
+                if (!camera_pause_observed_) {
+                    camera_pause_observed_ = true;
+                    return;
+                }
+
+                trainer->resumeTrainingTemporary();
                 LOG_INFO("Camera movement stopped - resuming training temporarily");
             }
+
+            training_was_paused_by_camera_ = false;
+            camera_pause_observed_ = false;
             camera_is_moving_ = false;
         }
     }
