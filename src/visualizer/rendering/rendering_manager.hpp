@@ -63,6 +63,7 @@ namespace lfs::vis {
             glm::ivec2 logical_screen_size{0, 0};
             const ViewportRegion* viewport_region = nullptr;
             SceneManager* scene_manager = nullptr;
+            bool defer_live_training_render = false;
         };
 
         RenderingManager();

@@ -1052,12 +1052,17 @@ namespace lfs::vis {
         }
 
         // viewport_region accounts for toolbar offset - required for all render modes
+        const bool defer_live_training_render =
+            trainer_manager_ && trainer_manager_->isRunning() &&
+            input_controller_ && input_controller_->isContinuousInputActive() &&
+            !trainer_manager_->isTrainerPaused();
         RenderingManager::RenderContext context{
             .viewport = viewport_,
             .settings = rendering_manager_->getSettings(),
             .logical_screen_size = window_manager_->getWindowSize(),
             .viewport_region = has_viewport_region ? &viewport_region : nullptr,
-            .scene_manager = scene_manager_.get()};
+            .scene_manager = scene_manager_.get(),
+            .defer_live_training_render = defer_live_training_render};
 
         if (gui_manager_) {
             rendering_manager_->setCropboxGizmoActive(gui_manager_->gizmo().isCropboxGizmoActive());

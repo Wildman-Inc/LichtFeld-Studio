@@ -156,6 +156,17 @@ namespace lfs::vis {
         }
 
         DirtyMask frame_dirty = dirty_mask_.exchange(0);
+        if (context.defer_live_training_render && frame_dirty) {
+            constexpr DirtyMask live_training_render_dirty =
+                DirtyFlag::SPLATS | DirtyFlag::SELECTION | DirtyFlag::CAMERA |
+                DirtyFlag::SPLIT_VIEW | DirtyFlag::VIEWPORT | DirtyFlag::BACKGROUND |
+                DirtyFlag::PPISP;
+            const DirtyMask deferred_dirty = frame_dirty & live_training_render_dirty;
+            frame_dirty &= ~live_training_render_dirty;
+            if (deferred_dirty) {
+                dirty_mask_.fetch_or(deferred_dirty, std::memory_order_relaxed);
+            }
+        }
         if (!has_renderable_content &&
             !splitViewEnabled(settings_.split_view_mode)) {
             // The shell is cleared before render passes run. When the scene is empty, always run
