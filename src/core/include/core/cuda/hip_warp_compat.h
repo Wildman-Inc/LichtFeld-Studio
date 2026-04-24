@@ -34,10 +34,21 @@
     #define LFS_FULL_WARP_MASK 0xFFFFFFFFu
 #elif defined(__HIP_DEVICE_COMPILE__)
     // AMD HIP - detect based on architecture
-    #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    #if defined(__AMDGCN_WAVEFRONT_SIZE)
+        #if __AMDGCN_WAVEFRONT_SIZE == 32
+            #define LFS_WARP_SIZE 32
+            #define LFS_WARP_MASK_TYPE unsigned int
+            #define LFS_FULL_WARP_MASK 0xFFFFFFFFu
+        #else
+            #define LFS_WARP_SIZE 64
+            #define LFS_WARP_MASK_TYPE unsigned long long
+            #define LFS_FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFull
+        #endif
+    #elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+        defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || \
         defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || \
         defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__)
-        // RDNA 1/2/3 - warp size 32
+        // RDNA 1/2/3/3.5 - warp size 32
         #define LFS_WARP_SIZE 32
         #define LFS_WARP_MASK_TYPE unsigned int
         #define LFS_FULL_WARP_MASK 0xFFFFFFFFu

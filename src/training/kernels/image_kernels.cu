@@ -41,6 +41,26 @@ namespace lfs::filters {
 } // namespace lfs::filters
 
 namespace lfs::training::kernels {
+    namespace {
+#if defined(_WIN32) && \
+    (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP) || (defined(USE_HIP) && USE_HIP))
+        constexpr int kImageBlockX = 16;
+        constexpr int kImageBlockY = 16;
+#else
+        constexpr int kImageBlockX = 32;
+        constexpr int kImageBlockY = 32;
+#endif
+
+        [[nodiscard]] dim3 image_block_dim() {
+            return dim3(kImageBlockX, kImageBlockY, 1);
+        }
+
+        [[nodiscard]] dim3 image_grid_dim(const int width, const int height) {
+            const dim3 block = image_block_dim();
+            return dim3((width + block.x - 1) / block.x,
+                        (height + block.y - 1) / block.y);
+        }
+    } // namespace
 
     // ============================================================================
     // Image Filtering Kernels (Convolution Kernels)
@@ -192,35 +212,31 @@ namespace lfs::training::kernels {
 
     void launch_nms_kernel(const float* d_magnitude, const float* d_angle, float* d_output, const int height, const int width) {
 
-        dim3 blockDim = {32, 32, 1};
-        dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
-                     (height + blockDim.y - 1) / blockDim.y);
+        dim3 blockDim = image_block_dim();
+        dim3 gridDim = image_grid_dim(width, height);
 
         nms_kernel<<<gridDim, blockDim>>>(d_magnitude, d_angle, d_output, height, width);
     }
 
     void launch_grayscale_filter(const float* d_input, float* d_output, const int height, const int width) {
 
-        dim3 blockDim = {32, 32, 1};
-        dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
-                     (height + blockDim.y - 1) / blockDim.y);
+        dim3 blockDim = image_block_dim();
+        dim3 gridDim = image_grid_dim(width, height);
 
         rgb_to_grayscale<<<gridDim, blockDim>>>(d_input, d_output, height, width);
     }
 
     void launch_gausssian_blur(const float* d_input, float* d_output, const int k_size, const int height, const int width) {
-        dim3 blockDim = {32, 32, 1};
-        dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
-                     (height + blockDim.y - 1) / blockDim.y);
+        dim3 blockDim = image_block_dim();
+        dim3 gridDim = image_grid_dim(width, height);
 
         gaussian_blur_5x5<<<gridDim, blockDim>>>(d_input, d_output, height, width);
     }
 
     void launch_laplacian_filter(const float* d_input, float* d_output, const int k_size, const int width, const int height) {
 
-        dim3 blockDim = {32, 32, 1};
-        dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
-                     (height + blockDim.y - 1) / blockDim.y);
+        dim3 blockDim = image_block_dim();
+        dim3 gridDim = image_grid_dim(width, height);
 
         switch (k_size) {
         case 3:
@@ -231,9 +247,8 @@ namespace lfs::training::kernels {
 
     void launch_sobel_gradient_filter(const float* d_input, float* d_magnitude, float* d_angle, const int height, const int width) {
 
-        dim3 blockDim(32, 32, 1);
-        dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
-                     (height + blockDim.y - 1) / blockDim.y);
+        dim3 blockDim = image_block_dim();
+        dim3 gridDim = image_grid_dim(width, height);
 
         sobel_gradient_kernel<<<gridDim, blockDim>>>(d_input, d_magnitude, d_angle, height, width);
     }

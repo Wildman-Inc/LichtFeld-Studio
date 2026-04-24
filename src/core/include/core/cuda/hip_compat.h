@@ -78,9 +78,16 @@ namespace cg = cooperative_groups;
 #include <hiprand/hiprand.h>
 
 // Warp size depends on architecture
-// RDNA 1/2/3 uses 32, CDNA/GCN uses 64
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
-    // RDNA 3 uses warp size of 32
+// RDNA uses 32, CDNA/GCN uses 64
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+    #if __AMDGCN_WAVEFRONT_SIZE == 32
+        #define WARP_SIZE 32
+    #else
+        #define WARP_SIZE 64
+    #endif
+#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+      defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+    // RDNA 3 / RDNA 3.5 uses warp size of 32
     #define WARP_SIZE 32
 #elif defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
     // RDNA 2 uses warp size of 32

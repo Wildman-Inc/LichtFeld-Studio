@@ -44,31 +44,38 @@ namespace lfs::mcp {
         std::expected<void, std::string> apply_dataset_load_arguments(
             const json& args,
             core::param::TrainingParameters& params) {
+            if (args.contains("strategy")) {
+                const auto requested = args["strategy"].get<std::string>();
+                if (requested != kDefaultStrategyAlias) {
+                    const auto canonical = core::param::canonical_strategy_name(requested);
+                    if (canonical.empty()) {
+                        return std::unexpected(std::format(
+                            "Invalid strategy '{}'. Use one of: default, mcmc, mrnf, igs+",
+                            requested));
+                    }
+
+                    if (canonical == core::param::kStrategyMCMC) {
+                        params.optimization = core::param::OptimizationParameters::mcmc_defaults();
+                    } else if (canonical == core::param::kStrategyMRNF) {
+                        params.optimization = core::param::OptimizationParameters::mrnf_defaults();
+                    } else if (canonical == core::param::kStrategyIGSPlus) {
+                        params.optimization = core::param::OptimizationParameters::igs_plus_defaults();
+                    }
+                }
+            }
+
             if (args.contains("images_folder"))
                 params.dataset.images = args["images_folder"].get<std::string>();
             if (args.contains("max_iterations"))
                 params.optimization.iterations = args["max_iterations"].get<size_t>();
+            if (args.contains("max_gaussians"))
+                params.optimization.max_cap = args["max_gaussians"].get<int>();
             if (args.contains("output_path"))
                 params.dataset.output_path = args["output_path"].get<std::string>();
             if (params.dataset.output_path.empty())
                 params.dataset.output_path = core::param::default_dataset_output_path(params.dataset.data_path);
 
-            if (!args.contains("strategy"))
-                return {};
-
-            const auto requested = args["strategy"].get<std::string>();
-            if (requested == kDefaultStrategyAlias) {
-                return {};
-            }
-
-            if (const auto canonical = core::param::canonical_strategy_name(requested); !canonical.empty()) {
-                params.optimization.strategy = std::string(canonical);
-                return {};
-            }
-
-            return std::unexpected(std::format(
-                "Invalid strategy '{}'. Use one of: default, mcmc, mrnf, igs+",
-                requested));
+            return {};
         }
 
     } // namespace
@@ -87,6 +94,7 @@ namespace lfs::mcp {
                         {"images_folder", json{{"type", "string"}, {"description", "Images subfolder (default: images)"}}},
                         {"output_path", json{{"type", "string"}, {"description", "Optional output directory for checkpoints and exports (default: <dataset>/output)"}}},
                         {"max_iterations", json{{"type", "integer"}, {"description", "Maximum training iterations (default: 30000)"}}},
+                        {"max_gaussians", json{{"type", "integer"}, {"description", "Maximum number of Gaussians"}}},
                         {"strategy", json{{"type", "string"}, {"enum", json::array({"default", "mcmc", "mrnf", "igs+"})}, {"description", "Training strategy or 'default' to keep the built-in default"}}}},
                     .required = {"path"}},
                 .metadata = command_metadata(backend, "scene", true)},
