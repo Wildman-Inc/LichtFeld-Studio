@@ -443,6 +443,24 @@ class TrainingPanel(Panel):
         if lf.ui.set_panel_label(self.id, label):
             self._last_panel_label = label
 
+    def _live_iteration(self):
+        value = AppState.iteration.value
+        if not AppState.has_trainer.value:
+            return value
+        try:
+            return max(value, int(lf.trainer_current_iteration()))
+        except Exception:
+            return value
+
+    def _live_num_gaussians(self):
+        value = AppState.num_gaussians.value
+        if not AppState.has_trainer.value:
+            return value
+        try:
+            return max(value, int(lf.trainer_num_splats()))
+        except Exception:
+            return value
+
     def _bind_labels(self, model):
         for label_id, key in LOCALE_KEYS.items():
             model.bind_func(f"label_{label_id}", lambda k=key: tr(k))
@@ -970,7 +988,7 @@ class TrainingPanel(Panel):
     def _bind_status(self, model, p):
         def _status_mode():
             state = AppState.trainer_state.value
-            it = AppState.iteration.value
+            it = self._live_iteration()
             labels = {
                 "idle": tr("training_panel.idle"),
                 "ready": tr("status.ready") if it == 0 else tr("training_panel.resume"),
@@ -984,16 +1002,16 @@ class TrainingPanel(Panel):
             return f"{tr('status.mode')}: {labels.get(state, tr('status.unknown'))}"
 
         def _status_iteration():
-            it = AppState.iteration.value
+            it = self._live_iteration()
             _rate_tracker.add_sample(it)
             rate = _rate_tracker.get_rate()
             return f"{tr('status.iteration')} {it:,} ({rate:.1f} {tr('training_panel.iters_per_sec')})"
 
         def _status_gaussians():
-            return tr("progress.num_splats") % f"{AppState.num_gaussians.value:,}"
+            return tr("progress.num_splats") % f"{self._live_num_gaussians():,}"
 
         def _progress_text():
-            it = AppState.iteration.value
+            it = self._live_iteration()
             mx = AppState.max_iterations.value
             return f"{it:,}/{mx:,}" if mx > 0 else ""
 
@@ -1137,7 +1155,7 @@ class TrainingPanel(Panel):
             self._handle.dirty_all()
             dirty = True
         else:
-            it = AppState.iteration.value
+            it = self._live_iteration()
             if it != self._last_iteration:
                 self._last_iteration = it
                 self._handle.dirty("status_iteration")
@@ -1145,7 +1163,7 @@ class TrainingPanel(Panel):
                 self._handle.dirty("show_progress")
                 dirty = True
 
-            ng = AppState.num_gaussians.value
+            ng = self._live_num_gaussians()
             if ng != self._last_num_gaussians:
                 self._last_num_gaussians = ng
                 self._handle.dirty("status_gaussians")
@@ -1178,7 +1196,7 @@ class TrainingPanel(Panel):
         return dirty
 
     def _update_progress(self):
-        it = AppState.iteration.value
+        it = self._live_iteration()
         mx = AppState.max_iterations.value
         frac = it / mx if mx > 0 and it > 0 else 0.0
         if frac != self._last_progress_frac:
@@ -3234,7 +3252,7 @@ class TrainingPanel(Panel):
         layout.label(
             f"{tr('status.iteration')} {iteration:,} ({rate:.1f} {tr('training_panel.iters_per_sec')})"
         )
-        layout.label(tr("progress.num_splats") % f"{AppState.num_gaussians.value:,}")
+        layout.label(tr("progress.num_splats") % f"{self._live_num_gaussians():,}")
 
         max_iter = AppState.max_iterations.value
         if max_iter > 0 and iteration > 0:

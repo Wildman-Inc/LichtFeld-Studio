@@ -284,6 +284,12 @@ namespace lfs::vis {
         accumulated_training_time_ = std::chrono::steady_clock::duration{0};
 
         state::TrainingStarted{.total_iterations = getTotalIterations()}.emit();
+        state::TrainingProgress{
+            .iteration = getCurrentIteration(),
+            .loss = getCurrentLoss(),
+            .num_gaussians = getNumSplats(),
+            .is_refining = false}
+            .emit();
 
         training_thread_ = std::make_unique<std::jthread>(
             [this](std::stop_token stop_token) {
