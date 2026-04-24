@@ -22,6 +22,22 @@ namespace lfs::vis {
         ui::GridSettingsChanged::when([this](const auto& event) { handleGridSettingsChanged(event); });
         ui::NodeSelected::when([this](const auto&) { triggerSelectionFlash(); });
         state::TrainingStarted::when([this](const auto&) { handleTrainingStarted(); });
+        state::TrainingPaused::when([this](const auto&) {
+            invalidateFrustumImageLoaderSync();
+            syncFrustumImageLoader(viewport_interaction_context_.scene_manager);
+            markDirty(DirtyFlag::OVERLAY);
+        });
+        state::TrainingResumed::when([this](const auto&) {
+            clearFrustumThumbnailState();
+            invalidateFrustumImageLoaderSync(true);
+            syncFrustumImageLoader(viewport_interaction_context_.scene_manager);
+            markDirty(DirtyFlag::OVERLAY);
+        });
+        state::TrainingStopped::when([this](const auto&) {
+            invalidateFrustumImageLoaderSync();
+            syncFrustumImageLoader(viewport_interaction_context_.scene_manager);
+            markDirty(DirtyFlag::OVERLAY);
+        });
         state::TrainingCompleted::when([this](const auto&) { handleTrainingCompleted(); });
         state::SceneLoaded::when([this](const auto&) { handleSceneLoaded(); });
         state::SceneChanged::when([this](const auto&) { handleSceneChanged(); });

@@ -53,6 +53,21 @@ namespace lfs::vis {
                 window_manager->wakeEventLoop();
             }
         }
+
+        [[nodiscard]] bool shouldDeferLiveTrainingRender(const TrainerManager* const trainer_manager,
+                                                         const bool camera_movement_active,
+                                                         const bool trainer_pause_pending) {
+            if (!trainer_manager || !trainer_manager->isRunning() || trainer_manager->isTrainerPaused()) {
+                return false;
+            }
+
+#if defined(_WIN32) && (defined(LFS_USE_HIP) || defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__))
+            return true;
+#else
+            return camera_movement_active || trainer_pause_pending;
+#endif
+        }
+
         std::optional<glm::mat3> buildValidatedViewRotation(const glm::vec3& eye,
                                                             const glm::vec3& target,
                                                             const glm::vec3& requested_up) {
@@ -1060,10 +1075,8 @@ namespace lfs::vis {
             input_controller_ &&
             (input_controller_->isContinuousInputActive() ||
              input_controller_->isCameraMovementActive());
-        const bool defer_live_training_render =
-            trainer_manager_ && trainer_manager_->isRunning() &&
-            !trainer_manager_->isTrainerPaused() &&
-            (camera_movement_active || trainer_pause_pending);
+        const bool defer_live_training_render = shouldDeferLiveTrainingRender(
+            trainer_manager_.get(), camera_movement_active, trainer_pause_pending);
         RenderingManager::RenderContext context{
             .viewport = viewport_,
             .settings = rendering_manager_->getSettings(),

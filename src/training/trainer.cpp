@@ -12,6 +12,7 @@
 #include "control/control_boundary.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/event_bridge/command_center_bridge.hpp"
 #include "core/events.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
@@ -77,6 +78,10 @@ namespace lfs::training {
             return value != "0" && value != "false" && value != "FALSE" &&
                    value != "off" && value != "OFF" &&
                    value != "no" && value != "NO";
+        }
+
+        void publish_command_center_bridge() {
+            lfs::event::CommandCenterBridge::instance().set(&CommandCenter::instance());
         }
 
         [[nodiscard]] double bytes_to_mib(const size_t bytes) {
@@ -3378,6 +3383,7 @@ namespace lfs::training {
         is_running_ = false;
         training_complete_ = false;
         ready_to_start_ = false; // Reset the flag
+        publish_command_center_bridge();
         lfs::training::CommandCenter::instance().set_phase(lfs::training::TrainingPhase::SafeControl);
 
         ready_to_start_ = true; // Skip GUI wait for now

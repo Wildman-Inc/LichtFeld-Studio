@@ -297,10 +297,14 @@ namespace lfs::vis {
         if (!show_camera_frustums) {
             allow_fallback_loader = false;
         } else if (const auto* tm = scene_manager ? scene_manager->getTrainerManager() : nullptr) {
-            if (const auto* trainer = tm->getTrainer()) {
+            const bool training_owns_gpu = tm->isRunning() && !tm->isTrainerPaused();
+            if (training_owns_gpu) {
+                allow_fallback_loader = false;
+                wait_for_active_loader = true;
+            } else if (const auto* trainer = tm->getTrainer()) {
                 frustum_loader = trainer->getActiveImageLoader();
             }
-            if (tm->isRunning() && !frustum_loader) {
+            if (!training_owns_gpu && tm->isRunning() && !frustum_loader) {
                 allow_fallback_loader = false;
                 wait_for_active_loader = true;
             }

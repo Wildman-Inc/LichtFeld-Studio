@@ -8,6 +8,7 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "cuda/image_format_kernels.cuh"
+#include "io/amf_image_loader.hpp"
 #include "io/nvcodec_image_loader.hpp"
 
 #include <cuda_runtime.h>
@@ -24,12 +25,26 @@ namespace lfs::io {
         constexpr int CACHE_HASH_LENGTH = 8;
         constexpr int DEFAULT_DECODER_POOL_SIZE = 8;
 
+        struct AmfLoaderCacheEntry {
+            std::shared_ptr<AmfImageLoader> instance;
+            size_t owner_count = 0;
+        };
+
         struct NvCodecLoaderCacheEntry {
             std::shared_ptr<NvCodecImageLoader> instance;
             size_t owner_count = 0;
         };
 
-        [[nodiscard]] size_t normalize_nvcodec_pool_size(size_t decoder_pool_size) {
+        struct HardwareDecodeLoader {
+            std::shared_ptr<AmfImageLoader> amf;
+            std::shared_ptr<NvCodecImageLoader> nvcodec;
+
+            explicit operator bool() const {
+                return amf || nvcodec;
+            }
+        };
+
+        [[nodiscard]] size_t normalize_decoder_pool_size(size_t decoder_pool_size) {
             return decoder_pool_size > 0 ? decoder_pool_size : DEFAULT_DECODER_POOL_SIZE;
         }
 
@@ -60,6 +75,25 @@ namespace lfs::io {
 #endif
         }
 
+        [[nodiscard]] bool prefer_amf_decode_backend() {
+#if defined(LFS_ENABLE_AMF) && defined(_WIN32) && \
+    (defined(LFS_USE_HIP) || defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__))
+            return true;
+#else
+            return false;
+#endif
+        }
+
+        std::mutex& get_amf_mutex() {
+            static std::mutex mtx;
+            return mtx;
+        }
+
+        std::unordered_map<size_t, AmfLoaderCacheEntry>& get_amf_loader_cache() {
+            static std::unordered_map<size_t, AmfLoaderCacheEntry> instances;
+            return instances;
+        }
+
         std::mutex& get_nvcodec_mutex() {
             static std::mutex mtx;
             return mtx;
@@ -70,10 +104,31 @@ namespace lfs::io {
             return instances;
         }
 
+        std::shared_ptr<AmfImageLoader> acquire_amf_loader(size_t decoder_pool_size) {
+            std::lock_guard<std::mutex> lock(get_amf_mutex());
+            auto& instances = get_amf_loader_cache();
+            const size_t requested_pool_size = normalize_decoder_pool_size(decoder_pool_size);
+
+            if (auto it = instances.find(requested_pool_size);
+                it != instances.end() && it->second.instance) {
+                return it->second.instance;
+            }
+
+            auto instance = [&requested_pool_size] {
+                AmfImageLoader::Options opts;
+                opts.device_id = 0;
+                opts.decoder_pool_size = requested_pool_size;
+                return std::make_shared<AmfImageLoader>(opts);
+            }();
+
+            instances[requested_pool_size].instance = instance;
+            return instance;
+        }
+
         std::shared_ptr<NvCodecImageLoader> acquire_nvcodec_loader(size_t decoder_pool_size) {
             std::lock_guard<std::mutex> lock(get_nvcodec_mutex());
             auto& instances = get_nvcodec_loader_cache();
-            const size_t requested_pool_size = normalize_nvcodec_pool_size(decoder_pool_size);
+            const size_t requested_pool_size = normalize_decoder_pool_size(decoder_pool_size);
 
             if (auto it = instances.find(requested_pool_size);
                 it != instances.end() && it->second.instance) {
@@ -92,9 +147,36 @@ namespace lfs::io {
             return instance;
         }
 
+        void retain_amf_loader_cache(size_t decoder_pool_size) {
+            std::lock_guard<std::mutex> lock(get_amf_mutex());
+            ++get_amf_loader_cache()[normalize_decoder_pool_size(decoder_pool_size)].owner_count;
+        }
+
         void retain_nvcodec_loader_cache(size_t decoder_pool_size) {
             std::lock_guard<std::mutex> lock(get_nvcodec_mutex());
-            ++get_nvcodec_loader_cache()[normalize_nvcodec_pool_size(decoder_pool_size)].owner_count;
+            ++get_nvcodec_loader_cache()[normalize_decoder_pool_size(decoder_pool_size)].owner_count;
+        }
+
+        void release_amf_loader_cache(size_t decoder_pool_size) {
+            std::shared_ptr<AmfImageLoader> released_instance;
+
+            {
+                std::lock_guard<std::mutex> lock(get_amf_mutex());
+                auto& instances = get_amf_loader_cache();
+                const size_t requested_pool_size = normalize_decoder_pool_size(decoder_pool_size);
+                const auto it = instances.find(requested_pool_size);
+                if (it == instances.end() || it->second.owner_count == 0)
+                    return;
+
+                auto& entry = it->second;
+                --entry.owner_count;
+                if (entry.owner_count == 0) {
+                    released_instance = std::move(entry.instance);
+                    instances.erase(it);
+                }
+            }
+
+            released_instance.reset();
         }
 
         void release_nvcodec_loader_cache(size_t decoder_pool_size) {
@@ -103,7 +185,7 @@ namespace lfs::io {
             {
                 std::lock_guard<std::mutex> lock(get_nvcodec_mutex());
                 auto& instances = get_nvcodec_loader_cache();
-                const size_t requested_pool_size = normalize_nvcodec_pool_size(decoder_pool_size);
+                const size_t requested_pool_size = normalize_decoder_pool_size(decoder_pool_size);
                 const auto it = instances.find(requested_pool_size);
                 if (it == instances.end() || it->second.owner_count == 0)
                     return;
@@ -120,11 +202,57 @@ namespace lfs::io {
             released_instance.reset();
         }
 
+        bool is_amf_available() {
+            if (!prefer_amf_decode_backend())
+                return false;
+
+            static std::once_flag flag;
+            static bool available = false;
+            std::call_once(flag, [] { available = AmfImageLoader::is_available(); });
+            return available;
+        }
+
         bool is_nvcodec_available() {
             static std::once_flag flag;
             static bool available = false;
             std::call_once(flag, [] { available = NvCodecImageLoader::is_available(); });
             return available;
+        }
+
+        bool is_hardware_decode_available() {
+            if (is_amf_available())
+                return true;
+            return is_nvcodec_available();
+        }
+
+        HardwareDecodeLoader acquire_hardware_decode_loader(size_t decoder_pool_size) {
+            if (is_amf_available())
+                return {.amf = acquire_amf_loader(decoder_pool_size)};
+            if (is_nvcodec_available())
+                return {.nvcodec = acquire_nvcodec_loader(decoder_pool_size)};
+            return {};
+        }
+
+        void retain_hardware_decode_loader_cache(size_t decoder_pool_size) {
+            if (is_amf_available())
+                retain_amf_loader_cache(decoder_pool_size);
+            else if (is_nvcodec_available())
+                retain_nvcodec_loader_cache(decoder_pool_size);
+        }
+
+        void release_hardware_decode_loader_cache(size_t decoder_pool_size) {
+            if (is_amf_available())
+                release_amf_loader_cache(decoder_pool_size);
+            else if (is_nvcodec_available())
+                release_nvcodec_loader_cache(decoder_pool_size);
+        }
+
+        [[nodiscard]] const char* hardware_decode_backend_name() {
+            if (is_amf_available())
+                return "AMF";
+            if (is_nvcodec_available())
+                return "NVCodec";
+            return "CPU";
         }
 
         [[nodiscard]] bool load_params_need_processing(const LoadParams& params) {
@@ -161,15 +289,15 @@ namespace lfs::io {
         }
 
         [[nodiscard]] lfs::core::Tensor decode_cached_rgb_tensor(
-            const std::shared_ptr<NvCodecImageLoader>& nvcodec,
+            const HardwareDecodeLoader& decoder,
             const std::shared_ptr<std::vector<uint8_t>>& jpeg_data,
             const LoadParams& params,
             const bool cached_blob_is_base) {
-            auto tensor = nvcodec->load_image_from_memory_gpu(
-                *jpeg_data,
-                cached_blob_is_base ? params.resize_factor : 1,
-                cached_blob_is_base ? params.max_width : 0,
-                params.cuda_stream);
+            const int resize_factor = cached_blob_is_base ? params.resize_factor : 1;
+            const int max_width = cached_blob_is_base ? params.max_width : 0;
+            auto tensor = decoder.amf
+                              ? decoder.amf->load_image_from_memory_gpu(*jpeg_data, resize_factor, max_width, params.cuda_stream)
+                              : decoder.nvcodec->load_image_from_memory_gpu(*jpeg_data, resize_factor, max_width, params.cuda_stream);
             if (!tensor.is_valid() || tensor.numel() == 0)
                 return {};
 
@@ -177,6 +305,16 @@ namespace lfs::io {
                 apply_requested_undistort(tensor, params);
 
             return tensor;
+        }
+
+        [[nodiscard]] lfs::core::Tensor load_image_hardware_decode(
+            const HardwareDecodeLoader& decoder,
+            const std::filesystem::path& path,
+            const LoadParams& params,
+            const DecodeFormat format = DecodeFormat::RGB) {
+            return decoder.amf
+                       ? decoder.amf->load_image_gpu(path, params.resize_factor, params.max_width, params.cuda_stream, format)
+                       : decoder.nvcodec->load_image_gpu(path, params.resize_factor, params.max_width, params.cuda_stream, format);
         }
 
         std::tuple<uint8_t*, int, int> load_grayscale_stb(const std::filesystem::path& path) {
@@ -193,7 +331,11 @@ namespace lfs::io {
         LOG_INFO("[PipelinedImageLoader] batch_size={}, prefetch={}, io_threads={}, cold_threads={}",
                  config_.jpeg_batch_size, config_.prefetch_count, config_.io_threads, config_.cold_process_threads);
 
-        const bool nvcodec_available = is_nvcodec_available();
+        const bool hardware_decode_available = is_hardware_decode_available();
+        if (!hardware_decode_available && config_.cold_process_threads == 0) {
+            config_.cold_process_threads = 1;
+            LOG_INFO("[PipelinedImageLoader] Hardware JPEG decode unavailable; enabling CPU decode worker");
+        }
 
         if (config_.use_filesystem_cache) {
             const auto cache_base = get_temp_folder() / "LichtFeld" / "pipeline_cache";
@@ -213,7 +355,7 @@ namespace lfs::io {
             io_threads_.emplace_back([this] { prefetch_thread_func(); });
         }
 
-        if (nvcodec_available) {
+        if (hardware_decode_available) {
             gpu_decode_thread_ = std::thread([this] { gpu_batch_decode_thread_func(); });
         }
 
@@ -221,12 +363,15 @@ namespace lfs::io {
             cold_process_threads_.emplace_back([this] { cold_process_thread_func(); });
         }
 
-        if (nvcodec_available) {
-            retain_nvcodec_loader_cache(config_.decoder_pool_size);
+        if (hardware_decode_available) {
+            retain_hardware_decode_loader_cache(config_.decoder_pool_size);
         }
 
-        LOG_INFO("[PipelinedImageLoader] Started {} I/O, 1 GPU, {} cold threads",
-                 config_.io_threads, config_.cold_process_threads);
+        LOG_INFO("[PipelinedImageLoader] Started {} I/O, {} GPU ({}), {} cold threads",
+                 config_.io_threads,
+                 hardware_decode_available ? 1 : 0,
+                 hardware_decode_backend_name(),
+                 config_.cold_process_threads);
     }
 
     PipelinedImageLoader::~PipelinedImageLoader() {
@@ -257,7 +402,7 @@ namespace lfs::io {
         }
 
         cudaDeviceSynchronize();
-        release_nvcodec_loader_cache(config_.decoder_pool_size);
+        release_hardware_decode_loader_cache(config_.decoder_pool_size);
         if (config_.use_filesystem_cache && !fs_cache_folder_.empty()) {
             std::error_code ec;
             std::filesystem::remove_all(fs_cache_folder_, ec);
@@ -345,12 +490,12 @@ namespace lfs::io {
         const auto base_key = make_base_cache_key(path);
         auto decode_cached_hit = [&](const std::shared_ptr<std::vector<uint8_t>>& jpeg_data,
                                      const bool cached_blob_is_base) -> lfs::core::Tensor {
-            if (!is_nvcodec_available())
-                return {};
-
             try {
-                auto nvcodec = acquire_nvcodec_loader(config_.decoder_pool_size);
-                auto tensor = decode_cached_rgb_tensor(nvcodec, jpeg_data, params, cached_blob_is_base);
+                auto decoder = acquire_hardware_decode_loader(config_.decoder_pool_size);
+                if (!decoder)
+                    return {};
+
+                auto tensor = decode_cached_rgb_tensor(decoder, jpeg_data, params, cached_blob_is_base);
                 if (tensor.is_valid() && tensor.numel() > 0)
                     return tensor;
             } catch (...) {}
@@ -380,10 +525,10 @@ namespace lfs::io {
             put_in_jpeg_cache(base_key, data);
             save_to_fs_cache(base_key, *data);
 
-            if (is_nvcodec_available()) {
+            if (is_hardware_decode_available()) {
                 try {
-                    auto nvcodec = acquire_nvcodec_loader(config_.decoder_pool_size);
-                    auto tensor = decode_cached_rgb_tensor(nvcodec, data, params, true);
+                    auto decoder = acquire_hardware_decode_loader(config_.decoder_pool_size);
+                    auto tensor = decode_cached_rgb_tensor(decoder, data, params, true);
                     if (tensor.is_valid() && tensor.numel() > 0)
                         return tensor;
                 } catch (const std::exception& e) {
@@ -438,7 +583,8 @@ namespace lfs::io {
                     put_in_jpeg_cache(base_key, jpeg_shared);
 
                     if (needs_requested_processing) {
-                        auto tensor = decode_cached_rgb_tensor(nvcodec, jpeg_shared, params, true);
+                        auto tensor = decode_cached_rgb_tensor(
+                            HardwareDecodeLoader{.nvcodec = nvcodec}, jpeg_shared, params, true);
                         if (tensor.is_valid() && tensor.numel() > 0)
                             return tensor;
                     }
@@ -671,6 +817,17 @@ namespace lfs::io {
     }
 
     void PipelinedImageLoader::prefetch_thread_func() {
+        const bool hardware_decode_available = is_hardware_decode_available();
+        const auto enqueue_decode = [this, hardware_decode_available](PrefetchedImage item) {
+            if (hardware_decode_available) {
+                hot_queue_.push(std::move(item));
+            } else {
+                item.jpeg_data.reset();
+                item.needs_processing = true;
+                cold_queue_.push(std::move(item));
+            }
+        };
+
         while (running_) {
             ImageRequest request;
             try {
@@ -698,7 +855,7 @@ namespace lfs::io {
                     img_item.cache_key = rgb_key;
                     img_item.jpeg_data = cached_rgb;
                     img_item.is_cache_hit = true;
-                    hot_queue_.push(std::move(img_item));
+                    enqueue_decode(std::move(img_item));
 
                     PrefetchedImage mask_item;
                     mask_item.sequence_id = request.sequence_id;
@@ -707,7 +864,7 @@ namespace lfs::io {
                     mask_item.jpeg_data = cached_alpha;
                     mask_item.is_mask = true;
                     mask_item.is_cache_hit = true;
-                    hot_queue_.push(std::move(mask_item));
+                    enqueue_decode(std::move(mask_item));
 
                     std::lock_guard<std::mutex> lock(stats_mutex_);
                     ++stats_.hot_path_hits;
@@ -745,7 +902,7 @@ namespace lfs::io {
                     result.jpeg_data = std::move(cached->data);
                     result.is_cache_hit = true;
                     result.needs_processing = cached->from_base_key && needs_requested_processing;
-                    hot_queue_.push(std::move(result));
+                    enqueue_decode(std::move(result));
                     std::lock_guard<std::mutex> lock(stats_mutex_);
                     ++stats_.hot_path_hits;
                 } else {
@@ -763,7 +920,7 @@ namespace lfs::io {
                         put_in_jpeg_cache(result.cache_key, data);
                         result.jpeg_data = data;
                         result.is_cache_hit = true;
-                        hot_queue_.push(std::move(result));
+                        enqueue_decode(std::move(result));
                         std::lock_guard<std::mutex> lock(stats_mutex_);
                         ++stats_.hot_path_hits;
                     } else {
@@ -798,7 +955,7 @@ namespace lfs::io {
                     if (auto cached = get_from_jpeg_cache(mask_result.cache_key)) {
                         mask_result.jpeg_data = cached;
                         mask_result.is_cache_hit = true;
-                        hot_queue_.push(std::move(mask_result));
+                        enqueue_decode(std::move(mask_result));
                         std::lock_guard<std::mutex> lock(stats_mutex_);
                         ++stats_.mask_cache_hits;
                     } else if (config_.use_filesystem_cache) {
@@ -810,7 +967,7 @@ namespace lfs::io {
                             put_in_jpeg_cache(mask_result.cache_key, data);
                             mask_result.jpeg_data = data;
                             mask_result.is_cache_hit = true;
-                            hot_queue_.push(std::move(mask_result));
+                            enqueue_decode(std::move(mask_result));
                             std::lock_guard<std::mutex> lock(stats_mutex_);
                             ++stats_.mask_cache_hits;
                         } else {
@@ -894,13 +1051,18 @@ namespace lfs::io {
                 continue;
 
             try {
-                auto nvcodec = acquire_nvcodec_loader(config_.decoder_pool_size);
+                auto decoder = acquire_hardware_decode_loader(config_.decoder_pool_size);
+                if (!decoder)
+                    throw std::runtime_error("No hardware JPEG decoder available");
 
                 for (size_t i = 0; i < batch.size(); ++i) {
                     try {
                         if (batch[i].is_mask) {
-                            auto mask_tensor = nvcodec->load_image_from_memory_gpu(
-                                *batch[i].jpeg_data, 1, 0, nullptr, DecodeFormat::Grayscale);
+                            auto mask_tensor = decoder.amf
+                                                   ? decoder.amf->load_image_from_memory_gpu(
+                                                         *batch[i].jpeg_data, 1, 0, nullptr, DecodeFormat::Grayscale)
+                                                   : decoder.nvcodec->load_image_from_memory_gpu(
+                                                         *batch[i].jpeg_data, 1, 0, nullptr, DecodeFormat::Grayscale);
 
                             if (!mask_tensor.is_valid() || mask_tensor.numel() == 0) {
                                 LOG_WARN("[PipelinedImageLoader] GPU mask decode failed for {}",
@@ -912,11 +1074,8 @@ namespace lfs::io {
 
                         } else {
                             const bool decode_from_base_cache = batch[i].needs_processing;
-                            auto tensor = nvcodec->load_image_from_memory_gpu(
-                                *batch[i].jpeg_data,
-                                decode_from_base_cache ? batch[i].params.resize_factor : 1,
-                                decode_from_base_cache ? batch[i].params.max_width : 0,
-                                batch[i].params.cuda_stream);
+                            auto tensor = decode_cached_rgb_tensor(
+                                decoder, batch[i].jpeg_data, batch[i].params, decode_from_base_cache);
 
                             if (!tensor.is_valid() || tensor.numel() == 0) {
                                 LOG_WARN("[PipelinedImageLoader] GPU decode failed for {}",
@@ -924,11 +1083,9 @@ namespace lfs::io {
                                 throw std::runtime_error("Invalid tensor");
                             }
 
-                            if (decode_from_base_cache) {
-                                apply_requested_undistort(tensor, batch[i].params);
-
+                            if (decode_from_base_cache && decoder.nvcodec) {
                                 try {
-                                    auto jpeg_bytes = nvcodec->encode_to_jpeg(
+                                    auto jpeg_bytes = decoder.nvcodec->encode_to_jpeg(
                                         tensor, config_.cache_jpeg_quality, batch[i].params.cuda_stream);
                                     save_to_fs_cache(batch[i].cache_key, jpeg_bytes);
                                     put_in_jpeg_cache(
@@ -1010,6 +1167,9 @@ namespace lfs::io {
     }
 
     void PipelinedImageLoader::cold_process_thread_func() {
+        const auto decoder = acquire_hardware_decode_loader(config_.decoder_pool_size);
+        const auto nvcodec = decoder.nvcodec;
+
         while (running_) {
             PrefetchedImage item;
             try {
@@ -1019,8 +1179,6 @@ namespace lfs::io {
             }
 
             try {
-                auto nvcodec = acquire_nvcodec_loader(config_.decoder_pool_size);
-
                 if (item.alpha_as_mask) {
                     auto [img_data, width, height, channels] = lfs::core::load_image_with_alpha(
                         item.path, item.params.resize_factor, item.params.max_width);
@@ -1065,7 +1223,7 @@ namespace lfs::io {
                         alpha = lfs::core::undistort_mask(alpha, scaled, nullptr);
                     }
 
-                    if (is_nvcodec_available()) {
+                    if (nvcodec) {
                         try {
                             auto rgb_jpeg = nvcodec->encode_to_jpeg(rgb, config_.cache_jpeg_quality, nullptr);
                             save_to_fs_cache(item.cache_key, rgb_jpeg);
@@ -1092,11 +1250,10 @@ namespace lfs::io {
                     lfs::core::Tensor mask_tensor;
                     bool used_gpu = false;
 
-                    if (is_nvcodec_available()) {
+                    if (decoder) {
                         try {
-                            mask_tensor = nvcodec->load_image_gpu(
-                                item.path, item.params.resize_factor, item.params.max_width,
-                                nullptr, DecodeFormat::Grayscale);
+                            mask_tensor = load_image_hardware_decode(
+                                decoder, item.path, item.params, DecodeFormat::Grayscale);
                             used_gpu = true;
                         } catch (const std::exception&) {
                         }
@@ -1159,7 +1316,7 @@ namespace lfs::io {
                         mask_tensor = lfs::core::undistort_mask(mask_tensor, scaled, nullptr);
                     }
 
-                    if (is_nvcodec_available()) {
+                    if (nvcodec) {
                         try {
                             auto jpeg_bytes = nvcodec->encode_grayscale_to_jpeg(
                                 mask_tensor, config_.cache_jpeg_quality, nullptr);
@@ -1180,10 +1337,9 @@ namespace lfs::io {
                     lfs::core::Tensor decoded;
                     bool used_gpu = false;
 
-                    if (is_nvcodec_available() && item.is_original_jpeg) {
+                    if (decoder && item.is_original_jpeg) {
                         try {
-                            decoded = nvcodec->load_image_gpu(
-                                item.path, item.params.resize_factor, item.params.max_width);
+                            decoded = load_image_hardware_decode(decoder, item.path, item.params);
                             used_gpu = true;
                         } catch (const std::exception&) {
                         }
@@ -1230,7 +1386,7 @@ namespace lfs::io {
                         decoded = lfs::core::undistort_image(decoded, scaled, nullptr);
                     }
 
-                    if (is_nvcodec_available()) {
+                    if (nvcodec) {
                         try {
                             auto jpeg_bytes = nvcodec->encode_to_jpeg(
                                 decoded, config_.cache_jpeg_quality, nullptr);

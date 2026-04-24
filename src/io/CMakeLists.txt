@@ -198,13 +198,24 @@ add_library(lfs_io STATIC
         mesh/openmesh_bridge.cpp
         mesh/texture_loader.hpp
         mesh/texture_loader.cpp
+        amf_image_loader.hpp
         cache_image_loader.cpp
+        image_decode_format.hpp
         nvcodec_image_loader.hpp
         pipelined_image_loader.cpp
         stb_image_impl.cpp
         tinyply.cpp
 
 )
+
+if(LFS_ENABLE_AMF)
+    target_sources(lfs_io PRIVATE
+            amf_image_loader.cpp
+            ${LFS_AMF_INCLUDE_DIR}/public/common/AMFFactory.cpp
+            ${LFS_AMF_INCLUDE_DIR}/public/common/Windows/ThreadWindows.cpp)
+else()
+    target_sources(lfs_io PRIVATE amf_image_loader_stub.cpp)
+endif()
 
 if(LFS_ENABLE_NVIMAGECODEC)
     target_sources(lfs_io PRIVATE nvcodec_image_loader.cpp)
@@ -224,6 +235,10 @@ target_include_directories(lfs_io
 )
 if(LFS_ENABLE_NVIMAGECODEC)
     target_include_directories(lfs_io PRIVATE ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include)
+endif()
+if(LFS_ENABLE_AMF)
+    target_include_directories(lfs_io PRIVATE ${LFS_AMF_INCLUDE_DIR})
+    target_compile_definitions(lfs_io PRIVATE LFS_ENABLE_AMF=1)
 endif()
 
 # Find the actual WebP library targets

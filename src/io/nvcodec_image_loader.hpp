@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/tensor.hpp"
+#include "io/image_decode_format.hpp"
 #include <filesystem>
 #include <memory>
 #include <vector>
@@ -15,14 +16,6 @@ typedef struct nvimgcodecDecoder* nvimgcodecDecoder_t;
 typedef struct nvimgcodecEncoder* nvimgcodecEncoder_t;
 
 namespace lfs::io {
-
-    /**
-     * @brief Output format for image decoding
-     */
-    enum class DecodeFormat {
-        RGB,      // 3-channel RGB [C,H,W] or [H,W,C]
-        Grayscale // 1-channel grayscale [H,W]
-    };
 
     /**
      * @brief GPU-accelerated image loader using NVIDIA nvImageCodec
