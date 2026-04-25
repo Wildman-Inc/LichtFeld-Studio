@@ -15,12 +15,33 @@
 #include "training/training_manager.hpp"
 #include "viewport_region_utils.hpp"
 #include <glad/glad.h>
+#include <algorithm>
 #include <optional>
 #include <shared_mutex>
 
 namespace lfs::vis {
 
     namespace {
+        // The Windows HIP raster path can exceed the watchdog on very large PLYs.
+        constexpr size_t kWindowsHipInteractiveSplatThreshold = 2'000'000;
+        constexpr size_t kWindowsHipHugeSplatThreshold = 4'000'000;
+        constexpr float kWindowsHipLargeSplatIdleRenderScale = 0.5f;
+        constexpr float kWindowsHipLargeSplatMovingRenderScale = 0.25f;
+
+        [[nodiscard]] bool shouldGuardWindowsHipLargeSplatRender(
+            const lfs::core::SplatData* const model,
+            const RenderSettings& settings) {
+#if defined(_WIN32) && (defined(LFS_USE_HIP) || defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__))
+            return model != nullptr &&
+                   model->size() >= kWindowsHipInteractiveSplatThreshold &&
+                   !settings.point_cloud_mode;
+#else
+            (void)model;
+            (void)settings;
+            return false;
+#endif
+        }
+
         [[nodiscard]] std::optional<std::shared_lock<std::shared_mutex>> acquireLiveModelRenderLock(
             const SceneManager* const scene_manager) {
             std::optional<std::shared_lock<std::shared_mutex>> lock;
@@ -105,6 +126,34 @@ namespace lfs::vis {
         const bool has_renderable_content = has_renderable_model || has_visible_point_cloud;
         const size_t model_ptr = reinterpret_cast<size_t>(model);
 
+        RenderSettings effective_settings = context.settings;
+        const bool guard_large_windows_hip_splat =
+            has_renderable_model && shouldGuardWindowsHipLargeSplatRender(model, effective_settings);
+        const bool force_large_splat_proxy =
+            guard_large_windows_hip_splat && model->size() >= kWindowsHipHugeSplatThreshold;
+        const bool use_large_splat_proxy =
+            guard_large_windows_hip_splat && (force_large_splat_proxy || context.camera_movement_active);
+        if (guard_large_windows_hip_splat) {
+            effective_settings.render_scale = std::min(
+                effective_settings.render_scale,
+                use_large_splat_proxy
+                    ? kWindowsHipLargeSplatMovingRenderScale
+                    : kWindowsHipLargeSplatIdleRenderScale);
+            if (use_large_splat_proxy) {
+                effective_settings.point_cloud_mode = true;
+                effective_settings.apply_appearance_correction = false;
+                effective_settings.show_rings = false;
+                effective_settings.show_center_markers = false;
+            }
+        }
+        if (use_large_splat_proxy != windows_hip_large_splat_proxy_active_) {
+            windows_hip_large_splat_proxy_active_ = use_large_splat_proxy;
+            markDirty(DirtyFlag::SPLATS | DirtyFlag::CAMERA | DirtyFlag::VIEWPORT);
+            LOG_INFO("{} Windows HIP large-splat preview proxy for {} gaussians",
+                     use_large_splat_proxy ? "Enabled" : "Disabled",
+                     model ? model->size() : 0);
+        }
+
         if (!context.defer_live_training_render) {
             if (const auto model_change = frame_lifecycle_service_.handleModelChange(model_ptr, viewport_artifact_service_);
                 model_change.changed) {
@@ -128,7 +177,7 @@ namespace lfs::vis {
         bool request_gt_prerender = false;
         split_view_service_.prepareGTComparisonContext(
             scene_manager,
-            settings_,
+            effective_settings,
             camera_interaction_service_.currentCameraId(),
             has_renderable_content,
             viewport_artifact_service_.hasGpuFrame(),
@@ -141,7 +190,7 @@ namespace lfs::vis {
         if (const DirtyMask required_dirty = frame_lifecycle_service_.requiredDirtyMask(
                 viewport_artifact_service_.hasViewportOutput(),
                 has_renderable_content,
-                settings_.split_view_mode);
+                effective_settings.split_view_mode);
             required_dirty) {
             dirty_mask_.fetch_or(required_dirty, std::memory_order_relaxed);
         }
@@ -177,7 +226,7 @@ namespace lfs::vis {
             }
         }
         if (!has_renderable_content &&
-            !splitViewEnabled(settings_.split_view_mode)) {
+            !splitViewEnabled(effective_settings.split_view_mode)) {
             // The shell is cleared before render passes run. When the scene is empty, always run
             // the viewport background pass as well so GUI/layout-only frames cannot leak the shell
             // theme color into the viewport region.
@@ -200,7 +249,7 @@ namespace lfs::vis {
              .model = model,
              .render_lock_held = render_lock.has_value(),
              .defer_live_training_render = context.defer_live_training_render,
-             .settings = settings_,
+             .settings = effective_settings,
              .grid_planes = panel_grid_planes_,
              .frame_dirty = frame_dirty,
              .selection_flash_intensity = getSelectionFlashIntensity(),

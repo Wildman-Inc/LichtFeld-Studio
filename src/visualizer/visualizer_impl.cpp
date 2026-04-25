@@ -1086,7 +1086,8 @@ namespace lfs::vis {
             .logical_screen_size = window_manager_->getWindowSize(),
             .viewport_region = has_viewport_region ? &viewport_region : nullptr,
             .scene_manager = scene_manager_.get(),
-            .defer_live_training_render = defer_live_training_render};
+            .defer_live_training_render = defer_live_training_render,
+            .camera_movement_active = camera_movement_active};
 
         if (gui_manager_) {
             rendering_manager_->setCropboxGizmoActive(gui_manager_->gizmo().isCropboxGizmoActive());

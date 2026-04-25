@@ -59,11 +59,12 @@ namespace lfs::vis {
     public:
         struct RenderContext {
             const Viewport& viewport;
-            const RenderSettings& settings;
+            RenderSettings settings;
             glm::ivec2 logical_screen_size{0, 0};
             const ViewportRegion* viewport_region = nullptr;
             SceneManager* scene_manager = nullptr;
             bool defer_live_training_render = false;
+            bool camera_movement_active = false;
         };
 
         RenderingManager();
@@ -439,6 +440,7 @@ namespace lfs::vis {
         std::atomic<bool> frustum_loader_poll_until_ready_{false};
         bool frustum_loader_sync_initialized_ = false;
         bool synced_frustum_allow_fallback_ = true;
+        bool windows_hip_large_splat_proxy_active_ = false;
 
         bool initialized_ = false;
 
