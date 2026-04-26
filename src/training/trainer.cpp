@@ -1698,10 +1698,6 @@ namespace lfs::training {
                         train_cameras, dataset_config, CameraDataset::Split::ALL);
                     val_dataset_ = std::make_shared<CameraDataset>(
                         val_cameras, dataset_config, CameraDataset::Split::ALL);
-
-                    LOG_INFO("Using camera split marks: {} train, {} val images",
-                             train_dataset_->size(),
-                             val_dataset_->size());
                 } else {
                     // Create train/val split
                     train_dataset_ = std::make_shared<CameraDataset>(
