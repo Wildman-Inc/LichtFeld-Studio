@@ -8,9 +8,9 @@
 #include "core/cuda/undistort/undistort.hpp"
 #include "core/export.hpp"
 #include "core/tensor.hpp"
-#include <cuda_runtime.h>
 #include <cassert>
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <filesystem>
 #include <future>
 #include <string>
