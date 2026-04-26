@@ -155,7 +155,9 @@ namespace lfs::training {
                 size_t val_count = 0;
                 size_t mask_count = 0;
                 for (size_t i = 0; i < cameras.size(); ++i) {
-                    if (enable_eval && (i % test_every) == 0) {
+                    const bool is_eval = enable_eval && (i % test_every) == 0;
+                    cameras[i]->set_split(is_eval ? lfs::core::CameraSplit::Eval : lfs::core::CameraSplit::Train);
+                    if (is_eval) {
                         val_count++;
                     } else {
                         train_count++;
@@ -466,6 +468,7 @@ namespace lfs::training {
                 size_t train_count = 0, val_count = 0, mask_count = 0;
                 for (size_t i = 0; i < cameras.size(); ++i) {
                     const bool is_val = enable_eval && (i % test_every) == 0;
+                    cameras[i]->set_split(is_val ? lfs::core::CameraSplit::Eval : lfs::core::CameraSplit::Train);
                     is_val ? ++val_count : ++train_count;
                     if (cameras[i]->has_mask())
                         ++mask_count;

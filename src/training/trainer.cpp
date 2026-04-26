@@ -1655,10 +1655,29 @@ namespace lfs::training {
 
             // Get source cameras from Scene nodes or base_dataset_
             std::vector<std::shared_ptr<lfs::core::Camera>> source_cameras;
+            std::vector<std::shared_ptr<lfs::core::Camera>> train_cameras;
+            std::vector<std::shared_ptr<lfs::core::Camera>> val_cameras;
             if (scene_) {
                 source_cameras = scene_->getActiveCameras();
                 if (source_cameras.empty()) {
                     return std::unexpected("Scene has no active cameras enabled for training");
+                }
+
+                if (params.optimization.enable_eval) {
+                    for (const auto& camera : source_cameras) {
+                        switch (camera->split()) {
+                        case lfs::core::CameraSplit::Train:
+                            train_cameras.push_back(camera);
+                            break;
+                        case lfs::core::CameraSplit::Eval:
+                            val_cameras.push_back(camera);
+                            break;
+                        default:
+                            assert(false && "Camera split must be Train or Eval");
+                            break;
+                        }
+                    }
+                    assert(train_cameras.size() + val_cameras.size() == source_cameras.size());
                 }
             } else if (base_dataset_) {
                 source_cameras = base_dataset_->get_cameras();
@@ -1674,17 +1693,28 @@ namespace lfs::training {
 
             // Handle dataset split based on evaluation flag
             if (params.optimization.enable_eval) {
-                // Create train/val split
-                train_dataset_ = std::make_shared<CameraDataset>(
-                    source_cameras, dataset_config, CameraDataset::Split::TRAIN,
-                    provided_splits_ ? std::make_optional(std::get<0>(*provided_splits_)) : std::nullopt);
-                val_dataset_ = std::make_shared<CameraDataset>(
-                    source_cameras, dataset_config, CameraDataset::Split::VAL,
-                    provided_splits_ ? std::make_optional(std::get<1>(*provided_splits_)) : std::nullopt);
+                if (scene_) {
+                    train_dataset_ = std::make_shared<CameraDataset>(
+                        train_cameras, dataset_config, CameraDataset::Split::ALL);
+                    val_dataset_ = std::make_shared<CameraDataset>(
+                        val_cameras, dataset_config, CameraDataset::Split::ALL);
 
-                LOG_INFO("Created train/val split: {} train, {} val images",
-                         train_dataset_->size(),
-                         val_dataset_->size());
+                    LOG_INFO("Using camera split marks: {} train, {} val images",
+                             train_dataset_->size(),
+                             val_dataset_->size());
+                } else {
+                    // Create train/val split
+                    train_dataset_ = std::make_shared<CameraDataset>(
+                        source_cameras, dataset_config, CameraDataset::Split::TRAIN,
+                        provided_splits_ ? std::make_optional(std::get<0>(*provided_splits_)) : std::nullopt);
+                    val_dataset_ = std::make_shared<CameraDataset>(
+                        source_cameras, dataset_config, CameraDataset::Split::VAL,
+                        provided_splits_ ? std::make_optional(std::get<1>(*provided_splits_)) : std::nullopt);
+
+                    LOG_INFO("Created train/val split: {} train, {} val images",
+                             train_dataset_->size(),
+                             val_dataset_->size());
+                }
                 if (train_dataset_->size() == 0) {
                     return std::unexpected("Evaluation split leaves no training images. Increase Test Every or disable evaluation.");
                 }
