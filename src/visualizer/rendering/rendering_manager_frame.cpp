@@ -7,6 +7,7 @@
 #include "core/tensor.hpp"
 #include "model_renderability.hpp"
 #include "render_frame_coordinator.hpp"
+#include "rendering/vksplat_rasterizer.hpp"
 #include "rendering/rasterizer/rasterization/include/rasterization_config.h"
 #include "rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
@@ -126,8 +127,19 @@ namespace lfs::vis {
         const bool has_renderable_content = has_renderable_model || has_visible_point_cloud;
         const size_t model_ptr = reinterpret_cast<size_t>(model);
 
+        const bool is_training = scene_manager && scene_manager->hasDataset() &&
+                                 scene_manager->getTrainerManager() &&
+                                 scene_manager->getTrainerManager()->isRunning();
+
         RenderSettings effective_settings = context.settings;
+        const bool prefer_vksplat_static_viewer =
+#if defined(_WIN32) && defined(LFS_AMD_PREFER_VKSPLAT)
+            !is_training && lfs::rendering::vksplat_is_available();
+#else
+            false;
+#endif
         const bool guard_large_windows_hip_splat =
+            !prefer_vksplat_static_viewer &&
             has_renderable_model && shouldGuardWindowsHipLargeSplatRender(model, effective_settings);
         const bool force_large_splat_proxy =
             guard_large_windows_hip_splat && model->size() >= kWindowsHipHugeSplatThreshold;
@@ -162,10 +174,6 @@ namespace lfs::vis {
                 markDirty(DirtyFlag::ALL);
             }
         }
-
-        const bool is_training = scene_manager && scene_manager->hasDataset() &&
-                                 scene_manager->getTrainerManager() &&
-                                 scene_manager->getTrainerManager()->isRunning();
 
         if (const DirtyMask training_dirty = frame_lifecycle_service_.handleTrainingRefresh(
                 is_training,

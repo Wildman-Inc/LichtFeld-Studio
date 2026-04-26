@@ -300,6 +300,7 @@ namespace lfs::rendering {
                 .sh_degree = render_state.sh_degree,
                 .gut = render_state.gut,
                 .equirectangular = render_state.equirectangular,
+                .prefer_vksplat = render_state.prefer_vksplat,
                 .scene = scene,
                 .filters = render_state.filters,
                 .overlay = render_state.overlay};

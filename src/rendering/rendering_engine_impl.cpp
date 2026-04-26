@@ -224,6 +224,8 @@ namespace lfs::rendering {
                 return "gut";
             if (a.equirectangular != b.equirectangular)
                 return "equirectangular";
+            if (a.prefer_vksplat != b.prefer_vksplat)
+                return "prefer_vksplat";
             if (a.transparent_background != b.transparent_background)
                 return "transparent_background";
             if (a.frame_view.focal_length_mm != b.frame_view.focal_length_mm)
@@ -285,6 +287,7 @@ namespace lfs::rendering {
                 .voxel_size = 0.01f,
                 .gut = request.gut,
                 .equirectangular = request.equirectangular,
+                .prefer_vksplat = request.prefer_vksplat,
                 .show_rings = request.overlay.markers.show_rings,
                 .ring_width = request.overlay.markers.ring_width,
                 .show_center_markers = request.overlay.markers.show_center_markers,

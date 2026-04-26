@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "viewport_request_builder.hpp"
+#include "rendering/vksplat_rasterizer.hpp"
 #include "scene/scene_manager.hpp"
+#include "training/training_manager.hpp"
 
 namespace lfs::vis {
 
@@ -103,6 +105,18 @@ namespace lfs::vis {
             filters.cull_outside_view_volume = ctx.settings.hide_outside_depth_box;
         }
 
+        [[nodiscard]] bool preferVkSplatForViewport(const FrameContext& ctx) {
+#if defined(_WIN32) && defined(LFS_AMD_PREFER_VKSPLAT)
+            const auto* trainer_manager = ctx.scene_manager ? ctx.scene_manager->getTrainerManager() : nullptr;
+            const bool training_active = trainer_manager && trainer_manager->isTrainingActive();
+            return ctx.model != nullptr && ctx.model->size() > 0 && !training_active &&
+                   lfs::rendering::vksplat_is_available();
+#else
+            (void)ctx;
+            return false;
+#endif
+        }
+
     } // namespace
 
     lfs::rendering::ViewportRenderRequest buildViewportRenderRequest(const FrameContext& ctx,
@@ -121,6 +135,7 @@ namespace lfs::vis {
             .sh_degree = ctx.settings.sh_degree,
             .gut = ctx.settings.gut,
             .equirectangular = ctx.settings.equirectangular,
+            .prefer_vksplat = preferVkSplatForViewport(ctx),
             .scene =
                 {.model_transforms = &ctx.scene_state.model_transforms,
                  .transform_indices = ctx.scene_state.transform_indices,
@@ -200,6 +215,7 @@ namespace lfs::vis {
             .sh_degree = request.sh_degree,
             .gut = request.gut,
             .equirectangular = request.equirectangular,
+            .prefer_vksplat = request.prefer_vksplat,
             .scene = request.scene,
             .filters = request.filters,
             .overlay = request.overlay};

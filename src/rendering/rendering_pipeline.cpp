@@ -10,7 +10,9 @@
 #include "gs_rasterizer_tensor.hpp"
 #include "image_layout.hpp"
 #include "rendering/coordinate_conventions.hpp"
+#include "vksplat_rasterizer.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <print>
 
@@ -61,6 +63,48 @@ namespace lfs::rendering {
         [[nodiscard]] bool tensorMatchesGaussianCount(const Tensor* const tensor,
                                                       const size_t gaussian_count) {
             return tensor == nullptr || !tensor->is_valid() || tensor->numel() == gaussian_count;
+        }
+
+        [[nodiscard]] bool allNodeVisibilityEnabled(const std::vector<bool>& mask) {
+            return std::ranges::all_of(mask, [](const bool visible) { return visible; });
+        }
+
+        [[nodiscard]] bool canUseVkSplat(
+            const RenderingPipeline::RasterRequest& request,
+            const lfs::core::SplatData& model,
+            const Tensor* const selection_mask,
+            const Tensor* const preview_selection,
+            const Tensor* const deleted_mask,
+            const Tensor* const screen_positions_out) {
+            if (!request.prefer_vksplat || !vksplat_is_available() || screen_positions_out != nullptr) {
+                return false;
+            }
+            if (request.gut || request.equirectangular || request.orthographic || request.mip_filter ||
+                request.scaling_modifier != 1.0f || model.has_deleted_mask()) {
+                return false;
+            }
+            if (request.show_rings || request.show_center_markers || request.cursor_active ||
+                request.cursor_saturation_preview || request.focused_gaussian_id >= 0 ||
+                request.hovered_depth_id != nullptr) {
+                return false;
+            }
+            if (selection_mask != nullptr || preview_selection != nullptr || deleted_mask != nullptr) {
+                return false;
+            }
+            if (request.crop_box_transform || request.crop_box_min || request.crop_box_max ||
+                request.ellipsoid_transform || request.ellipsoid_radii ||
+                request.view_volume_transform || request.view_volume_min || request.view_volume_max) {
+                return false;
+            }
+            if (request.crop_box || request.crop_inverse || request.crop_desaturate ||
+                request.ellipsoid_inverse || request.ellipsoid_desaturate || request.view_volume_cull) {
+                return false;
+            }
+            if (!request.emphasized_node_mask.empty() || request.dim_non_emphasized ||
+                request.emphasis_flash_intensity != 0.0f || !allNodeVisibilityEnabled(request.node_visibility_mask)) {
+                return false;
+            }
+            return request.model_transforms.size() <= 1;
         }
     } // namespace
 
@@ -473,6 +517,27 @@ namespace lfs::rendering {
                     .far_plane = request.far_plane,
                     .orthographic = request.orthographic,
                     .color_has_alpha = request.transparent_background};
+            }
+
+            if (canUseVkSplat(request, model, selection_mask_ptr, preview_selection_ptr, deleted_mask_ptr, screen_positions_out)) {
+                auto render_output = vksplat_rasterize_tensor(
+                    cam,
+                    model,
+                    VkSplatRasterizeRequest{
+                        .sh_degree = effective_sh_degree,
+                        .background_color = request.background_color,
+                        .transparent_background = request.transparent_background,
+                        .model_transforms = &request.model_transforms});
+                if (render_output) {
+                    return ImageRenderResult{
+                        .image = std::move(render_output->image),
+                        .valid = true,
+                        .flip_y = true,
+                        .far_plane = request.far_plane,
+                        .orthographic = request.orthographic,
+                        .color_has_alpha = request.transparent_background};
+                }
+                LOG_WARN("vksplat render failed; falling back to gsplat: {}", render_output.error());
             }
 
             // Use libtorch-free tensor-based rasterizer

@@ -46,6 +46,7 @@ namespace lfs::rendering {
             float voxel_size = 0.01f;
             bool gut = false;
             bool equirectangular = false;
+            bool prefer_vksplat = false;
             bool show_rings = false;
             float ring_width = 0.01f;
             bool show_center_markers = false;

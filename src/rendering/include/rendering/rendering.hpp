@@ -142,6 +142,7 @@ namespace lfs::rendering {
         int sh_degree = 3;
         bool gut = false;
         bool equirectangular = false;
+        bool prefer_vksplat = false;
         GaussianSceneState scene;
         GaussianFilterState filters;
         GaussianOverlayState overlay;
@@ -258,6 +259,7 @@ namespace lfs::rendering {
         int sh_degree = 3;
         bool gut = false;
         bool equirectangular = false;
+        bool prefer_vksplat = false;
         GaussianSceneState scene;
         GaussianFilterState filters;
         GaussianOverlayState overlay;
