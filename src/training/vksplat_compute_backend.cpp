@@ -17,6 +17,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "gs_trainer.h"
@@ -58,6 +59,28 @@ namespace lfs::training::vksplat_compute {
             } catch (...) {
                 return 100;
             }
+        }
+
+        [[nodiscard]] TrainerConfig::CacheImage image_cache_from_env() {
+            const char* raw = std::getenv("LFS_VKSPLAT_IMAGE_CACHE");
+            if (!raw || raw[0] == '\0') {
+                return TrainerConfig::CacheImage::CPU;
+            }
+
+            const std::string_view value(raw);
+            if (value == "cpu" || value == "CPU") {
+                return TrainerConfig::CacheImage::CPU;
+            }
+            if (value == "gpu" || value == "GPU" || value == "auto" || value == "AUTO") {
+                return TrainerConfig::CacheImage::GPU;
+            }
+
+            LOG_WARN("Unknown LFS_VKSPLAT_IMAGE_CACHE='{}'; using CPU image cache", raw);
+            return TrainerConfig::CacheImage::CPU;
+        }
+
+        [[nodiscard]] const char* image_cache_name(const TrainerConfig::CacheImage cache) {
+            return cache == TrainerConfig::CacheImage::GPU ? "gpu" : "cpu";
         }
 
         [[nodiscard]] double clamp_unit_finite(const double value) {
@@ -189,7 +212,7 @@ namespace lfs::training::vksplat_compute {
             config.mask_dir = "";
             config.sparse_dir = with_trailing_slash(choose_sparse_dir(params.dataset.data_path));
             config.eval_interval = std::max(2, params.dataset.test_every);
-            config.image_cache_device = TrainerConfig::CacheImage::CPU;
+            config.image_cache_device = image_cache_from_env();
 
             config.global_scale = 1.0f;
             config.init_scale = opt.init_scaling;
@@ -427,8 +450,8 @@ namespace lfs::training::vksplat_compute {
                 const int metric_interval = metric_interval_from_env();
                 SampleMetrics last_metrics;
 
-                LOG_INFO("Starting vksplat Vulkan compute training: {} steps, {} train images, output {}",
-                         total_steps, trainer.num_train(), config.output_ply);
+                LOG_INFO("Starting fused vksplat Vulkan compute training: {} steps, {} train images, image_cache={}, output {}",
+                         total_steps, trainer.num_train(), image_cache_name(config.image_cache_device), config.output_ply);
 
                 for (int step = 0; step < total_steps; ++step) {
                     if (stop_token.stop_requested()) {

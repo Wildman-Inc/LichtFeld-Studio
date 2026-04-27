@@ -46,6 +46,9 @@ namespace lfs::training::vksplat_compute {
         if (env_flag_enabled("LFS_USE_VKSPLAT_COMPUTE")) {
             return true;
         }
+        if (env_flag_enabled("LFS_USE_FUSED_SPLAT_PIPELINE")) {
+            return true;
+        }
 
         const char* raw = std::getenv("LFS_TRAINING_BACKEND");
         if (!raw) {
@@ -54,7 +57,10 @@ namespace lfs::training::vksplat_compute {
 
         const std::string_view backend(raw);
         return backend == "vksplat" || backend == "VKSPLAT" ||
-               backend == "vulkan" || backend == "VULKAN";
+               backend == "vulkan" || backend == "VULKAN" ||
+               backend == "fused" || backend == "FUSED" ||
+               backend == "gsplat" || backend == "GSPLAT" ||
+               backend == "hip-fused" || backend == "HIP-FUSED";
     }
 
 #if defined(LFS_VULKAN_COMPUTE_BACKEND)
