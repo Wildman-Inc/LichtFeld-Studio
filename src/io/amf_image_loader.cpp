@@ -122,13 +122,25 @@ namespace lfs::io {
             return {target_width, target_height};
         }
 
-        void copy_surface_to_hwc(
+        cuda::PackedPixelFormat packed_pixel_format_from_amf_surface(const amf::AMF_SURFACE_FORMAT surface_format) {
+            switch (surface_format) {
+            case amf::AMF_SURFACE_BGRA:
+                return cuda::PackedPixelFormat::BGRA;
+            case amf::AMF_SURFACE_RGBA:
+                return cuda::PackedPixelFormat::RGBA;
+            case amf::AMF_SURFACE_ARGB:
+                return cuda::PackedPixelFormat::ARGB;
+            default:
+                throw std::runtime_error("Unsupported AMF output surface format");
+            }
+        }
+
+        lfs::core::Tensor upload_surface_to_tensor(
             amf::AMFSurface* const surface,
+            const int target_width,
+            const int target_height,
             const DecodeFormat format,
-            std::vector<uint8_t>& output,
-            int& width,
-            int& height,
-            int& channels) {
+            void* const cuda_stream) {
             if (!surface)
                 throw std::runtime_error("AMF decode produced no surface");
 
@@ -139,116 +151,93 @@ namespace lfs::io {
             if (!plane || !plane->GetNative())
                 throw std::runtime_error("AMF decode produced no host plane");
 
-            const auto surface_format = surface->GetFormat();
-            if (surface_format != amf::AMF_SURFACE_BGRA &&
-                surface_format != amf::AMF_SURFACE_RGBA &&
-                surface_format != amf::AMF_SURFACE_ARGB) {
-                throw std::runtime_error("Unsupported AMF output surface format");
-            }
-
-            width = plane->GetWidth();
-            height = plane->GetHeight();
-            if (width <= 0 || height <= 0)
+            const int width = plane->GetWidth();
+            const int height = plane->GetHeight();
+            const int pitch = plane->GetHPitch();
+            if (width <= 0 || height <= 0 || pitch < width * 4)
                 throw std::runtime_error("AMF decode produced invalid dimensions");
 
-            channels = (format == DecodeFormat::Grayscale) ? 1 : 3;
-            output.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(channels));
-
-            const auto* const src_base = static_cast<const uint8_t*>(plane->GetNative());
-            const int pitch = plane->GetHPitch();
-            for (int y = 0; y < height; ++y) {
-                const auto* const src = src_base + static_cast<size_t>(y) * static_cast<size_t>(pitch);
-                auto* const dst = output.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * channels;
-                for (int x = 0; x < width; ++x) {
-                    const auto* const px = src + static_cast<size_t>(x) * 4;
-                    uint8_t r = 0;
-                    uint8_t g = 0;
-                    uint8_t b = 0;
-                    if (surface_format == amf::AMF_SURFACE_BGRA) {
-                        b = px[0];
-                        g = px[1];
-                        r = px[2];
-                    } else if (surface_format == amf::AMF_SURFACE_RGBA) {
-                        r = px[0];
-                        g = px[1];
-                        b = px[2];
-                    } else {
-                        r = px[1];
-                        g = px[2];
-                        b = px[3];
-                    }
-
-                    if (format == DecodeFormat::Grayscale) {
-                        dst[x] = static_cast<uint8_t>((77u * r + 150u * g + 29u * b + 128u) >> 8);
-                    } else {
-                        auto* const out = dst + static_cast<size_t>(x) * 3;
-                        out[0] = r;
-                        out[1] = g;
-                        out[2] = b;
-                    }
-                }
-            }
-        }
-
-        lfs::core::Tensor upload_hwc_to_tensor(
-            std::vector<uint8_t>& pixels,
-            const int width,
-            const int height,
-            const int channels,
-            const int target_width,
-            const int target_height,
-            const DecodeFormat format,
-            void* const cuda_stream) {
+            const auto packed_format = packed_pixel_format_from_amf_surface(surface->GetFormat());
             const auto stream = static_cast<cudaStream_t>(cuda_stream);
-            lfs::core::Tensor cpu_tensor;
-            if (format == DecodeFormat::Grayscale) {
-                cpu_tensor = lfs::core::Tensor::from_blob(
-                    pixels.data(),
-                    lfs::core::TensorShape({static_cast<size_t>(height), static_cast<size_t>(width)}),
-                    lfs::core::Device::CPU,
-                    lfs::core::DataType::UInt8);
-            } else {
-                cpu_tensor = lfs::core::Tensor::from_blob(
-                    pixels.data(),
-                    lfs::core::TensorShape({static_cast<size_t>(height), static_cast<size_t>(width), static_cast<size_t>(channels)}),
-                    lfs::core::Device::CPU,
-                    lfs::core::DataType::UInt8);
-            }
+            const auto pitch_bytes = static_cast<size_t>(pitch);
+            const auto width_bytes = static_cast<size_t>(width) * 4;
+            auto packed_gpu = lfs::core::Tensor::empty(
+                lfs::core::TensorShape({static_cast<size_t>(height) * pitch_bytes}),
+                lfs::core::Device::CUDA,
+                lfs::core::DataType::UInt8);
 
-            auto gpu_uint8 = cpu_tensor.to(lfs::core::Device::CUDA);
+            const cudaError_t copy_result = cudaMemcpy2DAsync(
+                packed_gpu.ptr<uint8_t>(),
+                pitch_bytes,
+                plane->GetNative(),
+                pitch_bytes,
+                width_bytes,
+                static_cast<size_t>(height),
+                cudaMemcpyHostToDevice,
+                stream);
+            if (copy_result != cudaSuccess) {
+                throw std::runtime_error(std::string("AMF surface upload failed: ") + cudaGetErrorString(copy_result));
+            }
 
             lfs::core::Tensor output;
             const bool needs_resize = target_width != width || target_height != height;
             if (needs_resize) {
                 if (format == DecodeFormat::Grayscale) {
+                    auto gpu_uint8 = lfs::core::Tensor::empty(
+                        lfs::core::TensorShape({static_cast<size_t>(height), static_cast<size_t>(width)}),
+                        lfs::core::Device::CUDA,
+                        lfs::core::DataType::UInt8);
+                    cuda::launch_packed4_to_uint8_hw(
+                        packed_gpu.ptr<uint8_t>(),
+                        gpu_uint8.ptr<uint8_t>(),
+                        static_cast<size_t>(height),
+                        static_cast<size_t>(width),
+                        pitch_bytes,
+                        packed_format,
+                        stream);
                     output = lfs::core::lanczos_resize_grayscale(
                         gpu_uint8, target_height, target_width, LANCZOS_KERNEL_SIZE, stream);
                 } else {
+                    auto gpu_uint8 = lfs::core::Tensor::empty(
+                        lfs::core::TensorShape({static_cast<size_t>(height), static_cast<size_t>(width), 3}),
+                        lfs::core::Device::CUDA,
+                        lfs::core::DataType::UInt8);
+                    cuda::launch_packed4_to_uint8_hwc(
+                        packed_gpu.ptr<uint8_t>(),
+                        gpu_uint8.ptr<uint8_t>(),
+                        static_cast<size_t>(height),
+                        static_cast<size_t>(width),
+                        pitch_bytes,
+                        packed_format,
+                        stream);
                     output = lfs::core::lanczos_resize(
                         gpu_uint8, target_height, target_width, LANCZOS_KERNEL_SIZE, stream);
                 }
             } else if (format == DecodeFormat::Grayscale) {
-                output = lfs::core::Tensor::zeros(
+                output = lfs::core::Tensor::empty(
                     lfs::core::TensorShape({static_cast<size_t>(height), static_cast<size_t>(width)}),
                     lfs::core::Device::CUDA,
                     lfs::core::DataType::Float32);
-                cuda::launch_uint8_hw_to_float32_hw(
-                    gpu_uint8.ptr<uint8_t>(),
+                cuda::launch_packed4_to_float32_hw(
+                    packed_gpu.ptr<uint8_t>(),
                     output.ptr<float>(),
                     static_cast<size_t>(height),
                     static_cast<size_t>(width),
+                    pitch_bytes,
+                    packed_format,
                     stream);
             } else {
-                output = lfs::core::Tensor::zeros(
-                    lfs::core::TensorShape({static_cast<size_t>(channels), static_cast<size_t>(height), static_cast<size_t>(width)}),
+                output = lfs::core::Tensor::empty(
+                    lfs::core::TensorShape({3, static_cast<size_t>(height), static_cast<size_t>(width)}),
                     lfs::core::Device::CUDA,
                     lfs::core::DataType::Float32);
-                cuda::launch_uint8_hwc_to_float32_chw(
-                    gpu_uint8.ptr<uint8_t>(),
+                cuda::launch_packed4_to_float32_chw(
+                    packed_gpu.ptr<uint8_t>(),
                     output.ptr<float>(),
                     static_cast<size_t>(height),
                     static_cast<size_t>(width),
-                    static_cast<size_t>(channels),
+                    pitch_bytes,
+                    packed_format,
                     stream);
             }
 
@@ -369,10 +358,7 @@ namespace lfs::io {
         const auto [target_width, target_height] =
             compute_target_size(src_width, src_height, resize_factor, max_width);
 
-        std::vector<uint8_t> pixels;
-        int width = 0;
-        int height = 0;
-        int channels = 0;
+        lfs::core::Tensor output;
 
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -443,12 +429,11 @@ namespace lfs::io {
             }
 
             amf::AMFSurfacePtr surface(data);
-            copy_surface_to_hwc(surface, format, pixels, width, height, channels);
+            output = upload_surface_to_tensor(surface, target_width, target_height, format, cuda_stream);
             decoder->Terminate();
         }
 
-        return upload_hwc_to_tensor(
-            pixels, width, height, channels, target_width, target_height, format, cuda_stream);
+        return output;
     }
 
 } // namespace lfs::io

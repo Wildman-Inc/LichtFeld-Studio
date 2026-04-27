@@ -9,7 +9,6 @@
 #include "rasterization_config.h"
 #include "utils.h"
 #include <cstdint>
-#include <cub/cub.cuh>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -135,13 +134,13 @@ std::tuple<int, int, int, int, int> fast_lfs::rasterization::forward(
     PerInstanceBuffers per_instance_buffers = PerInstanceBuffers::from_blob(per_instance_buffers_blob, alloc_instances, end_bit);
 
     if (n_visible_primitives > 0) {
-        cub::DeviceRadixSort::SortPairs(
+        gpu_primitives::sort_pairs(
             per_primitive_buffers.cub_workspace,
             per_primitive_buffers.cub_workspace_size,
             per_primitive_buffers.depth_keys,
             per_primitive_buffers.primitive_indices,
             n_visible_primitives);
-        CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (Depth)")
+        CHECK_CUDA(config::debug, "gpu_primitives::sort_pairs (Depth)")
 
         // Apply depth ordering
         kernels::forward::apply_depth_ordering_cu<<<div_round_up(n_visible_primitives, config::block_size_apply_depth_ordering), config::block_size_apply_depth_ordering>>>(
@@ -152,13 +151,13 @@ std::tuple<int, int, int, int, int> fast_lfs::rasterization::forward(
         CHECK_CUDA(config::debug, "apply_depth_ordering")
 
         // Compute exclusive sum for offsets
-        cub::DeviceScan::ExclusiveSum(
+        gpu_primitives::exclusive_sum(
             per_primitive_buffers.cub_workspace,
             per_primitive_buffers.cub_workspace_size,
             per_primitive_buffers.offset,
             per_primitive_buffers.offset,
             n_visible_primitives);
-        CHECK_CUDA(config::debug, "cub::DeviceScan::ExclusiveSum (Primitive Offsets)")
+        CHECK_CUDA(config::debug, "gpu_primitives::exclusive_sum (Primitive Offsets)")
 
         // Create instances
         kernels::forward::create_instances_cu<<<div_round_up(n_visible_primitives, config::block_size_create_instances), config::block_size_create_instances>>>(
@@ -175,13 +174,13 @@ std::tuple<int, int, int, int, int> fast_lfs::rasterization::forward(
 
         // Sort by tile
         if (n_instances > 0) {
-            cub::DeviceRadixSort::SortPairs(
+            gpu_primitives::sort_pairs(
                 per_instance_buffers.cub_workspace,
                 per_instance_buffers.cub_workspace_size,
                 per_instance_buffers.keys,
                 per_instance_buffers.primitive_indices,
                 n_instances, 0, end_bit);
-            CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (Tile)")
+            CHECK_CUDA(config::debug, "gpu_primitives::sort_pairs (Tile)")
         }
     }
 
@@ -207,13 +206,13 @@ std::tuple<int, int, int, int, int> fast_lfs::rasterization::forward(
     CHECK_CUDA(config::debug, "extract_bucket_counts")
 
     // Compute inclusive sum for bucket offsets
-    cub::DeviceScan::InclusiveSum(
+    gpu_primitives::inclusive_sum(
         per_tile_buffers.cub_workspace,
         per_tile_buffers.cub_workspace_size,
         per_tile_buffers.n_buckets,
         per_tile_buffers.bucket_offsets,
         n_tiles);
-    CHECK_CUDA(config::debug, "cub::DeviceScan::InclusiveSum (Bucket Counts)")
+    CHECK_CUDA(config::debug, "gpu_primitives::inclusive_sum (Bucket Counts)")
 
     // Get number of buckets
     uint32_t n_buckets_u32;

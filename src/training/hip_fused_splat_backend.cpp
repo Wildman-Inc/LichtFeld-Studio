@@ -132,7 +132,7 @@ namespace lfs::training::hip_fused_splat_backend {
         options.projection_backward_optimizer = !env_flag_disabled("LFS_HIP_FUSED_PROJECTION_OPTIMIZER");
         options.fused_optimizer = !env_flag_disabled("LFS_HIP_FUSED_OPTIMIZER");
         options.loss_raster_boundary_fusion = !env_flag_disabled("LFS_HIP_FUSED_LOSS_RASTER");
-        options.rocprim_sort_scan = !env_flag_disabled("LFS_HIP_FUSED_ROCPRIM_SORT_SCAN");
+        options.rocprim_sort_scan = true;
         options.resident_gpu_cache_bytes = read_cache_bytes_from_env();
         options.prefetch_count = read_prefetch_from_env();
         return options;
@@ -152,7 +152,7 @@ namespace lfs::training::hip_fused_splat_backend {
 
     std::string_view sort_scan_policy_name() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
-        return "rocPRIM/hipCUB";
+        return "rocPRIM";
 #else
         return "CUB";
 #endif
