@@ -140,6 +140,7 @@ namespace lfs::core {
           _image_path(std::move(other._image_path)),
           _image_name(std::move(other._image_name)),
           _mask_path(std::move(other._mask_path)),
+          _split(other._split),
           _camera_width(other._camera_width),
           _camera_height(other._camera_height),
           _image_width(other._image_width),
@@ -182,6 +183,7 @@ namespace lfs::core {
             _image_path = std::move(other._image_path);
             _image_name = std::move(other._image_name);
             _mask_path = std::move(other._mask_path);
+            _split = other._split;
             _camera_width = other._camera_width;
             _camera_height = other._camera_height;
             _image_width = other._image_width;
@@ -219,6 +221,7 @@ namespace lfs::core {
           _image_name(other._image_name),
           _image_path(other._image_path),
           _mask_path(other._mask_path),
+          _split(other._split),
           _camera_width(other._camera_width),
           _camera_height(other._camera_height),
           _image_width(other._image_width),
