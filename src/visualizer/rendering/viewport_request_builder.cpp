@@ -106,7 +106,7 @@ namespace lfs::vis {
         }
 
         [[nodiscard]] bool preferVkSplatForViewport(const FrameContext& ctx) {
-#if defined(_WIN32) && defined(LFS_AMD_PREFER_VKSPLAT)
+#if defined(LFS_VULKAN_VIEWER_RASTERIZATION)
             const auto* trainer_manager = ctx.scene_manager ? ctx.scene_manager->getTrainerManager() : nullptr;
             const bool training_active = trainer_manager && trainer_manager->isTrainingActive();
             return ctx.model != nullptr && ctx.model->size() > 0 && !training_active &&

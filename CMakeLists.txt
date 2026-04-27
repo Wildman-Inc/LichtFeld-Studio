@@ -140,11 +140,7 @@ option(ENABLE_CUDA_GL_INTEROP "Enable CUDA-OpenGL interoperability" ON)
 option(LFS_ENABLE_NVIMAGECODEC "Enable NVIDIA nvImageCodec integration" ON)
 option(LFS_ENABLE_AMF "Enable AMD AMF image decode integration" ON)
 set(LFS_AMF_SDK_ROOT "" CACHE PATH "AMD AMF SDK root")
-set(_lfs_enable_vksplat_default OFF)
-if(WIN32 AND USE_HIP)
-    set(_lfs_enable_vksplat_default ON)
-endif()
-option(LFS_ENABLE_VKSPLAT "Enable vksplat Vulkan viewer rasterization" ${_lfs_enable_vksplat_default})
+option(LFS_ENABLE_VKSPLAT "Enable vksplat Vulkan viewer rasterization and compute backend" OFF)
 option(BUILD_TESTS "Build tests" OFF)
 option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path test (no CUDA)" OFF)
 option(ENABLE_ALLOCATION_PROFILING "Enable tensor allocation profiling" OFF)
@@ -645,8 +641,40 @@ if(USE_HIP)
     include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_shim")
     add_compile_definitions(USE_HIP=1 LFS_USE_HIP=1 USE_ROCM=1 __HIP_PLATFORM_AMD__)
 endif()
-if(WIN32 AND USE_HIP AND LFS_ENABLE_VKSPLAT)
-    add_compile_definitions(LFS_AMD_PREFER_VKSPLAT=1)
+
+set(LFS_HAS_VKSPLAT OFF)
+set(LFS_VKSPLAT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/vksplat/vksplat")
+if(LFS_ENABLE_VKSPLAT AND EXISTS "${LFS_VKSPLAT_SOURCE_DIR}/src/gs_renderer.h")
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        add_library(lfs_vksplat STATIC
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/buffer.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/colmap_reader.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/knn.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/scheduler.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_pipeline.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_renderer.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_trainer.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/perf_timer.cpp
+        )
+        set_source_files_properties(
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/colmap_reader.cpp
+                PROPERTIES COMPILE_DEFINITIONS STB_IMAGE_STATIC
+        )
+        target_include_directories(lfs_vksplat PUBLIC "${LFS_VKSPLAT_SOURCE_DIR}/src")
+        target_link_libraries(lfs_vksplat PUBLIC Vulkan::Vulkan glm::glm)
+        target_compile_features(lfs_vksplat PUBLIC cxx_std_17)
+        target_compile_definitions(lfs_vksplat PRIVATE
+                $<$<PLATFORM_ID:Windows>:NOMINMAX>
+                $<$<PLATFORM_ID:Windows>:VK_USE_PLATFORM_WIN32_KHR>
+                $<$<AND:$<PLATFORM_ID:Linux>,$<NOT:$<PLATFORM_ID:Android>>>:VK_USE_PLATFORM_XLIB_KHR>
+                $<$<PLATFORM_ID:Darwin>:VK_USE_PLATFORM_MACOS_MVK>
+        )
+        set(LFS_HAS_VKSPLAT ON)
+        message(STATUS "vksplat Vulkan backend enabled: ${LFS_VKSPLAT_SOURCE_DIR}")
+    else()
+        message(WARNING "LFS_ENABLE_VKSPLAT is ON but Vulkan SDK was not found; vksplat disabled")
+    endif()
 endif()
 
 # =============================================================================

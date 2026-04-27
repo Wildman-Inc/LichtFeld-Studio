@@ -397,21 +397,21 @@ namespace {
     struct PyGaussiansView {
         std::size_t count() const {
             const auto snap = current_training_snapshot();
-            if (!snap.trainer)
+            if (!snap.trainer || !snap.trainer->has_strategy())
                 return 0;
             return snap.trainer->get_strategy_mutable().get_model().size();
         }
 
         int sh_degree() const {
             const auto snap = current_training_snapshot();
-            if (!snap.trainer)
+            if (!snap.trainer || !snap.trainer->has_strategy())
                 return 0;
             return snap.trainer->get_strategy_mutable().get_model().get_active_sh_degree();
         }
 
         int max_sh_degree() const {
             const auto snap = current_training_snapshot();
-            if (!snap.trainer)
+            if (!snap.trainer || !snap.trainer->has_strategy())
                 return 0;
             return snap.trainer->get_strategy_mutable().get_model().get_max_sh_degree();
         }
@@ -445,7 +445,7 @@ namespace {
 
         float get_lr() const {
             const auto snap = get_command_center().snapshot();
-            if (!snap.trainer)
+            if (!snap.trainer || !snap.trainer->has_strategy())
                 return 0.0f;
             return snap.trainer->get_strategy_mutable().get_optimizer().get_lr();
         }

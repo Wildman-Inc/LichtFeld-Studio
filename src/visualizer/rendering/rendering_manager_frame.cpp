@@ -133,7 +133,7 @@ namespace lfs::vis {
 
         RenderSettings effective_settings = context.settings;
         const bool prefer_vksplat_static_viewer =
-#if defined(_WIN32) && defined(LFS_AMD_PREFER_VKSPLAT)
+#if defined(LFS_VULKAN_VIEWER_RASTERIZATION)
             !is_training && lfs::rendering::vksplat_is_available();
 #else
             false;

@@ -155,6 +155,8 @@ namespace lfs::training {
 
         // just for viewer to get model
         const IStrategy& get_strategy() const { return *strategy_; }
+        bool has_strategy() const { return strategy_ != nullptr; }
+        bool uses_vksplat_compute_backend() const;
 
         // Mutable access for controlled callbacks (e.g., Python control layer)
         IStrategy& get_strategy_mutable() { return *strategy_; }
@@ -243,6 +245,7 @@ namespace lfs::training {
             lfs::core::Tensor gt_image,
             RenderMode render_mode,
             std::stop_token stop_token = {});
+        std::expected<void, std::string> train_with_vksplat_compute(std::stop_token stop_token = {});
 
         void setActiveImageLoader(std::shared_ptr<lfs::io::PipelinedImageLoader> loader);
         int get_regular_iterations() const;

@@ -4,32 +4,6 @@
 
 add_subdirectory(rasterizer)
 
-set(LFS_HAS_VKSPLAT OFF)
-set(LFS_VKSPLAT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/vksplat/vksplat")
-if(LFS_ENABLE_VKSPLAT AND EXISTS "${LFS_VKSPLAT_SOURCE_DIR}/src/gs_renderer.h")
-    find_package(Vulkan QUIET)
-    if(Vulkan_FOUND)
-        add_library(lfs_vksplat STATIC
-                ${LFS_VKSPLAT_SOURCE_DIR}/src/buffer.cpp
-                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_pipeline.cpp
-                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_renderer.cpp
-                ${LFS_VKSPLAT_SOURCE_DIR}/src/perf_timer.cpp
-                ${LFS_VKSPLAT_SOURCE_DIR}/src/scheduler.cpp
-        )
-        target_include_directories(lfs_vksplat PUBLIC "${LFS_VKSPLAT_SOURCE_DIR}/src")
-        target_link_libraries(lfs_vksplat PUBLIC Vulkan::Vulkan glm::glm)
-        target_compile_features(lfs_vksplat PUBLIC cxx_std_17)
-        target_compile_definitions(lfs_vksplat PRIVATE
-                $<$<PLATFORM_ID:Windows>:NOMINMAX>
-                $<$<PLATFORM_ID:Windows>:VK_USE_PLATFORM_WIN32_KHR>
-        )
-        set(LFS_HAS_VKSPLAT ON)
-        message(STATUS "vksplat Vulkan rasterization enabled: ${LFS_VKSPLAT_SOURCE_DIR}")
-    else()
-        message(WARNING "LFS_ENABLE_VKSPLAT is ON but Vulkan SDK was not found; vksplat disabled")
-    endif()
-endif()
-
 set(RENDERING_SOURCES
         rendering_engine.cpp
         rendering_engine_impl.cpp
@@ -83,6 +57,7 @@ target_link_libraries(lfs_rendering
 
 if(LFS_HAS_VKSPLAT)
     target_link_libraries(lfs_rendering PRIVATE lfs_vksplat)
+    target_compile_definitions(lfs_rendering PUBLIC LFS_VULKAN_VIEWER_RASTERIZATION=1)
 endif()
 
 # Since we're linking to lfs_core PUBLIC, we inherit its include directories

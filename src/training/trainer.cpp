@@ -36,6 +36,7 @@
 #include "training/kernels/camera_loss_heatmap.cuh"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
+#include "vksplat_compute_backend.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -693,6 +694,10 @@ namespace lfs::training {
 
     int Trainer::get_total_iterations() const {
         return get_regular_iterations() + get_active_sparsify_steps();
+    }
+
+    bool Trainer::uses_vksplat_compute_backend() const {
+        return vksplat_compute::is_requested();
     }
 
     lfs::core::param::OptimizationParameters Trainer::get_runtime_optimization_params() const {
@@ -1642,6 +1647,31 @@ namespace lfs::training {
             memory_breakdown_logged_first_batch_ = false;
             memory_breakdown_logged_first_raster_ = false;
             memory_breakdown_logged_first_step_ = false;
+
+            if (uses_vksplat_compute_backend()) {
+                if (params_.dataset.data_path.empty()) {
+                    return std::unexpected("vksplat compute backend requires a dataset path");
+                }
+
+                total_cameras_count_ = 0;
+                if (scene_) {
+                    total_cameras_count_ = scene_->getActiveCameras().size();
+                } else if (base_dataset_) {
+                    total_cameras_count_ = base_dataset_->size();
+                }
+                train_dataset_size_ = total_cameras_count_;
+
+                if (params.optimization.headless) {
+                    progress_ = std::make_unique<TrainingProgress>(
+                        get_total_iterations(),
+                        /*update_frequency=*/100);
+                }
+
+                initialized_ = true;
+                LOG_INFO("Initialized vksplat Vulkan compute trainer for dataset {}",
+                         lfs::core::path_to_utf8(params_.dataset.data_path));
+                return {};
+            }
 
             if (params_.optimization.enable_sparsity) {
                 const size_t stop_refine_limit = static_cast<size_t>(std::max(0, get_regular_iterations()));
@@ -3401,10 +3431,138 @@ namespace lfs::training {
         }
     }
 
+    std::expected<void, std::string> Trainer::train_with_vksplat_compute(std::stop_token stop_token) {
+        publish_command_center_bridge();
+        lfs::training::CommandCenter::instance().set_phase(lfs::training::TrainingPhase::SafeControl);
+
+        is_running_ = true;
+        training_complete_ = false;
+        ready_to_start_ = true;
+        current_loss_ = 0.0f;
+        int last_num_gaussians = 0;
+
+        LOG_INFO("Starting vksplat Vulkan compute training loop");
+
+        {
+            lfs::training::HookContext ctx{
+                .iteration = current_iteration_.load(),
+                .loss = current_loss_.load(),
+                .num_gaussians = static_cast<size_t>(last_num_gaussians),
+                .is_refining = false,
+                .trainer = this};
+            lfs::training::CommandCenter::instance().update_snapshot(
+                ctx, get_total_iterations(), is_paused_.load(), is_running_.load(), stop_requested_.load(),
+                lfs::training::TrainingPhase::SafeControl);
+            lfs::training::ControlBoundary::instance().notify(lfs::training::ControlHook::TrainingStart, ctx);
+        }
+
+        auto result = vksplat_compute::run_training(
+            params_,
+            stop_token,
+            vksplat_compute::StepControl{
+                .before_step = [this, stop_token](const int iter) mutable {
+                    current_iteration_ = iter;
+
+                    if (save_requested_.exchange(false)) {
+                        LOG_WARN("vksplat compute backend saves only the final PLY; intermediate checkpoints are not supported yet");
+                    }
+
+                    if (pause_requested_.load() && !is_paused_.load()) {
+                        is_paused_ = true;
+                        if (progress_) {
+                            progress_->pause();
+                        }
+                        LOG_INFO("vksplat compute training paused at iteration {}", iter);
+                    } else if (!pause_requested_.load() && is_paused_.load()) {
+                        is_paused_ = false;
+                        if (progress_) {
+                            progress_->resume(iter, current_loss_.load(), 0, TrainingProgress::Phase::Train);
+                        }
+                        LOG_INFO("vksplat compute training resumed at iteration {}", iter);
+                    }
+
+                    while (is_paused_.load() && !stop_requested_.load() && !stop_token.stop_requested()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        if (save_requested_.exchange(false)) {
+                            LOG_WARN("vksplat compute backend saves only the final PLY; intermediate checkpoints are not supported yet");
+                        }
+                        if (!pause_requested_.load()) {
+                            is_paused_ = false;
+                            if (progress_) {
+                                progress_->resume(iter, current_loss_.load(), 0, TrainingProgress::Phase::Train);
+                            }
+                            LOG_INFO("vksplat compute training resumed at iteration {}", iter);
+                            break;
+                        }
+                    }
+
+                    if (on_iteration_start_) {
+                        on_iteration_start_();
+                    }
+
+                    return !stop_requested_.load() && !stop_token.stop_requested();
+                },
+                .after_step = [this, &last_num_gaussians](const vksplat_compute::Progress& progress) {
+                    current_iteration_ = progress.iteration;
+                    current_loss_ = progress.loss;
+                    last_num_gaussians = progress.num_gaussians;
+
+                    if (progress_) {
+                        progress_->update(
+                            progress.iteration,
+                            progress.loss,
+                            progress.num_gaussians,
+                            TrainingProgress::Phase::Train);
+                    }
+
+                    lfs::core::events::state::TrainingProgress{
+                        .iteration = progress.iteration,
+                        .loss = progress.loss,
+                        .num_gaussians = progress.num_gaussians,
+                        .is_refining = false}
+                        .emit();
+                }});
+
+        if (progress_) {
+            if (result) {
+                progress_->complete();
+            }
+            progress_->print_final_summary(last_num_gaussians);
+        }
+
+        is_running_ = false;
+        training_complete_ = true;
+        lfs::training::CommandCenter::instance().set_phase(lfs::training::TrainingPhase::Idle);
+
+        {
+            lfs::training::HookContext ctx{
+                .iteration = current_iteration_.load(),
+                .loss = current_loss_.load(),
+                .num_gaussians = static_cast<size_t>(last_num_gaussians),
+                .is_refining = false,
+                .trainer = this};
+            lfs::training::CommandCenter::instance().update_snapshot(
+                ctx, get_total_iterations(), is_paused_.load(), is_running_.load(), stop_requested_.load(),
+                lfs::training::TrainingPhase::Idle);
+            lfs::training::ControlBoundary::instance().notify(lfs::training::ControlHook::TrainingEnd, ctx);
+        }
+
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+
+        LOG_INFO("vksplat Vulkan compute training completed successfully");
+        return {};
+    }
+
     std::expected<void, std::string> Trainer::train(std::stop_token stop_token) {
         // Check if initialized
         if (!initialized_.load()) {
             return std::unexpected("Trainer not initialized. Call initialize() before train()");
+        }
+
+        if (uses_vksplat_compute_backend()) {
+            return train_with_vksplat_compute(stop_token);
         }
 
         is_running_ = false;

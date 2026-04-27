@@ -481,6 +481,9 @@ namespace lfs::mcp {
         if (!trainer_) {
             return std::unexpected("No training session to save");
         }
+        if (!trainer_->has_strategy()) {
+            return std::unexpected("Active trainer does not expose a CUDA/HIP strategy checkpoint");
+        }
 
         auto result = training::save_checkpoint(
             path,

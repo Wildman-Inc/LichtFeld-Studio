@@ -100,6 +100,12 @@ set(TRAINING_NEW_SOURCES
     training_setup.cpp
 )
 
+if(LFS_HAS_VKSPLAT)
+    list(APPEND TRAINING_NEW_SOURCES
+        vksplat_compute_backend.cpp
+    )
+endif()
+
 # lfs_training - Training module with optimizer
 lfs_add_gpu_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
 
@@ -134,6 +140,15 @@ target_link_libraries(lfs_training
     PRIVATE
         lfs_python_utils
 )
+
+if(LFS_HAS_VKSPLAT)
+    target_link_libraries(lfs_training PRIVATE lfs_vksplat)
+    target_compile_definitions(lfs_training PUBLIC LFS_VULKAN_COMPUTE_BACKEND=1)
+    target_compile_definitions(lfs_training PRIVATE
+        LFS_HAS_VKSPLAT=1
+        LFS_VKSPLAT_SHADER_PATH="${LFS_VKSPLAT_SOURCE_DIR}/shader/"
+    )
+endif()
 
 # Set C++ standard
 set_target_properties(lfs_training PROPERTIES

@@ -11,6 +11,7 @@
 #include "core/tensor.hpp"
 #include "python/python_runtime.hpp"
 #include "training/training_setup.hpp"
+#include "training/vksplat_compute_backend.hpp"
 #include <cstring>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -215,8 +216,9 @@ namespace lfs::vis {
             LOG_DEBUG("Resuming from iteration {}", trainer_->get_current_iteration());
         } else {
             const auto& params = trainer_->getParams();
+            const bool use_vksplat_compute = lfs::training::vksplat_compute::is_requested();
 
-            if (scene_) {
+            if (scene_ && !use_vksplat_compute) {
                 if (auto result = lfs::training::initializeTrainingModel(params, *scene_); !result) {
                     LOG_ERROR("Failed to initialize model: {}", result.error());
                     last_error_ = result.error();
@@ -447,7 +449,7 @@ namespace lfs::vis {
         }
 
         // Legacy fallback for non-scene-backed trainers.
-        if (trainer_->isInitialized()) {
+        if (trainer_->isInitialized() && trainer_->has_strategy()) {
             const std::shared_lock lock(trainer_->getRenderMutex());
             return static_cast<int>(trainer_->get_strategy().get_model().size());
         }
@@ -462,6 +464,10 @@ namespace lfs::vis {
 
     const char* TrainerManager::getStrategyType() const {
         if (!trainer_ || !trainer_->isInitialized())
+            return "unknown";
+        if (trainer_->uses_vksplat_compute_backend())
+            return "vksplat";
+        if (!trainer_->has_strategy())
             return "unknown";
         return trainer_->get_strategy().strategy_type();
     }
