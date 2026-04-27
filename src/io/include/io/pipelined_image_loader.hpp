@@ -50,6 +50,8 @@ namespace lfs::io {
         size_t max_cache_bytes = config::DEFAULT_MAX_CACHE_BYTES;
         float min_free_memory_ratio = config::DEFAULT_MIN_FREE_RATIO;
         bool use_filesystem_cache = true;
+        bool resident_gpu_cache = false;
+        size_t resident_gpu_cache_max_bytes = 0;
         int cache_jpeg_quality = config::DEFAULT_JPEG_QUALITY;
         std::chrono::milliseconds batch_collect_timeout{config::DEFAULT_BATCH_TIMEOUT_MS};
         std::chrono::milliseconds output_wait_timeout{config::DEFAULT_OUTPUT_TIMEOUT_MS};
@@ -87,6 +89,11 @@ namespace lfs::io {
         struct CacheStats {
             size_t jpeg_cache_entries = 0;
             size_t jpeg_cache_bytes = 0;
+            size_t resident_gpu_cache_entries = 0;
+            size_t resident_gpu_cache_bytes = 0;
+            size_t resident_gpu_cache_hits = 0;
+            size_t resident_gpu_cache_misses = 0;
+            size_t resident_gpu_cache_evictions = 0;
             size_t hot_path_hits = 0;
             size_t cold_path_misses = 0;
             size_t gpu_batch_decodes = 0;
@@ -250,6 +257,9 @@ namespace lfs::io {
         void put_in_jpeg_cache(const std::string& cache_key, std::shared_ptr<std::vector<uint8_t>> data);
         void put_in_jpeg_cache(const std::string& cache_key, std::vector<uint8_t>&& data);
         void evict_jpeg_cache_if_needed(size_t required_bytes);
+        std::optional<lfs::core::Tensor> get_from_resident_gpu_cache(const std::string& cache_key);
+        void put_in_resident_gpu_cache(const std::string& cache_key, const lfs::core::Tensor& tensor);
+        size_t resident_gpu_cache_limit_bytes() const;
 
         // Mask-specific helpers
         std::string make_mask_cache_key(
@@ -280,6 +290,15 @@ namespace lfs::io {
         std::unordered_map<std::string, JpegCacheEntry> jpeg_cache_;
         mutable std::mutex jpeg_cache_mutex_;
         std::atomic<size_t> jpeg_cache_bytes_{0};
+
+        struct ResidentTensorEntry {
+            lfs::core::Tensor tensor;
+            std::chrono::steady_clock::time_point last_access;
+            size_t size_bytes = 0;
+        };
+        std::unordered_map<std::string, ResidentTensorEntry> resident_gpu_cache_;
+        mutable std::mutex resident_gpu_cache_mutex_;
+        std::atomic<size_t> resident_gpu_cache_bytes_{0};
 
         std::filesystem::path fs_cache_folder_;
         std::mutex fs_cache_mutex_;

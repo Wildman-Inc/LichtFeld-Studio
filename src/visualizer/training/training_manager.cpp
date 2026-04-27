@@ -467,6 +467,8 @@ namespace lfs::vis {
             return "unknown";
         if (trainer_->uses_vksplat_compute_backend())
             return "vksplat";
+        if (trainer_->uses_hip_fused_backend())
+            return "hip-fused";
         if (!trainer_->has_strategy())
             return "unknown";
         return trainer_->get_strategy().strategy_type();

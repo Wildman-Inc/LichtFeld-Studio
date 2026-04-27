@@ -124,6 +124,7 @@ namespace lfs::training {
         std::string param_name(ParamType type) const;
         void init_state(ParamType type);
         void step_param(ParamType type, int iteration);
+        bool step_fused(int iteration);
         size_t compute_new_capacity(size_t current_capacity, size_t required_size) const;
     };
 

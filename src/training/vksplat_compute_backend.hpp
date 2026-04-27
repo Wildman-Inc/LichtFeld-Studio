@@ -59,8 +59,7 @@ namespace lfs::training::vksplat_compute {
         return backend == "vksplat" || backend == "VKSPLAT" ||
                backend == "vulkan" || backend == "VULKAN" ||
                backend == "fused" || backend == "FUSED" ||
-               backend == "gsplat" || backend == "GSPLAT" ||
-               backend == "hip-fused" || backend == "HIP-FUSED";
+               backend == "gsplat" || backend == "GSPLAT";
     }
 
 #if defined(LFS_VULKAN_COMPUTE_BACKEND)

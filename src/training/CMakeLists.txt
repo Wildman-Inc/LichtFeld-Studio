@@ -76,6 +76,7 @@ endif()
 # Optimizer sources
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
+    optimizer/hip_fused_adam.cu
     optimizer/scheduler.cpp
     losses/regularization.cpp
     losses/photometric_loss.cpp
@@ -96,6 +97,7 @@ set(TRAINING_NEW_SOURCES
     control/command_api.cpp
     metrics/metrics.cpp
     checkpoint.cpp
+    hip_fused_splat_backend.cpp
     trainer.cpp
     training_setup.cpp
 )

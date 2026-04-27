@@ -157,6 +157,8 @@ namespace lfs::training {
         const IStrategy& get_strategy() const { return *strategy_; }
         bool has_strategy() const { return strategy_ != nullptr; }
         bool uses_vksplat_compute_backend() const;
+        bool uses_hip_fused_backend() const;
+        bool uses_hip_resident_backend() const;
 
         // Mutable access for controlled callbacks (e.g., Python control layer)
         IStrategy& get_strategy_mutable() { return *strategy_; }
