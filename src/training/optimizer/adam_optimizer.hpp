@@ -28,6 +28,10 @@
 
 namespace lfs::training {
 
+    namespace optimizer {
+        struct HipFusedProjectionBackwardOptimizerConfig;
+    }
+
     struct AdamConfig {
         float lr = 1e-3f;
         double beta1 = 0.9; // Must be double to match legacy precision
@@ -105,6 +109,11 @@ namespace lfs::training {
         int64_t get_step_count(ParamType type) const;
         void set_state(ParamType type, const AdamParamState& state);
         const AdamConfig& get_config() const { return config_; }
+        bool prepare_fused_projection_optimizer(
+            int iteration,
+            lfs::training::optimizer::HipFusedProjectionBackwardOptimizerConfig& launch_config);
+        void mark_fused_projection_step_completed(int iteration);
+        bool fused_projection_step_completed(int iteration) const;
 
         // Serialization
         void serialize(std::ostream& os) const;
@@ -119,11 +128,13 @@ namespace lfs::training {
         AdamConfig config_;
         lfs::core::SplatData& splat_data_;
         std::unordered_map<std::string, AdamParamState> states_;
+        int fused_projection_step_completed_iteration_ = -1;
 
         lfs::core::Tensor& get_param(ParamType type);
         std::string param_name(ParamType type) const;
         void init_state(ParamType type);
         void step_param(ParamType type, int iteration);
+        bool step_fused(int iteration);
         size_t compute_new_capacity(size_t current_capacity, size_t required_size) const;
     };
 

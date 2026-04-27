@@ -6,6 +6,7 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
+#include "optimizer/hip_fused_projection_optimizer.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include <cassert>
 #include <chrono>
@@ -449,7 +450,8 @@ namespace lfs::training {
         AdamOptimizer& optimizer,
         const core::Tensor& grad_alpha_extra,
         const core::Tensor& pixel_error_map,
-        DensificationType densification_type) {
+        DensificationType densification_type,
+        const FastRasterizeBackwardOptions& options) {
 
         // Compute grad_alpha from background blending: output = image + (1 - alpha) * bg
         int H, W;
@@ -531,6 +533,49 @@ namespace lfs::training {
 
         auto raw_image = ctx.image;
         compose_background_in_place(raw_image, ctx.alpha, ctx.bg_color, ctx.bg_image, H, W, stream, true);
+
+        if (options.fused_projection_optimizer) {
+            lfs::training::optimizer::HipFusedProjectionBackwardOptimizerConfig fused_config{};
+            if (optimizer.prepare_fused_projection_optimizer(options.iteration, fused_config)) {
+                fused_config.densification_info =
+                    update_densification_info ? gaussian_model._densification_info.ptr<float>() : nullptr;
+                fused_config.densification_error_map =
+                    use_pixel_error_densification ? error_map_2d.ptr<float>() : nullptr;
+                fused_config.grad_image = grad_image.ptr<float>();
+                fused_config.grad_alpha = grad_alpha.ptr<float>();
+                fused_config.image = raw_image.ptr<float>();
+                fused_config.alpha = ctx.alpha.ptr<float>();
+                fused_config.w2c = ctx.w2c_ptr;
+                fused_config.cam_position = ctx.cam_position_ptr;
+                fused_config.forward_ctx = ctx.forward_ctx;
+                fused_config.n_primitives = n_primitives;
+                fused_config.active_sh_bases = ctx.active_sh_bases;
+                fused_config.total_bases_sh_rest = ctx.total_bases_sh_rest;
+                fused_config.width = ctx.width;
+                fused_config.height = ctx.height;
+                fused_config.focal_x = ctx.focal_x;
+                fused_config.focal_y = ctx.focal_y;
+                fused_config.center_x = ctx.center_x;
+                fused_config.center_y = ctx.center_y;
+                fused_config.mip_filter = ctx.mip_filter;
+                fused_config.densification_type = densification_type;
+                fused_config.scale_reg_weight = options.scale_reg_weight;
+                fused_config.opacity_reg_weight = options.opacity_reg_weight;
+
+                auto& arena = lfs::core::GlobalArenaManager::instance().get_arena();
+                try {
+                    lfs::training::optimizer::launch_hip_fused_projection_backward_optimizer(
+                        fused_config,
+                        stream);
+                    arena.end_frame(ctx.forward_ctx.frame_id);
+                    optimizer.mark_fused_projection_step_completed(options.iteration);
+                    return;
+                } catch (...) {
+                    arena.end_frame(ctx.forward_ctx.frame_id);
+                    throw;
+                }
+            }
+        }
 
         auto backward_result = fast_lfs::rasterization::backward_raw(
             update_densification_info ? gaussian_model._densification_info.ptr<float>() : nullptr,

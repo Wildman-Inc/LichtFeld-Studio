@@ -9,6 +9,38 @@ namespace lfs::io::cuda {
     namespace {
         constexpr int BLOCK_SIZE = 256;
         constexpr float NORMALIZE_SCALE = 1.0f / 255.0f;
+
+        __device__ __forceinline__ void read_packed4_rgb(
+            const uint8_t* px,
+            const PackedPixelFormat format,
+            uint8_t& r,
+            uint8_t& g,
+            uint8_t& b) {
+            switch (format) {
+            case PackedPixelFormat::BGRA:
+                b = px[0];
+                g = px[1];
+                r = px[2];
+                return;
+            case PackedPixelFormat::RGBA:
+                r = px[0];
+                g = px[1];
+                b = px[2];
+                return;
+            case PackedPixelFormat::ARGB:
+                r = px[1];
+                g = px[2];
+                b = px[3];
+                return;
+            }
+            b = px[0];
+            g = px[1];
+            r = px[2];
+        }
+
+        __device__ __forceinline__ uint8_t rgb_to_gray(const uint8_t r, const uint8_t g, const uint8_t b) {
+            return static_cast<uint8_t>((77u * r + 150u * g + 29u * b + 128u) >> 8);
+        }
     } // namespace
 
     __global__ void uint8_hwc_to_float32_chw_kernel(
@@ -71,6 +103,173 @@ namespace lfs::io::cuda {
 
         uint8_hw_to_float32_hw_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             input, output, total);
+    }
+
+    __global__ void packed4_to_uint8_hwc_kernel(
+        const uint8_t* __restrict__ input,
+        uint8_t* __restrict__ output,
+        const size_t H,
+        const size_t W,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format) {
+
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const size_t total = H * W;
+        if (idx >= total)
+            return;
+
+        const size_t h = idx / W;
+        const size_t w = idx - h * W;
+        const uint8_t* px = input + h * pitch_bytes + w * 4;
+
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        read_packed4_rgb(px, format, r, g, b);
+
+        uint8_t* out = output + idx * 3;
+        out[0] = r;
+        out[1] = g;
+        out[2] = b;
+    }
+
+    void launch_packed4_to_uint8_hwc(
+        const uint8_t* input,
+        uint8_t* output,
+        const size_t height,
+        const size_t width,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format,
+        cudaStream_t stream) {
+
+        const size_t total = height * width;
+        const int num_blocks = static_cast<int>((total + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+        packed4_to_uint8_hwc_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+            input, output, height, width, pitch_bytes, format);
+    }
+
+    __global__ void packed4_to_uint8_hw_kernel(
+        const uint8_t* __restrict__ input,
+        uint8_t* __restrict__ output,
+        const size_t H,
+        const size_t W,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format) {
+
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const size_t total = H * W;
+        if (idx >= total)
+            return;
+
+        const size_t h = idx / W;
+        const size_t w = idx - h * W;
+        const uint8_t* px = input + h * pitch_bytes + w * 4;
+
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        read_packed4_rgb(px, format, r, g, b);
+        output[idx] = rgb_to_gray(r, g, b);
+    }
+
+    void launch_packed4_to_uint8_hw(
+        const uint8_t* input,
+        uint8_t* output,
+        const size_t height,
+        const size_t width,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format,
+        cudaStream_t stream) {
+
+        const size_t total = height * width;
+        const int num_blocks = static_cast<int>((total + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+        packed4_to_uint8_hw_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+            input, output, height, width, pitch_bytes, format);
+    }
+
+    __global__ void packed4_to_float32_chw_kernel(
+        const uint8_t* __restrict__ input,
+        float* __restrict__ output,
+        const size_t H,
+        const size_t W,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format) {
+
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const size_t total = H * W;
+        if (idx >= total)
+            return;
+
+        const size_t h = idx / W;
+        const size_t w = idx - h * W;
+        const uint8_t* px = input + h * pitch_bytes + w * 4;
+
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        read_packed4_rgb(px, format, r, g, b);
+
+        output[idx] = static_cast<float>(r) * NORMALIZE_SCALE;
+        output[total + idx] = static_cast<float>(g) * NORMALIZE_SCALE;
+        output[2 * total + idx] = static_cast<float>(b) * NORMALIZE_SCALE;
+    }
+
+    void launch_packed4_to_float32_chw(
+        const uint8_t* input,
+        float* output,
+        const size_t height,
+        const size_t width,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format,
+        cudaStream_t stream) {
+
+        const size_t total = height * width;
+        const int num_blocks = static_cast<int>((total + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+        packed4_to_float32_chw_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+            input, output, height, width, pitch_bytes, format);
+    }
+
+    __global__ void packed4_to_float32_hw_kernel(
+        const uint8_t* __restrict__ input,
+        float* __restrict__ output,
+        const size_t H,
+        const size_t W,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format) {
+
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const size_t total = H * W;
+        if (idx >= total)
+            return;
+
+        const size_t h = idx / W;
+        const size_t w = idx - h * W;
+        const uint8_t* px = input + h * pitch_bytes + w * 4;
+
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        read_packed4_rgb(px, format, r, g, b);
+        output[idx] = static_cast<float>(rgb_to_gray(r, g, b)) * NORMALIZE_SCALE;
+    }
+
+    void launch_packed4_to_float32_hw(
+        const uint8_t* input,
+        float* output,
+        const size_t height,
+        const size_t width,
+        const size_t pitch_bytes,
+        const PackedPixelFormat format,
+        cudaStream_t stream) {
+
+        const size_t total = height * width;
+        const int num_blocks = static_cast<int>((total + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+        packed4_to_float32_hw_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+            input, output, height, width, pitch_bytes, format);
     }
 
     __global__ void uint8_rgba_split_kernel(

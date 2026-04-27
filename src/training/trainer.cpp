@@ -21,6 +21,7 @@
 #include "core/splat_data_transform.hpp"
 #include "core/tensor/internal/gpu_slab_allocator.hpp"
 #include "core/tensor/internal/size_bucketed_pool.hpp"
+#include "hip_fused_splat_backend.hpp"
 #include "io/cache_image_loader.hpp"
 #include "io/cuda/image_format_kernels.cuh"
 #include "io/exporter.hpp"
@@ -698,6 +699,14 @@ namespace lfs::training {
 
     bool Trainer::uses_vksplat_compute_backend() const {
         return vksplat_compute::is_requested();
+    }
+
+    bool Trainer::uses_hip_fused_backend() const {
+        return hip_fused_splat_backend::is_requested();
+    }
+
+    bool Trainer::uses_hip_resident_backend() const {
+        return hip_fused_splat_backend::resident_pipeline_requested();
     }
 
     lfs::core::param::OptimizationParameters Trainer::get_runtime_optimization_params() const {
@@ -2511,6 +2520,8 @@ namespace lfs::training {
             }
 
             current_iteration_ = iter;
+            const bool hip_loss_raster_fusion =
+                hip_fused_splat_backend::loss_raster_boundary_fusion_enabled();
 
             // Check control requests at the beginning
             handle_control_requests(iter, stop_token);
@@ -2599,6 +2610,14 @@ namespace lfs::training {
                 loss_accumulator_.zero_();
             }
             auto& loss_tensor_gpu = loss_accumulator_;
+            auto accumulate_loss_gpu = [&loss_tensor_gpu, hip_loss_raster_fusion](
+                                           const lfs::core::Tensor& loss) {
+                if (hip_loss_raster_fusion) {
+                    loss_tensor_gpu.add_(loss);
+                } else {
+                    loss_tensor_gpu = loss_tensor_gpu + loss;
+                }
+            };
             RenderOutput r_output;
             int tiles_processed = 0;
 
@@ -2614,6 +2633,8 @@ namespace lfs::training {
                                              iter >= ppisp_activation_step &&
                                              ppisp_cam_idx >= 0 &&
                                              ppisp_cam_idx < ppisp_controller_pool_->num_cameras();
+            const bool in_sparsification = get_active_sparsify_steps() > 0 &&
+                                           iter > get_sparsity_boundary_iteration();
             const bool use_pixel_error_densification =
                 (params_.optimization.strategy == "mcmc") ||
                 (params_.optimization.strategy == "igs+") ||
@@ -2625,6 +2646,21 @@ namespace lfs::training {
                 densification_type = DensificationType::MCMC;
             else if (core::param::is_mrnf_strategy(params_.optimization.strategy))
                 densification_type = DensificationType::MRNF;
+
+            const bool freeze_gaussians_for_distill =
+                ppisp_controller_pool_ &&
+                params_.optimization.ppisp_use_controller &&
+                params_.optimization.ppisp_freeze_gaussians_on_distill &&
+                iter >= ppisp_activation_step;
+            const bool hip_projection_optimizer_fusion =
+                hip_fused_splat_backend::projection_backward_optimizer_enabled() &&
+                core::param::strategy_names_match(params_.optimization.strategy, core::param::kStrategyMCMC) &&
+                num_tiles == 1 &&
+                !in_controller_phase &&
+                !in_sparsification &&
+                !freeze_gaussians_for_distill &&
+                !params_.optimization.enable_sparsity &&
+                iter < get_total_iterations();
 
             // Loop over tiles (row-major order)
             for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
@@ -2834,7 +2870,7 @@ namespace lfs::training {
                         tile_grad = result->grad_corrected;
                     }
 
-                    loss_tensor_gpu = loss_tensor_gpu + tile_loss;
+                    accumulate_loss_gpu(tile_loss);
                     tiles_processed++;
                     nvtxRangePop(); // compute_photometric_loss
 
@@ -3072,7 +3108,7 @@ namespace lfs::training {
                         memory_breakdown_logged_first_raster_ = true;
                     }
 
-                    loss_tensor_gpu = loss_tensor_gpu + tile_loss;
+                    accumulate_loss_gpu(tile_loss);
                     tiles_processed++;
                     nvtxRangePop();
 
@@ -3093,7 +3129,11 @@ namespace lfs::training {
                     }
 
                     if (tile_grad_raw.is_valid() && tile_grad_raw.numel() > 0) {
-                        raster_grad = raster_grad + tile_grad_raw;
+                        if (hip_loss_raster_fusion) {
+                            raster_grad.add_(tile_grad_raw);
+                        } else {
+                            raster_grad = raster_grad + tile_grad_raw;
+                        }
                     }
 
                     nvtxRangePush("rasterize_backward");
@@ -3107,10 +3147,16 @@ namespace lfs::training {
                                                   use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{});
                     } else {
                         tile_context_guard.release();
+                        const FastRasterizeBackwardOptions backward_options{
+                            .fused_projection_optimizer = hip_projection_optimizer_fusion,
+                            .iteration = iter,
+                            .scale_reg_weight = params_.optimization.scale_reg,
+                            .opacity_reg_weight = params_.optimization.opacity_reg};
                         fast_rasterize_backward(*fast_ctx, raster_grad, strategy_->get_model(),
                                                 strategy_->get_optimizer(), tile_grad_alpha,
                                                 use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{},
-                                                densification_type);
+                                                densification_type,
+                                                backward_options);
                     }
                     nvtxRangePop();
                 }
@@ -3140,24 +3186,27 @@ namespace lfs::training {
                 nvtxRangePop();
             } else {
                 // Normal phase: regularization losses + optimizer steps for all components
+                const bool fused_projection_step_completed =
+                    strategy_->get_optimizer().fused_projection_step_completed(iter);
+                // The HIP fused projection optimizer folds these regularization gradients into its Adam step.
 
-                if (params_.optimization.scale_reg > 0.0f) {
+                if (params_.optimization.scale_reg > 0.0f && !fused_projection_step_completed) {
                     nvtxRangePush("compute_scale_reg_loss");
                     auto scale_loss_result = compute_scale_reg_loss(strategy_->get_model(), strategy_->get_optimizer(), params_.optimization);
                     if (!scale_loss_result) {
                         return std::unexpected(scale_loss_result.error());
                     }
-                    loss_tensor_gpu = loss_tensor_gpu + *scale_loss_result;
+                    accumulate_loss_gpu(*scale_loss_result);
                     nvtxRangePop();
                 }
 
-                if (params_.optimization.opacity_reg > 0.0f) {
+                if (params_.optimization.opacity_reg > 0.0f && !fused_projection_step_completed) {
                     nvtxRangePush("compute_opacity_reg_loss");
                     auto opacity_loss_result = compute_opacity_reg_loss(strategy_->get_model(), strategy_->get_optimizer(), params_.optimization);
                     if (!opacity_loss_result) {
                         return std::unexpected(opacity_loss_result.error());
                     }
-                    loss_tensor_gpu = loss_tensor_gpu + *opacity_loss_result;
+                    accumulate_loss_gpu(*opacity_loss_result);
                     nvtxRangePop();
                 }
 
@@ -3165,7 +3214,7 @@ namespace lfs::training {
                     nvtxRangePush("bilateral_grid_tv_and_step");
                     const float tv_weight = params_.optimization.tv_loss_weight;
 
-                    loss_tensor_gpu = loss_tensor_gpu + bilateral_grid_->tv_loss_gpu() * tv_weight;
+                    accumulate_loss_gpu(bilateral_grid_->tv_loss_gpu() * tv_weight);
                     bilateral_grid_->tv_backward(tv_weight);
                     bilateral_grid_->optimizer_step();
                     bilateral_grid_->zero_grad();
@@ -3177,7 +3226,7 @@ namespace lfs::training {
                 if (ppisp_ && params_.optimization.use_ppisp && !ppisp_frozen) {
                     nvtxRangePush("ppisp_reg_and_step");
 
-                    loss_tensor_gpu = loss_tensor_gpu + ppisp_->reg_loss_gpu();
+                    accumulate_loss_gpu(ppisp_->reg_loss_gpu());
                     ppisp_->reg_backward();
                     ppisp_->optimizer_step();
                     ppisp_->zero_grad();
@@ -3248,9 +3297,6 @@ namespace lfs::training {
                     .is_refining = strategy_->is_refining(iter)}
                     .emit();
             }
-
-            const bool in_sparsification = get_active_sparsify_steps() > 0 &&
-                                           iter > get_sparsity_boundary_iteration();
 
             if (!in_sparsification) {
                 strategy_->pre_step(iter, r_output);
@@ -3565,6 +3611,9 @@ namespace lfs::training {
             return train_with_vksplat_compute(stop_token);
         }
 
+        const bool hip_fused_backend = uses_hip_fused_backend();
+        const bool hip_resident_backend = uses_hip_resident_backend();
+
         is_running_ = false;
         training_complete_ = false;
         ready_to_start_ = false; // Reset the flag
@@ -3574,7 +3623,13 @@ namespace lfs::training {
         ready_to_start_ = true; // Skip GUI wait for now
 
         is_running_ = true; // Now we can start
-        LOG_INFO("Starting training loop");
+        if (hip_fused_backend) {
+            LOG_INFO("Starting HIP fused splat training loop");
+        } else if (hip_resident_backend) {
+            LOG_INFO("Starting HIP GPU-resident training loop");
+        } else {
+            LOG_INFO("Starting training loop");
+        }
         auto& cache_loader = lfs::io::CacheLoader::getInstance();
         cache_loader.reset_cache();
         cache_loader.update_cache_params(params_.dataset.loading_params.use_cpu_memory,
@@ -3634,6 +3689,68 @@ namespace lfs::training {
             }
 
             pipelined_config = tunePipelinedLoaderConfig(pipelined_config, train_dataset_);
+
+            if (hip_fused_backend) {
+                hip_fused_splat_backend::configure_pipelined_loader(
+                    pipelined_config,
+                    train_dataset_size_);
+            } else if (hip_resident_backend) {
+                pipelined_config.resident_gpu_cache = true;
+
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess && free_bytes > 0) {
+                    constexpr size_t SAFETY_BYTES = 2ULL * 1024 * 1024 * 1024;
+                    const size_t cache_budget =
+                        free_bytes > SAFETY_BYTES
+                            ? (free_bytes - SAFETY_BYTES) / 2
+                            : free_bytes / 4;
+                    pipelined_config.resident_gpu_cache_max_bytes =
+                        std::max<size_t>(cache_budget, 512ULL * 1024 * 1024);
+                }
+
+                if (const char* cache_gb = std::getenv("LFS_HIP_RESIDENT_CACHE_GB")) {
+                    char* end = nullptr;
+                    const double value_gb = std::strtod(cache_gb, &end);
+                    if (end != cache_gb && std::isfinite(value_gb) && value_gb > 0.0) {
+                        pipelined_config.resident_gpu_cache_max_bytes =
+                            static_cast<size_t>(value_gb * BYTES_PER_GIB);
+                    }
+                }
+                if (pipelined_config.resident_gpu_cache_max_bytes == 0) {
+                    pipelined_config.resident_gpu_cache_max_bytes = pipelined_config.max_cache_bytes;
+                }
+
+                if (const char* prefetch_raw = std::getenv("LFS_HIP_RESIDENT_PREFETCH")) {
+                    char* end = nullptr;
+                    const auto requested_prefetch = std::strtoull(prefetch_raw, &end, 10);
+                    if (end != prefetch_raw && requested_prefetch > 0) {
+                        const size_t target_prefetch = std::clamp<size_t>(
+                            static_cast<size_t>(requested_prefetch),
+                            size_t{1},
+                            std::max<size_t>(train_dataset_size_, 1));
+                        pipelined_config.prefetch_count = std::max(
+                            pipelined_config.prefetch_count,
+                            target_prefetch);
+                        pipelined_config.jpeg_batch_size = std::max(
+                            pipelined_config.jpeg_batch_size,
+                            std::min<size_t>(16, pipelined_config.prefetch_count));
+                        pipelined_config.output_queue_size = std::max(
+                            pipelined_config.output_queue_size,
+                            std::min<size_t>(16, std::max<size_t>(1, pipelined_config.prefetch_count / 2)));
+                    }
+                }
+                pipelined_config.decoder_pool_size = std::max(
+                    pipelined_config.decoder_pool_size,
+                    pipelined_config.jpeg_batch_size);
+
+                LOG_INFO(
+                    "HIP GPU-resident image cache enabled (limit {:.1f} GB, prefetch={}, batch={}, output_queue={})",
+                    pipelined_config.resident_gpu_cache_max_bytes / BYTES_PER_GIB,
+                    pipelined_config.prefetch_count,
+                    pipelined_config.jpeg_batch_size,
+                    pipelined_config.output_queue_size);
+            }
 
             const bool alpha_available = scene_ && scene_->imagesHaveAlpha();
             PipelinedMaskConfig mask_pipeline_config;

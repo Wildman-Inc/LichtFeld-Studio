@@ -11,6 +11,7 @@
 #include "utils.h"
 #include <cooperative_groups.h>
 #include <cstdint>
+#include <cub/cub.cuh>
 namespace cg = cooperative_groups;
 
 namespace fast_lfs::rasterization::kernels::forward {

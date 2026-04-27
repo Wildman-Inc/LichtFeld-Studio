@@ -30,7 +30,7 @@ namespace fast_lfs::rasterization::kernels::backward {
         return make_float4(clamp_grad(g.x), clamp_grad(g.y), clamp_grad(g.z), clamp_grad(g.w));
     }
 
-    __global__ void preprocess_backward_cu(
+    static __global__ void preprocess_backward_cu(
         const float3* __restrict__ means,
         const float3* __restrict__ raw_scales,
         const float4* __restrict__ raw_rotations,
@@ -267,7 +267,7 @@ namespace fast_lfs::rasterization::kernels::backward {
 
     // based on https://github.com/humansensinglab/taming-3dgs/blob/fd0f7d9edfe135eb4eefd3be82ee56dada7f2a16/submodules/diff-gaussian-rasterization/cuda_rasterizer/backward.cu#L404
     template <DensificationType DENSIFICATION_TYPE>
-    __global__ void blend_backward_cu(
+    static __global__ void blend_backward_cu(
         const uint2* __restrict__ tile_instance_ranges,
         const uint* __restrict__ tile_bucket_offsets,
         const uint* __restrict__ instance_primitive_indices,

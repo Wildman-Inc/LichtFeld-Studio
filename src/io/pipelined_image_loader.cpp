@@ -328,8 +328,13 @@ namespace lfs::io {
     PipelinedImageLoader::PipelinedImageLoader(PipelinedLoaderConfig config)
         : config_(std::move(config)) {
 
-        LOG_INFO("[PipelinedImageLoader] batch_size={}, prefetch={}, io_threads={}, cold_threads={}",
-                 config_.jpeg_batch_size, config_.prefetch_count, config_.io_threads, config_.cold_process_threads);
+        LOG_INFO("[PipelinedImageLoader] batch_size={}, prefetch={}, io_threads={}, cold_threads={}, resident_gpu_cache={}, resident_limit={:.1f} GB",
+                 config_.jpeg_batch_size,
+                 config_.prefetch_count,
+                 config_.io_threads,
+                 config_.cold_process_threads,
+                 config_.resident_gpu_cache,
+                 resident_gpu_cache_limit_bytes() / (1024.0 * 1024.0 * 1024.0));
 
         const bool hardware_decode_available = is_hardware_decode_available();
         if (!hardware_decode_available && config_.cold_process_threads == 0) {
@@ -408,8 +413,15 @@ namespace lfs::io {
             std::filesystem::remove_all(fs_cache_folder_, ec);
         }
 
-        LOG_INFO("[PipelinedImageLoader] Done: {} loaded, {} hits, {} misses",
-                 stats_.total_images_loaded, stats_.hot_path_hits, stats_.cold_path_misses);
+        LOG_INFO("[PipelinedImageLoader] Done: {} loaded, {} hits, {} misses, resident entries={}, resident={:.1f} MB, resident_hits={}, resident_misses={}, resident_evictions={}",
+                 stats_.total_images_loaded,
+                 stats_.hot_path_hits,
+                 stats_.cold_path_misses,
+                 resident_gpu_cache_.size(),
+                 resident_gpu_cache_bytes_.load() / (1024.0 * 1024.0),
+                 stats_.resident_gpu_cache_hits,
+                 stats_.resident_gpu_cache_misses,
+                 stats_.resident_gpu_cache_evictions);
     }
 
     void PipelinedImageLoader::prefetch(const std::vector<ImageRequest>& requests) {
@@ -469,10 +481,21 @@ namespace lfs::io {
     }
 
     PipelinedImageLoader::CacheStats PipelinedImageLoader::get_stats() const {
-        std::lock_guard<std::mutex> lock(stats_mutex_);
-        CacheStats s = stats_;
-        s.jpeg_cache_entries = jpeg_cache_.size();
-        s.jpeg_cache_bytes = jpeg_cache_bytes_.load();
+        CacheStats s;
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            s = stats_;
+        }
+        {
+            std::lock_guard<std::mutex> jpeg_lock(jpeg_cache_mutex_);
+            s.jpeg_cache_entries = jpeg_cache_.size();
+            s.jpeg_cache_bytes = jpeg_cache_bytes_.load();
+        }
+        {
+            std::lock_guard<std::mutex> resident_lock(resident_gpu_cache_mutex_);
+            s.resident_gpu_cache_entries = resident_gpu_cache_.size();
+            s.resident_gpu_cache_bytes = resident_gpu_cache_bytes_.load();
+        }
         {
             std::lock_guard<std::mutex> pairs_lock(pending_pairs_mutex_);
             s.pending_pairs_count = pending_pairs_.size();
@@ -488,6 +511,10 @@ namespace lfs::io {
         const std::filesystem::path& path, const LoadParams& params) {
         const auto cache_key = make_cache_key(path, params);
         const auto base_key = make_base_cache_key(path);
+        if (auto cached = get_from_resident_gpu_cache(cache_key)) {
+            return *cached;
+        }
+
         auto decode_cached_hit = [&](const std::shared_ptr<std::vector<uint8_t>>& jpeg_data,
                                      const bool cached_blob_is_base) -> lfs::core::Tensor {
             try {
@@ -505,6 +532,7 @@ namespace lfs::io {
         if (auto jpeg_data = load_cached_jpeg_blob(cache_key)) {
             if (auto tensor = decode_cached_hit(jpeg_data, false);
                 tensor.is_valid() && tensor.numel() > 0) {
+                put_in_resident_gpu_cache(cache_key, tensor);
                 return tensor;
             }
         }
@@ -512,6 +540,7 @@ namespace lfs::io {
         if (auto jpeg_data = load_cached_jpeg_blob(base_key)) {
             if (auto tensor = decode_cached_hit(jpeg_data, true);
                 tensor.is_valid() && tensor.numel() > 0) {
+                put_in_resident_gpu_cache(cache_key, tensor);
                 return tensor;
             }
         }
@@ -529,8 +558,10 @@ namespace lfs::io {
                 try {
                     auto decoder = acquire_hardware_decode_loader(config_.decoder_pool_size);
                     auto tensor = decode_cached_rgb_tensor(decoder, data, params, true);
-                    if (tensor.is_valid() && tensor.numel() > 0)
+                    if (tensor.is_valid() && tensor.numel() > 0) {
+                        put_in_resident_gpu_cache(cache_key, tensor);
                         return tensor;
+                    }
                 } catch (const std::exception& e) {
                     LOG_DEBUG("[PipelinedImageLoader] Immediate JPEG decode fallback for {}: {}",
                               lfs::core::path_to_utf8(path), e.what());
@@ -585,8 +616,10 @@ namespace lfs::io {
                     if (needs_requested_processing) {
                         auto tensor = decode_cached_rgb_tensor(
                             HardwareDecodeLoader{.nvcodec = nvcodec}, jpeg_shared, params, true);
-                        if (tensor.is_valid() && tensor.numel() > 0)
+                        if (tensor.is_valid() && tensor.numel() > 0) {
+                            put_in_resident_gpu_cache(cache_key, tensor);
                             return tensor;
+                        }
                     }
                 } catch (const std::exception& e) {
                     LOG_DEBUG("[PipelinedImageLoader] Immediate cache write skipped for {}: {}",
@@ -620,6 +653,7 @@ namespace lfs::io {
         }
 
         apply_requested_undistort(decoded, params);
+        put_in_resident_gpu_cache(cache_key, decoded);
         return decoded;
     }
 
@@ -751,6 +785,96 @@ namespace lfs::io {
         }
     }
 
+    size_t PipelinedImageLoader::resident_gpu_cache_limit_bytes() const {
+        if (!config_.resident_gpu_cache) {
+            return 0;
+        }
+        return config_.resident_gpu_cache_max_bytes > 0
+                   ? config_.resident_gpu_cache_max_bytes
+                   : config_.max_cache_bytes;
+    }
+
+    std::optional<lfs::core::Tensor> PipelinedImageLoader::get_from_resident_gpu_cache(
+        const std::string& cache_key) {
+        if (!config_.resident_gpu_cache) {
+            return std::nullopt;
+        }
+
+        std::optional<lfs::core::Tensor> tensor;
+        {
+            std::lock_guard<std::mutex> lock(resident_gpu_cache_mutex_);
+            const auto it = resident_gpu_cache_.find(cache_key);
+            if (it != resident_gpu_cache_.end() &&
+                it->second.tensor.is_valid() &&
+                it->second.tensor.device() == lfs::core::Device::CUDA) {
+                it->second.last_access = std::chrono::steady_clock::now();
+                tensor = it->second.tensor;
+            }
+        }
+
+        std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+        if (tensor) {
+            ++stats_.resident_gpu_cache_hits;
+        } else {
+            ++stats_.resident_gpu_cache_misses;
+        }
+        return tensor;
+    }
+
+    void PipelinedImageLoader::put_in_resident_gpu_cache(
+        const std::string& cache_key,
+        const lfs::core::Tensor& tensor) {
+        if (!config_.resident_gpu_cache ||
+            !tensor.is_valid() ||
+            tensor.numel() == 0 ||
+            tensor.device() != lfs::core::Device::CUDA) {
+            return;
+        }
+
+        const size_t tensor_bytes = tensor.bytes();
+        const size_t limit_bytes = resident_gpu_cache_limit_bytes();
+        if (tensor_bytes == 0 || (limit_bytes > 0 && tensor_bytes > limit_bytes)) {
+            return;
+        }
+
+        size_t evictions = 0;
+        {
+            std::lock_guard<std::mutex> lock(resident_gpu_cache_mutex_);
+            size_t current_bytes = resident_gpu_cache_bytes_.load(std::memory_order_relaxed);
+
+            if (const auto it = resident_gpu_cache_.find(cache_key); it != resident_gpu_cache_.end()) {
+                current_bytes -= std::min(current_bytes, it->second.size_bytes);
+                resident_gpu_cache_.erase(it);
+            }
+
+            while (limit_bytes > 0 &&
+                   current_bytes + tensor_bytes > limit_bytes &&
+                   !resident_gpu_cache_.empty()) {
+                auto oldest = resident_gpu_cache_.begin();
+                for (auto it = resident_gpu_cache_.begin(); it != resident_gpu_cache_.end(); ++it) {
+                    if (it->second.last_access < oldest->second.last_access) {
+                        oldest = it;
+                    }
+                }
+                current_bytes -= std::min(current_bytes, oldest->second.size_bytes);
+                resident_gpu_cache_.erase(oldest);
+                ++evictions;
+            }
+
+            resident_gpu_cache_[cache_key] = ResidentTensorEntry{
+                tensor,
+                std::chrono::steady_clock::now(),
+                tensor_bytes};
+            current_bytes += tensor_bytes;
+            resident_gpu_cache_bytes_.store(current_bytes, std::memory_order_relaxed);
+        }
+
+        if (evictions > 0) {
+            std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+            stats_.resident_gpu_cache_evictions += evictions;
+        }
+    }
+
     void PipelinedImageLoader::save_to_fs_cache(const std::string& cache_key, const std::vector<uint8_t>& data) {
         if (!config_.use_filesystem_cache)
             return;
@@ -845,6 +969,17 @@ namespace lfs::io {
             if (request.extract_alpha_as_mask) {
                 const auto rgb_key = make_cache_key(request.path, request.params);
                 const auto alpha_key = make_mask_cache_key(request.path, request.params);
+                auto resident_rgb = get_from_resident_gpu_cache(rgb_key);
+                auto resident_alpha = get_from_resident_gpu_cache(alpha_key);
+                if (resident_rgb && resident_alpha) {
+                    try_complete_pair(
+                        request.sequence_id,
+                        std::move(resident_rgb),
+                        std::move(resident_alpha),
+                        nullptr);
+                    continue;
+                }
+
                 auto cached_rgb = get_from_jpeg_cache(rgb_key);
                 auto cached_alpha = get_from_jpeg_cache(alpha_key);
 
@@ -886,6 +1021,7 @@ namespace lfs::io {
                 continue;
             }
 
+            bool image_delivered_from_resident_cache = false;
             PrefetchedImage result;
             result.sequence_id = request.sequence_id;
             result.path = request.path;
@@ -894,51 +1030,63 @@ namespace lfs::io {
             result.is_mask = false;
             result.undistort = request.undistort;
 
-            try {
-                const bool needs_requested_processing = load_params_need_processing(request.params);
-                const auto base_key = make_base_cache_key(request.path);
+            if (auto resident_image = get_from_resident_gpu_cache(result.cache_key)) {
+                try_complete_pair(
+                    request.sequence_id,
+                    std::move(resident_image),
+                    std::nullopt,
+                    nullptr);
+                image_delivered_from_resident_cache = true;
+            }
 
-                if (auto cached = find_cached_jpeg(result.cache_key, base_key)) {
-                    result.jpeg_data = std::move(cached->data);
-                    result.is_cache_hit = true;
-                    result.needs_processing = cached->from_base_key && needs_requested_processing;
-                    enqueue_decode(std::move(result));
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
-                    ++stats_.hot_path_hits;
-                } else {
-                    result.raw_bytes = read_file(request.path);
-                    result.is_original_jpeg = is_jpeg_data(result.raw_bytes);
-                    result.is_cache_hit = false;
+            if (!image_delivered_from_resident_cache) {
+                try {
+                    const bool needs_requested_processing = load_params_need_processing(request.params);
+                    const auto base_key = make_base_cache_key(request.path);
 
-                    {
-                        std::lock_guard<std::mutex> lock(stats_mutex_);
-                        stats_.total_bytes_read += result.raw_bytes.size();
-                    }
-
-                    if (result.is_original_jpeg && !needs_requested_processing) {
-                        auto data = std::make_shared<std::vector<uint8_t>>(std::move(result.raw_bytes));
-                        put_in_jpeg_cache(result.cache_key, data);
-                        result.jpeg_data = data;
+                    if (auto cached = find_cached_jpeg(result.cache_key, base_key)) {
+                        result.jpeg_data = std::move(cached->data);
                         result.is_cache_hit = true;
+                        result.needs_processing = cached->from_base_key && needs_requested_processing;
                         enqueue_decode(std::move(result));
                         std::lock_guard<std::mutex> lock(stats_mutex_);
                         ++stats_.hot_path_hits;
                     } else {
-                        result.needs_processing = true;
-                        cold_queue_.push(std::move(result));
-                        std::lock_guard<std::mutex> lock(stats_mutex_);
-                        ++stats_.cold_path_misses;
+                        result.raw_bytes = read_file(request.path);
+                        result.is_original_jpeg = is_jpeg_data(result.raw_bytes);
+                        result.is_cache_hit = false;
+
+                        {
+                            std::lock_guard<std::mutex> lock(stats_mutex_);
+                            stats_.total_bytes_read += result.raw_bytes.size();
+                        }
+
+                        if (result.is_original_jpeg && !needs_requested_processing) {
+                            auto data = std::make_shared<std::vector<uint8_t>>(std::move(result.raw_bytes));
+                            put_in_jpeg_cache(result.cache_key, data);
+                            result.jpeg_data = data;
+                            result.is_cache_hit = true;
+                            enqueue_decode(std::move(result));
+                            std::lock_guard<std::mutex> lock(stats_mutex_);
+                            ++stats_.hot_path_hits;
+                        } else {
+                            result.needs_processing = true;
+                            cold_queue_.push(std::move(result));
+                            std::lock_guard<std::mutex> lock(stats_mutex_);
+                            ++stats_.cold_path_misses;
+                        }
                     }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("[PipelinedImageLoader] Prefetch error {}: {}", lfs::core::path_to_utf8(request.path), e.what());
+                    {
+                        std::lock_guard<std::mutex> lock(pending_pairs_mutex_);
+                        pending_pairs_.erase(request.sequence_id);
+                    }
+                    in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+                    continue;
                 }
-            } catch (const std::exception& e) {
-                LOG_ERROR("[PipelinedImageLoader] Prefetch error {}: {}", lfs::core::path_to_utf8(request.path), e.what());
-                // Clean up pending_pairs_ entry to prevent memory leak
-                {
-                    std::lock_guard<std::mutex> lock(pending_pairs_mutex_);
-                    pending_pairs_.erase(request.sequence_id);
-                }
-                in_flight_.fetch_sub(1, std::memory_order_acq_rel);
-                continue; // Skip mask processing if image failed
+            } else if (!request.mask_path) {
+                continue;
             }
 
             if (request.mask_path) {
@@ -952,7 +1100,15 @@ namespace lfs::io {
                 mask_result.undistort = request.undistort;
 
                 try {
-                    if (auto cached = get_from_jpeg_cache(mask_result.cache_key)) {
+                    if (auto resident_mask = get_from_resident_gpu_cache(mask_result.cache_key)) {
+                        try_complete_pair(
+                            request.sequence_id,
+                            std::nullopt,
+                            std::move(resident_mask),
+                            nullptr);
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        ++stats_.mask_cache_hits;
+                    } else if (auto cached = get_from_jpeg_cache(mask_result.cache_key)) {
                         mask_result.jpeg_data = cached;
                         mask_result.is_cache_hit = true;
                         enqueue_decode(std::move(mask_result));
@@ -1070,6 +1226,7 @@ namespace lfs::io {
                                 throw std::runtime_error("Invalid mask tensor");
                             }
 
+                            put_in_resident_gpu_cache(batch[i].cache_key, mask_tensor);
                             try_complete_pair(batch[i].sequence_id, std::nullopt, std::move(mask_tensor), nullptr);
 
                         } else {
@@ -1097,6 +1254,7 @@ namespace lfs::io {
                                 }
                             }
 
+                            put_in_resident_gpu_cache(batch[i].cache_key, tensor);
                             try_complete_pair(batch[i].sequence_id, std::move(tensor), std::nullopt, nullptr);
                         }
                     } catch (const std::exception&) {
@@ -1223,6 +1381,7 @@ namespace lfs::io {
                         alpha = lfs::core::undistort_mask(alpha, scaled, nullptr);
                     }
 
+                    const auto alpha_key = make_mask_cache_key(item.path, item.params);
                     if (nvcodec) {
                         try {
                             auto rgb_jpeg = nvcodec->encode_to_jpeg(rgb, config_.cache_jpeg_quality, nullptr);
@@ -1230,7 +1389,6 @@ namespace lfs::io {
                             put_in_jpeg_cache(item.cache_key,
                                               std::make_shared<std::vector<uint8_t>>(std::move(rgb_jpeg)));
 
-                            const auto alpha_key = make_mask_cache_key(item.path, item.params);
                             auto alpha_jpeg = nvcodec->encode_grayscale_to_jpeg(
                                 alpha, config_.cache_jpeg_quality, nullptr);
                             save_to_fs_cache(alpha_key, alpha_jpeg);
@@ -1244,6 +1402,8 @@ namespace lfs::io {
                         throw std::runtime_error(std::string("CUDA sync failed: ") + cudaGetErrorString(err));
                     }
 
+                    put_in_resident_gpu_cache(item.cache_key, rgb);
+                    put_in_resident_gpu_cache(alpha_key, alpha);
                     try_complete_pair(item.sequence_id, std::move(rgb), std::move(alpha), nullptr);
 
                 } else if (item.is_mask) {
@@ -1331,6 +1491,7 @@ namespace lfs::io {
                         throw std::runtime_error(std::string("CUDA sync failed: ") + cudaGetErrorString(err));
                     }
 
+                    put_in_resident_gpu_cache(item.cache_key, mask_tensor);
                     try_complete_pair(item.sequence_id, std::nullopt, std::move(mask_tensor), nullptr);
 
                 } else {
@@ -1397,6 +1558,7 @@ namespace lfs::io {
                         }
                     }
 
+                    put_in_resident_gpu_cache(item.cache_key, decoded);
                     try_complete_pair(item.sequence_id, std::move(decoded), std::nullopt, nullptr);
                 }
 
@@ -1433,6 +1595,7 @@ namespace lfs::io {
                                 it->second.mask_expected = false;
                             }
                         }
+                        put_in_resident_gpu_cache(item.cache_key, decoded);
                         try_complete_pair(item.sequence_id, std::move(decoded), std::nullopt, nullptr);
                     } catch (const std::exception& e2) {
                         LOG_ERROR("[PipelinedImageLoader] RGB fallback also failed {}: {}",

@@ -8,6 +8,12 @@
 
 namespace lfs::io::cuda {
 
+    enum class PackedPixelFormat : int {
+        BGRA = 0,
+        RGBA = 1,
+        ARGB = 2,
+    };
+
     // Fused kernel: uint8 HWC -> float32 CHW normalized [0,1]
     void launch_uint8_hwc_to_float32_chw(
         const uint8_t* input,
@@ -23,6 +29,46 @@ namespace lfs::io::cuda {
         float* output,
         size_t height,
         size_t width,
+        cudaStream_t stream = nullptr);
+
+    // Fused packed 4-byte surface -> uint8 RGB HWC.
+    void launch_packed4_to_uint8_hwc(
+        const uint8_t* input,
+        uint8_t* output,
+        size_t height,
+        size_t width,
+        size_t pitch_bytes,
+        PackedPixelFormat format,
+        cudaStream_t stream = nullptr);
+
+    // Fused packed 4-byte surface -> uint8 grayscale HW.
+    void launch_packed4_to_uint8_hw(
+        const uint8_t* input,
+        uint8_t* output,
+        size_t height,
+        size_t width,
+        size_t pitch_bytes,
+        PackedPixelFormat format,
+        cudaStream_t stream = nullptr);
+
+    // Fused packed 4-byte surface -> float32 RGB CHW normalized [0,1].
+    void launch_packed4_to_float32_chw(
+        const uint8_t* input,
+        float* output,
+        size_t height,
+        size_t width,
+        size_t pitch_bytes,
+        PackedPixelFormat format,
+        cudaStream_t stream = nullptr);
+
+    // Fused packed 4-byte surface -> float32 grayscale HW normalized [0,1].
+    void launch_packed4_to_float32_hw(
+        const uint8_t* input,
+        float* output,
+        size_t height,
+        size_t width,
+        size_t pitch_bytes,
+        PackedPixelFormat format,
         cudaStream_t stream = nullptr);
 
     // Split uint8 RGBA [H,W,4] into float32 RGB [3,H,W] + float32 alpha [H,W], normalized [0,1]

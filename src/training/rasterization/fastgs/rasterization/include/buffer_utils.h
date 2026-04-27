@@ -4,10 +4,10 @@
 
 #pragma once
 
+#include "gpu_primitives.h"
 #include "helper_math.h"
 #include "rasterization_config.h"
 #include <cstdint>
-#include <cub/cub.cuh>
 #include <cuda_fp16.h>
 
 namespace fast_lfs::rasterization {
@@ -63,8 +63,8 @@ namespace fast_lfs::rasterization {
     struct PerPrimitiveBuffers {
         size_t cub_workspace_size;
         char* cub_workspace;
-        cub::DoubleBuffer<uint> depth_keys;
-        cub::DoubleBuffer<uint> primitive_indices;
+        gpu_primitives::DoubleBuffer<uint> depth_keys;
+        gpu_primitives::DoubleBuffer<uint> primitive_indices;
         uint* n_touched_tiles;
         uint* offset;
         ushort4* screen_bounds;
@@ -80,24 +80,24 @@ namespace fast_lfs::rasterization {
             obtain(blob, depth_keys_current, n_primitives, 128);
             uint* depth_keys_alternate;
             obtain(blob, depth_keys_alternate, n_primitives, 128);
-            buffers.depth_keys = cub::DoubleBuffer<uint>(depth_keys_current, depth_keys_alternate);
+            buffers.depth_keys = gpu_primitives::DoubleBuffer<uint>(depth_keys_current, depth_keys_alternate);
             uint* primitive_indices_current;
             obtain(blob, primitive_indices_current, n_primitives, 128);
             uint* primitive_indices_alternate;
             obtain(blob, primitive_indices_alternate, n_primitives, 128);
-            buffers.primitive_indices = cub::DoubleBuffer<uint>(primitive_indices_current, primitive_indices_alternate);
+            buffers.primitive_indices = gpu_primitives::DoubleBuffer<uint>(primitive_indices_current, primitive_indices_alternate);
             obtain(blob, buffers.n_touched_tiles, n_primitives, 128);
             obtain(blob, buffers.offset, n_primitives, 128);
             obtain(blob, buffers.screen_bounds, n_primitives, 128);
             obtain(blob, buffers.mean2d, n_primitives, 128);
             obtain(blob, buffers.conic_opacity, n_primitives, 128);
             obtain(blob, buffers.color, n_primitives, 128);
-            cub::DeviceScan::ExclusiveSum(
+            gpu_primitives::exclusive_sum(
                 nullptr, buffers.cub_workspace_size,
                 buffers.offset, buffers.offset,
                 n_primitives);
             size_t sorting_workspace_size;
-            cub::DeviceRadixSort::SortPairs(
+            gpu_primitives::sort_pairs(
                 nullptr, sorting_workspace_size,
                 buffers.depth_keys, buffers.primitive_indices,
                 n_primitives);
@@ -112,8 +112,8 @@ namespace fast_lfs::rasterization {
     struct PerInstanceBuffers {
         size_t cub_workspace_size;
         char* cub_workspace;
-        cub::DoubleBuffer<ushort> keys;
-        cub::DoubleBuffer<uint> primitive_indices;
+        gpu_primitives::DoubleBuffer<ushort> keys;
+        gpu_primitives::DoubleBuffer<uint> primitive_indices;
 
         static PerInstanceBuffers from_blob(char*& blob, int n_instances, int end_bit = 16) {
             PerInstanceBuffers buffers;
@@ -121,13 +121,13 @@ namespace fast_lfs::rasterization {
             obtain(blob, keys_current, n_instances, 128);
             ushort* keys_alternate;
             obtain(blob, keys_alternate, n_instances, 128);
-            buffers.keys = cub::DoubleBuffer<ushort>(keys_current, keys_alternate);
+            buffers.keys = gpu_primitives::DoubleBuffer<ushort>(keys_current, keys_alternate);
             uint* primitive_indices_current;
             obtain(blob, primitive_indices_current, n_instances, 128);
             uint* primitive_indices_alternate;
             obtain(blob, primitive_indices_alternate, n_instances, 128);
-            buffers.primitive_indices = cub::DoubleBuffer<uint>(primitive_indices_current, primitive_indices_alternate);
-            cub::DeviceRadixSort::SortPairs(
+            buffers.primitive_indices = gpu_primitives::DoubleBuffer<uint>(primitive_indices_current, primitive_indices_alternate);
+            gpu_primitives::sort_pairs(
                 nullptr, buffers.cub_workspace_size,
                 buffers.keys, buffers.primitive_indices,
                 n_instances, 0, end_bit);
@@ -153,7 +153,7 @@ namespace fast_lfs::rasterization {
             obtain(blob, buffers.max_n_contributions, n_tiles, 128);
             obtain(blob, buffers.n_contributions,
                    static_cast<std::size_t>(n_tiles) * static_cast<std::size_t>(config::block_size_blend), 128);
-            cub::DeviceScan::InclusiveSum(
+            gpu_primitives::inclusive_sum(
                 nullptr, buffers.cub_workspace_size,
                 buffers.n_buckets, buffers.bucket_offsets,
                 n_tiles);

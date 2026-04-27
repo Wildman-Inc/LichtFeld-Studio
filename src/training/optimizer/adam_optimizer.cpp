@@ -6,6 +6,9 @@
 #include "adam_api.h" // fast_lfs::optimizer::adam_step_raw
 #include "core/logger.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
+#include "hip_fused_adam.hpp"
+#include "hip_fused_projection_optimizer.hpp"
+#include "hip_fused_splat_backend.hpp"
 #include <cmath>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -32,6 +35,14 @@ namespace lfs::training {
           splat_data_(splat_data) {}
 
     void AdamOptimizer::step(const int iteration) {
+        if (fused_projection_step_completed(iteration)) {
+            return;
+        }
+
+        if (hip_fused_splat_backend::fused_optimizer_enabled() && step_fused(iteration)) {
+            return;
+        }
+
         for (const auto type : all_param_types()) {
             step_param(type, iteration);
         }
@@ -208,6 +219,186 @@ namespace lfs::training {
             config_.eps,
             bias_correction1_rcp,
             bias_correction2_sqrt_rcp);
+    }
+
+    bool AdamOptimizer::step_fused(const int iteration) {
+        lfs::training::optimizer::HipFusedAdamLaunchConfig launch_config{};
+        launch_config.beta1 = static_cast<float>(config_.beta1);
+        launch_config.beta2 = static_cast<float>(config_.beta2);
+        launch_config.eps = static_cast<float>(config_.eps);
+
+        for (const auto type : all_param_types()) {
+            auto& param = get_param(type);
+            if (!param.is_valid() || param.numel() == 0) {
+                continue;
+            }
+
+            const auto name = param_name(type);
+            if (!states_.contains(name)) {
+                init_state(type);
+            }
+
+            auto& state = states_[name];
+            if (!state.grad.is_valid() || state.grad.numel() == 0 ||
+                !state.exp_avg.is_valid() || state.exp_avg.numel() == 0 ||
+                !state.exp_avg_sq.is_valid() || state.exp_avg_sq.numel() == 0) {
+                continue;
+            }
+
+            state.step_count++;
+
+            if (type == ParamType::ShN && iteration <= SH_WARMUP_ITERATIONS) {
+                continue;
+            }
+
+            const size_t param_size = param.shape()[0];
+            if (param_size == 0) {
+                continue;
+            }
+            if (param_size != state.size) {
+                throw std::runtime_error("Optimizer state desync: " + name);
+            }
+
+            const size_t feature_dim = param.numel() / param_size;
+            const int64_t num_elements = static_cast<int64_t>(state.size * feature_dim);
+            if (num_elements <= 0) {
+                continue;
+            }
+
+            if (launch_config.group_count >= lfs::training::optimizer::HIP_FUSED_ADAM_MAX_GROUPS) {
+                return false;
+            }
+
+            const double bias_correction1_rcp =
+                1.0 / (1.0 - std::pow(config_.beta1, state.step_count));
+            const double bias_correction2_sqrt_rcp =
+                1.0 / std::sqrt(1.0 - std::pow(config_.beta2, state.step_count));
+
+            auto& group = launch_config.groups[launch_config.group_count++];
+            group.param = param.ptr<float>();
+            group.exp_avg = state.exp_avg.ptr<float>();
+            group.exp_avg_sq = state.exp_avg_sq.ptr<float>();
+            group.grad = state.grad.ptr<float>();
+            group.n_elements = num_elements;
+            group.lr = static_cast<float>(get_param_lr(type));
+            group.bias_correction1_rcp = static_cast<float>(bias_correction1_rcp);
+            group.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+            launch_config.total_elements += num_elements;
+        }
+
+        if (launch_config.total_elements > 0) {
+            lfs::training::optimizer::launch_hip_fused_adam_step(launch_config, nullptr);
+        }
+        return true;
+    }
+
+    bool AdamOptimizer::prepare_fused_projection_optimizer(
+        const int iteration,
+        lfs::training::optimizer::HipFusedProjectionBackwardOptimizerConfig& launch_config) {
+        auto ensure_state = [this](const ParamType type) -> AdamParamState* {
+            auto& param = get_param(type);
+            if (!param.is_valid() || param.numel() == 0 || param.shape()[0] == 0) {
+                return nullptr;
+            }
+
+            const auto name = param_name(type);
+            if (!states_.contains(name)) {
+                init_state(type);
+            }
+
+            auto& state = states_[name];
+            if (!state.grad.is_valid() || state.grad.numel() == 0 ||
+                !state.exp_avg.is_valid() || state.exp_avg.numel() == 0 ||
+                !state.exp_avg_sq.is_valid() || state.exp_avg_sq.numel() == 0) {
+                return nullptr;
+            }
+
+            const size_t param_size = param.shape()[0];
+            if (param_size != state.size) {
+                throw std::runtime_error("Optimizer state desync: " + name);
+            }
+            return &state;
+        };
+
+        AdamParamState* means_state = ensure_state(ParamType::Means);
+        AdamParamState* sh0_state = ensure_state(ParamType::Sh0);
+        AdamParamState* scaling_state = ensure_state(ParamType::Scaling);
+        AdamParamState* rotation_state = ensure_state(ParamType::Rotation);
+        AdamParamState* opacity_state = ensure_state(ParamType::Opacity);
+        AdamParamState* shN_state = ensure_state(ParamType::ShN);
+
+        if (!means_state || !sh0_state || !scaling_state || !rotation_state || !opacity_state) {
+            return false;
+        }
+
+        launch_config.beta1 = static_cast<float>(config_.beta1);
+        launch_config.beta2 = static_cast<float>(config_.beta2);
+        launch_config.eps = static_cast<float>(config_.eps);
+
+        auto fill_group = [this](
+                              const ParamType type,
+                              AdamParamState& state,
+                              lfs::training::optimizer::HipFusedAdamParam& group) {
+            auto& param = get_param(type);
+            state.step_count++;
+
+            const double bias_correction1_rcp =
+                1.0 / (1.0 - std::pow(config_.beta1, state.step_count));
+            const double bias_correction2_sqrt_rcp =
+                1.0 / std::sqrt(1.0 - std::pow(config_.beta2, state.step_count));
+
+            group.param = param.ptr<float>();
+            group.exp_avg = state.exp_avg.ptr<float>();
+            group.exp_avg_sq = state.exp_avg_sq.ptr<float>();
+            group.lr = static_cast<float>(get_param_lr(type));
+            group.bias_correction1_rcp = static_cast<float>(bias_correction1_rcp);
+            group.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+            group.n_elements = static_cast<int64_t>(state.size * (param.numel() / param.shape()[0]));
+        };
+
+        fill_group(ParamType::Means, *means_state, launch_config.means);
+        fill_group(ParamType::Sh0, *sh0_state, launch_config.sh0);
+        fill_group(ParamType::Scaling, *scaling_state, launch_config.scaling);
+        fill_group(ParamType::Rotation, *rotation_state, launch_config.rotation);
+        fill_group(ParamType::Opacity, *opacity_state, launch_config.opacity);
+
+        launch_config.grad_opacity = opacity_state->grad.ptr<float>();
+        launch_config.grad_sh0 = sh0_state->grad.ptr<float>();
+        launch_config.grad_shN = nullptr;
+        launch_config.update_shN = false;
+
+        if (shN_state) {
+            auto& shN_param = get_param(ParamType::ShN);
+            launch_config.shN.param = shN_param.ptr<float>();
+            launch_config.grad_shN = shN_state->grad.ptr<float>();
+            shN_state->step_count++;
+            if (iteration > SH_WARMUP_ITERATIONS) {
+                const double bias_correction1_rcp =
+                    1.0 / (1.0 - std::pow(config_.beta1, shN_state->step_count));
+                const double bias_correction2_sqrt_rcp =
+                    1.0 / std::sqrt(1.0 - std::pow(config_.beta2, shN_state->step_count));
+
+                launch_config.shN.param = shN_param.ptr<float>();
+                launch_config.shN.exp_avg = shN_state->exp_avg.ptr<float>();
+                launch_config.shN.exp_avg_sq = shN_state->exp_avg_sq.ptr<float>();
+                launch_config.shN.lr = static_cast<float>(get_param_lr(ParamType::ShN));
+                launch_config.shN.bias_correction1_rcp = static_cast<float>(bias_correction1_rcp);
+                launch_config.shN.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+                launch_config.shN.n_elements =
+                    static_cast<int64_t>(shN_state->size * (shN_param.numel() / shN_param.shape()[0]));
+                launch_config.update_shN = true;
+            }
+        }
+
+        return true;
+    }
+
+    void AdamOptimizer::mark_fused_projection_step_completed(const int iteration) {
+        fused_projection_step_completed_iteration_ = iteration;
+    }
+
+    bool AdamOptimizer::fused_projection_step_completed(const int iteration) const {
+        return fused_projection_step_completed_iteration_ == iteration;
     }
 
     void AdamOptimizer::reset_state_at_indices(ParamType type, const std::vector<int64_t>& indices) {
