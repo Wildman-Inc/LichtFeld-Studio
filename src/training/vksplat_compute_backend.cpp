@@ -226,6 +226,46 @@ namespace lfs::training::vksplat_compute {
             trainer.executeRasterizeForward(uniforms, buffers);
         }
 
+        void cap_initial_splats(VulkanGSPipelineBuffers& buffers, const TrainerConfig& config) {
+            if (config.cap_max <= 0) {
+                return;
+            }
+
+            const size_t target_count = static_cast<size_t>(config.cap_max);
+            if (buffers.num_splats <= target_count) {
+                return;
+            }
+
+            std::vector<size_t> selected(buffers.num_splats);
+            std::iota(selected.begin(), selected.end(), size_t{0});
+            std::mt19937 rng{0};
+            std::shuffle(selected.begin(), selected.end(), rng);
+            selected.resize(target_count);
+            std::sort(selected.begin(), selected.end());
+
+            auto compact = [&selected, target_count](auto& buffer, const size_t stride) {
+                for (size_t dst = 0; dst < target_count; ++dst) {
+                    const size_t src = selected[dst];
+                    if (dst == src) {
+                        continue;
+                    }
+                    std::copy_n(
+                        buffer.begin() + static_cast<std::ptrdiff_t>(src * stride),
+                        stride,
+                        buffer.begin() + static_cast<std::ptrdiff_t>(dst * stride));
+                }
+                buffer.resize(target_count * stride);
+            };
+
+            compact(buffers.xyz_ws, 3);
+            compact(buffers.sh_coeffs, 16 * 3);
+            compact(buffers.rotations, 4);
+            compact(buffers.scales_opacs, 4);
+            buffers.num_splats = target_count;
+
+            LOG_INFO("vksplat initial splats capped to {} from COLMAP input", target_count);
+        }
+
         void run_train_step(VulkanGSTrainer& trainer, VulkanGSRendererUniforms& uniforms,
                             VulkanGSPipelineBuffers& buffers, const TrainerConfig& config,
                             const size_t train_idx, const int step) {
@@ -270,6 +310,7 @@ namespace lfs::training::vksplat_compute {
 
             try {
                 trainer.load_colmap_dataset(config, buffers);
+                cap_initial_splats(buffers, config);
                 if (trainer.num_train() == 0) {
                     cleanup();
                     return std::unexpected("vksplat dataset split produced no training images");
