@@ -18,6 +18,12 @@ namespace lfs::vis::gui {
 
     namespace {
 
+        std::string shortenGpuDeviceName(std::string name) {
+            if (name.rfind("NVIDIA ", 0) == 0)
+                name.erase(0, std::string_view("NVIDIA ").size());
+            return name;
+        }
+
 #ifdef _WIN32
         // Windows: DXGI QueryVideoMemoryInfo for per-process GPU memory.
         // NVML returns NVML_VALUE_NOT_AVAILABLE under WDDM.
@@ -30,8 +36,10 @@ namespace lfs::vis::gui {
             DxgiMemoryState() = default;
 
             ~DxgiMemoryState() {
-                if (adapter3)
-                    adapter3->Release();
+                // Intentionally not releasing adapter3 here.
+                // At static destruction time, DXGI/DirectX runtime may already be
+                // unloaded, causing a crash. The OS will clean up the COM reference
+                // when the process exits anyway.
             }
 
             void ensureInit() {
@@ -219,6 +227,13 @@ namespace lfs::vis::gui {
 
     GpuMemoryInfo queryGpuMemory() {
         GpuMemoryInfo info;
+
+        int cuda_device = 0;
+        if (cudaGetDevice(&cuda_device) == cudaSuccess) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, cuda_device) == cudaSuccess)
+                info.device_name = shortenGpuDeviceName(prop.name);
+        }
 
         size_t free_mem = 0;
         size_t total_mem = 0;

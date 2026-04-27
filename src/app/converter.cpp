@@ -8,6 +8,7 @@
 #include "core/splat_data.hpp"
 #include "io/exporter.hpp"
 #include "io/loader.hpp"
+#include <algorithm>
 #include <cctype>
 #include <iostream>
 #include <print>
@@ -18,8 +19,7 @@ namespace lfs::app {
 
     namespace {
 
-        constexpr size_t SH_CHANNELS = 3;
-        constexpr const char* VALID_EXTENSIONS[] = {".ply", ".sog", ".spz", ".resume"};
+        constexpr const char* VALID_EXTENSIONS[] = {".ply", ".sog", ".spz", ".usd", ".usda", ".usdc", ".usdz", ".resume", ".rad"};
 
         enum class OverwriteChoice { YES,
                                      NO,
@@ -40,21 +40,9 @@ namespace lfs::app {
         }
 
         void truncateSHDegree(SplatData& splat, const int degree) {
-            if (degree < 0 || degree >= splat.get_max_sh_degree())
+            if (degree < 0)
                 return;
-
-            if (degree == 0) {
-                splat.shN() = Tensor{};
-            } else {
-                const size_t keep = static_cast<size_t>((degree + 1) * (degree + 1) - 1);
-                auto& shN = splat.shN();
-                if (shN.is_valid() && shN.ndim() >= 2 && shN.shape()[1] > keep) {
-                    const auto slice_end = static_cast<int64_t>(shN.ndim() == 3 ? keep : keep * SH_CHANNELS);
-                    shN = shN.slice(1, 0, slice_end).contiguous();
-                }
-            }
-            splat.set_max_sh_degree(degree);
-            splat.set_active_sh_degree(degree);
+            splat.set_sh_degree(degree);
         }
 
         std::vector<std::filesystem::path> getInputFiles(const std::filesystem::path& path) {
@@ -63,7 +51,10 @@ namespace lfs::app {
                 for (const auto& entry : std::filesystem::directory_iterator(path)) {
                     if (!entry.is_regular_file())
                         continue;
-                    const auto ext = entry.path().extension().string();
+                    auto ext = entry.path().extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(), [](const unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
                     for (const auto* valid : VALID_EXTENSIONS) {
                         if (ext == valid) {
                             files.push_back(entry.path());
@@ -83,6 +74,10 @@ namespace lfs::app {
             case param::OutputFormat::SOG: return ".sog";
             case param::OutputFormat::SPZ: return ".spz";
             case param::OutputFormat::HTML: return ".html";
+            case param::OutputFormat::USD: return ".usd";
+            case param::OutputFormat::USDA: return ".usda";
+            case param::OutputFormat::USDC: return ".usdc";
+            case param::OutputFormat::RAD: return ".rad";
             }
             return ".ply";
         }
@@ -137,9 +132,9 @@ namespace lfs::app {
             auto splat = std::move(*splat_ptr);
             std::println("  Loaded {} gaussians, SH degree {}", splat->size(), splat->get_max_sh_degree());
 
-            if (params.sh_degree >= 0 && params.sh_degree < splat->get_max_sh_degree()) {
+            if (params.sh_degree >= 0 && params.sh_degree != splat->get_max_sh_degree()) {
                 truncateSHDegree(*splat, params.sh_degree);
-                std::println("  Truncated to SH degree {}", params.sh_degree);
+                std::println("  Set SH degree {}", params.sh_degree);
             }
 
             lfs::io::Result<void> result;
@@ -155,6 +150,14 @@ namespace lfs::app {
                 break;
             case param::OutputFormat::HTML:
                 result = lfs::io::export_html(*splat, {.output_path = output, .kmeans_iterations = params.sog_iterations});
+                break;
+            case param::OutputFormat::USD:
+            case param::OutputFormat::USDA:
+            case param::OutputFormat::USDC:
+                result = lfs::io::save_usd(*splat, {.output_path = output});
+                break;
+            case param::OutputFormat::RAD:
+                result = lfs::io::save_rad(*splat, {.output_path = output, .lod_ratios = params.rad_lod_levels});
                 break;
             }
 
@@ -174,7 +177,7 @@ namespace lfs::app {
         const auto files = getInputFiles(params.input_path);
         if (files.empty()) {
             LOG_ERROR("No convertible files in: {}", path_to_utf8(params.input_path));
-            std::println(stderr, "Error: No .ply, .sog, or .resume files found");
+            std::println(stderr, "Error: No .ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume, or .rad files found");
             return 1;
         }
 

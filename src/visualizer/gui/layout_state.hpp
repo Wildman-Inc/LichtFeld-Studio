@@ -14,11 +14,14 @@ namespace lfs::vis::gui {
         float right_panel_width = 300.0f;
         float scene_panel_ratio = 0.4f;
         float python_console_width = -1.0f;
+        float bottom_dock_height = 320.0f;
         bool show_sequencer = false;
+        std::string file_association;
         std::unordered_map<std::string, bool> window_visibility;
 
         void save() const;
         void load();
+        static std::filesystem::path getConfigDir();
 
     private:
         static std::filesystem::path getConfigPath();

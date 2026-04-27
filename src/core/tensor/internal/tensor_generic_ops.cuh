@@ -8,6 +8,11 @@
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/transform.h>
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+#include <thrust/system/hip/execution_policy.h>
+#else
+#include <thrust/system/cuda/execution_policy.h>
+#endif
 
 // Include vectorized operations for float4 optimizations
 #include "tensor_vectorized_ops.cuh"
@@ -22,7 +27,11 @@ namespace lfs::core::tensor_ops {
     inline void run_with_thrust_policy(cudaStream_t stream, Func&& func) {
         // Always use .on(stream) to avoid implicit sync after thrust operations
         // When stream is nullptr/0, this uses the default stream without syncing
+#if defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP)
+        func(thrust::hip::par.on(stream));
+#else
         func(thrust::cuda::par.on(stream));
+#endif
     }
 
     // ============================================================================

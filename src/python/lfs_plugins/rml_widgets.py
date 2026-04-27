@@ -3,7 +3,7 @@
 """RmlUI widget builder helpers for constructing DOM subtrees
 with correct CSS classes from components.rcss.
 
-Usage in RmlPanel.on_load():
+Usage in Panel.on_mount():
 
     from . import rml_widgets as w
 
@@ -18,6 +18,162 @@ Usage in RmlPanel.on_load():
     w.progress(container, "prog", value=0.5, label="50%")
 """
 
+from dataclasses import dataclass
+from typing import Any, Callable
+
+
+def find_ancestor_with_attribute(element, attribute, stop=None):
+    """Walk up the DOM tree looking for an element with the given attribute."""
+    while element is not None and element != stop:
+        if element.has_attribute(attribute):
+            return element
+        element = element.parent()
+    return None
+
+
+def _select_all_text(element):
+    if element is None:
+        return False
+    try:
+        return bool(element.select())
+    except Exception:
+        return False
+
+
+def bind_select_all_on_focus(element):
+    """Select all text when the given input element receives focus."""
+    if element is None:
+        return None
+    if element.get_attribute("data-select-all-bound", "") == "1":
+        return element
+
+    element.set_attribute("data-select-all-bound", "1")
+    element.add_event_listener("focus", lambda _event, el=element: _select_all_text(el))
+    return element
+
+
+@dataclass
+class _EscapeRevertBinding:
+    element: object
+    capture: Callable[[], Any]
+    restore: Callable[[Any], None]
+    snapshot: Any = None
+
+
+class EscapeRevertController:
+    """Restore focused text inputs to their pre-edit value on host-dispatched cancel."""
+
+    def __init__(self):
+        self._bindings = {}
+
+    def clear(self):
+        self._bindings.clear()
+
+    def bind(self, element, key, capture, restore):
+        if element is None:
+            return None
+
+        binding_key = str(key)
+        self._bindings[binding_key] = _EscapeRevertBinding(
+            element=element,
+            capture=capture,
+            restore=restore,
+        )
+        element.add_event_listener("focus", lambda _event, k=binding_key: self._capture_binding(k))
+        element.add_event_listener("blur", lambda _event, k=binding_key: self._clear_binding(k))
+        element.add_event_listener("escapecancel", lambda event, k=binding_key: self._restore_binding(k, event))
+        return element
+
+    def _restore_binding(self, key, event):
+        binding = self._bindings.get(key)
+        if binding is None or binding.element.parent() is None:
+            return False
+
+        snapshot = binding.snapshot if binding.snapshot is not None else binding.capture()
+        binding.restore(snapshot)
+        event.stop_propagation()
+        return True
+
+    def _capture_binding(self, key):
+        binding = self._bindings.get(key)
+        if binding is None:
+            return
+        binding.snapshot = binding.capture()
+
+    def _clear_binding(self, key):
+        binding = self._bindings.get(key)
+        if binding is not None:
+            binding.snapshot = None
+
+
+def _section_duration(height_px, duration):
+    if duration is not None:
+        return max(0.08, float(duration))
+    height_px = max(0.0, float(height_px))
+    return min(0.28, 0.16 + height_px / 2200.0)
+
+
+def _apply_section_visual_state(expanded, header_element=None, arrow_element=None):
+    if header_element:
+        header_element.set_class("is-expanded", expanded)
+        header_element.set_class("is-collapsed", not expanded)
+    if arrow_element:
+        arrow_element.set_text(chr(0x25B6))
+        arrow_element.set_class("is-expanded", expanded)
+        arrow_element.set_class("is-collapsed", not expanded)
+
+
+def sync_section_state(content_element, expanded, header_element=None, arrow_element=None):
+    """Apply the steady-state visual state for a collapsible section."""
+    if not content_element:
+        return
+
+    _apply_section_visual_state(expanded, header_element, arrow_element)
+    content_element.set_class("collapsed", not expanded)
+
+    content_element.remove_property("max-height")
+    content_element.remove_property("opacity")
+    content_element.remove_property("pointer-events")
+
+
+def animate_section_toggle(content_element, expanding, arrow_element=None,
+                           duration=None, header_element=None):
+    """Animate a section open/close with synchronized arrow and header state."""
+    if not content_element:
+        return
+
+    _apply_section_visual_state(expanding, header_element, arrow_element)
+
+    if expanding:
+        content_element.set_class("collapsed", False)
+        content_element.remove_property("pointer-events")
+
+        current_h = max(content_element.client_height, 0)
+        target_h = max(content_element.scroll_height, current_h)
+        if target_h <= 0:
+            sync_section_state(content_element, True, header_element, arrow_element)
+            return
+        duration = _section_duration(target_h, duration)
+        fade_duration = max(0.1, min(0.18, duration * 0.7))
+        content_element.animate("max-height", f"{target_h}px", duration, "cubic-out",
+                                f"{current_h}px" if current_h > 0 else "0px",
+                                remove_on_complete=True)
+        content_element.animate("opacity", "1", fade_duration, "quadratic-out",
+                                remove_on_complete=True)
+        return
+
+    content_element.set_property("pointer-events", "none")
+    current_h = max(content_element.client_height, 0)
+    target_h = max(content_element.scroll_height, current_h)
+    if target_h <= 0:
+        sync_section_state(content_element, False, header_element, arrow_element)
+        return
+    duration = _section_duration(target_h, duration)
+    fade_duration = max(0.1, min(0.18, duration * 0.7))
+    content_element.animate("max-height", "0px", duration, "cubic-in-out",
+                            f"{target_h}px")
+    content_element.animate("opacity", "0", fade_duration, "quadratic-out", "1")
+
 
 def button(container, id, label, style="", disabled=False):
     """Create a styled button element.
@@ -31,45 +187,79 @@ def button(container, id, label, style="", disabled=False):
     if style:
         classes += f" btn--{style}"
     btn.set_class_names(classes)
-    btn.set_inner_rml(label)
+    btn.set_text(label)
     if disabled:
         btn.set_attribute("disabled", "disabled")
     return btn
 
 
-def checkbox(container, id, label="", checked=False, data_prop=""):
-    """Create a setting row with a labeled checkbox."""
+def aligned_property_row(container, label="", control_classes="setting-row__control-col"):
+    """Create a fixed label-left / control-right row.
+
+    Returns:
+        Tuple of (row_element, control_container).
+    """
     row = container.append_child("div")
-    row.set_class_names("setting-row")
+    row.set_class_names("setting-row setting-row--aligned")
+
+    lbl = row.append_child("span")
+    lbl.set_class_names("setting-row__label-col")
+    if label:
+        lbl.set_text(label)
+
+    control = row.append_child("div")
+    control.set_class_names(control_classes)
+    return row, control
+
+
+def aligned_checkbox_row(container, id, label="", checked=False, data_prop=""):
+    """Create a fixed label-left / checkbox-right row."""
+    row = container.append_child("div")
+    row.set_class_names("setting-row setting-row--aligned")
     row.set_id(f"row-{id}")
 
-    lbl = row.append_child("label")
-    lbl.set_class_names("setting-label")
-    lbl.set_id(f"label-{id}")
+    lbl = row.append_child("span")
+    lbl.set_class_names("setting-row__label-col")
+    lbl.set_id(f"text-{id}")
+    if label:
+        lbl.set_text(label)
 
-    cb = lbl.append_child("input")
+    control = row.append_child("label")
+    control.set_class_names("setting-row__control-col setting-row__control-col--checkbox")
+    control.set_id(f"label-{id}")
+
+    cb = control.append_child("input")
     cb.set_id(f"cb-{id}")
     cb.set_attribute("type", "checkbox")
     if data_prop:
         cb.set_attribute("data-prop", data_prop)
     if checked:
         cb.set_attribute("checked", "")
+    return row, cb, control
 
-    if label:
-        span = lbl.append_child("span")
-        span.set_id(f"text-{id}")
-        span.set_inner_rml(label)
 
+def checkbox(container, id, label="", checked=False, data_prop=""):
+    """Create a setting row with a labeled checkbox."""
+    row, _cb, _control = aligned_checkbox_row(
+        container,
+        id,
+        label=label,
+        checked=checked,
+        data_prop=data_prop,
+    )
     return row
 
 
 def slider(container, id, label="", min=0.0, max=1.0, step=0.01,
            value=None, data_prop=""):
     """Create a setting row with a range slider and value display."""
-    row = container.append_child("div")
-    row.set_class_names("setting-row")
+    row, control = aligned_property_row(
+        container,
+        label=label,
+        control_classes="setting-row__control-col setting-row__control-col--slider",
+    )
 
-    inp = row.append_child("input")
+    inp = control.append_child("input")
     inp.set_id(f"slider-{id}")
     inp.set_attribute("type", "range")
     inp.set_class_names("setting-slider")
@@ -81,17 +271,11 @@ def slider(container, id, label="", min=0.0, max=1.0, step=0.01,
     if value is not None:
         inp.set_attribute("value", str(value))
 
-    val_span = row.append_child("span")
+    val_span = control.append_child("span")
     val_span.set_id(f"val-{id}")
     val_span.set_class_names("slider-value")
     if value is not None:
-        val_span.set_inner_rml(f"{value:.3f}")
-
-    if label:
-        prop_lbl = row.append_child("span")
-        prop_lbl.set_id(f"label-{id}")
-        prop_lbl.set_class_names("prop-label")
-        prop_lbl.set_inner_rml(label)
+        val_span.set_text(f"{value:.3f}")
 
     return row
 
@@ -102,24 +286,22 @@ def select(container, id, label="", options=None, data_prop=""):
     Args:
         options: List of (value, display_text) tuples.
     """
-    row = container.append_child("div")
-    row.set_class_names("setting-row")
+    row, control = aligned_property_row(
+        container,
+        label=label,
+        control_classes="setting-row__control-col setting-row__control-col--fill",
+    )
 
-    sel = row.append_child("select")
+    sel = control.append_child("select")
     sel.set_id(f"sel-{id}")
     if data_prop:
         sel.set_attribute("data-prop", data_prop)
 
     if options:
         for val, text in options:
-            opt_rml = f'<option value="{val}">{text}</option>'
-            sel.set_inner_rml(sel.get_inner_rml() + opt_rml)
-
-    if label:
-        prop_lbl = row.append_child("span")
-        prop_lbl.set_id(f"label-{id}")
-        prop_lbl.set_class_names("prop-label")
-        prop_lbl.set_inner_rml(label)
+            opt = sel.append_child("option")
+            opt.set_attribute("value", str(val))
+            opt.set_text(text)
 
     return row
 
@@ -136,17 +318,17 @@ def collapsible(container, id, title="", open=True):
 
     arrow = header.append_child("span")
     arrow.set_class_names("section-arrow")
-    arrow.set_inner_rml("&#x25BC;" if open else "&#x25B6;")
+    arrow.set_id(f"arrow-{id}")
+    arrow.set_text(chr(0x25B6))
 
     title_span = header.append_child("span")
     title_span.set_id(f"text-hdr-{id}")
-    title_span.set_inner_rml(title)
+    title_span.set_text(title)
 
     content = container.append_child("div")
     content.set_class_names("section-content")
     content.set_id(f"sec-{id}")
-    if not open:
-        content.set_class("collapsed", True)
+    sync_section_state(content, open, header, arrow)
 
     return header, content
 
@@ -165,24 +347,26 @@ def progress(container, id, value=0.0, label=""):
         text = wrapper.append_child("span")
         text.set_id(f"{id}-text")
         text.set_class_names("progress__text")
-        text.set_inner_rml(label)
+        text.set_text(label)
 
     return wrapper
 
 
 def color_swatch(container, id, r=0, g=0, b=0, data_prop=""):
     """Create a color swatch with RGB component displays."""
-    row = container.append_child("div")
-    row.set_class_names("setting-row")
+    row, control = aligned_property_row(
+        container,
+        control_classes="setting-row__control-col setting-row__control-col--color",
+    )
     row.set_id(f"row-{id}")
 
     for ch, val in [("r", r), ("g", g), ("b", b)]:
-        comp = row.append_child("span")
+        comp = control.append_child("span")
         comp.set_class_names("color-comp")
         comp.set_id(f"{ch}c-{id}")
-        comp.set_inner_rml(f"{val:.0f}")
+        comp.set_text(f"{val:.0f}")
 
-    swatch = row.append_child("div")
+    swatch = control.append_child("div")
     swatch.set_class_names("color-swatch")
     swatch.set_id(f"swatch-{id}")
     swatch.set_property("background-color",
@@ -190,12 +374,13 @@ def color_swatch(container, id, r=0, g=0, b=0, data_prop=""):
     if data_prop:
         swatch.set_attribute("data-prop", data_prop)
 
-    hex_input = row.append_child("input")
+    hex_input = control.append_child("input")
     hex_input.set_id(f"hex-{id}")
     hex_input.set_class_names("color-hex")
     hex_input.set_attribute("type", "text")
     if data_prop:
         hex_input.set_attribute("data-prop", data_prop)
+    bind_select_all_on_focus(hex_input)
 
     return row
 
@@ -220,7 +405,7 @@ def setting_row(container, label="", control_id=""):
         lbl.set_class_names("prop-label")
         if control_id:
             lbl.set_id(f"label-{control_id}")
-        lbl.set_inner_rml(label)
+        lbl.set_text(label)
 
     return row
 
@@ -234,10 +419,13 @@ def number_input(container, id, label="", value="", data_prop="",
         fmt: Python format string for display (e.g. "%.6f", "%d").
         min_val/max_val: Clamping bounds (None = unclamped).
     """
-    row = container.append_child("div")
-    row.set_class_names("setting-row")
+    row, control = aligned_property_row(
+        container,
+        label=label,
+        control_classes="setting-row__control-col setting-row__control-col--fill",
+    )
 
-    inp = row.append_child("input")
+    inp = control.append_child("input")
     inp.set_id(f"num-{id}")
     inp.set_attribute("type", "text")
     inp.set_class_names("number-input")
@@ -253,22 +441,18 @@ def number_input(container, id, label="", value="", data_prop="",
         inp.set_attribute("data-max", str(max_val))
     if value != "":
         inp.set_attribute("value", str(value))
-
-    if label:
-        prop_lbl = row.append_child("span")
-        prop_lbl.set_id(f"label-{id}")
-        prop_lbl.set_class_names("prop-label")
-        prop_lbl.set_inner_rml(label)
+    bind_select_all_on_focus(inp)
 
     return row
 
 
 def icon_button(container, id, icon_src, selected=False,
-                disabled=False, tooltip=""):
+                disabled=False, tooltip="", tooltip_key=""):
     """Create an icon button for toolbars.
 
     Args:
         icon_src: Path to icon image (relative to assets).
+        tooltip_key: Locale key for tooltip (resolved via LocalizationManager).
     """
     btn = container.append_child("div")
     btn.set_id(id)
@@ -281,7 +465,9 @@ def icon_button(container, id, icon_src, selected=False,
     img = btn.append_child("img")
     img.set_attribute("src", icon_src)
 
-    if tooltip:
+    if tooltip_key:
+        btn.set_attribute("data-tooltip", tooltip_key)
+    elif tooltip:
         btn.set_attribute("title", tooltip)
 
     return btn

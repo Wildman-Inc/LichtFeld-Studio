@@ -14,7 +14,7 @@
 #include <mutex>
 #include <unordered_set>
 
-#include <Python.h>
+#include "python_compat.hpp"
 
 namespace lfs::python {
 
@@ -44,6 +44,11 @@ namespace lfs::python {
 
         // Exit popup state for window close callback (thread-safe)
         std::atomic<bool> g_exit_popup_open{false};
+
+        // GL-thread callback queue (set once during module init, before any reader threads)
+        std::thread::id g_gl_thread_id{};
+        std::mutex g_gl_callbacks_mutex;
+        std::vector<std::function<void()>> g_gl_callbacks;
 
         // Sequencer callbacks
         IsSequencerVisibleCallback g_is_sequencer_visible_cb = nullptr;
@@ -103,6 +108,7 @@ namespace lfs::python {
         core::Scene* g_scene_for_python = nullptr;
 
         ApplicationSceneContext g_app_scene_context;
+        std::atomic<vis::Visualizer*> g_visualizer{nullptr};
         std::atomic<vis::TrainerManager*> g_trainer_manager{nullptr};
         std::atomic<vis::ParameterManager*> g_parameter_manager{nullptr};
         std::atomic<vis::RenderingManager*> g_rendering_manager{nullptr};
@@ -142,6 +148,7 @@ namespace lfs::python {
         void* g_view_context_state{nullptr};
         float g_shared_dpi_scale{DEFAULT_DPI_SCALE};
         void* g_rml_manager{nullptr};
+        RmlContextDestroyFn g_rml_context_destroy_handler{nullptr};
         RmlPanelHostOps g_rml_panel_host_ops{};
         RmlDocRegisterCallback g_rml_doc_register_cb{nullptr};
         RmlDocUnregisterCallback g_rml_doc_unregister_cb{nullptr};
@@ -164,6 +171,7 @@ namespace lfs::python {
 
         // Redraw request flag
         std::atomic<bool> g_redraw_requested{false};
+        MainLoopWakeCallback g_main_loop_wake_callback = nullptr;
     } // namespace
 
     // Bridge API
@@ -197,10 +205,18 @@ namespace lfs::python {
     const PyContext& context() { return g_frame_context; }
 
     // Redraw request mechanism
-    void request_redraw() { g_redraw_requested.store(true, std::memory_order_release); }
+    void request_redraw() {
+        const bool was_requested = g_redraw_requested.exchange(true, std::memory_order_acq_rel);
+        if (!was_requested && g_main_loop_wake_callback)
+            g_main_loop_wake_callback();
+    }
 
     bool consume_redraw_request() {
         return g_redraw_requested.exchange(false, std::memory_order_acq_rel);
+    }
+
+    void set_main_loop_wake_callback(MainLoopWakeCallback cb) {
+        g_main_loop_wake_callback = cb;
     }
 
     // Operation context (short-lived)
@@ -209,6 +225,9 @@ namespace lfs::python {
 
     void set_trainer_manager(vis::TrainerManager* tm) { g_trainer_manager.store(tm); }
     vis::TrainerManager* get_trainer_manager() { return g_trainer_manager.load(); }
+
+    void set_visualizer(vis::Visualizer* viewer) { g_visualizer.store(viewer); }
+    vis::Visualizer* get_visualizer() { return g_visualizer.load(); }
 
     void set_parameter_manager(vis::ParameterManager* pm) { g_parameter_manager.store(pm); }
     vis::ParameterManager* get_parameter_manager() { return g_parameter_manager.load(); }
@@ -239,16 +258,19 @@ namespace lfs::python {
         Mesh2SplatStartFn g_m2s_start;
         std::function<bool()> g_m2s_active;
         std::function<float()> g_m2s_progress;
+        std::function<std::string()> g_m2s_stage;
         std::function<std::string()> g_m2s_error;
     } // namespace
 
     void set_mesh2splat_callbacks(Mesh2SplatStartFn start,
                                   std::function<bool()> is_active,
                                   std::function<float()> get_progress,
+                                  std::function<std::string()> get_stage,
                                   std::function<std::string()> get_error) {
         g_m2s_start = std::move(start);
         g_m2s_active = std::move(is_active);
         g_m2s_progress = std::move(get_progress);
+        g_m2s_stage = std::move(get_stage);
         g_m2s_error = std::move(get_error);
     }
 
@@ -260,7 +282,46 @@ namespace lfs::python {
 
     bool invoke_mesh2splat_active() { return g_m2s_active ? g_m2s_active() : false; }
     float invoke_mesh2splat_progress() { return g_m2s_progress ? g_m2s_progress() : 0.0f; }
+    std::string invoke_mesh2splat_stage() { return g_m2s_stage ? g_m2s_stage() : std::string{}; }
     std::string invoke_mesh2splat_error() { return g_m2s_error ? g_m2s_error() : std::string{}; }
+
+    namespace {
+        SplatSimplifyStartFn g_splat_simplify_start;
+        std::function<void()> g_splat_simplify_cancel;
+        std::function<bool()> g_splat_simplify_active;
+        std::function<float()> g_splat_simplify_progress;
+        std::function<std::string()> g_splat_simplify_stage;
+        std::function<std::string()> g_splat_simplify_error;
+    } // namespace
+
+    void set_splat_simplify_callbacks(SplatSimplifyStartFn start,
+                                      std::function<void()> cancel,
+                                      std::function<bool()> is_active,
+                                      std::function<float()> get_progress,
+                                      std::function<std::string()> get_stage,
+                                      std::function<std::string()> get_error) {
+        g_splat_simplify_start = std::move(start);
+        g_splat_simplify_cancel = std::move(cancel);
+        g_splat_simplify_active = std::move(is_active);
+        g_splat_simplify_progress = std::move(get_progress);
+        g_splat_simplify_stage = std::move(get_stage);
+        g_splat_simplify_error = std::move(get_error);
+    }
+
+    void invoke_splat_simplify_start(const std::string& name, const core::SplatSimplifyOptions& options) {
+        if (g_splat_simplify_start)
+            g_splat_simplify_start(name, options);
+    }
+
+    void invoke_splat_simplify_cancel() {
+        if (g_splat_simplify_cancel)
+            g_splat_simplify_cancel();
+    }
+
+    bool invoke_splat_simplify_active() { return g_splat_simplify_active ? g_splat_simplify_active() : false; }
+    float invoke_splat_simplify_progress() { return g_splat_simplify_progress ? g_splat_simplify_progress() : 0.0f; }
+    std::string invoke_splat_simplify_stage() { return g_splat_simplify_stage ? g_splat_simplify_stage() : std::string{}; }
+    std::string invoke_splat_simplify_error() { return g_splat_simplify_error ? g_splat_simplify_error() : std::string{}; }
 
     namespace {
         GetSelectedCameraUidCallback g_get_selected_camera_cb = nullptr;
@@ -467,6 +528,7 @@ namespace lfs::python {
     // Application context (long-lived)
     void ApplicationSceneContext::set(core::Scene* scene) {
         scene_.store(scene);
+        mutation_flags_.store(0, std::memory_order_release);
         generation_.fetch_add(1);
     }
 
@@ -474,7 +536,19 @@ namespace lfs::python {
 
     uint64_t ApplicationSceneContext::generation() const { return generation_.load(); }
 
+    uint32_t ApplicationSceneContext::mutation_flags() const {
+        return mutation_flags_.load(std::memory_order_acquire);
+    }
+
+    uint32_t ApplicationSceneContext::consume_mutation_flags() {
+        return mutation_flags_.exchange(0, std::memory_order_acq_rel);
+    }
+
     void ApplicationSceneContext::bump() { generation_.fetch_add(1); }
+
+    void ApplicationSceneContext::set_mutation_flags(const uint32_t flags) {
+        mutation_flags_.fetch_or(flags, std::memory_order_acq_rel);
+    }
 
     void set_application_scene(core::Scene* scene) { g_app_scene_context.set(scene); }
 
@@ -482,7 +556,15 @@ namespace lfs::python {
 
     uint64_t get_scene_generation() { return g_app_scene_context.generation(); }
 
+    uint32_t get_scene_mutation_flags() { return g_app_scene_context.mutation_flags(); }
+
+    uint32_t consume_scene_mutation_flags() { return g_app_scene_context.consume_mutation_flags(); }
+
     void bump_scene_generation() { g_app_scene_context.bump(); }
+
+    void set_scene_mutation_flags(const uint32_t flags) {
+        g_app_scene_context.set_mutation_flags(flags);
+    }
 
     void set_gil_state_ready(const bool ready) { g_gil_state_ready.store(ready, std::memory_order_release); }
     bool is_gil_state_ready() { return g_gil_state_ready.load(std::memory_order_acquire); }
@@ -588,6 +670,14 @@ namespace lfs::python {
 
     void* get_rml_manager() {
         return g_rml_manager;
+    }
+
+    void set_rml_context_destroy_handler(RmlContextDestroyFn fn) {
+        g_rml_context_destroy_handler = fn;
+    }
+
+    RmlContextDestroyFn get_rml_context_destroy_handler() {
+        return g_rml_context_destroy_handler;
     }
 
     void set_rml_panel_host_ops(const RmlPanelHostOps& ops) {
@@ -811,7 +901,9 @@ namespace lfs::python {
     void set_export_callback(ExportCallback cb) { g_export_callback = cb; }
 
     void invoke_export(int format, const std::string& path,
-                       const std::vector<std::string>& node_names, int sh_degree) {
+                       const std::vector<std::string>& node_names, int sh_degree,
+                       const std::vector<float>& rad_lod_ratios,
+                       bool rad_flip_y) {
         if (!g_export_callback)
             return;
 
@@ -821,7 +913,9 @@ namespace lfs::python {
             names_ptrs.push_back(name.c_str());
         }
         g_export_callback(format, path.c_str(), names_ptrs.data(),
-                          static_cast<int>(names_ptrs.size()), sh_degree);
+                          static_cast<int>(names_ptrs.size()), sh_degree,
+                          rad_lod_ratios.data(), static_cast<int>(rad_lod_ratios.size()),
+                          rad_flip_y);
     }
 
     bool has_python_toolbar() {
@@ -908,6 +1002,7 @@ namespace lfs::python {
         core_evt.mods = event.mods;
         core_evt.scroll_x = event.scroll_x;
         core_evt.scroll_y = event.scroll_y;
+        core_evt.over_gui = event.over_gui;
 
         if (!can_acquire_gil())
             return false;
@@ -939,6 +1034,28 @@ namespace lfs::python {
 
     bool is_exit_popup_open() { return g_exit_popup_open.load(); }
     void set_exit_popup_open(bool open) { g_exit_popup_open.store(open); }
+
+    void set_gl_thread_id(std::thread::id id) { g_gl_thread_id = id; }
+
+    bool on_gl_thread() {
+        return g_gl_thread_id != std::thread::id{} &&
+               std::this_thread::get_id() == g_gl_thread_id;
+    }
+
+    void schedule_gl_callback(std::function<void()> fn) {
+        std::lock_guard lock(g_gl_callbacks_mutex);
+        g_gl_callbacks.push_back(std::move(fn));
+    }
+
+    void flush_gl_callbacks() {
+        std::vector<std::function<void()>> pending;
+        {
+            std::lock_guard lock(g_gl_callbacks_mutex);
+            pending.swap(g_gl_callbacks);
+        }
+        for (auto& fn : pending)
+            fn();
+    }
 
     void set_thumbnail_callbacks(RequestThumbnailCallback request_cb,
                                  ProcessThumbnailsCallback process_cb,

@@ -5,6 +5,7 @@
 #include "py_signals.hpp"
 
 #include <chrono>
+#include <mutex>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
@@ -29,6 +30,7 @@ namespace lfs::python {
         };
 
         TrainingBuffer g_training;
+        std::mutex g_training_mutex;
         nb::object g_app_state;
         bool g_initialized = false;
 
@@ -41,12 +43,14 @@ namespace lfs::python {
             try {
                 nb::object signal = g_app_state.attr(signal_name);
                 signal.attr("value") = value;
+                request_redraw();
             } catch (const std::exception& e) {
                 LOG_ERROR("Failed to set signal '{}': {}", signal_name, e.what());
             }
         }
 
         void do_training_progress(int iteration, float loss, std::size_t num_gaussians) {
+            std::lock_guard lock(g_training_mutex);
             g_training.iteration = iteration;
             g_training.loss = loss;
             g_training.num_gaussians = num_gaussians;
@@ -69,7 +73,10 @@ namespace lfs::python {
                 return;
             }
 
-            g_training = TrainingBuffer{};
+            {
+                std::lock_guard lock(g_training_mutex);
+                g_training = TrainingBuffer{};
+            }
 
             nb::gil_scoped_acquire gil;
 
@@ -104,6 +111,7 @@ namespace lfs::python {
                 nb::object gen_signal = g_app_state.attr("scene_generation");
                 int current = nb::cast<int>(gen_signal.attr("value"));
                 gen_signal.attr("value") = current + 1;
+                request_redraw();
             } catch (const std::exception& e) {
                 LOG_ERROR("Failed to increment scene_generation: {}", e.what());
             }
@@ -123,33 +131,43 @@ namespace lfs::python {
                 nb::object gen_signal = g_app_state.attr("selection_generation");
                 int current = nb::cast<int>(gen_signal.attr("value"));
                 gen_signal.attr("value") = current + 1;
+                request_redraw();
             } catch (const std::exception& e) {
                 LOG_ERROR("Failed to increment selection_generation: {}", e.what());
             }
         }
 
         void do_flush() {
-            if (!g_initialized || !g_training.dirty) {
+            if (!g_initialized) {
                 return;
             }
 
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               now - g_training.last_update)
-                               .count();
+            TrainingBuffer snapshot;
+            {
+                std::lock_guard lock(g_training_mutex);
+                if (!g_training.dirty) {
+                    return;
+                }
 
-            if (elapsed < THROTTLE_MS) {
-                return;
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   now - g_training.last_update)
+                                   .count();
+
+                if (elapsed < THROTTLE_MS) {
+                    return;
+                }
+
+                snapshot = g_training;
+                g_training.last_update = now;
+                g_training.dirty = false;
             }
 
             nb::gil_scoped_acquire gil;
 
-            set_signal_value("iteration", g_training.iteration);
-            set_signal_value("loss", g_training.loss);
-            set_signal_value("num_gaussians", static_cast<int>(g_training.num_gaussians));
-
-            g_training.last_update = now;
-            g_training.dirty = false;
+            set_signal_value("iteration", snapshot.iteration);
+            set_signal_value("loss", snapshot.loss);
+            set_signal_value("num_gaussians", static_cast<int>(snapshot.num_gaussians));
         }
 
         void init_bridge() {

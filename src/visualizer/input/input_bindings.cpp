@@ -6,6 +6,7 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -17,6 +18,200 @@
 #endif
 
 namespace lfs::vis::input {
+
+    namespace {
+
+        constexpr int PROFILE_VERSION = 5; // Version 5 collapses depth-box wheel controls to a single Alt+Scroll adjustment.
+        constexpr std::array<ToolMode, 8> ALL_MODES = {
+            ToolMode::GLOBAL,
+            ToolMode::SELECTION,
+            ToolMode::BRUSH,
+            ToolMode::ALIGN,
+            ToolMode::CROP_BOX,
+            ToolMode::TRANSLATE,
+            ToolMode::ROTATE,
+            ToolMode::SCALE,
+        };
+        constexpr std::array<ToolMode, 4> NODE_PICK_MODES = {
+            ToolMode::GLOBAL,
+            ToolMode::TRANSLATE,
+            ToolMode::ROTATE,
+            ToolMode::SCALE,
+        };
+        constexpr std::array<ToolMode, 4> DELETE_NODE_MODES = {
+            ToolMode::GLOBAL,
+            ToolMode::TRANSLATE,
+            ToolMode::ROTATE,
+            ToolMode::SCALE,
+        };
+        constexpr std::array<ToolMode, 4> DELETE_GAUSSIANS_MODES = {
+            ToolMode::SELECTION,
+            ToolMode::BRUSH,
+            ToolMode::ALIGN,
+            ToolMode::CROP_BOX,
+        };
+
+        [[nodiscard]] bool actionUsesPhysicalKeyBinding(const Action action) {
+            switch (action) {
+            case Action::CAMERA_MOVE_FORWARD:
+            case Action::CAMERA_MOVE_BACKWARD:
+            case Action::CAMERA_MOVE_LEFT:
+            case Action::CAMERA_MOVE_RIGHT:
+            case Action::CAMERA_MOVE_UP:
+            case Action::CAMERA_MOVE_DOWN:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        [[nodiscard]] bool isSelectionDepthAction(const Action action) {
+            switch (action) {
+            case Action::TOGGLE_DEPTH_MODE:
+            case Action::DEPTH_ADJUST_NEAR:
+            case Action::DEPTH_ADJUST_FAR:
+            case Action::DEPTH_ADJUST_SIDE:
+            case Action::TOGGLE_SELECTION_DEPTH_FILTER:
+            case Action::TOGGLE_SELECTION_CROP_FILTER:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        [[nodiscard]] bool actionAllowsExtraMouseModifiers(const Action action) {
+            switch (action) {
+            case Action::CAMERA_ORBIT:
+            case Action::CAMERA_PAN:
+            case Action::CAMERA_SET_PIVOT:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        [[nodiscard]] bool actionPrefersSingleMouseButtonCapture(const Action action) {
+            switch (action) {
+            case Action::CAMERA_ORBIT:
+            case Action::CAMERA_PAN:
+            case Action::CAMERA_SET_PIVOT:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        [[nodiscard]] bool triggerUsesDefaultRedoBinding(const std::optional<InputTrigger>& trigger) {
+            const auto* key_trigger = trigger ? std::get_if<KeyTrigger>(&*trigger) : nullptr;
+            return key_trigger && key_trigger->key == KEY_Y &&
+                   key_trigger->modifiers == MODIFIER_CTRL;
+        }
+
+        [[nodiscard]] bool actionSupportsGlobalKeyFallback(const Action action) {
+            switch (action) {
+            case Action::UNDO:
+            case Action::REDO:
+            case Action::INVERT_SELECTION:
+            case Action::DESELECT_ALL:
+            case Action::SELECT_ALL:
+            case Action::COPY_SELECTION:
+            case Action::PASTE_SELECTION:
+            case Action::CANCEL_POLYGON:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        [[nodiscard]] Binding normalizeLoadedBinding(Binding binding) {
+            if (!isSelectionDepthAction(binding.action)) {
+                return binding;
+            }
+
+            if (binding.action == Action::TOGGLE_DEPTH_MODE) {
+                binding.action = Action::TOGGLE_SELECTION_DEPTH_FILTER;
+            } else if (binding.action == Action::DEPTH_ADJUST_NEAR ||
+                       binding.action == Action::DEPTH_ADJUST_SIDE) {
+                binding.action = Action::DEPTH_ADJUST_FAR;
+            }
+
+            binding.mode = ToolMode::SELECTION;
+            binding.description = getActionName(binding.action);
+            return binding;
+        }
+
+        bool isDefaultProfile(const std::filesystem::path& path, const std::string& profile_name) {
+            return profile_name == "Default" || lfs::core::path_to_utf8(path.stem()) == "Default";
+        }
+
+        template <size_t N>
+        size_t mirrorLegacyBindingToModes(std::vector<Binding>& bindings,
+                                          const Binding& source,
+                                          const Action target_action,
+                                          const std::array<ToolMode, N>& target_modes) {
+            size_t added = 0;
+            for (const auto mode : target_modes) {
+                const bool already_present = std::ranges::any_of(
+                    bindings,
+                    [&](const Binding& current) {
+                        return current.mode == mode && current.action == target_action;
+                    });
+                if (already_present) {
+                    continue;
+                }
+
+                Binding mirrored = source;
+                mirrored.mode = mode;
+                mirrored.action = target_action;
+                mirrored.description = getActionName(target_action);
+                bindings.push_back(std::move(mirrored));
+                ++added;
+            }
+            return added;
+        }
+
+        size_t projectLegacyGlobalBindings(std::vector<Binding>& bindings, const int version) {
+            if (version >= 2) {
+                return 0;
+            }
+
+            const auto legacy_bindings = bindings;
+            size_t added = 0;
+            for (const auto& binding : legacy_bindings) {
+                if (binding.mode != ToolMode::GLOBAL) {
+                    continue;
+                }
+
+                switch (binding.action) {
+                case Action::NONE:
+                    break;
+                case Action::DELETE_NODE:
+                    added += mirrorLegacyBindingToModes(bindings, binding, Action::DELETE_NODE, DELETE_NODE_MODES);
+                    added += mirrorLegacyBindingToModes(bindings, binding, Action::DELETE_SELECTED, DELETE_GAUSSIANS_MODES);
+                    break;
+                case Action::DELETE_SELECTED:
+                    added += mirrorLegacyBindingToModes(bindings, binding, Action::DELETE_SELECTED, DELETE_GAUSSIANS_MODES);
+                    break;
+                case Action::NODE_PICK:
+                    added += mirrorLegacyBindingToModes(bindings, binding, Action::NODE_PICK, NODE_PICK_MODES);
+                    break;
+                case Action::NODE_RECT_SELECT:
+                    added += mirrorLegacyBindingToModes(bindings, binding, Action::NODE_RECT_SELECT, NODE_PICK_MODES);
+                    break;
+                case Action::TOGGLE_SELECTION_DEPTH_FILTER:
+                case Action::TOGGLE_SELECTION_CROP_FILTER:
+                case Action::DEPTH_ADJUST_FAR:
+                    added += mirrorLegacyBindingToModes(bindings, binding, binding.action, std::array<ToolMode, 1>{ToolMode::SELECTION});
+                    break;
+                default:
+                    added += mirrorLegacyBindingToModes(bindings, binding, binding.action, ALL_MODES);
+                    break;
+                }
+            }
+            return added;
+        }
+
+    } // namespace
 
     InputBindings::InputBindings() {
         const auto config_dir = getConfigDir();
@@ -86,8 +281,6 @@ namespace lfs::vis::input {
     bool InputBindings::saveProfileToFile(const std::filesystem::path& path) const {
         using json = nlohmann::json;
 
-        constexpr int PROFILE_VERSION = 2; // Version 2 adds tool mode
-
         json j;
         j["name"] = current_profile_name_;
         j["version"] = PROFILE_VERSION;
@@ -152,11 +345,23 @@ namespace lfs::vis::input {
 
             const json j = json::parse(file);
             const int version = j.value("version", 0);
-            if (version < 1 || version > 2) {
+            const std::string profile_name = j.value("name", "Custom");
+
+            if (version < PROFILE_VERSION && isDefaultProfile(path, profile_name)) {
+                auto profile = createDefaultProfile();
+                current_profile_name_ = profile.name;
+                bindings_ = std::move(profile.bindings);
+                rebuildLookupMaps();
+                LOG_INFO("Reloaded legacy default input profile from {} with current version {} defaults",
+                         lfs::core::path_to_utf8(path), PROFILE_VERSION);
+                return true;
+            }
+
+            if (version < 1 || version > PROFILE_VERSION) {
                 LOG_WARN("Unknown profile version: {}", version);
             }
 
-            current_profile_name_ = j.value("name", "Custom");
+            current_profile_name_ = profile_name;
             bindings_.clear();
 
             for (const auto& b : j["bindings"]) {
@@ -164,7 +369,7 @@ namespace lfs::vis::input {
                 // Version 1 had no mode field, default to GLOBAL
                 binding.mode = static_cast<ToolMode>(b.value("mode", 0));
                 binding.action = static_cast<Action>(b["action"].get<int>());
-                binding.description = b.value("description", "");
+                binding.description = b.value("description", getActionName(binding.action));
 
                 const std::string trigger_type = b["trigger_type"];
                 if (trigger_type == "key") {
@@ -190,7 +395,22 @@ namespace lfs::vis::input {
                     binding.trigger = trigger;
                 }
 
-                bindings_.push_back(binding);
+                binding = normalizeLoadedBinding(std::move(binding));
+
+                if (auto existing = std::find_if(bindings_.begin(), bindings_.end(), [&](const Binding& current) {
+                        return current.mode == binding.mode && current.action == binding.action;
+                    });
+                    existing != bindings_.end()) {
+                    *existing = binding;
+                } else {
+                    bindings_.push_back(binding);
+                }
+            }
+
+            if (const size_t added_bindings = projectLegacyGlobalBindings(bindings_, version);
+                added_bindings > 0) {
+                LOG_INFO("Projected {} legacy global bindings into mode-specific shortcuts for profile '{}'",
+                         added_bindings, current_profile_name_);
             }
 
             rebuildLookupMaps();
@@ -225,6 +445,31 @@ namespace lfs::vis::input {
         if (auto it = key_map_.find({mode, key, mods}); it != key_map_.end()) {
             return it->second;
         }
+
+        if (mode != ToolMode::GLOBAL) {
+            if (auto it = key_map_.find({ToolMode::GLOBAL, key, mods});
+                it != key_map_.end() &&
+                actionSupportsGlobalKeyFallback(it->second)) {
+                return it->second;
+            }
+        }
+
+        // Support the common redo alias when the profile still uses the default Ctrl+Y binding.
+        const auto redo_trigger = [&]() -> std::optional<InputTrigger> {
+            if (auto trigger = getTriggerForAction(Action::REDO, mode)) {
+                return trigger;
+            }
+            if (mode != ToolMode::GLOBAL) {
+                return getTriggerForAction(Action::REDO, ToolMode::GLOBAL);
+            }
+            return std::nullopt;
+        }();
+        if (key == KEY_Z &&
+            mods == (MODIFIER_CTRL | MODIFIER_SHIFT) &&
+            triggerUsesDefaultRedoBinding(redo_trigger)) {
+            return Action::REDO;
+        }
+
         return Action::NONE;
     }
 
@@ -233,10 +478,24 @@ namespace lfs::vis::input {
         if (auto it = mouse_button_map_.find({mode, button, mods, is_double_click}); it != mouse_button_map_.end()) {
             return it->second;
         }
+        if (mods != MODIFIER_NONE) {
+            if (auto it = mouse_button_map_.find({mode, button, MODIFIER_NONE, is_double_click});
+                it != mouse_button_map_.end() &&
+                actionAllowsExtraMouseModifiers(it->second)) {
+                return it->second;
+            }
+        }
         // If double-click, also try single-click binding in same mode
         if (is_double_click) {
             if (auto it = mouse_button_map_.find({mode, button, mods, false}); it != mouse_button_map_.end()) {
                 return it->second;
+            }
+            if (mods != MODIFIER_NONE) {
+                if (auto it = mouse_button_map_.find({mode, button, MODIFIER_NONE, false});
+                    it != mouse_button_map_.end() &&
+                    actionAllowsExtraMouseModifiers(it->second)) {
+                    return it->second;
+                }
             }
         }
         return Action::NONE;
@@ -254,6 +513,13 @@ namespace lfs::vis::input {
         const int mods = modifiers & MODIFIER_MASK;
         if (auto it = drag_map_.find({mode, button, mods}); it != drag_map_.end()) {
             return it->second;
+        }
+        if (mods != MODIFIER_NONE) {
+            if (auto it = drag_map_.find({mode, button, MODIFIER_NONE});
+                it != drag_map_.end() &&
+                actionAllowsExtraMouseModifiers(it->second)) {
+                return it->second;
+            }
         }
         return Action::NONE;
     }
@@ -389,12 +655,9 @@ namespace lfs::vis::input {
             {KeyTrigger{KEY_KP_SUBTRACT, MODIFIER_CTRL | MODIFIER_SHIFT}, Action::ZOOM_SPEED_DOWN, "Zoom speed down"},
             // View
             {KeyTrigger{KEY_V, MODIFIER_NONE}, Action::TOGGLE_SPLIT_VIEW, "Split view"},
+            {KeyTrigger{KEY_V, MODIFIER_SHIFT}, Action::TOGGLE_INDEPENDENT_SPLIT_VIEW, "Independent split"},
             {KeyTrigger{KEY_G, MODIFIER_NONE}, Action::TOGGLE_GT_COMPARISON, "GT comparison"},
             {KeyTrigger{KEY_T, MODIFIER_NONE}, Action::CYCLE_PLY, "Cycle PLY"},
-            // Depth
-            {KeyTrigger{KEY_F, MODIFIER_CTRL}, Action::TOGGLE_DEPTH_MODE, "Depth filter"},
-            {MouseScrollTrigger{MODIFIER_ALT}, Action::DEPTH_ADJUST_FAR, "Depth far"},
-            {MouseScrollTrigger{MODIFIER_ALT | MODIFIER_CTRL}, Action::DEPTH_ADJUST_SIDE, "Depth side"},
             // Editing (Delete is mode-specific, added below)
             {KeyTrigger{KEY_Z, MODIFIER_CTRL}, Action::UNDO, "Undo"},
             {KeyTrigger{KEY_Y, MODIFIER_CTRL}, Action::REDO, "Redo"},
@@ -426,65 +689,50 @@ namespace lfs::vis::input {
             {KeyTrigger{KEY_SPACE, MODIFIER_NONE}, Action::SEQUENCER_PLAY_PAUSE, "Play/Pause"},
         };
 
-        constexpr ToolMode ALL_MODES[] = {
-            ToolMode::GLOBAL,
-            ToolMode::SELECTION,
-            ToolMode::BRUSH,
-            ToolMode::ALIGN,
-            ToolMode::CROP_BOX,
-            ToolMode::TRANSLATE,
-            ToolMode::ROTATE,
-            ToolMode::SCALE,
-        };
-
         for (const auto mode : ALL_MODES) {
             for (const auto& b : base) {
                 profile.bindings.push_back({mode, b.trigger, b.action, b.desc});
             }
         }
 
-        // Node picking only for transform modes (not selection/cropbox/brush/align)
-        constexpr ToolMode NODE_PICK_MODES[] = {
-            ToolMode::GLOBAL,
-            ToolMode::TRANSLATE,
-            ToolMode::ROTATE,
-            ToolMode::SCALE,
-        };
+        profile.bindings.push_back({ToolMode::SELECTION,
+                                    KeyTrigger{KEY_X, MODIFIER_NONE},
+                                    Action::TOGGLE_SELECTION_DEPTH_FILTER,
+                                    "Depth box"});
+        profile.bindings.push_back({ToolMode::SELECTION,
+                                    MouseScrollTrigger{MODIFIER_ALT},
+                                    Action::DEPTH_ADJUST_FAR,
+                                    "Depth"});
+        profile.bindings.push_back({ToolMode::SELECTION,
+                                    KeyTrigger{KEY_C, MODIFIER_CTRL | MODIFIER_ALT},
+                                    Action::TOGGLE_SELECTION_CROP_FILTER,
+                                    "Crop filter"});
 
+        // Node picking only for transform modes (not selection/cropbox/brush/align)
         for (const auto mode : NODE_PICK_MODES) {
             profile.bindings.push_back({mode, MouseButtonTrigger{MouseButton::LEFT, MODIFIER_NONE}, Action::NODE_PICK, "Pick node"});
             profile.bindings.push_back({mode, MouseDragTrigger{MouseButton::LEFT, MODIFIER_NONE}, Action::NODE_RECT_SELECT, "Rectangle select nodes"});
         }
 
         // Delete key: GLOBAL/transform modes delete node, SELECTION/BRUSH delete Gaussians
-        constexpr ToolMode DELETE_NODE_MODES[] = {
-            ToolMode::GLOBAL,
-            ToolMode::TRANSLATE,
-            ToolMode::ROTATE,
-            ToolMode::SCALE,
-        };
         for (const auto mode : DELETE_NODE_MODES) {
             profile.bindings.push_back({mode, KeyTrigger{KEY_DELETE, MODIFIER_NONE}, Action::DELETE_NODE, "Delete node"});
         }
 
-        constexpr ToolMode DELETE_GAUSSIANS_MODES[] = {
-            ToolMode::SELECTION,
-            ToolMode::BRUSH,
-            ToolMode::ALIGN,
-            ToolMode::CROP_BOX,
-        };
         for (const auto mode : DELETE_GAUSSIANS_MODES) {
             profile.bindings.push_back({mode, KeyTrigger{KEY_DELETE, MODIFIER_NONE}, Action::DELETE_SELECTED, "Delete Gaussians"});
         }
 
-        // Tool shortcuts (GLOBAL mode only, number keys 1-7)
-        profile.bindings.push_back({ToolMode::GLOBAL, KeyTrigger{KEY_1}, Action::TOOL_SELECT, "Select"});
-        profile.bindings.push_back({ToolMode::GLOBAL, KeyTrigger{KEY_2}, Action::TOOL_TRANSLATE, "Translate"});
-        profile.bindings.push_back({ToolMode::GLOBAL, KeyTrigger{KEY_3}, Action::TOOL_ROTATE, "Rotate"});
-        profile.bindings.push_back({ToolMode::GLOBAL, KeyTrigger{KEY_4}, Action::TOOL_SCALE, "Scale"});
-        profile.bindings.push_back({ToolMode::GLOBAL, KeyTrigger{KEY_5}, Action::TOOL_MIRROR, "Mirror"});
-        profile.bindings.push_back({ToolMode::GLOBAL, KeyTrigger{KEY_6}, Action::TOOL_BRUSH, "Brush"});
-        profile.bindings.push_back({ToolMode::GLOBAL, KeyTrigger{KEY_7}, Action::TOOL_ALIGN, "Align"});
+        // Tool shortcuts (all modes, number keys 1-7)
+        for (const auto mode : ALL_MODES) {
+            profile.bindings.push_back({mode, KeyTrigger{KEY_1}, Action::TOOL_SELECT, "Select"});
+            profile.bindings.push_back({mode, KeyTrigger{KEY_2}, Action::TOOL_TRANSLATE, "Translate"});
+            profile.bindings.push_back({mode, KeyTrigger{KEY_3}, Action::TOOL_ROTATE, "Rotate"});
+            profile.bindings.push_back({mode, KeyTrigger{KEY_4}, Action::TOOL_SCALE, "Scale"});
+            profile.bindings.push_back({mode, KeyTrigger{KEY_5}, Action::TOOL_MIRROR, "Mirror"});
+            profile.bindings.push_back({mode, KeyTrigger{KEY_6}, Action::TOOL_BRUSH, "Brush"});
+            profile.bindings.push_back({mode, KeyTrigger{KEY_7}, Action::TOOL_ALIGN, "Align"});
+        }
 
         // Pie menu (all modes)
         for (const auto mode : ALL_MODES) {
@@ -517,8 +765,9 @@ namespace lfs::vis::input {
         case Action::ZOOM_SPEED_UP: return "Increase Zoom Speed";
         case Action::ZOOM_SPEED_DOWN: return "Decrease Zoom Speed";
         case Action::TOGGLE_SPLIT_VIEW: return "Toggle Split View";
+        case Action::TOGGLE_INDEPENDENT_SPLIT_VIEW: return "Toggle Independent Split View";
         case Action::TOGGLE_GT_COMPARISON: return "Toggle GT Comparison";
-        case Action::TOGGLE_DEPTH_MODE: return "Toggle Depth Mode";
+        case Action::TOGGLE_DEPTH_MODE: return "Toggle Depth Box";
         case Action::CYCLE_PLY: return "Cycle PLY";
         case Action::DELETE_SELECTED: return "Delete Selected Gaussians";
         case Action::DELETE_NODE: return "Delete Node";
@@ -528,8 +777,11 @@ namespace lfs::vis::input {
         case Action::DESELECT_ALL: return "Deselect All";
         case Action::COPY_SELECTION: return "Copy Selection";
         case Action::PASTE_SELECTION: return "Paste Selection";
-        case Action::DEPTH_ADJUST_FAR: return "Adjust Depth Far";
-        case Action::DEPTH_ADJUST_SIDE: return "Adjust Depth Side";
+        case Action::DEPTH_ADJUST_NEAR: return "Adjust Depth Box";
+        case Action::DEPTH_ADJUST_FAR: return "Adjust Depth Box";
+        case Action::DEPTH_ADJUST_SIDE: return "Adjust Depth Box";
+        case Action::TOGGLE_SELECTION_DEPTH_FILTER: return "Toggle Depth Box";
+        case Action::TOGGLE_SELECTION_CROP_FILTER: return "Toggle Selection Crop Filter";
         case Action::BRUSH_RESIZE: return "Resize Brush";
         case Action::CYCLE_BRUSH_MODE: return "Cycle Brush Mode";
         case Action::CONFIRM_POLYGON: return "Confirm Polygon";
@@ -702,8 +954,17 @@ namespace lfs::vis::input {
     }
 
     void InputBindings::captureKey(int key, int mods) {
+        captureKey(key, key, mods);
+    }
+
+    void InputBindings::captureKey(const int physical_key, const int logical_key, const int mods) {
         if (!capture_state_.active)
             return;
+
+        int key = actionUsesPhysicalKeyBinding(capture_state_.action) ? physical_key : logical_key;
+        if (key == KEY_UNKNOWN) {
+            key = (logical_key != KEY_UNKNOWN) ? logical_key : physical_key;
+        }
 
         if (key == KEY_ESCAPE) {
             cancelCapture();
@@ -755,9 +1016,15 @@ namespace lfs::vis::input {
 
         if (elapsed >= CaptureState::DOUBLE_CLICK_WAIT_TIME) {
             const auto mouse_btn = static_cast<MouseButton>(capture_state_.pending_button);
-            const MouseDragTrigger trigger{mouse_btn, capture_state_.pending_mods};
-            setBinding(capture_state_.mode, capture_state_.action, trigger);
-            capture_state_.captured = trigger;
+            if (actionPrefersSingleMouseButtonCapture(capture_state_.action)) {
+                const MouseButtonTrigger trigger{mouse_btn, capture_state_.pending_mods, false};
+                setBinding(capture_state_.mode, capture_state_.action, trigger);
+                capture_state_.captured = trigger;
+            } else {
+                const MouseDragTrigger trigger{mouse_btn, capture_state_.pending_mods};
+                setBinding(capture_state_.mode, capture_state_.action, trigger);
+                capture_state_.captured = trigger;
+            }
             capture_state_.active = false;
             capture_state_.waiting_for_double_click = false;
             capture_state_.pending_button = -1;
@@ -778,6 +1045,66 @@ namespace lfs::vis::input {
             }
         }
         return result;
+    }
+
+    ShortcutScope shortcutScopeForAction(const Action action) {
+        switch (action) {
+        case Action::TOOL_SELECT:
+        case Action::TOOL_TRANSLATE:
+        case Action::TOOL_ROTATE:
+        case Action::TOOL_SCALE:
+        case Action::TOOL_MIRROR:
+        case Action::TOOL_BRUSH:
+        case Action::TOOL_ALIGN:
+        case Action::TOGGLE_UI:
+        case Action::TOGGLE_FULLSCREEN:
+        case Action::SELECT_MODE_CENTERS:
+        case Action::SELECT_MODE_RECTANGLE:
+        case Action::SELECT_MODE_POLYGON:
+        case Action::SELECT_MODE_LASSO:
+        case Action::SELECT_MODE_RINGS:
+        case Action::UNDO:
+        case Action::REDO:
+        case Action::DELETE_SELECTED:
+        case Action::DELETE_NODE:
+        case Action::INVERT_SELECTION:
+        case Action::DESELECT_ALL:
+        case Action::SELECT_ALL:
+        case Action::COPY_SELECTION:
+        case Action::PASTE_SELECTION:
+        case Action::TOGGLE_DEPTH_MODE:
+        case Action::TOGGLE_SELECTION_DEPTH_FILTER:
+        case Action::TOGGLE_SELECTION_CROP_FILTER:
+        case Action::SEQUENCER_ADD_KEYFRAME:
+        case Action::SEQUENCER_UPDATE_KEYFRAME:
+        case Action::SEQUENCER_PLAY_PAUSE:
+            return ShortcutScope::GlobalWhenNotTextEditing;
+
+        case Action::CAMERA_MOVE_FORWARD:
+        case Action::CAMERA_MOVE_BACKWARD:
+        case Action::CAMERA_MOVE_LEFT:
+        case Action::CAMERA_MOVE_RIGHT:
+        case Action::CAMERA_MOVE_UP:
+        case Action::CAMERA_MOVE_DOWN:
+        case Action::CAMERA_RESET_HOME:
+        case Action::CAMERA_FOCUS_SELECTION:
+        case Action::CAMERA_SET_PIVOT:
+        case Action::CAMERA_NEXT_VIEW:
+        case Action::CAMERA_PREV_VIEW:
+        case Action::CAMERA_SPEED_UP:
+        case Action::CAMERA_SPEED_DOWN:
+        case Action::ZOOM_SPEED_UP:
+        case Action::ZOOM_SPEED_DOWN:
+        case Action::TOGGLE_SPLIT_VIEW:
+        case Action::TOGGLE_INDEPENDENT_SPLIT_VIEW:
+        case Action::TOGGLE_GT_COMPARISON:
+        case Action::CYCLE_SELECTION_VIS:
+        case Action::PIE_MENU:
+            return ShortcutScope::Viewport;
+
+        default:
+            return ShortcutScope::Global;
+        }
     }
 
 } // namespace lfs::vis::input

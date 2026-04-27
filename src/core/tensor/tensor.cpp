@@ -58,6 +58,7 @@ namespace lfs::core {
     const TensorShape& TensorLeaf::shape_impl() const { return tensor_ptr_->shape(); }
     Device TensorLeaf::device_impl() const { return tensor_ptr_->device(); }
     DataType TensorLeaf::dtype_impl() const { return tensor_ptr_->dtype(); }
+    cudaStream_t TensorLeaf::stream_hint_impl() const { return tensor_ptr_ ? tensor_ptr_->stream() : nullptr; }
 
     Tensor Tensor::make_deferred_expr_tensor(TensorShape shape,
                                              Device device,
@@ -177,7 +178,9 @@ namespace lfs::core {
         if (!preserved_name.empty()) {
             state_->name = preserved_name;
         }
-        if (preserved_stream) {
+        // Keep the actual materialization stream when one exists. The deferred hint is
+        // only a fallback for materializers that do not stamp stream metadata.
+        if (state_->stream == nullptr && preserved_stream) {
             state_->stream = preserved_stream;
         }
 
@@ -940,6 +943,27 @@ namespace lfs::core {
         return t;
     }
 
+    namespace {
+        template <typename FromT, typename ToT>
+        ToT convert_dtype_cpu_value(const FromT& value) {
+            if constexpr (std::is_same_v<FromT, float> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(value), 0.0f, 255.0f)));
+            } else if constexpr (std::is_same_v<FromT, int> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int>(value), 0, 255));
+            } else if constexpr (std::is_same_v<FromT, int64_t> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int64_t>(value), static_cast<int64_t>(0), static_cast<int64_t>(255)));
+            } else if constexpr (std::is_same_v<FromT, __half> && std::is_same_v<ToT, uint8_t>) {
+                return static_cast<uint8_t>(std::round(std::clamp(__half2float(value), 0.0f, 255.0f)));
+            } else if constexpr (std::is_same_v<ToT, __half>) {
+                return __float2half(static_cast<float>(value));
+            } else if constexpr (std::is_same_v<FromT, __half>) {
+                return static_cast<ToT>(__half2float(value));
+            } else {
+                return static_cast<ToT>(value);
+            }
+        }
+    } // namespace
+
     // ============= Type Conversion =============
     Tensor Tensor::to(DataType dtype) const {
         materialize_if_deferred();
@@ -973,15 +997,7 @@ namespace lfs::core {
         const FROM_TYPE* src = ptr<FROM_TYPE>();                                                                                             \
         TO_TYPE* dst = result.ptr<TO_TYPE>();                                                                                                \
         for (size_t i = 0; i < numel(); ++i) {                                                                                               \
-            if constexpr (std::is_same_v<FROM_TYPE, float> && std::is_same_v<TO_TYPE, uint8_t>) {                                            \
-                dst[i] = static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(src[i]), 0.0f, 255.0f)));                             \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int> && std::is_same_v<TO_TYPE, uint8_t>) {                                       \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(src[i]), 0, 255));                                                 \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int64_t> && std::is_same_v<TO_TYPE, uint8_t>) {                                   \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int64_t>(src[i]), static_cast<int64_t>(0), static_cast<int64_t>(255))); \
-            } else {                                                                                                                         \
-                dst[i] = static_cast<TO_TYPE>(src[i]);                                                                                       \
-            }                                                                                                                                \
+            dst[i] = convert_dtype_cpu_value<FROM_TYPE, TO_TYPE>(src[i]);                                                                    \
         }                                                                                                                                    \
         return result;                                                                                                                       \
     }
@@ -1531,6 +1547,11 @@ namespace lfs::core {
             return *this;
         }
 
+        // Strided destination, contiguous source (cross-device: move src to dst device first)
+        if (!dst_contig && src_contig && device_ != other.device_) {
+            return copy_from(other.to(device_));
+        }
+
         // Fallback: materialize non-contiguous source
         if (!src_contig) {
             return copy_from(other.contiguous());
@@ -1565,7 +1586,7 @@ namespace lfs::core {
             if (source_id != 0) {
                 deferred_inputs.push_back(source_id);
             }
-            return make_deferred_expr_tensor(
+            Tensor deferred = make_deferred_expr_tensor(
                 deferred_shape, device_, dtype_,
                 [source = std::move(source), deferred_shape]() mutable {
                     Tensor materialized = source;
@@ -1573,6 +1594,8 @@ namespace lfs::core {
                     return lfs::core::broadcast_to(materialized, deferred_shape);
                 },
                 std::move(deferred_inputs));
+            deferred.set_stream(source.stream());
+            return deferred;
         }
         return lfs::core::broadcast_to(*this, target_shape);
     }
@@ -2220,6 +2243,11 @@ namespace lfs::core {
             std::vector<uint8_t> result(numel());
 
             if (device_ == Device::CUDA) {
+                if (stream()) {
+                    CHECK_CUDA(cudaStreamSynchronize(stream()));
+                } else {
+                    CHECK_CUDA(cudaDeviceSynchronize());
+                }
                 CHECK_CUDA(cudaMemcpy(result.data(), data_ptr(), bytes(), cudaMemcpyDeviceToHost));
             } else {
                 std::memcpy(result.data(), data_ptr(), bytes());
@@ -2233,6 +2261,11 @@ namespace lfs::core {
             std::vector<uint8_t> result(numel());
 
             if (device_ == Device::CUDA) {
+                if (stream()) {
+                    CHECK_CUDA(cudaStreamSynchronize(stream()));
+                } else {
+                    CHECK_CUDA(cudaDeviceSynchronize());
+                }
                 CHECK_CUDA(cudaMemcpy(result.data(), data_ptr(), bytes(), cudaMemcpyDeviceToHost));
             } else {
                 const unsigned char* src = ptr<unsigned char>();

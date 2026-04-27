@@ -12,21 +12,24 @@
 #include "gui/startup_overlay.hpp"
 #include "internal/viewport.hpp"
 #include "python/python_runtime.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering_manager.hpp"
+#include "theme/theme.hpp"
+#include "visualizer/gui/video_widget_interface.hpp"
 #include "visualizer_impl.hpp"
-#include "windows/video_extractor_dialog.hpp"
 
+#include <algorithm>
 #include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
 
 namespace lfs::vis::gui::native_panels {
 
-    VideoExtractorPanel::VideoExtractorPanel(lfs::gui::VideoExtractorDialog* dialog)
-        : dialog_(dialog) {}
+    VideoExtractorPanel::VideoExtractorPanel(lfs::gui::IVideoExtractorWidget* widget)
+        : widget_(widget) {}
 
     void VideoExtractorPanel::draw(const PanelDrawContext& ctx) {
         (void)ctx;
-        if (!dialog_->render())
+        if (!widget_ || !widget_->render())
             PanelRegistry::instance().set_panel_enabled("native.video_extractor", false);
     }
 
@@ -65,13 +68,55 @@ namespace lfs::vis::gui::native_panels {
           layout_(layout) {}
 
     void SequencerPanel::draw(const PanelDrawContext& ctx) {
-        if (ctx.ui && ctx.viewport)
-            seq_->render(*ctx.ui, *ctx.viewport);
+        (void)ctx;
+    }
+
+    void SequencerPanel::preloadDirect(const float w, const float h,
+                                       const PanelDrawContext& ctx,
+                                       const float clip_y_min,
+                                       const float clip_y_max,
+                                       const PanelInputState* input) {
+        (void)w;
+        (void)ctx;
+        (void)clip_y_min;
+        (void)clip_y_max;
+        input_ = input;
+
+        if (seq_)
+            seq_->setFloating(is_floating_);
+
+        if (is_floating_) {
+            const float preferred_h = seq_ ? seq_->preferredFloatingHeight() : 0.0f;
+            direct_draw_height_ = forced_height_ > 0.0f
+                                      ? forced_height_
+                                      : std::min(h, std::max(0.0f, preferred_h));
+        } else {
+            direct_draw_height_ = h;
+        }
+    }
+
+    void SequencerPanel::drawDirect(const float x, const float y,
+                                    const float w, const float h,
+                                    const PanelDrawContext& ctx) {
+        if (seq_)
+            seq_->setFloating(is_floating_);
+
+        if (is_floating_) {
+            direct_draw_height_ = seq_ ? std::max(0.0f, seq_->preferredFloatingHeight()) : h;
+        } else {
+            direct_draw_height_ = h;
+        }
+
+        if (seq_ && ctx.ui && ctx.viewport && input_ && h > 0.0f)
+            seq_->render(*ctx.ui, *ctx.viewport, x, y, w, h, *input_);
     }
 
     bool SequencerPanel::poll(const PanelDrawContext& ctx) {
-        return !ctx.ui_hidden && ctx.ui && ctx.ui->editor &&
-               !ctx.ui->editor->isToolsDisabled() && layout_->isShowSequencer();
+        const bool is_enabled = !ctx.ui_hidden && ctx.ui && ctx.ui->editor &&
+                                !ctx.ui->editor->isToolsDisabled() && layout_->isShowSequencer();
+        if (!is_enabled && seq_)
+            seq_->setSequencerEnabled(false);
+        return is_enabled;
     }
 
     NodeTransformGizmoPanel::NodeTransformGizmoPanel(GizmoManager* gizmo)
@@ -145,18 +190,12 @@ namespace lfs::vis::gui::native_panels {
         const float vp_pos[] = {ctx.viewport->pos.x, ctx.viewport->pos.y};
         const float vp_size[] = {ctx.viewport->size.x, ctx.viewport->size.y};
         const float cam_pos[] = {vp.camera.t.x, vp.camera.t.y, vp.camera.t.z};
-        const float cam_fwd[] = {vp.camera.R[2].x, vp.camera.R[2].y, vp.camera.R[2].z};
+        const glm::vec3 forward = lfs::rendering::cameraForward(vp.camera.R);
+        const float cam_fwd[] = {forward.x, forward.y, forward.z};
 
         python::invoke_viewport_overlay(glm::value_ptr(view), glm::value_ptr(proj),
                                         vp_pos, vp_size, cam_pos, cam_fwd,
                                         ImGui::GetBackgroundDrawList());
-    }
-
-    RmlStatusBarPanel::RmlStatusBarPanel(RmlStatusBar* sb)
-        : status_bar_(sb) {}
-
-    void RmlStatusBarPanel::draw(const PanelDrawContext& ctx) {
-        status_bar_->draw(ctx);
     }
 
 } // namespace lfs::vis::gui::native_panels

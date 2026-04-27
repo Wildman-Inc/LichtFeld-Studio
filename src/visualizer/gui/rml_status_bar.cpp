@@ -11,6 +11,7 @@
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "gui/gpu_memory_query.hpp"
+#include "gui/rmlui/rml_document_utils.hpp"
 #include "gui/rmlui/rml_theme.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/rmlui/rmlui_render_interface.hpp"
@@ -25,11 +26,12 @@
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
+#include <SDL3/SDL_video.h>
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <format>
-#include <imgui.h>
 
 #include "git_version.h"
 
@@ -64,6 +66,39 @@ namespace lfs::vis::gui {
             if (end == std::string::npos)
                 return s;
             return s.substr(0, end + 1);
+        }
+
+        struct FramebufferBlitRect {
+            float x = 0.0f;
+            float y = 0.0f;
+            float w = 0.0f;
+            float h = 0.0f;
+            int screen_w = 0;
+            int screen_h = 0;
+        };
+
+        FramebufferBlitRect toFramebufferBlitRect(SDL_Window* window,
+                                                  float x, float y, float w, float h,
+                                                  int screen_w, int screen_h) {
+            FramebufferBlitRect rect{x, y, w, h, screen_w, screen_h};
+            if (!window || screen_w <= 0 || screen_h <= 0)
+                return rect;
+
+            int framebuffer_w = 0;
+            int framebuffer_h = 0;
+            SDL_GetWindowSizeInPixels(window, &framebuffer_w, &framebuffer_h);
+            if (framebuffer_w <= 0 || framebuffer_h <= 0)
+                return rect;
+
+            const float scale_x = static_cast<float>(framebuffer_w) / static_cast<float>(screen_w);
+            const float scale_y = static_cast<float>(framebuffer_h) / static_cast<float>(screen_h);
+            rect.x = std::round(x * scale_x);
+            rect.y = std::round(y * scale_y);
+            rect.w = std::max(1.0f, std::round(w * scale_x));
+            rect.h = std::max(1.0f, std::round(h * scale_y));
+            rect.screen_w = framebuffer_w;
+            rect.screen_h = framebuffer_h;
+            return rect;
         }
     } // namespace
 
@@ -109,15 +144,72 @@ namespace lfs::vis::gui {
         assert(mgr);
         rml_manager_ = mgr;
 
+        const auto& palette = lfs::vis::theme().palette;
+        model_.mode_color = colorToRml(palette.text_dim);
+        model_.splat_color = colorToRml(palette.text);
+        model_.split_mode_color = colorToRml(palette.warning);
+        model_.wasd_color = colorToRml(palette.info);
+        model_.wasd_sep_color = colorToRml(palette.text_dim);
+        model_.zoom_color = colorToRml(palette.info);
+        model_.zoom_sep_color = colorToRml(palette.text_dim);
+        model_.lfs_mem_color = colorToRml(palette.info);
+        model_.gpu_mem_color = colorToRml(palette.text);
+        model_.fps_color = colorToRml(palette.success);
+
         rml_context_ = rml_manager_->createContext("status_bar", 800, 22);
         if (!rml_context_) {
             LOG_ERROR("RmlStatusBar: failed to create RML context");
             return;
         }
 
+        auto ctor = rml_context_->CreateDataModel("status_bar");
+        assert(ctor);
+        ctor.Bind("mode_text", &model_.mode_text);
+        ctor.Bind("mode_color", &model_.mode_color);
+        ctor.Bind("show_training", &model_.show_training);
+        ctor.Bind("progress_width", &model_.progress_width);
+        ctor.Bind("progress_text", &model_.progress_text);
+        ctor.Bind("step_label", &model_.step_label);
+        ctor.Bind("step_value", &model_.step_value);
+        ctor.Bind("loss_label", &model_.loss_label);
+        ctor.Bind("loss_value", &model_.loss_value);
+        ctor.Bind("show_eval_metrics", &model_.show_eval_metrics);
+        ctor.Bind("eval_metrics_value", &model_.eval_metrics_value);
+        ctor.Bind("gaussians_label", &model_.gaussians_label);
+        ctor.Bind("gaussians_value", &model_.gaussians_value);
+        ctor.Bind("time_value", &model_.time_value);
+        ctor.Bind("eta_label", &model_.eta_label);
+        ctor.Bind("eta_value", &model_.eta_value);
+        ctor.Bind("show_splats", &model_.show_splats);
+        ctor.Bind("splat_text", &model_.splat_text);
+        ctor.Bind("splat_color", &model_.splat_color);
+        ctor.Bind("show_split", &model_.show_split);
+        ctor.Bind("split_mode", &model_.split_mode);
+        ctor.Bind("split_mode_color", &model_.split_mode_color);
+        ctor.Bind("split_detail", &model_.split_detail);
+        ctor.Bind("show_wasd", &model_.show_wasd);
+        ctor.Bind("wasd_text", &model_.wasd_text);
+        ctor.Bind("wasd_color", &model_.wasd_color);
+        ctor.Bind("wasd_sep_color", &model_.wasd_sep_color);
+        ctor.Bind("show_zoom", &model_.show_zoom);
+        ctor.Bind("zoom_text", &model_.zoom_text);
+        ctor.Bind("zoom_color", &model_.zoom_color);
+        ctor.Bind("zoom_sep_color", &model_.zoom_sep_color);
+        ctor.Bind("lfs_mem_text", &model_.lfs_mem_text);
+        ctor.Bind("lfs_mem_color", &model_.lfs_mem_color);
+        ctor.Bind("show_gpu_model", &model_.show_gpu_model);
+        ctor.Bind("gpu_model_text", &model_.gpu_model_text);
+        ctor.Bind("gpu_mem_text", &model_.gpu_mem_text);
+        ctor.Bind("gpu_mem_color", &model_.gpu_mem_color);
+        ctor.Bind("fps_value", &model_.fps_value);
+        ctor.Bind("fps_color", &model_.fps_color);
+        ctor.Bind("fps_label", &model_.fps_label);
+        ctor.Bind("git_commit", &model_.git_commit);
+        model_handle_ = ctor.GetModelHandle();
+
         try {
             const auto rml_path = lfs::vis::getAssetPath("rmlui/statusbar.rml");
-            document_ = rml_context_->LoadDocument(rml_path.string());
+            document_ = rml_documents::loadDocument(rml_context_, rml_path);
             if (!document_) {
                 LOG_ERROR("RmlStatusBar: failed to load statusbar.rml");
                 return;
@@ -128,21 +220,16 @@ namespace lfs::vis::gui {
             return;
         }
 
-        cacheElements();
-
-        try {
-            const auto icon_path = lfs::vis::getAssetPath("icon/gpu.png");
-            if (gpu_icon_)
-                gpu_icon_->SetAttribute("src", icon_path.string());
-        } catch (...) {
-        }
-
         if (!speed_events_initialized_) {
             lfs::core::events::ui::SpeedChanged::when([this](const auto& e) {
                 speed_state_.showWasd(e.current_speed);
+                animation_active_ = true;
+                next_refresh_at_ = {};
             });
             lfs::core::events::ui::ZoomSpeedChanged::when([this](const auto& e) {
                 speed_state_.showZoom(e.zoom_speed);
+                animation_active_ = true;
+                next_refresh_at_ = {};
             });
             speed_events_initialized_ = true;
         }
@@ -151,6 +238,7 @@ namespace lfs::vis::gui {
     }
 
     void RmlStatusBar::shutdown() {
+        model_handle_ = {};
         fbo_.destroy();
         if (rml_context_ && rml_manager_)
             rml_manager_->destroyContext("status_bar");
@@ -158,87 +246,86 @@ namespace lfs::vis::gui {
         document_ = nullptr;
     }
 
-    void RmlStatusBar::cacheElements() {
-        assert(document_);
-        auto get = [this](const char* id) -> Rml::Element* {
-            return document_->GetElementById(id);
-        };
+    void RmlStatusBar::reloadResources() {
+        if (!rml_context_)
+            return;
 
-        mode_text_ = get("mode-text");
-        training_section_ = get("training-section");
-        progress_fill_ = get("progress-fill");
-        progress_text_ = get("progress-text");
-        step_label_ = get("step-label");
-        step_value_ = get("step-value");
-        loss_label_ = get("loss-label");
-        loss_value_ = get("loss-value");
-        gaussians_label_ = get("gaussians-label");
-        gaussians_value_ = get("gaussians-value");
-        time_value_ = get("time-value");
-        eta_label_ = get("eta-label");
-        eta_value_ = get("eta-value");
-        splat_section_ = get("splat-section");
-        splat_text_ = get("splat-text");
-        split_section_ = get("split-section");
-        split_mode_ = get("split-mode");
-        split_detail_ = get("split-detail");
-        wasd_section_ = get("wasd-section");
-        wasd_text_ = get("wasd-text");
-        zoom_section_ = get("zoom-section");
-        zoom_text_ = get("zoom-text");
-        gpu_icon_ = get("gpu-icon");
-        lfs_mem_ = get("lfs-mem");
-        gpu_mem_ = get("gpu-mem");
-        fps_value_ = get("fps-value");
-        fps_label_ = get("fps-label");
-        git_commit_ = get("git-commit");
+        if (document_) {
+            rml_context_->UnloadDocument(document_);
+            rml_context_->Update();
+        }
+
+        document_ = nullptr;
+        base_rcss_.clear();
+        has_theme_signature_ = false;
+        model_dirty_ = true;
+        animation_active_ = true;
+        last_render_w_ = 0;
+        last_render_h_ = 0;
+        last_document_h_ = 0;
+        next_refresh_at_ = {};
+
+        try {
+            const auto rml_path = lfs::vis::getAssetPath("rmlui/statusbar.rml");
+            document_ = rml_documents::loadDocument(rml_context_, rml_path);
+            if (!document_) {
+                LOG_ERROR("RmlStatusBar: failed to reload statusbar.rml");
+                return;
+            }
+            document_->Show();
+        } catch (const std::exception& e) {
+            LOG_ERROR("RmlStatusBar: resource not found during reload: {}", e.what());
+            return;
+        }
+
+        updateTheme();
     }
 
-    std::string RmlStatusBar::generateThemeRCSS() const {
-        const auto& p = lfs::vis::theme().palette;
-
-        const auto text = colorToRml(p.text);
-        const auto text_dim = colorToRml(p.text_dim);
-        const auto surface_bright = colorToRml(p.surface_bright);
-        const auto primary = colorToRml(p.primary);
-        const auto success = colorToRml(p.success);
-        const auto warning = colorToRml(p.warning);
-        const auto error = colorToRml(p.error);
-        const auto info = colorToRml(p.info);
-
-        auto surface_bright_half = colorToRmlAlpha(p.surface_bright, 0.5f);
-
-        return std::format(
-            "body {{ color: {0}; }}\n"
-            ".dim {{ color: {1}; }}\n"
-            ".separator {{ color: {1}; }}\n"
-            "#progress-container {{ background-color: {2}; }}\n"
-            "#progress-fill {{ background-color: {3}; }}\n"
-            "#progress-text {{ color: {0}; }}\n"
-            "#gpu-icon {{ image-color: {1}; }}\n",
-            text, text_dim, surface_bright_half, primary);
-    }
-
-    void RmlStatusBar::updateTheme() {
+    bool RmlStatusBar::updateTheme() {
         if (!document_)
-            return;
+            return false;
 
-        const auto& t = lfs::vis::theme();
-        if (t.name == last_theme_)
-            return;
-        last_theme_ = t.name;
+        const std::size_t theme_signature = rml_theme::currentThemeSignature();
+        if (has_theme_signature_ && theme_signature == last_theme_signature_)
+            return false;
+        last_theme_signature_ = theme_signature;
+        has_theme_signature_ = true;
 
         if (base_rcss_.empty())
             base_rcss_ = rml_theme::loadBaseRCSS("rmlui/statusbar.rcss");
 
-        rml_theme::applyTheme(document_, base_rcss_, generateThemeRCSS());
-
-        cache_ = CachedState{};
+        rml_theme::applyTheme(document_, base_rcss_, rml_theme::loadBaseRCSS("rmlui/statusbar.theme.rcss"));
+        model_dirty_ = true;
+        return true;
     }
 
-    void RmlStatusBar::updateContent(const PanelDrawContext& ctx) {
-        if (!document_)
+    void RmlStatusBar::setModelString(const char* name, std::string& field, std::string value) {
+        if (field == value)
             return;
+        field = std::move(value);
+        model_handle_.DirtyVariable(name);
+        model_dirty_ = true;
+    }
+
+    void RmlStatusBar::setModelBool(const char* name, bool& field, bool value) {
+        if (field == value)
+            return;
+        field = value;
+        model_handle_.DirtyVariable(name);
+        model_dirty_ = true;
+    }
+
+    bool RmlStatusBar::updateContent(const PanelDrawContext& ctx, const bool force_refresh) {
+        if (!document_)
+            return false;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!force_refresh && next_refresh_at_ != std::chrono::steady_clock::time_point{} &&
+            now < next_refresh_at_) {
+            return false;
+        }
+
+        model_dirty_ = false;
 
         const auto& p = lfs::vis::theme().palette;
 
@@ -265,9 +352,17 @@ namespace lfs::vis::gui {
             const char* strategy_raw = tm ? tm->getStrategyType() : "default";
             bool gut = tm && tm->isGutEnabled();
             std::string method = gut ? "GUT" : "3DGS";
-            std::string strat_name = (std::string_view(strategy_raw) == "mcmc")
-                                         ? LOC("training.options.strategy.mcmc")
-                                         : LOC("status_bar.strategy_default");
+            std::string strat_name;
+            const std::string_view strategy = strategy_raw ? std::string_view(strategy_raw) : std::string_view{};
+            if (strategy == "mcmc") {
+                strat_name = LOC("training.options.strategy.mcmc");
+            } else if (lfs::core::param::is_mrnf_strategy(strategy)) {
+                strat_name = LOC("training.options.strategy.mrnf");
+            } else if (strategy == "igs+") {
+                strat_name = LOC("training.options.strategy.igs_plus");
+            } else {
+                strat_name = LOC("status_bar.strategy_default");
+            }
 
             auto suffix = std::format(" ({}/{})", strat_name, method);
 
@@ -303,26 +398,20 @@ namespace lfs::vis::gui {
                 break;
             }
         }
-
-        if (mode_rml != cache_.mode_rml || mode_color != cache_.mode_color) {
-            cache_.mode_rml = mode_rml;
-            cache_.mode_color = mode_color;
-            if (mode_text_) {
-                mode_text_->SetInnerRML(mode_rml);
-                mode_text_->SetProperty("color", mode_color);
-            }
-        }
+        setModelString("mode_text", model_.mode_text, std::move(mode_rml));
+        setModelString("mode_color", model_.mode_color, std::move(mode_color));
 
         // Training section
         bool show_training = content_type == SceneManager::ContentType::Dataset &&
                              (training_state == TrainingState::Running ||
                               training_state == TrainingState::Paused);
+        setModelBool("show_training", model_.show_training, show_training);
 
-        if (show_training != cache_.show_training) {
-            cache_.show_training = show_training;
-            if (training_section_)
-                training_section_->SetClass("hidden", !show_training);
-        }
+        setModelString("step_label", model_.step_label, LOC(lichtfeld::Strings::Status::STEP));
+        setModelString("loss_label", model_.loss_label, LOC(lichtfeld::Strings::Status::LOSS));
+        setModelString("gaussians_label", model_.gaussians_label,
+                       stripColon(LOC(lichtfeld::Strings::Status::GAUSSIANS)));
+        setModelString("eta_label", model_.eta_label, LOC(lichtfeld::Strings::Status::ETA));
 
         if (show_training && tm) {
             int cur = tm->getCurrentIteration();
@@ -332,87 +421,60 @@ namespace lfs::vis::gui {
             int max_g = tm->getMaxGaussians();
             float elapsed = tm->getElapsedSeconds();
             float eta = tm->getEstimatedRemainingSeconds();
+            float progress = total > 0 ? static_cast<float>(cur) / static_cast<float>(total) : 0.0f;
+            auto progress_pct = std::format("{:.0f}%", progress * 100.0f);
 
-            if (cur != cache_.current_iter || total != cache_.total_iter) {
-                cache_.current_iter = cur;
-                cache_.total_iter = total;
+            setModelString("progress_width", model_.progress_width, progress_pct);
+            setModelString("progress_text", model_.progress_text, progress_pct);
+            setModelString("step_value", model_.step_value, std::format("{}/{}", cur, total));
+            setModelString("loss_value", model_.loss_value, std::format("{:.4f}", loss));
+            setModelString("gaussians_value", model_.gaussians_value,
+                           std::format("{}/{}", fmtCount(num_splats), fmtCount(max_g)));
+            setModelString("time_value", model_.time_value, fmtTime(elapsed));
+            setModelString("eta_value", model_.eta_value, fmtTime(eta));
 
-                float progress = total > 0 ? static_cast<float>(cur) / static_cast<float>(total) : 0.0f;
-                if (progress_fill_)
-                    progress_fill_->SetProperty("width", std::format("{:.0f}%", progress * 100.0f));
-                if (progress_text_)
-                    progress_text_->SetInnerRML(std::format("{:.0f}%", progress * 100.0f));
-                if (step_value_)
-                    step_value_->SetInnerRML(std::format("{}/{}", cur, total));
+            const auto eval_metrics = tm->getLastEvaluationMetrics();
+            setModelBool("show_eval_metrics", model_.show_eval_metrics, eval_metrics.has_value());
+            if (eval_metrics) {
+                setModelString("eval_metrics_value", model_.eval_metrics_value,
+                               std::format("{} {:.2f} / {} {:.4f}",
+                                           LOC(lichtfeld::Strings::Status::PSNR),
+                                           eval_metrics->psnr,
+                                           LOC(lichtfeld::Strings::Status::SSIM),
+                                           eval_metrics->ssim));
+            } else {
+                setModelString("eval_metrics_value", model_.eval_metrics_value, "");
             }
-
-            if (loss != cache_.loss) {
-                cache_.loss = loss;
-                if (loss_value_)
-                    loss_value_->SetInnerRML(std::format("{:.4f}", loss));
-            }
-
-            if (num_splats != cache_.num_splats || max_g != cache_.max_gaussians) {
-                cache_.num_splats = num_splats;
-                cache_.max_gaussians = max_g;
-                if (gaussians_value_)
-                    gaussians_value_->SetInnerRML(
-                        std::format("{}/{}", fmtCount(num_splats), fmtCount(max_g)));
-            }
-
-            if (elapsed != cache_.elapsed) {
-                cache_.elapsed = elapsed;
-                if (time_value_)
-                    time_value_->SetInnerRML(fmtTime(elapsed));
-            }
-
-            if (eta != cache_.eta) {
-                cache_.eta = eta;
-                if (eta_value_)
-                    eta_value_->SetInnerRML(fmtTime(eta));
-            }
-
-            // Update labels (only on first pass or theme change)
-            if (!cache_.git_set) {
-                if (step_label_)
-                    step_label_->SetInnerRML(LOC(lichtfeld::Strings::Status::STEP));
-                if (loss_label_)
-                    loss_label_->SetInnerRML(LOC(lichtfeld::Strings::Status::LOSS));
-                if (gaussians_label_)
-                    gaussians_label_->SetInnerRML(
-                        stripColon(LOC(lichtfeld::Strings::Status::GAUSSIANS)));
-                if (eta_label_)
-                    eta_label_->SetInnerRML(LOC(lichtfeld::Strings::Status::ETA));
-            }
+        } else {
+            setModelString("progress_width", model_.progress_width, "0%");
+            setModelString("progress_text", model_.progress_text, "");
+            setModelString("step_value", model_.step_value, "");
+            setModelString("loss_value", model_.loss_value, "");
+            setModelBool("show_eval_metrics", model_.show_eval_metrics, false);
+            setModelString("eval_metrics_value", model_.eval_metrics_value, "");
+            setModelString("gaussians_value", model_.gaussians_value, "");
+            setModelString("time_value", model_.time_value, "");
+            setModelString("eta_value", model_.eta_value, "");
         }
 
         // Splat section (non-training)
         bool show_splats = !show_training && content_type != SceneManager::ContentType::Empty;
         size_t total_gaussians = 0;
         if (show_splats && sm) {
-            const auto* model = sm->getScene().getCombinedModel();
-            total_gaussians = model ? model->size() : 0;
+            total_gaussians = sm->getScene().getVisibleGaussianCount();
             if (total_gaussians == 0)
                 show_splats = false;
         }
-
-        if (show_splats != cache_.show_splats) {
-            cache_.show_splats = show_splats;
-            if (splat_section_)
-                splat_section_->SetClass("hidden", !show_splats);
-        }
+        setModelBool("show_splats", model_.show_splats, show_splats);
 
         if (show_splats) {
             auto splat_rml = std::format("{} {}",
                                          fmtCount(static_cast<int64_t>(total_gaussians)),
                                          stripColon(LOC(lichtfeld::Strings::Status::GAUSSIANS)));
-            if (splat_rml != cache_.splat_rml) {
-                cache_.splat_rml = splat_rml;
-                if (splat_text_) {
-                    splat_text_->SetInnerRML(splat_rml);
-                    splat_text_->SetProperty("color", colorToRml(p.text));
-                }
-            }
+            setModelString("splat_text", model_.splat_text, std::move(splat_rml));
+            setModelString("splat_color", model_.splat_color, colorToRml(p.text));
+        } else {
+            setModelString("splat_text", model_.splat_text, "");
         }
 
         // Split view
@@ -424,41 +486,19 @@ namespace lfs::vis::gui {
             auto split_info = rm->getSplitViewInfo();
             split_enabled = split_info.enabled;
             if (split_enabled) {
-                auto settings = rm->getSettings();
-                if (settings.split_view_mode == SplitViewMode::GTComparison) {
-                    int cam_id = rm->getCurrentCameraId();
-                    split_mode_rml = LOC("status_bar.gt_compare");
-                    std::string cam_template = LOC("status_bar.camera");
-                    auto pos = cam_template.find("{cam_id}");
-                    if (pos != std::string::npos)
-                        cam_template.replace(pos, 8, std::to_string(cam_id));
-                    split_detail_rml = cam_template;
-                } else if (settings.split_view_mode == SplitViewMode::PLYComparison) {
-                    split_mode_rml = LOC("status_bar.split");
-                    split_detail_rml = std::format("{} | {}", split_info.left_name, split_info.right_name);
-                }
+                split_mode_rml = split_info.mode_label;
+                split_detail_rml = split_info.detail_label;
             }
         }
-
-        if (split_enabled != cache_.split_enabled) {
-            cache_.split_enabled = split_enabled;
-            if (split_section_)
-                split_section_->SetClass("hidden", !split_enabled);
-        }
+        setModelBool("show_split", model_.show_split, split_enabled);
 
         if (split_enabled) {
-            if (split_mode_rml != cache_.split_mode_rml) {
-                cache_.split_mode_rml = split_mode_rml;
-                if (split_mode_) {
-                    split_mode_->SetInnerRML(split_mode_rml);
-                    split_mode_->SetProperty("color", colorToRml(p.warning));
-                }
-            }
-            if (split_detail_rml != cache_.split_detail_rml) {
-                cache_.split_detail_rml = split_detail_rml;
-                if (split_detail_)
-                    split_detail_->SetInnerRML(split_detail_rml);
-            }
+            setModelString("split_mode", model_.split_mode, std::move(split_mode_rml));
+            setModelString("split_mode_color", model_.split_mode_color, colorToRml(p.warning));
+            setModelString("split_detail", model_.split_detail, std::move(split_detail_rml));
+        } else {
+            setModelString("split_mode", model_.split_mode, "");
+            setModelString("split_detail", model_.split_detail, "");
         }
 
         // Speed overlays
@@ -469,26 +509,13 @@ namespace lfs::vis::gui {
             auto wasd_rml = std::format("{}: {:.0f}",
                                         stripColon(LOC(lichtfeld::Strings::Controls::WASD)),
                                         wasd_speed);
-            if (wasd_rml != cache_.wasd_rml || wasd_alpha != cache_.wasd_alpha) {
-                cache_.wasd_rml = wasd_rml;
-                cache_.wasd_alpha = wasd_alpha;
-                if (wasd_section_)
-                    wasd_section_->SetClass("hidden", false);
-                if (wasd_text_) {
-                    wasd_text_->SetInnerRML(wasd_rml);
-                    wasd_text_->SetProperty("color", colorToRmlAlpha(p.info, wasd_alpha));
-                }
-                auto* sep = wasd_section_ ? wasd_section_->GetElementById("wasd-sep") : nullptr;
-                if (!sep && wasd_section_ && wasd_section_->GetNumChildren() > 0)
-                    sep = wasd_section_->GetChild(0);
-                if (sep)
-                    sep->SetProperty("color", colorToRmlAlpha(p.text_dim, wasd_alpha));
-            }
-        } else if (cache_.wasd_alpha > 0.0f) {
-            cache_.wasd_alpha = 0.0f;
-            cache_.wasd_rml.clear();
-            if (wasd_section_)
-                wasd_section_->SetClass("hidden", true);
+            setModelBool("show_wasd", model_.show_wasd, true);
+            setModelString("wasd_text", model_.wasd_text, std::move(wasd_rml));
+            setModelString("wasd_color", model_.wasd_color, colorToRmlAlpha(p.info, wasd_alpha));
+            setModelString("wasd_sep_color", model_.wasd_sep_color,
+                           colorToRmlAlpha(p.text_dim, wasd_alpha));
+        } else {
+            setModelBool("show_wasd", model_.show_wasd, false);
         }
 
         auto [zoom_speed, zoom_alpha] = speed_state_.getZoom();
@@ -498,123 +525,121 @@ namespace lfs::vis::gui {
             auto zoom_rml = std::format("{}: {:.0f}",
                                         stripColon(LOC(lichtfeld::Strings::Controls::ZOOM)),
                                         zoom_speed * 10.0f);
-            if (zoom_rml != cache_.zoom_rml || zoom_alpha != cache_.zoom_alpha) {
-                cache_.zoom_rml = zoom_rml;
-                cache_.zoom_alpha = zoom_alpha;
-                if (zoom_section_)
-                    zoom_section_->SetClass("hidden", false);
-                if (zoom_text_) {
-                    zoom_text_->SetInnerRML(zoom_rml);
-                    zoom_text_->SetProperty("color", colorToRmlAlpha(p.info, zoom_alpha));
-                }
-                auto* sep = zoom_section_ ? zoom_section_->GetElementById("zoom-sep") : nullptr;
-                if (!sep && zoom_section_ && zoom_section_->GetNumChildren() > 0)
-                    sep = zoom_section_->GetChild(0);
-                if (sep)
-                    sep->SetProperty("color", colorToRmlAlpha(p.text_dim, zoom_alpha));
-            }
-        } else if (cache_.zoom_alpha > 0.0f) {
-            cache_.zoom_alpha = 0.0f;
-            cache_.zoom_rml.clear();
-            if (zoom_section_)
-                zoom_section_->SetClass("hidden", true);
+            setModelBool("show_zoom", model_.show_zoom, true);
+            setModelString("zoom_text", model_.zoom_text, std::move(zoom_rml));
+            setModelString("zoom_color", model_.zoom_color, colorToRmlAlpha(p.info, zoom_alpha));
+            setModelString("zoom_sep_color", model_.zoom_sep_color,
+                           colorToRmlAlpha(p.text_dim, zoom_alpha));
+        } else {
+            setModelBool("show_zoom", model_.show_zoom, false);
         }
 
         // Right section: GPU memory
-        auto mem = queryGpuMemory();
+        if (next_gpu_refresh_at_ == std::chrono::steady_clock::time_point{} ||
+            now >= next_gpu_refresh_at_) {
+            cached_gpu_mem_ = queryGpuMemory();
+            next_gpu_refresh_at_ = now + kGpuRefreshInterval;
+        }
+        const auto mem = cached_gpu_mem_;
         float app_gb = mem.process_used / 1e9f;
         float used_gb = mem.total_used / 1e9f;
         float total_gb = mem.total / 1e9f;
         float pct = total_gb > 0.0f ? (used_gb / total_gb) * 100.0f : 0.0f;
 
         ImVec4 mem_color = pct < 50.0f ? p.success : (pct < 75.0f ? p.warning : p.error);
-
-        auto lfs_mem_rml = std::format("LFS {:.1f}GB", app_gb);
-        if (lfs_mem_rml != cache_.lfs_mem_rml) {
-            cache_.lfs_mem_rml = lfs_mem_rml;
-            if (lfs_mem_) {
-                lfs_mem_->SetInnerRML(lfs_mem_rml);
-                lfs_mem_->SetProperty("color", colorToRml(p.info));
-            }
-        }
-
-        auto gpu_mem_rml = std::format("{} {:.1f}/{:.1f}GB",
-                                       LOC("status_bar.gpu"), used_gb, total_gb);
-        auto gpu_mem_color = colorToRml(mem_color);
-        if (gpu_mem_rml != cache_.gpu_mem_rml || gpu_mem_color != cache_.gpu_mem_color) {
-            cache_.gpu_mem_rml = gpu_mem_rml;
-            cache_.gpu_mem_color = gpu_mem_color;
-            if (gpu_mem_) {
-                gpu_mem_->SetInnerRML(gpu_mem_rml);
-                gpu_mem_->SetProperty("color", gpu_mem_color);
-            }
-        }
+        setModelString("lfs_mem_text", model_.lfs_mem_text, std::format("LFS {:.1f}GB", app_gb));
+        setModelString("lfs_mem_color", model_.lfs_mem_color, colorToRml(p.info));
+        setModelBool("show_gpu_model", model_.show_gpu_model, !mem.device_name.empty());
+        setModelString("gpu_model_text", model_.gpu_model_text, mem.device_name);
+        setModelString("gpu_mem_text", model_.gpu_mem_text,
+                       std::format("{} {:.1f}/{:.1f}GB", LOC("status_bar.gpu"), used_gb, total_gb));
+        setModelString("gpu_mem_color", model_.gpu_mem_color, colorToRml(mem_color));
 
         // FPS
         float fps = rm ? rm->getAverageFPS() : 0.0f;
         ImVec4 fps_col = fps >= 30.0f ? p.success : (fps >= 15.0f ? p.warning : p.error);
+        setModelString("fps_value", model_.fps_value, std::format("{:.0f}", fps));
+        setModelString("fps_color", model_.fps_color, colorToRml(fps_col));
+        setModelString("fps_label", model_.fps_label,
+                       std::format(" {}", LOC(lichtfeld::Strings::Status::FPS)));
+        setModelString("git_commit", model_.git_commit, GIT_COMMIT_HASH_SHORT);
 
-        auto fps_rml = std::format("{:.0f}", fps);
-        auto fps_color = colorToRml(fps_col);
-        if (fps_rml != cache_.fps_rml || fps_color != cache_.fps_color) {
-            cache_.fps_rml = fps_rml;
-            cache_.fps_color = fps_color;
-            if (fps_value_) {
-                fps_value_->SetInnerRML(fps_rml);
-                fps_value_->SetProperty("color", fps_color);
-            }
-        }
-
-        // FPS label and git commit (set once)
-        if (!cache_.git_set) {
-            cache_.git_set = true;
-            if (fps_label_)
-                fps_label_->SetInnerRML(std::format(" {}", LOC(lichtfeld::Strings::Status::FPS)));
-            if (git_commit_)
-                git_commit_->SetInnerRML(GIT_COMMIT_HASH_SHORT);
-        }
+        animation_active_ = wasd_visible || zoom_visible;
+        next_refresh_at_ = now + (animation_active_ ? kAnimatedRefreshInterval
+                                                    : (ctx.is_training ? kBusyRefreshInterval
+                                                                       : kIdleRefreshInterval));
+        return model_dirty_;
     }
 
-    void RmlStatusBar::draw(const PanelDrawContext& ctx) {
+    void RmlStatusBar::render(const PanelDrawContext& ctx, const float x, const float y,
+                              const float w_px, const float h_px,
+                              const int screen_w, const int screen_h) {
         if (!rml_context_ || !document_)
             return;
 
-        const float avail_w = ImGui::GetContentRegionAvail().x;
-        const float avail_h = ImGui::GetContentRegionAvail().y;
-        if (avail_w <= 0 || avail_h <= 0)
+        if (w_px <= 0.0f || h_px <= 0.0f || screen_w <= 0 || screen_h <= 0)
             return;
 
-        if (!rml_manager_->shouldDeferFboUpdate(fbo_)) {
-            updateTheme();
-            updateContent(ctx);
+        const auto blit_rect = toFramebufferBlitRect(rml_manager_ ? rml_manager_->getWindow() : nullptr,
+                                                     x, y, w_px, h_px, screen_w, screen_h);
+        const int render_w = static_cast<int>(w_px);
+        const int render_h = static_cast<int>(h_px);
+        const bool size_changed = (render_w != last_render_w_ || render_h != last_render_h_);
+        const bool had_pending_model_dirty = model_dirty_;
+        const bool theme_changed = updateTheme();
+        const auto now = std::chrono::steady_clock::now();
+        const bool refresh_due =
+            size_changed || theme_changed || had_pending_model_dirty || animation_active_ ||
+            next_refresh_at_ == std::chrono::steady_clock::time_point{} ||
+            now >= next_refresh_at_;
+        const bool content_changed = updateContent(ctx, refresh_due);
+        const bool needs_render = size_changed || theme_changed || had_pending_model_dirty ||
+                                  content_changed ||
+                                  (animation_active_ && refresh_due);
+        if (rml_manager_->shouldDeferFboUpdate(fbo_)) {
+            if (needs_render)
+                model_dirty_ = true;
+            if (fbo_.valid())
+                fbo_.blitToScreen(blit_rect.x, blit_rect.y, blit_rect.w, blit_rect.h,
+                                  blit_rect.screen_w, blit_rect.screen_h);
+            return;
+        }
 
-            const int w = static_cast<int>(avail_w);
-            const int h = static_cast<int>(avail_h);
-
-            rml_context_->SetDimensions(Rml::Vector2i(w, h));
-            document_->SetProperty("height", std::format("{}px", h));
+        if (needs_render) {
+            rml_context_->SetDimensions(Rml::Vector2i(render_w, render_h));
+            if (render_h != last_document_h_) {
+                document_->SetProperty("height", std::format("{}px", render_h));
+                last_document_h_ = render_h;
+            }
             rml_context_->Update();
 
-            fbo_.ensure(w, h);
+            fbo_.ensure(render_w, render_h);
             if (!fbo_.valid())
                 return;
 
             auto* render = rml_manager_->getRenderInterface();
             assert(render);
-            render->SetViewport(w, h);
+            render->SetViewport(render_w, render_h);
 
             GLint prev_fbo = 0;
             fbo_.bind(&prev_fbo);
+            render->SetTargetFramebuffer(fbo_.fbo());
 
             render->BeginFrame();
             rml_context_->Render();
             render->EndFrame();
 
+            render->SetTargetFramebuffer(0);
             fbo_.unbind(prev_fbo);
+
+            animation_active_ = animation_active_ || (rml_context_->GetNextUpdateDelay() == 0);
+            last_render_w_ = render_w;
+            last_render_h_ = render_h;
         }
 
         if (fbo_.valid())
-            fbo_.blitAsImage(avail_w, avail_h);
+            fbo_.blitToScreen(blit_rect.x, blit_rect.y, blit_rect.w, blit_rect.h,
+                              blit_rect.screen_w, blit_rect.screen_h);
     }
 
 } // namespace lfs::vis::gui

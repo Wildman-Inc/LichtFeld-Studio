@@ -5,6 +5,7 @@
 
 #include "core/export.hpp"
 #include "tensor_functors.hpp"
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -21,7 +22,7 @@ namespace lfs::core {
 // ============= Generic CUDA Operations =============
 // Include template implementation for inline instantiation
 // Only include in CUDA compilation units - C++ files will link to .cu implementations
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include "tensor_generic_ops.cuh"
 #include <cfloat>
 #define CUDA_INFINITY FLT_MAX
@@ -203,7 +204,7 @@ namespace lfs::core::tensor_ops {
 
 // Include template implementation for inline instantiation
 // Only include in CUDA compilation units - C++ files will link to .cu implementations
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include "tensor_broadcast_ops.cuh"
 #else
 // Forward declaration for C++ files - implementation in tensor_broadcast_ops.cu
@@ -272,6 +273,14 @@ namespace lfs::core::tensor_ops {
 
     LFS_CORE_API void launch_masked_fill(float* data, const unsigned char* mask,
                                          float value, size_t n, cudaStream_t stream);
+    LFS_CORE_API void launch_masked_fill(int32_t* data, const unsigned char* mask,
+                                         int32_t value, size_t n, cudaStream_t stream);
+    LFS_CORE_API void launch_masked_fill(int64_t* data, const unsigned char* mask,
+                                         int64_t value, size_t n, cudaStream_t stream);
+    LFS_CORE_API void launch_masked_fill(uint8_t* data, const unsigned char* mask,
+                                         uint8_t value, size_t n, cudaStream_t stream);
+    LFS_CORE_API void launch_masked_fill(__half* data, const unsigned char* mask,
+                                         __half value, size_t n, cudaStream_t stream);
 
     LFS_CORE_API void launch_masked_scatter(float* data, const unsigned char* mask,
                                             const float* src, size_t n, size_t src_size, cudaStream_t stream);
@@ -366,15 +375,18 @@ namespace lfs::core::tensor_ops {
     // Explicit instantiation declarations
     extern template void launch_scatter<float>(float*, const int*, const float*, const size_t*, const size_t*, size_t, int, size_t, int, cudaStream_t);
     extern template void launch_scatter<int>(int*, const int*, const int*, const size_t*, const size_t*, size_t, int, size_t, int, cudaStream_t);
+    extern template void launch_scatter<uint8_t>(uint8_t*, const int*, const uint8_t*, const size_t*, const size_t*, size_t, int, size_t, int, cudaStream_t);
 
     extern template void launch_index_add<float>(float*, const int*, const float*, const size_t*, size_t, int, size_t, cudaStream_t);
     extern template void launch_index_add<int>(int*, const int*, const int*, const size_t*, size_t, int, size_t, cudaStream_t);
 
     extern template void launch_index_copy<float>(float*, const int*, const float*, const size_t*, size_t, int, size_t, cudaStream_t);
     extern template void launch_index_copy<int>(int*, const int*, const int*, const size_t*, size_t, int, size_t, cudaStream_t);
+    extern template void launch_index_copy<uint8_t>(uint8_t*, const int*, const uint8_t*, const size_t*, size_t, int, size_t, cudaStream_t);
 
     extern template void launch_index_fill<float>(float*, const int*, float, const size_t*, size_t, int, size_t, cudaStream_t);
     extern template void launch_index_fill<int>(int*, const int*, int, const size_t*, size_t, int, size_t, cudaStream_t);
+    extern template void launch_index_fill<uint8_t>(uint8_t*, const int*, uint8_t, const size_t*, size_t, int, size_t, cudaStream_t);
 
     LFS_CORE_API void launch_index_put(float* data, const int* indices, const float* values,
                                        size_t data_size, size_t index_size, cudaStream_t stream);

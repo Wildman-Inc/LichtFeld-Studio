@@ -8,19 +8,190 @@
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Context.h>
+#include <RmlUi/Core/DataTypeRegister.h>
+#include <RmlUi/Core/DataVariable.h>
+#include <RmlUi/Core/Elements/ElementFormControlInput.h>
+#include <RmlUi/Core/StyleSheetSpecification.h>
+#include <RmlUi/Core/Tween.h>
 #include <cassert>
 #include <cmath>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
+#include <unordered_set>
 
 namespace lfs::python {
 
-    void register_builtin_transforms(Rml::DataModelConstructor& ctor);
+    void register_builtin_transforms(Rml::DataModelConstructor& ctor, Rml::Context* context);
+    nb::object variant_to_python(const Rml::Variant& v);
+    Rml::Variant python_to_variant(const nb::handle& obj);
 
     namespace {
         std::unordered_map<Rml::ElementDocument*, std::vector<Rml::ElementPtr>> s_held_elements;
+        std::unordered_map<Rml::Element*, Rml::ElementDocument*> s_detached_element_documents;
+        std::unordered_set<Rml::ElementDocument*> s_dirty_documents;
         std::map<std::string, DataModelArrayStorage> s_model_storage;
         std::unordered_map<std::string, Rml::DataModelHandle> s_active_handles;
-        bool s_string_array_type_registered = false;
+        std::unordered_map<std::string, Rml::Context*> s_model_contexts;
+        std::unordered_set<Rml::Context*> s_string_array_type_contexts;
+        std::unordered_set<Rml::Context*> s_record_array_type_contexts;
+        std::unordered_set<Rml::Context*> s_builtin_transform_contexts;
+        std::unordered_map<Rml::Context*, class DynamicRecordDefinition*> s_record_definitions;
+
+        class DynamicFieldDefinition final : public Rml::VariableDefinition {
+        public:
+            DynamicFieldDefinition() : Rml::VariableDefinition(Rml::DataVariableType::Scalar) {}
+
+            bool Get(void* ptr, Rml::Variant& variant) override {
+                if (!ptr)
+                    return false;
+                variant = static_cast<DynamicDataField*>(ptr)->value;
+                return true;
+            }
+
+            bool Set(void* ptr, const Rml::Variant& variant) override {
+                if (!ptr)
+                    return false;
+                static_cast<DynamicDataField*>(ptr)->value = variant;
+                return true;
+            }
+        };
+
+        class DynamicRecordDefinition final : public Rml::VariableDefinition {
+        public:
+            DynamicRecordDefinition() : Rml::VariableDefinition(Rml::DataVariableType::Struct) {}
+
+            Rml::DataVariable Child(void* ptr, const Rml::DataAddressEntry& address) override {
+                if (!ptr || address.name.empty())
+                    return {};
+
+                auto* record = static_cast<DynamicDataRecord*>(ptr);
+                auto it = record->fields.find(address.name);
+                if (it == record->fields.end())
+                    return {};
+
+                return Rml::DataVariable(&field_definition_, &it->second);
+            }
+
+            Rml::StringList ReflectMemberNames() override {
+                return member_names_;
+            }
+
+            void note_member(const std::string& name) {
+                if (name.empty() || member_name_set_.contains(name))
+                    return;
+                member_name_set_.insert(name);
+                member_names_.push_back(name);
+            }
+
+        private:
+            DynamicFieldDefinition field_definition_;
+            std::unordered_set<std::string> member_name_set_;
+            Rml::StringList member_names_;
+        };
+
+        DynamicRecordDefinition* ensure_record_types_registered(
+            Rml::DataModelConstructor& ctor, Rml::Context* context) {
+            if (!context)
+                return nullptr;
+
+            auto def_it = s_record_definitions.find(context);
+            if (def_it == s_record_definitions.end()) {
+                auto record_definition = Rml::MakeUnique<DynamicRecordDefinition>();
+                auto* raw_definition = record_definition.get();
+                const bool registered =
+                    ctor.RegisterCustomDataVariableDefinition<DynamicDataRecord>(
+                        std::move(record_definition));
+                if (!registered)
+                    return nullptr;
+                def_it = s_record_definitions.emplace(context, raw_definition).first;
+            }
+
+            if (!s_record_array_type_contexts.contains(context)) {
+                if (!ctor.RegisterArray<std::vector<DynamicDataRecord>>())
+                    return nullptr;
+                s_record_array_type_contexts.insert(context);
+            }
+
+            return def_it->second;
+        }
+
+        DynamicRecordDefinition* get_record_definition(Rml::Context* context) {
+            if (!context)
+                return nullptr;
+            auto it = s_record_definitions.find(context);
+            return it != s_record_definitions.end() ? it->second : nullptr;
+        }
+
+        DynamicDataRecord python_to_record(const nb::handle& item, Rml::Context* context) {
+            DynamicDataRecord record;
+            if (!nb::isinstance<nb::dict>(item))
+                return record;
+
+            auto* record_definition = get_record_definition(context);
+            nb::dict dict = nb::cast<nb::dict>(item);
+            for (auto kv : dict) {
+                std::string key = nb::cast<std::string>(kv.first);
+                if (record_definition)
+                    record_definition->note_member(key);
+                record.fields.emplace(
+                    std::move(key),
+                    DynamicDataField{python_to_variant(kv.second)});
+            }
+            return record;
+        }
+
+        void register_detached_subtree(Rml::ElementDocument* doc, Rml::Element* element) {
+            if (!doc || !element)
+                return;
+
+            s_detached_element_documents[element] = doc;
+            for (int i = 0; i < element->GetNumChildren(); ++i) {
+                register_detached_subtree(doc, element->GetChild(i));
+            }
+        }
+
+        void unregister_detached_subtree(Rml::Element* element) {
+            if (!element)
+                return;
+
+            s_detached_element_documents.erase(element);
+            for (int i = 0; i < element->GetNumChildren(); ++i) {
+                unregister_detached_subtree(element->GetChild(i));
+            }
+        }
+
+        Rml::ElementDocument* resolve_document(Rml::Element* element) {
+            for (Rml::Element* current = element; current; current = current->GetParentNode()) {
+                if (auto* doc = current->GetOwnerDocument()) {
+                    return doc;
+                }
+                if (auto* doc = rmlui_dynamic_cast<Rml::ElementDocument*>(current)) {
+                    return doc;
+                }
+                if (auto it = s_detached_element_documents.find(current);
+                    it != s_detached_element_documents.end()) {
+                    return it->second;
+                }
+            }
+
+            return nullptr;
+        }
+
+        bool is_detached_subtree_rooted(Rml::Element* element) {
+            return element && !element->GetOwnerDocument() &&
+                   !rmlui_dynamic_cast<Rml::ElementDocument*>(element) &&
+                   resolve_document(element) != nullptr;
+        }
+
+        void mark_document_dirty(Rml::Element* element) {
+            if (!element)
+                return;
+            if (auto* doc = resolve_document(element)) {
+                s_dirty_documents.insert(doc);
+                request_redraw();
+            }
+        }
+
     } // namespace
 
     Rml::ElementPtr extractHeldElement(Rml::ElementDocument* doc, Rml::Element* raw) {
@@ -31,6 +202,7 @@ namespace lfs::python {
         for (auto vi = vec.begin(); vi != vec.end(); ++vi) {
             if (vi->get() == raw) {
                 auto ptr = std::move(*vi);
+                unregister_detached_subtree(ptr.get());
                 vec.erase(vi);
                 return ptr;
             }
@@ -39,11 +211,26 @@ namespace lfs::python {
     }
 
     void storeHeldElement(Rml::ElementDocument* doc, Rml::ElementPtr elem) {
+        register_detached_subtree(doc, elem.get());
         s_held_elements[doc].push_back(std::move(elem));
     }
 
     void clearHeldElements(Rml::ElementDocument* doc) {
+        auto it = s_held_elements.find(doc);
+        if (it != s_held_elements.end()) {
+            for (auto& elem : it->second) {
+                unregister_detached_subtree(elem.get());
+            }
+        }
         s_held_elements.erase(doc);
+    }
+
+    bool consume_document_dirty(Rml::ElementDocument* doc) {
+        return s_dirty_documents.erase(doc) > 0;
+    }
+
+    bool is_document_dirty(Rml::ElementDocument* doc) {
+        return doc && s_dirty_documents.contains(doc);
     }
 
     nb::object variant_to_python(const Rml::Variant& v) {
@@ -77,16 +264,19 @@ namespace lfs::python {
     // --- PyRmlContext ---
 
     nb::object PyRmlContext::create_data_model(const std::string& name) {
+        remove_data_model(name);
         auto ctor = ctx_->CreateDataModel(name);
         if (!ctor)
             return nb::none();
-        register_builtin_transforms(ctor);
-        return nb::cast(PyDataModelConstructor(std::move(ctor), name));
+        s_model_contexts[name] = ctx_;
+        register_builtin_transforms(ctor, ctx_);
+        return nb::cast(PyDataModelConstructor(std::move(ctor), name, ctx_));
     }
 
     bool PyRmlContext::remove_data_model(const std::string& name) {
         s_model_storage.erase(name);
         s_active_handles.erase(name);
+        s_model_contexts.erase(name);
         return ctx_->RemoveDataModel(name);
     }
 
@@ -112,6 +302,10 @@ namespace lfs::python {
 
     std::string PyRmlEvent::get_parameter(const std::string& key, const std::string& default_val) {
         return event_->GetParameter<Rml::String>(key, default_val);
+    }
+
+    bool PyRmlEvent::get_bool_parameter(const std::string& key, const bool default_val) {
+        return event_->GetParameter<bool>(key, default_val);
     }
 
     // --- PyRmlElement ---
@@ -158,65 +352,110 @@ namespace lfs::python {
     int PyRmlElement::num_children() { return elem_->GetNumChildren(); }
 
     nb::object PyRmlElement::append_child(const std::string& tag_name) {
-        auto* doc = elem_->GetOwnerDocument();
-        assert(doc);
+        auto* doc = resolve_document(elem_);
+        if (!doc) {
+            LOG_ERROR("append_child: failed to resolve owning document for <{}>", elem_->GetTagName());
+            return nb::none();
+        }
         auto new_elem = doc->CreateElement(tag_name);
         if (!new_elem)
             return nb::none();
         Rml::Element* raw = new_elem.get();
+        const bool parent_detached = is_detached_subtree_rooted(elem_);
         elem_->AppendChild(std::move(new_elem));
+        if (parent_detached) {
+            register_detached_subtree(doc, raw);
+        }
+        mark_document_dirty(elem_);
         return nb::cast(PyRmlElement(raw));
     }
 
     nb::object PyRmlElement::append_child_element(PyRmlElement& child) {
-        auto* doc = elem_->GetOwnerDocument();
-        assert(doc);
+        auto* doc = resolve_document(elem_);
+        if (!doc) {
+            LOG_ERROR("append_child_element: failed to resolve owning document for <{}>",
+                      elem_->GetTagName());
+            return nb::none();
+        }
         auto held = extractHeldElement(doc, child.raw());
         if (!held) {
-            LOG_ERROR("append_child: element not in holding area");
+            LOG_ERROR("append_child_element: element not in holding area");
             return nb::none();
         }
         Rml::Element* raw = held.get();
+        const bool parent_detached = is_detached_subtree_rooted(elem_);
         elem_->AppendChild(std::move(held));
+        if (parent_detached) {
+            register_detached_subtree(doc, raw);
+        }
+        mark_document_dirty(elem_);
         return nb::cast(PyRmlElement(raw));
     }
 
     nb::object PyRmlElement::insert_before(const std::string& tag_name, PyRmlElement& ref_child) {
-        auto* doc = elem_->GetOwnerDocument();
-        assert(doc);
+        auto* doc = resolve_document(elem_);
+        if (!doc) {
+            LOG_ERROR("insert_before: failed to resolve owning document for <{}>", elem_->GetTagName());
+            return nb::none();
+        }
         auto new_elem = doc->CreateElement(tag_name);
         if (!new_elem)
             return nb::none();
         Rml::Element* raw = new_elem.get();
+        const bool parent_detached = is_detached_subtree_rooted(elem_);
         elem_->InsertBefore(std::move(new_elem), ref_child.raw());
+        if (parent_detached) {
+            register_detached_subtree(doc, raw);
+        }
+        mark_document_dirty(elem_);
         return nb::cast(PyRmlElement(raw));
     }
 
     nb::object PyRmlElement::insert_before_element(PyRmlElement& child, PyRmlElement& ref_child) {
-        auto* doc = elem_->GetOwnerDocument();
-        assert(doc);
+        auto* doc = resolve_document(elem_);
+        if (!doc) {
+            LOG_ERROR("insert_before_element: failed to resolve owning document for <{}>",
+                      elem_->GetTagName());
+            return nb::none();
+        }
         auto held = extractHeldElement(doc, child.raw());
         if (!held) {
-            LOG_ERROR("insert_before: element not in holding area");
+            LOG_ERROR("insert_before_element: element not in holding area");
             return nb::none();
         }
         Rml::Element* raw = held.get();
+        const bool parent_detached = is_detached_subtree_rooted(elem_);
         elem_->InsertBefore(std::move(held), ref_child.raw());
+        if (parent_detached) {
+            register_detached_subtree(doc, raw);
+        }
+        mark_document_dirty(elem_);
         return nb::cast(PyRmlElement(raw));
     }
 
     void PyRmlElement::remove_child(PyRmlElement& child) {
-        elem_->RemoveChild(child.raw());
+        auto removed = elem_->RemoveChild(child.raw());
+        if (removed) {
+            unregister_detached_subtree(removed.get());
+        }
+        mark_document_dirty(elem_);
     }
 
-    void PyRmlElement::set_inner_rml(const std::string& rml) { elem_->SetInnerRML(rml); }
+    void PyRmlElement::set_inner_rml(const std::string& rml) {
+        elem_->SetInnerRML(rml);
+        mark_document_dirty(elem_);
+    }
 
     std::string PyRmlElement::get_inner_rml() { return elem_->GetInnerRML(); }
 
-    void PyRmlElement::set_text(const std::string& text) { elem_->SetInnerRML(text); }
+    void PyRmlElement::set_text(const std::string& text) {
+        elem_->SetInnerRML(Rml::StringUtilities::EncodeRml(text));
+        mark_document_dirty(elem_);
+    }
 
     void PyRmlElement::set_attribute(const std::string& name, const std::string& value) {
         elem_->SetAttribute(name, value);
+        mark_document_dirty(elem_);
     }
 
     std::string PyRmlElement::get_attribute(const std::string& name,
@@ -225,15 +464,26 @@ namespace lfs::python {
     }
 
     bool PyRmlElement::has_attribute(const std::string& name) {
+        if (name == "checked" && elem_->GetTagName() == "input") {
+            const auto input_type = elem_->GetAttribute<Rml::String>("type", "");
+            if (input_type == "checkbox" || input_type == "radio") {
+                // RmlUi tracks live checkbox/radio state via pseudo-classes.
+                return elem_->IsPseudoClassSet("checked");
+            }
+        }
         return elem_->HasAttribute(name);
     }
 
     void PyRmlElement::remove_attribute(const std::string& name) {
         elem_->RemoveAttribute(name);
+        mark_document_dirty(elem_);
     }
 
     void PyRmlElement::set_class(const std::string& name, bool active) {
+        if (elem_->IsClassSet(name) == active)
+            return;
         elem_->SetClass(name, active);
+        mark_document_dirty(elem_);
     }
 
     bool PyRmlElement::is_class_set(const std::string& name) {
@@ -242,6 +492,7 @@ namespace lfs::python {
 
     void PyRmlElement::set_class_names(const std::string& names) {
         elem_->SetClassNames(names);
+        mark_document_dirty(elem_);
     }
 
     std::string PyRmlElement::get_class_names() {
@@ -249,11 +500,130 @@ namespace lfs::python {
     }
 
     bool PyRmlElement::set_property(const std::string& name, const std::string& value) {
-        return elem_->SetProperty(name, value);
+        const bool changed = elem_->SetProperty(name, value);
+        if (changed)
+            mark_document_dirty(elem_);
+        return changed;
     }
 
     void PyRmlElement::remove_property(const std::string& name) {
         elem_->RemoveProperty(name);
+        mark_document_dirty(elem_);
+    }
+
+    namespace {
+        Rml::Tween parse_tween(const std::string& str) {
+            static const std::unordered_map<std::string, Rml::Tween::Type> types = {
+                {"none", Rml::Tween::None},
+                {"back", Rml::Tween::Back},
+                {"bounce", Rml::Tween::Bounce},
+                {"circular", Rml::Tween::Circular},
+                {"cubic", Rml::Tween::Cubic},
+                {"elastic", Rml::Tween::Elastic},
+                {"exponential", Rml::Tween::Exponential},
+                {"linear", Rml::Tween::Linear},
+                {"quadratic", Rml::Tween::Quadratic},
+                {"quartic", Rml::Tween::Quartic},
+                {"quintic", Rml::Tween::Quintic},
+                {"sine", Rml::Tween::Sine},
+            };
+            static const std::unordered_map<std::string, Rml::Tween::Direction> dirs = {
+                {"in", Rml::Tween::In},
+                {"out", Rml::Tween::Out},
+                {"inout", Rml::Tween::InOut},
+                {"in-out", Rml::Tween::InOut},
+            };
+
+            auto type = Rml::Tween::Quadratic;
+            auto dir = Rml::Tween::Out;
+
+            auto sep = str.find('-');
+            std::string type_str = str;
+            std::string dir_str;
+            if (sep != std::string::npos) {
+                type_str = str.substr(0, sep);
+                dir_str = str.substr(sep + 1);
+                // Handle "in-out" as a compound direction
+                if (dir_str == "out" || dir_str == "in") {
+                    // single direction, already split correctly
+                } else if (type_str.size() > 0) {
+                    // Could be "in-out" where type_str is e.g. "quadratic" from "quadratic-in-out"
+                    auto second_sep = dir_str.find('-');
+                    if (second_sep != std::string::npos) {
+                        dir_str = str.substr(sep + 1);
+                    }
+                }
+            }
+
+            if (auto it = types.find(type_str); it != types.end())
+                type = it->second;
+            if (!dir_str.empty()) {
+                if (auto it = dirs.find(dir_str); it != dirs.end())
+                    dir = it->second;
+            }
+
+            return Rml::Tween(type, dir);
+        }
+
+        std::optional<Rml::Property> parse_property_value(const std::string& property,
+                                                          const std::string& value) {
+            Rml::PropertyDictionary dict;
+            if (!Rml::StyleSheetSpecification::ParsePropertyDeclaration(dict, property, value))
+                return std::nullopt;
+            auto& props = dict.GetProperties();
+            if (props.empty())
+                return std::nullopt;
+            return props.begin()->second;
+        }
+
+        class AnimationCleanupListener final : public Rml::EventListener {
+        public:
+            explicit AnimationCleanupListener(std::string property) : property_(std::move(property)) {}
+
+            void ProcessEvent(Rml::Event& event) override {
+                if (event.GetParameter("property", Rml::String{}) != property_)
+                    return;
+                if (auto* el = event.GetCurrentElement()) {
+                    el->RemoveProperty(property_);
+                    el->RemoveEventListener("animationend", this, false);
+                    mark_document_dirty(el);
+                }
+            }
+
+            void OnDetach(Rml::Element*) override { delete this; }
+
+        private:
+            Rml::String property_;
+        };
+    } // namespace
+
+    bool PyRmlElement::animate(const std::string& property, const std::string& target_value,
+                               float duration, const std::string& tween,
+                               const std::optional<std::string>& start_value,
+                               bool remove_on_complete) {
+        auto target = parse_property_value(property, target_value);
+        if (!target)
+            return false;
+
+        auto tw = parse_tween(tween);
+
+        const Rml::Property* start_ptr = nullptr;
+        std::optional<Rml::Property> start;
+        if (start_value) {
+            start = parse_property_value(property, *start_value);
+            if (!start)
+                return false;
+            start_ptr = &*start;
+        }
+
+        bool ok = elem_->Animate(property, *target, duration, tw, 1, false, 0.f, start_ptr);
+        if (ok) {
+            if (remove_on_complete)
+                elem_->AddEventListener("animationend", new AnimationCleanupListener(property),
+                                        false);
+            mark_document_dirty(elem_);
+        }
+        return ok;
     }
 
     void PyRmlElement::add_event_listener(const std::string& event, nb::callable callback) {
@@ -267,14 +637,48 @@ namespace lfs::python {
 
     float PyRmlElement::scroll_left() { return elem_->GetScrollLeft(); }
     float PyRmlElement::scroll_top() { return elem_->GetScrollTop(); }
-    void PyRmlElement::set_scroll_left(float v) { elem_->SetScrollLeft(v); }
-    void PyRmlElement::set_scroll_top(float v) { elem_->SetScrollTop(v); }
+    void PyRmlElement::set_scroll_left(float v) {
+        elem_->SetScrollLeft(v);
+        mark_document_dirty(elem_);
+    }
+    void PyRmlElement::set_scroll_top(float v) {
+        elem_->SetScrollTop(v);
+        mark_document_dirty(elem_);
+    }
     float PyRmlElement::scroll_width() { return elem_->GetScrollWidth(); }
     float PyRmlElement::scroll_height() { return elem_->GetScrollHeight(); }
+    float PyRmlElement::client_width() { return elem_->GetClientWidth(); }
+    float PyRmlElement::client_height() { return elem_->GetClientHeight(); }
+    float PyRmlElement::absolute_left() { return elem_->GetAbsoluteOffset(Rml::BoxArea::Border).x; }
+    float PyRmlElement::absolute_top() { return elem_->GetAbsoluteOffset(Rml::BoxArea::Border).y; }
+    float PyRmlElement::absolute_width() { return elem_->GetBox().GetSize(Rml::BoxArea::Border).x; }
+    float PyRmlElement::absolute_height() { return elem_->GetBox().GetSize(Rml::BoxArea::Border).y; }
+    float PyRmlElement::offset_top() { return elem_->GetOffsetTop(); }
+    float PyRmlElement::offset_height() { return elem_->GetOffsetHeight(); }
     void PyRmlElement::scroll_into_view(bool align_top) { elem_->ScrollIntoView(align_top); }
 
     bool PyRmlElement::focus() { return elem_->Focus(); }
     void PyRmlElement::blur() { elem_->Blur(); }
+    bool PyRmlElement::select() {
+        if (auto* input = rmlui_dynamic_cast<Rml::ElementFormControlInput*>(elem_)) {
+            input->Select();
+            mark_document_dirty(input);
+            return true;
+        }
+        return false;
+    }
+
+    void PyRmlElement::submit(const std::string& name, const std::string& value) {
+        Rml::Element* element = elem_;
+        while (element) {
+            if (auto* form = rmlui_dynamic_cast<Rml::ElementForm*>(element)) {
+                form->Submit(name, value);
+                mark_document_dirty(form);
+                return;
+            }
+            element = element->GetParentNode();
+        }
+    }
 
     // --- PyRmlDocument ---
 
@@ -296,19 +700,33 @@ namespace lfs::python {
         return nb::cast(PyRmlElement(raw));
     }
 
-    void PyRmlDocument::show() { doc_->Show(); }
-    void PyRmlDocument::hide() { doc_->Hide(); }
+    void PyRmlDocument::show() {
+        doc_->Show();
+        s_dirty_documents.insert(doc_);
+        request_redraw();
+    }
+    void PyRmlDocument::hide() {
+        doc_->Hide();
+        s_dirty_documents.insert(doc_);
+        request_redraw();
+    }
     std::string PyRmlDocument::title() { return doc_->GetTitle(); }
-    void PyRmlDocument::set_title(const std::string& t) { doc_->SetTitle(t); }
+    void PyRmlDocument::set_title(const std::string& t) {
+        doc_->SetTitle(t);
+        s_dirty_documents.insert(doc_);
+        request_redraw();
+    }
 
     nb::object PyRmlDocument::create_data_model(const std::string& name) {
         auto* ctx = doc_->GetContext();
         assert(ctx);
+        remove_data_model(name);
         auto ctor = ctx->CreateDataModel(name);
         if (!ctor)
             return nb::none();
-        register_builtin_transforms(ctor);
-        return nb::cast(PyDataModelConstructor(std::move(ctor), name));
+        s_model_contexts[name] = ctx;
+        register_builtin_transforms(ctor, ctx);
+        return nb::cast(PyDataModelConstructor(std::move(ctor), name, ctx));
     }
 
     bool PyRmlDocument::remove_data_model(const std::string& name) {
@@ -316,6 +734,7 @@ namespace lfs::python {
         assert(ctx);
         s_model_storage.erase(name);
         s_active_handles.erase(name);
+        s_model_contexts.erase(name);
         return ctx->RemoveDataModel(name);
     }
 
@@ -323,10 +742,12 @@ namespace lfs::python {
 
     void PyDataModelHandle::dirty(const std::string& name) {
         handle_.DirtyVariable(name);
+        request_redraw();
     }
 
     void PyDataModelHandle::dirty_all() {
         handle_.DirtyAllVariables();
+        request_redraw();
     }
 
     bool PyDataModelHandle::is_dirty(const std::string& name) {
@@ -338,12 +759,33 @@ namespace lfs::python {
         assert(model_it != s_model_storage.end());
         auto arr_it = model_it->second.string_arrays.find(name);
         assert(arr_it != model_it->second.string_arrays.end());
-        auto& vec = arr_it->second;
-        vec.clear();
-        vec.reserve(nb::len(items));
+        std::vector<Rml::String> updated;
+        updated.reserve(nb::len(items));
         for (auto item : items)
-            vec.push_back(nb::cast<std::string>(item));
+            updated.push_back(nb::cast<std::string>(item));
+        if (updated == arr_it->second)
+            return;
+        arr_it->second = std::move(updated);
         handle_.DirtyVariable(name);
+        request_redraw();
+    }
+
+    void PyDataModelHandle::update_record_list(const std::string& name, nb::list items) {
+        auto model_it = s_model_storage.find(model_name_);
+        assert(model_it != s_model_storage.end());
+        auto arr_it = model_it->second.record_arrays.find(name);
+        assert(arr_it != model_it->second.record_arrays.end());
+
+        std::vector<DynamicDataRecord> updated;
+        updated.reserve(nb::len(items));
+        for (auto item : items)
+            updated.push_back(python_to_record(item, context_));
+
+        if (updated == arr_it->second)
+            return;
+        arr_it->second = std::move(updated);
+        handle_.DirtyVariable(name);
+        request_redraw();
     }
 
     // --- PyDataModelConstructor ---
@@ -389,16 +831,18 @@ namespace lfs::python {
         nb::callable cb = nb::borrow<nb::callable>(callback);
         prevent_gc_.push_back(nb::object(cb));
         const auto model_name = model_name_;
+        auto* context = context_;
 
         ctor_.BindEventCallback(
-            name, [cb, model_name](Rml::DataModelHandle handle, Rml::Event& event,
-                                   const Rml::VariantList& args) {
+            name, [cb, model_name, context](Rml::DataModelHandle handle, Rml::Event& event,
+                                            const Rml::VariantList& args) {
                 nb::gil_scoped_acquire gil;
                 try {
                     nb::list py_args;
                     for (const auto& arg : args)
                         py_args.append(variant_to_python(arg));
-                    cb(PyDataModelHandle(handle, model_name), PyRmlEvent(&event), py_args);
+                    cb(PyDataModelHandle(handle, model_name, context), PyRmlEvent(&event),
+                       py_args);
                 } catch (const std::exception& e) {
                     LOG_ERROR("Data model event error: {}", e.what());
                 }
@@ -426,22 +870,34 @@ namespace lfs::python {
     }
 
     void PyDataModelConstructor::bind_string_list(const std::string& name) {
-        if (!s_string_array_type_registered) {
-            ctor_.RegisterArray<std::vector<Rml::String>>();
-            s_string_array_type_registered = true;
+        if (context_ && !s_string_array_type_contexts.contains(context_)) {
+            if (!ctor_.RegisterArray<std::vector<Rml::String>>())
+                return;
+            s_string_array_type_contexts.insert(context_);
         }
         auto& storage = s_model_storage[model_name_];
         storage.string_arrays[name]; // create empty vector
         ctor_.Bind(name, &storage.string_arrays[name]);
     }
 
+    void PyDataModelConstructor::bind_record_list(const std::string& name) {
+        if (!ensure_record_types_registered(ctor_, context_))
+            return;
+        auto& storage = s_model_storage[model_name_];
+        storage.record_arrays[name];
+        ctor_.Bind(name, &storage.record_arrays[name]);
+    }
+
     PyDataModelHandle PyDataModelConstructor::get_handle() {
         auto handle = ctor_.GetModelHandle();
         s_active_handles[model_name_] = handle;
-        return PyDataModelHandle(handle, model_name_);
+        return PyDataModelHandle(handle, model_name_, context_);
     }
 
-    void register_builtin_transforms(Rml::DataModelConstructor& ctor) {
+    void register_builtin_transforms(Rml::DataModelConstructor& ctor, Rml::Context* context) {
+        if (context && s_builtin_transform_contexts.contains(context))
+            return;
+
         ctor.RegisterTransformFunc("format_float",
                                    [](const Rml::VariantList& args) -> Rml::Variant {
                                        if (args.empty())
@@ -481,11 +937,9 @@ namespace lfs::python {
                                        std::snprintf(buf, sizeof(buf), "%.1f\xC2\xB0", deg);
                                        return Rml::Variant(Rml::String(buf));
                                    });
-    }
 
-    void dirty_all_data_models() {
-        for (auto& [name, handle] : s_active_handles)
-            handle.DirtyAllVariables();
+        if (context)
+            s_builtin_transform_contexts.insert(context);
     }
 
     // --- PyEventListener ---
@@ -527,9 +981,31 @@ namespace lfs::python {
         return it != documents_.end() ? it->second : nullptr;
     }
 
+    void release_rml_context_state(Rml::Context* context) {
+        if (!context)
+            return;
+
+        std::erase_if(s_model_contexts, [context](const auto& entry) {
+            if (entry.second != context)
+                return false;
+            s_model_storage.erase(entry.first);
+            s_active_handles.erase(entry.first);
+            return true;
+        });
+
+        s_string_array_type_contexts.erase(context);
+        s_record_array_type_contexts.erase(context);
+        s_builtin_transform_contexts.erase(context);
+        s_record_definitions.erase(context);
+    }
+
     // --- Nanobind registration ---
 
     void register_rml_bindings(nb::module_& m) {
+        set_rml_context_destroy_handler([](void* ctx) {
+            release_rml_context_state(static_cast<Rml::Context*>(ctx));
+        });
+
         auto rml = m.def_submodule("rml", "RmlUI DOM API");
 
         nb::class_<PyRmlContext>(rml, "RmlContext")
@@ -542,7 +1018,9 @@ namespace lfs::python {
             .def("current_target", &PyRmlEvent::current_target)
             .def("stop_propagation", &PyRmlEvent::stop_propagation)
             .def("get_parameter", &PyRmlEvent::get_parameter, nb::arg("key"),
-                 nb::arg("default_val") = "");
+                 nb::arg("default_val") = "")
+            .def("get_bool_parameter", &PyRmlEvent::get_bool_parameter, nb::arg("key"),
+                 nb::arg("default_val") = false);
 
         nb::class_<PyRmlElement>(rml, "RmlElement")
             .def("get_element_by_id", &PyRmlElement::get_element_by_id)
@@ -572,6 +1050,10 @@ namespace lfs::python {
             .def("get_class_names", &PyRmlElement::get_class_names)
             .def("set_property", &PyRmlElement::set_property)
             .def("remove_property", &PyRmlElement::remove_property)
+            .def("animate", &PyRmlElement::animate, nb::arg("property"),
+                 nb::arg("target_value"), nb::arg("duration"),
+                 nb::arg("tween") = "quadratic-out", nb::arg("start_value") = nb::none(),
+                 nb::arg("remove_on_complete") = false)
             .def("add_event_listener", &PyRmlElement::add_event_listener)
             .def("set_id", &PyRmlElement::set_id)
             .def_prop_rw("id", &PyRmlElement::id, &PyRmlElement::set_id)
@@ -581,10 +1063,21 @@ namespace lfs::python {
             .def_prop_rw("scroll_top", &PyRmlElement::scroll_top, &PyRmlElement::set_scroll_top)
             .def_prop_ro("scroll_width", &PyRmlElement::scroll_width)
             .def_prop_ro("scroll_height", &PyRmlElement::scroll_height)
+            .def_prop_ro("client_width", &PyRmlElement::client_width)
+            .def_prop_ro("client_height", &PyRmlElement::client_height)
+            .def_prop_ro("absolute_left", &PyRmlElement::absolute_left)
+            .def_prop_ro("absolute_top", &PyRmlElement::absolute_top)
+            .def_prop_ro("absolute_width", &PyRmlElement::absolute_width)
+            .def_prop_ro("absolute_height", &PyRmlElement::absolute_height)
+            .def_prop_ro("offset_top", &PyRmlElement::offset_top)
+            .def_prop_ro("offset_height", &PyRmlElement::offset_height)
             .def("scroll_into_view", &PyRmlElement::scroll_into_view,
                  nb::arg("align_top") = true)
             .def("focus", &PyRmlElement::focus)
-            .def("blur", &PyRmlElement::blur);
+            .def("blur", &PyRmlElement::blur)
+            .def("select", &PyRmlElement::select)
+            .def("submit", &PyRmlElement::submit, nb::arg("name") = "",
+                 nb::arg("value") = "");
 
         nb::class_<PyRmlDocument, PyRmlElement>(rml, "RmlDocument")
             .def("create_element", &PyRmlDocument::create_element)
@@ -600,6 +1093,8 @@ namespace lfs::python {
             .def("dirty_all", &PyDataModelHandle::dirty_all)
             .def("is_dirty", &PyDataModelHandle::is_dirty, nb::arg("name"))
             .def("update_string_list", &PyDataModelHandle::update_string_list, nb::arg("name"),
+                 nb::arg("items"))
+            .def("update_record_list", &PyDataModelHandle::update_record_list, nb::arg("name"),
                  nb::arg("items"));
 
         nb::class_<PyDataModelConstructor>(rml, "DataModelConstructor")
@@ -612,6 +1107,7 @@ namespace lfs::python {
             .def("register_transform", &PyDataModelConstructor::register_transform,
                  nb::arg("name"), nb::arg("func"))
             .def("bind_string_list", &PyDataModelConstructor::bind_string_list, nb::arg("name"))
+            .def("bind_record_list", &PyDataModelConstructor::bind_record_list, nb::arg("name"))
             .def("get_handle", &PyDataModelConstructor::get_handle);
 
         rml.def("get_document", [](const std::string& name) -> nb::object {

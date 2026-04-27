@@ -1,3 +1,5 @@
+"""User interface API"""
+
 from collections.abc import Callable, Sequence
 import enum
 from typing import overload
@@ -176,6 +178,19 @@ class ThemeSizes:
     @property
     def toolbar_spacing(self) -> float: ...
 
+class ThemeVignette:
+    @property
+    def enabled(self) -> bool: ...
+
+    @property
+    def intensity(self) -> float: ...
+
+    @property
+    def radius(self) -> float: ...
+
+    @property
+    def softness(self) -> float: ...
+
 class Theme:
     @property
     def name(self) -> str: ...
@@ -186,8 +201,20 @@ class Theme:
     @property
     def sizes(self) -> ThemeSizes: ...
 
+    @property
+    def vignette(self) -> ThemeVignette: ...
+
 def theme() -> Theme:
     """Get the current theme"""
+
+def set_theme_vignette_enabled(arg: bool, /) -> None:
+    """Set theme vignette enabled"""
+
+def set_theme_vignette_intensity(arg: float, /) -> None:
+    """Set theme vignette intensity"""
+
+def set_theme_vignette_style(arg0: float, arg1: float, arg2: float, /) -> None:
+    """Set vignette intensity, radius, and softness"""
 
 class PanelSpace(enum.Enum):
     SIDE_PANEL = 0
@@ -196,51 +223,155 @@ class PanelSpace(enum.Enum):
 
     VIEWPORT_OVERLAY = 2
 
-    DOCKABLE = 3
+    MAIN_PANEL_TAB = 3
 
-    MAIN_PANEL_TAB = 4
+    SCENE_HEADER = 4
 
-    SCENE_HEADER = 5
+    BOTTOM_DOCK = 5
 
     STATUS_BAR = 6
 
-def register_panel(cls: object) -> None:
-    """Register a panel class for rendering in the UI"""
+class PanelHeightMode(enum.Enum):
+    FILL = 0
 
-def register_rml_panel(cls: object) -> None:
-    """Register an RmlUI panel class"""
+    CONTENT = 1
 
-def unregister_panel(cls: object) -> None:
-    """Unregister a panel class"""
+class PanelOption(enum.Enum):
+    DEFAULT_CLOSED = 1
+
+    HIDE_HEADER = 2
+
+class PollDependency(enum.Enum):
+    NONE = 0
+
+    SELECTION = 1
+
+    TRAINING = 2
+
+    SCENE = 4
+
+    ALL = 7
+
+class Panel:
+    """Public base class for all Python UI panels."""
+
+    id: str = ''
+
+    label: str = ''
+
+    space: PanelSpace = PanelSpace.MAIN_PANEL_TAB
+
+    parent: str = ''
+
+    order: int = 100
+
+    options: set = ...
+
+    poll_dependencies: set = ...
+
+    size: None = None
+
+    template: str = ''
+
+    style: str = ''
+
+    height_mode: PanelHeightMode = PanelHeightMode.FILL
+
+    update_interval_ms: int = 100
+
+    @classmethod
+    def poll(cls, context) -> bool: ...
+
+    def draw(self, ui): ...
+
+    def on_bind_model(self, ctx): ...
+
+    def on_mount(self, doc): ...
+
+    def on_unmount(self, doc): ...
+
+    def on_update(self, doc): ...
+
+    def on_scene_changed(self, doc): ...
+
+class PanelSummary:
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def label(self) -> str: ...
+
+    @property
+    def space(self) -> PanelSpace: ...
+
+    @property
+    def order(self) -> int: ...
+
+    @property
+    def enabled(self) -> bool: ...
+
+class PanelInfo:
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def label(self) -> str: ...
+
+    @property
+    def parent(self) -> str: ...
+
+    @property
+    def space(self) -> PanelSpace: ...
+
+    @property
+    def order(self) -> int: ...
+
+    @property
+    def enabled(self) -> bool: ...
+
+    @property
+    def options(self) -> set: ...
+
+    @property
+    def poll_dependencies(self) -> set: ...
+
+    @property
+    def is_native(self) -> bool: ...
+
+    @property
+    def size(self) -> object: ...
 
 def unregister_all_panels() -> None:
     """Unregister all Python panels"""
 
-def get_panel_names(space: str = 'FLOATING') -> list[str]:
-    """Get registered panel names for a given space"""
+def unregister_panels_for_module(module_prefix: str) -> None:
+    """Unregister all panels registered by a given module prefix"""
 
-def set_panel_enabled(idname: str, enabled: bool) -> None:
-    """Enable or disable a panel by idname"""
+def get_panel_names(space: PanelSpace = PanelSpace.FLOATING) -> list[str]:
+    """Get registered panel ids for a given space"""
 
-def is_panel_enabled(idname: str) -> bool:
+def set_panel_enabled(panel_id: str, enabled: bool) -> None:
+    """Enable or disable a panel by id"""
+
+def is_panel_enabled(panel_id: str) -> bool:
     """Check if a panel is enabled"""
 
-def get_main_panel_tabs() -> list:
-    """Get all main panel tabs as list of dicts"""
+def get_main_panel_tabs() -> list[PanelSummary]:
+    """Get all main panel tabs as typed panel summaries"""
 
-def get_panel(idname: str) -> object:
-    """Get panel info by idname (None if not found)"""
+def get_panel(panel_id: str) -> PanelInfo | None:
+    """Get typed panel info by id (None if not found)"""
 
-def set_panel_label(idname: str, label: str) -> bool:
+def set_panel_label(panel_id: str, label: str) -> bool:
     """Set the display label for a panel"""
 
-def set_panel_order(idname: str, order: int) -> bool:
+def set_panel_order(panel_id: str, order: int) -> bool:
     """Set the sort order for a panel"""
 
-def set_panel_space(idname: str, space: str) -> bool:
+def set_panel_space(panel_id: str, space: PanelSpace) -> bool:
     """Set the panel space (where it renders)"""
 
-def set_panel_parent(idname: str, parent: str) -> bool:
+def set_panel_parent(panel_id: str, parent: str) -> bool:
     """Set the parent panel (embeds as collapsible section)"""
 
 def has_main_panel_tabs() -> bool:
@@ -301,7 +432,10 @@ class RmlUILayout:
 
     def stepper_float(self, label: str, value: float, steps: Sequence[float] = [1.0, 0.10000000149011612, 0.009999999776482582]) -> tuple[bool, float]: ...
 
-    def path_input(self, label: str, value: str, folder_mode: bool = True, dialog_title: str = '') -> tuple[bool, str]: ...
+    def path_input(self, label: str, value: str, folder_mode: bool = True, dialog_title: str = '') -> tuple[bool, str]:
+        """
+        Draw a path input, returns (changed, path). dialog_title is accepted for compatibility and currently ignored.
+        """
 
     def color_edit3(self, label: str, color: tuple[float, float, float]) -> tuple[bool, tuple[float, float, float]]: ...
 
@@ -874,6 +1008,9 @@ def request_redraw() -> None:
 def consume_redraw_request() -> bool:
     """Consume and return pending redraw request flag"""
 
+def schedule_on_ui_thread(callback: Callable) -> None:
+    """Schedule a Python callable on the UI thread"""
+
 class Event:
     def __init__(self) -> None:
         """Create a default Event"""
@@ -1160,7 +1297,7 @@ class SubLayout:
     def __getattr__(self, arg: str, /) -> object: ...
 
 class WindowFlags:
-    None: int = ...
+    NONE: int = ...
     """No flags set"""
 
     NoScrollbar: int = ...
@@ -1290,7 +1427,9 @@ class UILayout:
         """
 
     def path_input(self, label: str, value: str, folder_mode: bool = True, dialog_title: str = '') -> tuple[bool, str]:
-        """Draw a path input with browse button, returns (changed, path)"""
+        """
+        Draw a path input with browse button, returns (changed, path). dialog_title is accepted for compatibility and currently ignored.
+        """
 
     def color_edit3(self, label: str, color: tuple[float, float, float]) -> tuple[bool, tuple[float, float, float]]:
         """Draw an RGB color editor, returns (changed, color)"""
@@ -1741,12 +1880,19 @@ def open_image_dialog(start_dir: str = '') -> str:
     Open a file dialog to select an image file. Returns empty string if cancelled.
     """
 
+def open_environment_map_dialog(start_dir: str = '') -> str:
+    """
+    Open a file dialog to select an environment map (.hdr, .exr). Returns empty string if cancelled.
+    """
+
 def open_folder_dialog(title: str = 'Select Folder', start_dir: str = '') -> str:
-    """Open a folder selection dialog. Returns empty string if cancelled."""
+    """
+    Open a folder selection dialog. Returns empty string if cancelled. title is accepted for compatibility and currently ignored.
+    """
 
 def open_ply_file_dialog(start_dir: str = '') -> str:
     """
-    Open a file dialog to select a PLY file. Returns empty string if cancelled.
+    Open a file dialog to select a splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz). Returns empty string if cancelled.
     """
 
 def open_mesh_file_dialog(start_dir: str = '') -> str:
@@ -1759,6 +1905,11 @@ def open_checkpoint_file_dialog() -> str:
     Open a file dialog to select a checkpoint file. Returns empty string if cancelled.
     """
 
+def open_ppisp_file_dialog(start_dir: str = '') -> str:
+    """
+    Open a file dialog to select a PPISP sidecar file. Returns empty string if cancelled.
+    """
+
 def open_json_file_dialog() -> str:
     """
     Open a file dialog to select a JSON config file. Returns empty string if cancelled.
@@ -1769,24 +1920,39 @@ def save_json_file_dialog(default_name: str = 'config.json') -> str:
     Open a save file dialog for JSON files. Returns empty string if cancelled.
     """
 
-def save_ply_file_dialog(default_name: str = 'export.ply') -> str:
+def save_ply_file_dialog(default_name: str = 'export') -> str:
     """
     Open a save file dialog for PLY files. Returns empty string if cancelled.
     """
 
-def save_sog_file_dialog(default_name: str = 'export.sog') -> str:
+def save_sog_file_dialog(default_name: str = 'export') -> str:
     """
     Open a save file dialog for SOG files. Returns empty string if cancelled.
     """
 
-def save_spz_file_dialog(default_name: str = 'export.spz') -> str:
+def save_spz_file_dialog(default_name: str = 'export') -> str:
     """
     Open a save file dialog for SPZ files. Returns empty string if cancelled.
     """
 
-def save_html_file_dialog(default_name: str = 'viewer.html') -> str:
+def save_usd_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for USD files. Returns empty string if cancelled.
+    """
+
+def save_usdz_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for USDZ files. Returns empty string if cancelled.
+    """
+
+def save_html_file_dialog(default_name: str = 'viewer') -> str:
     """
     Open a save file dialog for HTML viewer files. Returns empty string if cancelled.
+    """
+
+def save_rad_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for RAD files. Returns empty string if cancelled.
     """
 
 def open_dataset_folder_dialog() -> str:
@@ -1880,10 +2046,10 @@ def loc_clear_all() -> None:
     """Clear all localization overrides"""
 
 def register_popup_draw_callback(callback: object) -> None:
-    """Register a callback for drawing popup content"""
+    """Register a legacy immediate-mode callback for drawing popup content"""
 
 def unregister_popup_draw_callback(callback: object) -> None:
-    """Unregister the popup draw callback"""
+    """Unregister a legacy popup draw callback"""
 
 def on_show_dataset_load_popup(callback: object) -> None:
     """Register callback for ShowDatasetLoadPopup event"""
@@ -1893,6 +2059,9 @@ def on_show_resume_checkpoint_popup(callback: object) -> None:
 
 def on_request_exit(callback: object) -> None:
     """Register callback for RequestExit event"""
+
+def on_open_camera_preview(callback: object) -> None:
+    """Register callback for OpenCameraPreview event"""
 
 def set_exit_popup_open(open: bool) -> None:
     """Set exit popup open state (for window close callback)"""
@@ -1935,6 +2104,22 @@ def execute_mirror(axis: str) -> None:
 
 def go_to_camera_view(cam_uid: int) -> None:
     """Go to camera view by UID"""
+
+def open_camera_preview(cam_uid: int) -> None:
+    """Open the image preview panel for a camera UID"""
+
+def toggle_gt_comparison() -> None:
+    """Toggle ground-truth comparison split view"""
+
+def is_gt_comparison_active() -> bool:
+    """
+    Returns true if ground-truth comparison split view is currently enabled.
+    """
+
+def reveal_in_file_manager(path: str) -> bool:
+    """
+    Reveal a file or directory in the OS file manager. Returns true on success.
+    """
 
 def apply_cropbox() -> None:
     """Apply the selected cropbox"""
@@ -1981,6 +2166,16 @@ def load_thumbnail(path: str, max_size: int) -> tuple:
 
 def release_texture(texture_id: int) -> None:
     """Release an OpenGL texture"""
+
+def get_image_info(path: str) -> tuple:
+    """
+    Get image dimensions without loading pixel data, returns (width, height, channels)
+    """
+
+def sample_image_color(path: str, x: int, y: int, radius: int = 10) -> tuple:
+    """
+    Sample average color around pixel (x, y) within given radius, returns (r, g, b) in 0..1
+    """
 
 def preload_image_async(path: str) -> None:
     """Start async preload of image data"""
@@ -2149,6 +2344,26 @@ def toggle_system_console() -> None:
 def is_windows_platform() -> bool:
     """Returns true on Windows"""
 
+def register_file_associations() -> bool:
+    """
+    Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz files (Windows only)
+    """
+
+def open_file_association_settings() -> bool:
+    """
+    Open the Windows Default Apps UI for LichtFeld Studio file associations (Windows only)
+    """
+
+def unregister_file_associations() -> bool:
+    """
+    Remove LichtFeld Studio file associations for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)
+    """
+
+def are_file_associations_registered() -> bool:
+    """
+    Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)
+    """
+
 def get_pivot_mode() -> int:
     """Get pivot mode (0=Origin, 1=Bounds)"""
 
@@ -2223,14 +2438,13 @@ def get_invert_masks() -> bool:
     """Get whether masks are inverted"""
 
 def set_theme(name: str) -> None:
-    """
-    Set theme ('dark', 'light', 'gruvbox', 'catppuccin_mocha', 'catppuccin_latte', or 'nord')
-    """
+    """Set theme by stable theme id"""
 
 def get_theme() -> str:
-    """
-    Get current theme name (e.g. 'Dark', 'Light', 'Gruvbox', 'Catppuccin Mocha', 'Catppuccin Latte', or 'Nord')
-    """
+    """Get current stable theme id"""
+
+def themes() -> list:
+    """Get available theme presets with stable ids and UI metadata"""
 
 def set_ui_scale(scale: float) -> None:
     """Set UI scale (0.0 = auto from OS, or 1.0-4.0)"""
@@ -2240,6 +2454,12 @@ def get_ui_scale() -> float:
 
 def get_ui_scale_preference() -> float:
     """Get saved UI scale preference (0.0 = auto)"""
+
+def set_clipboard_text(text: str) -> None:
+    """Copy text to the system clipboard"""
+
+def set_mouse_cursor_hand() -> None:
+    """Set mouse cursor to hand pointer for this frame"""
 
 def set_language(lang_code: str) -> None:
     """Set language by code (e.g., 'en', 'de')"""
@@ -2356,7 +2576,9 @@ def get_current_camera_id() -> int:
     """Get current camera ID for GT comparison"""
 
 def get_split_view_mode() -> str:
-    """Get split view mode (none, gt_comparison, ply_comparison)"""
+    """
+    Get split view mode (none, gt_comparison, ply_comparison, independent_dual)
+    """
 
 def get_speed_overlay() -> tuple[float, float, float, float]:
     """

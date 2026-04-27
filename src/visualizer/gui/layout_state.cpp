@@ -9,6 +9,7 @@
 
 #ifdef _WIN32
 #include <cstdlib>
+#include <shlobj.h>
 #else
 #include <pwd.h>
 #include <unistd.h>
@@ -16,14 +17,19 @@
 
 namespace lfs::vis::gui {
 
-    std::filesystem::path LayoutState::getConfigPath() {
+    std::filesystem::path LayoutState::getConfigDir() {
         std::filesystem::path config_dir;
 #ifdef _WIN32
-        const char* appdata = std::getenv("APPDATA");
-        if (appdata) {
-            config_dir = std::filesystem::path(appdata) / "LichtFeldStudio";
+        wchar_t path[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
+            config_dir = std::filesystem::path(path) / "LichtFeldStudio";
         } else {
-            config_dir = std::filesystem::current_path() / "config";
+            const char* appdata = std::getenv("APPDATA");
+            if (appdata) {
+                config_dir = std::filesystem::path(appdata) / "LichtFeldStudio";
+            } else {
+                config_dir = std::filesystem::current_path() / "config";
+            }
         }
 #else
         const char* xdg = std::getenv("XDG_CONFIG_HOME");
@@ -43,7 +49,11 @@ namespace lfs::vis::gui {
             }
         }
 #endif
-        return config_dir / "layout.json";
+        return config_dir;
+    }
+
+    std::filesystem::path LayoutState::getConfigPath() {
+        return getConfigDir() / "layout.json";
     }
 
     void LayoutState::save() const {
@@ -55,7 +65,11 @@ namespace lfs::vis::gui {
             j["right_panel_width"] = right_panel_width;
             j["scene_panel_ratio"] = scene_panel_ratio;
             j["python_console_width"] = python_console_width;
+            j["bottom_dock_height"] = bottom_dock_height;
             j["show_sequencer"] = show_sequencer;
+
+            if (!file_association.empty())
+                j["file_association"] = file_association;
 
             nlohmann::json windows;
             for (const auto& [name, visible] : window_visibility) {
@@ -88,7 +102,9 @@ namespace lfs::vis::gui {
             right_panel_width = j.value("right_panel_width", right_panel_width);
             scene_panel_ratio = j.value("scene_panel_ratio", scene_panel_ratio);
             python_console_width = j.value("python_console_width", python_console_width);
+            bottom_dock_height = j.value("bottom_dock_height", bottom_dock_height);
             show_sequencer = j.value("show_sequencer", show_sequencer);
+            file_association = j.value("file_association", file_association);
 
             if (j.contains("windows") && j["windows"].is_object()) {
                 for (const auto& [key, val] : j["windows"].items()) {

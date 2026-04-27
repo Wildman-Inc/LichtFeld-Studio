@@ -9,12 +9,15 @@
 #include "core/tensor/internal/tensor_serialization.hpp"
 #include "nanoflann.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <expected>
 #include <format>
 #include <vector>
 
 namespace {
+    constexpr int MAX_SUPPORTED_SH_DEGREE = 3;
+    constexpr size_t SH_CHANNELS = 3;
 
     // Point cloud adaptor for nanoflann
     struct PointCloudAdaptor {
@@ -99,6 +102,125 @@ namespace {
         }
 
         return result.to(points.device());
+    }
+
+    lfs::core::Tensor compute_mrnf_knn_log_scales(const lfs::core::Tensor& points) {
+        auto cpu_points = points.cpu();
+        const int num_points = cpu_points.size(0);
+
+        if (cpu_points.ndim() != 2 || cpu_points.size(1) != 3) {
+            LOG_ERROR("Input points must have shape [N, 3], got {}", cpu_points.shape().str());
+            return lfs::core::Tensor();
+        }
+
+        if (cpu_points.dtype() != lfs::core::DataType::Float32) {
+            LOG_ERROR("Input points must be float32");
+            return lfs::core::Tensor();
+        }
+
+        // Match MRNF: if there are too few points, use log_scale=0.
+        if (num_points < 3) {
+            auto zeros = lfs::core::Tensor::zeros(
+                {static_cast<size_t>(num_points), 3},
+                lfs::core::Device::CPU);
+            return zeros.to(points.device());
+        }
+
+        const float* data = cpu_points.ptr<float>();
+
+        constexpr float percentile = 0.75f;
+        std::vector<float> x_vals;
+        std::vector<float> y_vals;
+        std::vector<float> z_vals;
+        x_vals.reserve(num_points);
+        y_vals.reserve(num_points);
+        z_vals.reserve(num_points);
+        for (int i = 0; i < num_points; ++i) {
+            const float x = data[i * 3 + 0];
+            const float y = data[i * 3 + 1];
+            const float z = data[i * 3 + 2];
+            if (std::isfinite(x))
+                x_vals.push_back(x);
+            if (std::isfinite(y))
+                y_vals.push_back(y);
+            if (std::isfinite(z))
+                z_vals.push_back(z);
+        }
+
+        if (x_vals.empty() || y_vals.empty() || z_vals.empty()) {
+            auto zeros = lfs::core::Tensor::zeros(
+                {static_cast<size_t>(num_points), 3},
+                lfs::core::Device::CPU);
+            return zeros.to(points.device());
+        }
+
+        std::sort(x_vals.begin(), x_vals.end());
+        std::sort(y_vals.begin(), y_vals.end());
+        std::sort(z_vals.begin(), z_vals.end());
+
+        const auto idx_pair = [percentile](const size_t len) {
+            const size_t lower_idx = static_cast<size_t>(((1.0f - percentile) / 2.0f) * static_cast<float>(len));
+            const size_t upper_idx =
+                std::min(len - 1, static_cast<size_t>(((1.0f + percentile) / 2.0f) * static_cast<float>(len)));
+            return std::pair<size_t, size_t>{lower_idx, upper_idx};
+        };
+
+        const auto [lx, ux] = idx_pair(x_vals.size());
+        const auto [ly, uy] = idx_pair(y_vals.size());
+        const auto [lz, uz] = idx_pair(z_vals.size());
+
+        const float ex = (x_vals[ux] - x_vals[lx]) * 0.5f;
+        const float ey = (y_vals[uy] - y_vals[ly]) * 0.5f;
+        const float ez = (z_vals[uz] - z_vals[lz]) * 0.5f;
+
+        float sorted_extents[3] = {ex, ey, ez};
+        std::sort(sorted_extents, sorted_extents + 3);
+        const float median_size = std::max(sorted_extents[1] * 2.0f, 0.01f);
+        const float max_scale = median_size * 0.1f;
+
+        PointCloudAdaptor cloud(data, num_points);
+        KDTree index(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+        index.buildIndex();
+
+        auto result = lfs::core::Tensor::zeros(
+            {static_cast<size_t>(num_points), 3},
+            lfs::core::Device::CPU);
+        float* result_data = result.ptr<float>();
+
+#pragma omp parallel for if (num_points > 1000)
+        for (int i = 0; i < num_points; i++) {
+            const float query_pt[3] = {
+                data[i * 3 + 0],
+                data[i * 3 + 1],
+                data[i * 3 + 2]};
+
+            constexpr size_t num_results = 3; // self + 2 nearest neighbors
+            std::vector<size_t> ret_indices(num_results);
+            std::vector<float> out_dists_sqr(num_results);
+
+            nanoflann::KNNResultSet<float> result_set(num_results);
+            result_set.init(&ret_indices[0], &out_dists_sqr[0]);
+            index.findNeighbors(result_set, &query_pt[0], nanoflann::SearchParameters(10));
+
+            const float a1 = std::sqrt(std::max(out_dists_sqr[1], 0.0f));
+            const float a2 = std::sqrt(std::max(out_dists_sqr[2], 0.0f));
+            const float dist = (a1 + a2) * 0.25f;
+            const float log_scale = std::log(std::clamp(dist, 1e-3f, max_scale));
+
+            result_data[i * 3 + 0] = log_scale;
+            result_data[i * 3 + 1] = log_scale;
+            result_data[i * 3 + 2] = log_scale;
+        }
+
+        return result.to(points.device());
+    }
+
+    size_t sh_rest_coefficients_for_degree(const int degree) {
+        if (degree <= 0) {
+            return 0;
+        }
+        const auto d = static_cast<size_t>(degree);
+        return (d + 1) * (d + 1) - 1;
     }
 
 } // anonymous namespace
@@ -196,7 +318,7 @@ namespace lfs::core {
     Tensor SplatData::get_shs() const {
         // _sh0 is [N, 1, 3], _shN is [N, coeffs, 3]
         // Concatenate along dim 1 (coeffs) to get [N, total_coeffs, 3]
-        if (!_shN.is_valid()) {
+        if (!_shN.is_valid() || _shN.shape()[1] == 0) {
             return _sh0; // SH degree 0: only DC component
         }
         return _sh0.cat(_shN, 1);
@@ -216,6 +338,42 @@ namespace lfs::core {
         } else {
             _active_sh_degree = _max_sh_degree;
         }
+    }
+
+    bool SplatData::set_sh_degree(const int sh_degree) {
+        assert(_means.is_valid());
+
+        const int target_degree = std::clamp(sh_degree, 0, MAX_SUPPORTED_SH_DEGREE);
+        const size_t target_coeffs = sh_rest_coefficients_for_degree(target_degree);
+        const size_t n = static_cast<size_t>(size());
+
+        const bool shape_ok = _shN.is_valid() && _shN.ndim() == 3 &&
+                              _shN.shape()[0] == n &&
+                              _shN.shape()[1] == target_coeffs &&
+                              _shN.shape()[2] == SH_CHANNELS;
+
+        bool changed = _max_sh_degree != target_degree || _active_sh_degree != target_degree;
+
+        if (!shape_ok) {
+            const auto device = _shN.is_valid() ? _shN.device() : _means.device();
+            const auto dtype = _shN.is_valid() ? _shN.dtype() : DataType::Float32;
+            auto resized = Tensor::zeros({n, target_coeffs, SH_CHANNELS}, device, dtype);
+
+            if (target_coeffs > 0 && _shN.is_valid() && _shN.ndim() == 3 &&
+                _shN.shape()[0] == n && _shN.shape()[2] == SH_CHANNELS) {
+                const size_t copy_coeffs = std::min(_shN.shape()[1], target_coeffs);
+                if (copy_coeffs > 0) {
+                    resized.slice(1, 0, static_cast<int64_t>(copy_coeffs)) =
+                        _shN.slice(1, 0, static_cast<int64_t>(copy_coeffs));
+                }
+            }
+            _shN = std::move(resized);
+            changed = true;
+        }
+
+        _max_sh_degree = target_degree;
+        _active_sh_degree = target_degree;
+        return changed;
     }
 
     void SplatData::reserve_capacity(const size_t capacity) {
@@ -621,16 +779,20 @@ namespace lfs::core {
 
                 // Compute scaling on CPU
                 LOG_DEBUG("  Computing neighbor distances...");
-                auto nn_dist = compute_mean_neighbor_distances(means_cpu).clamp_min(1e-7f);
-                LOG_DEBUG("  nn_dist computed: is_valid={}, shape={}, numel={}",
-                          nn_dist.is_valid(), nn_dist.shape().str(), nn_dist.numel());
+                if (lfs::core::param::is_mrnf_strategy(params.optimization.strategy)) {
+                    scaling_cpu = compute_mrnf_knn_log_scales(means_cpu);
+                } else {
+                    auto nn_dist = compute_mean_neighbor_distances(means_cpu).clamp_min(1e-7f);
+                    LOG_DEBUG("  nn_dist computed: is_valid={}, shape={}, numel={}",
+                              nn_dist.is_valid(), nn_dist.shape().str(), nn_dist.numel());
 
-                std::vector<int> scale_expand_shape = {static_cast<int>(num_points), 3};
-                scaling_cpu = nn_dist.sqrt()
-                                  .mul(params.optimization.init_scaling)
-                                  .log()
-                                  .unsqueeze(-1)
-                                  .expand(std::span<const int>(scale_expand_shape));
+                    std::vector<int> scale_expand_shape = {static_cast<int>(num_points), 3};
+                    scaling_cpu = nn_dist.sqrt()
+                                      .mul(params.optimization.init_scaling)
+                                      .log()
+                                      .unsqueeze(-1)
+                                      .expand(std::span<const int>(scale_expand_shape));
+                }
                 LOG_DEBUG("  scaling_cpu computed: is_valid={}, ptr={}, device={}, shape={}, numel={}",
                           scaling_cpu.is_valid(), static_cast<const void*>(scaling_cpu.ptr<float>()),
                           scaling_cpu.device() == Device::CUDA ? "CUDA" : "CPU",
@@ -818,14 +980,19 @@ namespace lfs::core {
                     means_temp = positions.cuda();
                 }
 
-                auto nn_dist = compute_mean_neighbor_distances(means_temp).clamp_min(1e-7f);
-                std::vector<int> scale_expand_shape = {static_cast<int>(num_points), 3};
-                auto scaling_temp = nn_dist.sqrt()
-                                        .mul(params.optimization.init_scaling)
-                                        .log()
-                                        .unsqueeze(-1)
-                                        .expand(std::span<const int>(scale_expand_shape))
-                                        .cuda();
+                Tensor scaling_temp;
+                if (lfs::core::param::is_mrnf_strategy(params.optimization.strategy)) {
+                    scaling_temp = compute_mrnf_knn_log_scales(means_temp).cuda();
+                } else {
+                    auto nn_dist = compute_mean_neighbor_distances(means_temp).clamp_min(1e-7f);
+                    std::vector<int> scale_expand_shape = {static_cast<int>(num_points), 3};
+                    scaling_temp = nn_dist.sqrt()
+                                       .mul(params.optimization.init_scaling)
+                                       .log()
+                                       .unsqueeze(-1)
+                                       .expand(std::span<const int>(scale_expand_shape))
+                                       .cuda();
+                }
 
                 auto ones_col = Tensor::ones({num_points, 1}, Device::CUDA);
                 auto zeros_cols = Tensor::zeros({num_points, 3}, Device::CUDA);

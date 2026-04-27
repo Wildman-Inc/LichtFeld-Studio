@@ -1,3 +1,5 @@
+"""LichtFeld Python control module for Gaussian splatting"""
+
 from collections.abc import Callable, Sequence
 import enum
 from typing import overload
@@ -233,6 +235,9 @@ def reset_training() -> None:
 def save_checkpoint() -> None:
     """Save a training checkpoint to disk"""
 
+def new_project() -> None:
+    """Clear all project state and start a new project"""
+
 def clear_scene() -> None:
     """Remove all nodes from the scene"""
 
@@ -256,8 +261,10 @@ def request_exit() -> None:
 def force_exit() -> None:
     """Force immediate application exit (bypasses confirmation)."""
 
-def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int) -> None:
-    """Export scene nodes to file. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML."""
+def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int, rad_lod_ratios: Sequence[float] | None = None, rad_flip_y: bool = False) -> None:
+    """
+    Export scene nodes to file. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD.
+    """
 
 def save_config_file(path: str) -> None:
     """Save current training configuration to a JSON file."""
@@ -270,6 +277,12 @@ def loss_buffer() -> list[float]:
 
 def push_loss_to_element(arg0: ui.rml.RmlElement, arg1: Sequence[float], /) -> tuple:
     """Push loss data to a loss-graph element, returns (data_min, data_max)"""
+
+def psnr_buffer() -> list[float]:
+    """Get the recent PSNR history as a list of floats"""
+
+def push_psnr_to_element(arg0: ui.rml.RmlElement, arg1: Sequence[float], /) -> tuple:
+    """Push PSNR data to a psnr-graph element, returns (data_min, data_max)"""
 
 def trainer_elapsed_seconds() -> float:
     """Get elapsed training time in seconds"""
@@ -337,8 +350,13 @@ def set_selected_node_transform(matrix: Sequence[float]) -> None:
 def get_selection_center() -> list[float] | None:
     """Get center of current selection (local space)"""
 
+def get_selection_visualizer_world_center() -> list[float] | None:
+    """Get center of current selection in visualizer-world space"""
+
 def get_selection_world_center() -> list[float] | None:
-    """Get center of current selection (world space)"""
+    """
+    Deprecated: get center of current selection in legacy data-world space; use get_selection_visualizer_world_center()
+    """
 
 def has_scene() -> bool:
     """Check if a scene is loaded"""
@@ -356,13 +374,19 @@ def can_transform_selection() -> bool:
     """Check if selected node can be transformed"""
 
 def get_num_gaussians() -> int:
-    """Get total number of gaussians in scene"""
+    """Get number of active gaussians in scene"""
 
 def get_node_transform(name: str) -> list[float] | None:
     """Get node transform matrix (16 floats, column-major)"""
 
+def get_node_visualizer_world_transform(name: str) -> list[float] | None:
+    """Get node visualizer-world transform matrix (16 floats, column-major)"""
+
 def set_node_transform(name: str, matrix: Sequence[float]) -> None:
     """Set node transform matrix (16 floats, column-major)"""
+
+def set_node_visualizer_world_transform(name: str, matrix: Sequence[float]) -> None:
+    """Set node visualizer-world transform matrix (16 floats, column-major)"""
 
 def capture_selection_transforms() -> dict:
     """Capture transforms of all selected nodes"""
@@ -386,6 +410,18 @@ def free_icon(texture_id: int) -> None:
 def reset_camera() -> None:
     """Reset camera to default position and orientation"""
 
+def get_camera_navigation_mode() -> str:
+    """Get the active camera navigation mode ('orbit', 'trackball', or 'fpv')"""
+
+def set_camera_navigation_mode(mode: str) -> None:
+    """Set the active camera navigation mode"""
+
+def get_camera_view_snap_enabled() -> bool:
+    """Check whether camera axis-view snapping is enabled"""
+
+def set_camera_view_snap_enabled(enabled: bool) -> None:
+    """Enable or disable camera axis-view snapping"""
+
 def toggle_fullscreen() -> None:
     """Toggle fullscreen mode"""
 
@@ -394,6 +430,9 @@ def is_fullscreen() -> bool:
 
 def toggle_ui() -> None:
     """Toggle UI overlay visibility"""
+
+def toggle_independent_split_view() -> None:
+    """Toggle independent split view"""
 
 def get_render_mode() -> RenderMode:
     """Get current render mode (Splats, Points, Rings, Centers)"""
@@ -476,6 +515,12 @@ class Tensor:
 
     def numpy(self, copy: bool = True) -> object:
         """Convert to NumPy array"""
+
+    def tolist(self) -> object:
+        """Convert tensor to nested Python lists"""
+
+    def count_nonzero(self) -> int:
+        """Count non-zero elements"""
 
     @staticmethod
     def from_numpy(arr: NDArray, copy: bool = True) -> Tensor:
@@ -860,6 +905,9 @@ class Tensor:
     def norm_scalar(self, p: float = 2.0) -> float:
         """Lp norm as scalar"""
 
+    def sort(self, dim: int = -1, descending: bool = False) -> tuple:
+        """Sort tensor values along a dimension and return (values, indices)"""
+
     def index_select(self, dim: int, indices: Tensor) -> Tensor:
         """Select along dimension by indices"""
 
@@ -971,10 +1019,132 @@ def is_mesh2splat_active() -> bool:
 def get_mesh2splat_progress() -> float:
     """Get mesh-to-splat conversion progress (0.0 to 1.0)"""
 
+def get_mesh2splat_stage() -> str:
+    """Get mesh-to-splat conversion stage text"""
+
 def get_mesh2splat_error() -> str:
     """
     Get error message from last mesh-to-splat conversion (empty on success)
     """
+
+class SplatSimplifyMergeTree:
+    @property
+    def source_means(self) -> Tensor:
+        """Filtered source means tensor [N, 3]"""
+
+    @property
+    def source_sh0(self) -> Tensor:
+        """Filtered source SH0 tensor [N, 1, 3]"""
+
+    @property
+    def source_shN(self) -> Tensor:
+        """Filtered source higher-order SH tensor [N, K, 3]"""
+
+    @property
+    def source_scaling(self) -> Tensor:
+        """Filtered source scaling tensor [N, 3] in log-space"""
+
+    @property
+    def source_rotation(self) -> Tensor:
+        """Filtered source rotation tensor [N, 4]"""
+
+    @property
+    def source_opacity(self) -> Tensor:
+        """Filtered source opacity tensor [N, 1] in logit-space"""
+
+    @property
+    def source_active_sh_degree(self) -> int:
+        """Active SH degree of the filtered source splat"""
+
+    @property
+    def source_max_sh_degree(self) -> int:
+        """Maximum SH degree of the filtered source splat"""
+
+    @property
+    def source_scene_scale(self) -> float:
+        """Scene scale of the filtered source splat"""
+
+    @property
+    def target_count(self) -> int:
+        """Requested target count before pruning"""
+
+    @property
+    def post_prune_count(self) -> int:
+        """Count remaining after opacity pruning"""
+
+    @property
+    def requested_ratio(self) -> float:
+        """Requested simplify ratio"""
+
+    @property
+    def requested_knn_k(self) -> int:
+        """Requested kNN neighborhood size"""
+
+    @property
+    def requested_merge_cap(self) -> float:
+        """Requested per-pass merge cap"""
+
+    @property
+    def requested_opacity_prune_threshold(self) -> float:
+        """Requested opacity prune threshold"""
+
+    @property
+    def final_roots(self) -> list[int]:
+        """Tree node ids that survive into the simplified output"""
+
+    @property
+    def pruned_leaf_ids(self) -> list[int]:
+        """Leaf ids removed during the initial opacity prune"""
+
+    @property
+    def merge_left(self) -> list[int]:
+        """Left child id for each merge node"""
+
+    @property
+    def merge_right(self) -> list[int]:
+        """Right child id for each merge node"""
+
+    @property
+    def merge_pass(self) -> list[int]:
+        """Zero-based simplify pass index for each merge node"""
+
+    def leaf_count(self) -> int:
+        """Number of source leaves in the tree"""
+
+    def merge_count(self) -> int:
+        """Number of merge nodes in the tree"""
+
+class SplatSimplifyResult:
+    @property
+    def splat_data(self) -> scene.SplatData:
+        """Simplified output splat data"""
+
+    @property
+    def merge_tree(self) -> SplatSimplifyMergeTree:
+        """Merge tree describing how the output was formed"""
+
+def simplify_splats(source_name: str, ratio: float = 0.1, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612) -> None:
+    """Simplify a splat node asynchronously and create a new output node."""
+
+def simplify_splat_data_with_history(source: scene.SplatData, ratio: float = 0.1, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612, progress: object | None = None) -> SplatSimplifyResult:
+    """
+    Synchronously simplify SplatData and return both the simplified output and its merge tree.
+    """
+
+def cancel_splat_simplify() -> None:
+    """Cancel the active splat simplification job"""
+
+def is_splat_simplify_active() -> bool:
+    """Check if a splat simplification job is currently running"""
+
+def get_splat_simplify_progress() -> float:
+    """Get splat simplification progress (0.0 to 1.0)"""
+
+def get_splat_simplify_stage() -> str:
+    """Get splat simplification stage text"""
+
+def get_splat_simplify_error() -> str:
+    """Get the last splat simplification error (empty on success)"""
 
 class ViewInfo:
     @property
@@ -1008,12 +1178,12 @@ class ViewportRender:
 
 def get_viewport_render() -> ViewportRender | None:
     """
-    Get the current viewport's rendered image and screen positions (None if not available)
+    Get the most recently captured CPU-visible viewport render if available (does not force GPU readback)
     """
 
 def capture_viewport() -> ViewportRender | None:
     """
-    Capture viewport render for async processing (clones data, safe to use from background threads)
+    Capture viewport render explicitly (may read back from GPU; clones data, safe to use from background threads)
     """
 
 def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None) -> Tensor | None:
@@ -1021,11 +1191,11 @@ def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, 
     Render scene from arbitrary camera parameters.
 
     Args:
-        rotation: [3, 3] camera rotation matrix
-        translation: [3] camera position
+        rotation: [3, 3] camera-to-world rotation in visualizer coordinates
+        translation: [3] camera position in visualizer world coordinates
         width: Render width in pixels
         height: Render height in pixels
-        fov: Field of view in degrees (default: 60)
+        fov: Vertical field of view in degrees (default: 60)
         bg_color: Optional [3] RGB background color
 
     Returns:
@@ -1037,18 +1207,18 @@ def compute_screen_positions(rotation: Tensor, translation: Tensor, width: int, 
     Compute screen positions of all Gaussians for a given camera view.
 
     Args:
-        rotation: [3, 3] camera rotation matrix
-        translation: [3] camera position
+        rotation: [3, 3] camera-to-world rotation in visualizer coordinates
+        translation: [3] camera position in visualizer world coordinates
         width: Viewport width in pixels
         height: Viewport height in pixels
-        fov: Field of view in degrees (default: 60)
+        fov: Vertical field of view in degrees (default: 60)
 
     Returns:
         Tensor [N, 2] with (x, y) pixel coordinates for each Gaussian
     """
 
 def get_current_view() -> ViewInfo | None:
-    """Get current viewport camera info (None if not available)"""
+    """Get current viewport camera pose (None if not available)"""
 
 class CameraState:
     @property
@@ -1076,7 +1246,7 @@ def set_camera_fov(fov: float) -> None:
 
 def look_at(eye: tuple[float, float, float], target: tuple[float, float, float], up: tuple[float, float, float] = (0.0, 1.0, 0.0)) -> tuple[Tensor, Tensor]:
     """
-    Compute (rotation, translation) camera matrices for render_view from eye/target position.
+    Compute a visualizer camera pose tuple (rotation, translation) for render_view from eye/target.
     """
 
 def render_at(eye: tuple[float, float, float], target: tuple[float, float, float], width: int, height: int, fov: float = 60.0, up: tuple[float, float, float] = (0.0, 1.0, 0.0), bg_color: Tensor | None = None) -> Tensor | None:
@@ -1116,6 +1286,8 @@ def register_class(cls: object) -> None:
 def unregister_class(cls: object) -> None:
     """Unregister a class (Panel, Operator, or Menu)"""
 
+PLUGIN_API_VERSION: str = '1.0'
+
 class GizmoEventType(enum.Enum):
     PRESS = 0
 
@@ -1143,7 +1315,7 @@ class GizmoContext:
 
     @property
     def selection_center(self) -> tuple[float, float, float]:
-        """Selection center in world space (x, y, z)"""
+        """Selection center in visualizer-world space (x, y, z)"""
 
     @property
     def selection_center_screen(self) -> tuple[float, float]:
@@ -1151,17 +1323,17 @@ class GizmoContext:
 
     @property
     def camera_position(self) -> tuple[float, float, float]:
-        """Camera position in world space (x, y, z)"""
+        """Camera position in visualizer-world space (x, y, z)"""
 
     @property
     def camera_forward(self) -> tuple[float, float, float]:
         """Camera forward direction (x, y, z)"""
 
     def world_to_screen(self, pos: tuple[float, float, float]) -> tuple[float, float] | None:
-        """Project world position to screen coordinates"""
+        """Project visualizer-world position to screen coordinates"""
 
     def screen_to_world_ray(self, pos: tuple[float, float]) -> tuple[float, float, float] | None:
-        """Get world-space ray direction from screen point"""
+        """Get visualizer-world ray direction from screen point"""
 
     def draw_line(self, start: tuple[float, float], end: tuple[float, float], color: tuple[float, float, float, float], thickness: float = 1.0) -> None:
         """Draw a 2D line"""
@@ -1380,6 +1552,13 @@ class OptimizationParams:
     def means_lr(self, arg: float, /) -> None: ...
 
     @property
+    def means_lr_end(self) -> float:
+        """Target end learning rate for gaussian positions"""
+
+    @means_lr_end.setter
+    def means_lr_end(self, arg: float, /) -> None: ...
+
+    @property
     def shs_lr(self) -> float:
         """Learning rate for spherical harmonics"""
 
@@ -1399,6 +1578,13 @@ class OptimizationParams:
 
     @scaling_lr.setter
     def scaling_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def scaling_lr_end(self) -> float:
+        """Target end learning rate for gaussian scales"""
+
+    @scaling_lr_end.setter
+    def scaling_lr_end(self, arg: float, /) -> None: ...
 
     @property
     def rotation_lr(self) -> float:
@@ -1433,11 +1619,18 @@ class OptimizationParams:
         """Active optimization strategy name"""
 
     def set_strategy(self, strategy: str) -> None:
-        """Set active strategy ('mcmc' or 'adc')"""
+        """Set active strategy ('mcmc', 'mrnf', or 'igs+')"""
 
     @property
     def headless(self) -> bool:
         """Whether running without visualization"""
+
+    @property
+    def enable_eval(self) -> bool:
+        """Enable evaluation during training"""
+
+    @enable_eval.setter
+    def enable_eval(self, arg: bool, /) -> None: ...
 
     @property
     def tile_mode(self) -> int:
@@ -1457,7 +1650,7 @@ class OptimizationParams:
         """Set steps_scaler and scale all step-related parameters by the ratio"""
 
     def auto_scale_steps(self, image_count: int) -> None:
-        """Auto-scale steps for both strategies based on image count"""
+        """Auto-scale steps for all strategies based on image count"""
 
     @property
     def gut(self) -> bool:
@@ -1502,8 +1695,24 @@ class OptimizationParams:
     def ppisp_use_controller(self, arg: bool, /) -> None: ...
 
     @property
+    def ppisp_freeze_from_sidecar(self) -> bool:
+        """Freeze PPISP learning and reuse a PPISP sidecar during training"""
+
+    @ppisp_freeze_from_sidecar.setter
+    def ppisp_freeze_from_sidecar(self, arg: bool, /) -> None: ...
+
+    @property
+    def ppisp_sidecar_path(self) -> str:
+        """Path to a PPISP sidecar used for frozen PPISP training"""
+
+    @ppisp_sidecar_path.setter
+    def ppisp_sidecar_path(self, arg: str, /) -> None: ...
+
+    @property
     def ppisp_controller_activation_step(self) -> int:
-        """Iteration to start controller distillation (-1 = auto)"""
+        """
+        Iteration to start controller distillation (negative = default schedule)
+        """
 
     @ppisp_controller_activation_step.setter
     def ppisp_controller_activation_step(self, arg: int, /) -> None: ...
@@ -1579,6 +1788,13 @@ class OptimizationParams:
     def undistort(self, arg: bool, /) -> None: ...
 
     @property
+    def revised_opacity(self) -> bool:
+        """Use revised opacity calculation during densification"""
+
+    @revised_opacity.setter
+    def revised_opacity(self, arg: bool, /) -> None: ...
+
+    @property
     def save_steps(self) -> list[int]:
         """List of iterations at which to save checkpoints"""
 
@@ -1590,6 +1806,19 @@ class OptimizationParams:
 
     def clear_save_steps(self) -> None:
         """Clear all save steps"""
+
+    @property
+    def eval_steps(self) -> list[int]:
+        """List of iterations at which to run evaluation"""
+
+    def add_eval_step(self, step: int) -> None:
+        """Add an eval step (ignored if duplicate)"""
+
+    def remove_eval_step(self, step: int) -> None:
+        """Remove an eval step"""
+
+    def clear_eval_steps(self) -> None:
+        """Clear all eval steps"""
 
 def optimization_params() -> OptimizationParams:
     """Get the optimization parameters object"""
@@ -1637,6 +1866,9 @@ class DatasetParams:
     @property
     def test_every(self) -> int:
         """Use every Nth image for testing"""
+
+    @test_every.setter
+    def test_every(self, arg: int, /) -> None: ...
 
     @property
     def resize_factor(self) -> int:
@@ -1690,6 +1922,12 @@ def get_scene() -> scene.Scene | None:
 
 def get_scene_generation() -> int:
     """Get current scene generation counter (for validity checking)"""
+
+def get_scene_mutation_flags() -> int:
+    """Get accumulated scene mutation flags"""
+
+def consume_scene_mutation_flags() -> int:
+    """Get and clear accumulated scene mutation flags"""
 
 def run(path: str) -> None:
     """Execute a Python script file"""
@@ -1747,8 +1985,16 @@ class DatasetInfo:
 
     def __repr__(self) -> str: ...
 
+def build_splat_lod_hierarchy(source: object | None = None, ratio: float = 0.5, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612, max_levels: int | None = None, min_points: int = 1, progress: object | None = None) -> object:
+    """
+    Build a script-side multi-level LOD hierarchy from SplatData or a scene node.
+    """
+
 def detect_dataset_info(path: str) -> DatasetInfo:
     """Detect dataset information from a directory path"""
+
+def is_dataset_path(path: str) -> bool:
+    """Check whether a path can be treated as a dataset source"""
 
 class CheckpointHeader:
     """Information from a checkpoint file header"""
@@ -1781,4 +2027,4 @@ class CheckpointParams:
 def read_checkpoint_params(path: str) -> CheckpointParams | None:
     """Read training parameters from a checkpoint (None if failed)"""
 
-__all__: tuple = ('context', 'gaussians', 'session', 'get_scene', 'Tensor', 'Hook', 'ScopedHandler', 'on_training_start', 'on_iteration_start', 'on_post_step', 'on_pre_optimizer_step', 'on_training_end', 'mesh_to_splat', 'is_mesh2splat_active', 'get_mesh2splat_progress', 'get_mesh2splat_error', 'on_frame', 'stop_animation', 'run', 'list_scene', 'mat4', 'colormap', 'help', 'scene', 'io', 'packages', 'mcp')
+__all__: tuple = ('context', 'gaussians', 'session', 'get_scene', 'Tensor', 'Hook', 'ScopedHandler', 'SplatSimplifyResult', 'SplatSimplifyMergeTree', 'on_training_start', 'on_iteration_start', 'on_post_step', 'on_pre_optimizer_step', 'on_training_end', 'mesh_to_splat', 'is_mesh2splat_active', 'get_mesh2splat_progress', 'get_mesh2splat_stage', 'get_mesh2splat_error', 'simplify_splats', 'simplify_splat_data_with_history', 'build_splat_lod_hierarchy', 'cancel_splat_simplify', 'is_splat_simplify_active', 'get_splat_simplify_progress', 'get_splat_simplify_stage', 'get_splat_simplify_error', 'on_frame', 'stop_animation', 'run', 'list_scene', 'mat4', 'colormap', 'help', 'scene', 'io', 'packages', 'mcp')

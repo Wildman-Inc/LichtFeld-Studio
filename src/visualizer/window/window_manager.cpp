@@ -5,16 +5,115 @@
 #include "window_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
-#include "gui/rmlui/rml_panel_host.hpp"
 #include "input/input_controller.hpp"
 #include "input/sdl_key_mapping.hpp"
 #include <SDL3/SDL.h>
+#include <cstdlib>
+#include <cstring>
 #include <glad/glad.h>
 #include <imgui_impl_sdl3.h>
 #include <iostream>
+#include <string>
 #include <imgui.h>
 
 namespace lfs::vis {
+
+    namespace {
+        bool eventTargetsWindow(const SDL_Event& event, const SDL_WindowID target_window_id) {
+            if (target_window_id == 0)
+                return true;
+
+            switch (event.type) {
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+            case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+                return event.window.windowID == target_window_id;
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                return event.button.windowID == target_window_id;
+            case SDL_EVENT_MOUSE_MOTION:
+                return event.motion.windowID == target_window_id;
+            case SDL_EVENT_MOUSE_WHEEL:
+                return event.wheel.windowID == target_window_id;
+            case SDL_EVENT_KEY_DOWN:
+            case SDL_EVENT_KEY_UP:
+                return event.key.windowID == target_window_id;
+            case SDL_EVENT_TEXT_INPUT:
+                return event.text.windowID == target_window_id;
+            case SDL_EVENT_DROP_FILE:
+            case SDL_EVENT_DROP_COMPLETE:
+                return event.drop.windowID == target_window_id;
+            default:
+                return true;
+            }
+        }
+
+        std::string compiledVideoDrivers() {
+            const int num_drivers = SDL_GetNumVideoDrivers();
+            if (num_drivers <= 0) {
+                return "<none>";
+            }
+
+            std::string result;
+            for (int i = 0; i < num_drivers; ++i) {
+                const char* const driver = SDL_GetVideoDriver(i);
+                if (i > 0) {
+                    result += ", ";
+                }
+                result += driver ? driver : "<null>";
+            }
+            return result;
+        }
+
+        bool hasCompiledVideoDriver(const char* const expected_driver) {
+            const int num_drivers = SDL_GetNumVideoDrivers();
+            for (int i = 0; i < num_drivers; ++i) {
+                const char* const driver = SDL_GetVideoDriver(i);
+                if (driver && std::strcmp(driver, expected_driver) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool containsToken(const char* const haystack, const char* const needle) {
+            return haystack && needle && std::strstr(haystack, needle) != nullptr;
+        }
+
+        bool shouldPreferX11OnGnome() {
+#if defined(__linux__)
+            // GNOME on Wayland can present undecorated SDL toplevels when the
+            // compositor expects client-side decorations but libdecor is not
+            // available at runtime. Prefer X11/Xwayland in that case so the
+            // native min/max/close buttons remain available.
+            const char* const current_desktop = std::getenv("XDG_CURRENT_DESKTOP");
+            const char* const session_desktop = std::getenv("XDG_SESSION_DESKTOP");
+            const bool is_gnome = containsToken(current_desktop, "GNOME") ||
+                                  containsToken(session_desktop, "gnome") ||
+                                  containsToken(session_desktop, "GNOME");
+            const bool has_wayland = std::getenv("WAYLAND_DISPLAY") != nullptr;
+            const bool has_x11 = std::getenv("DISPLAY") != nullptr;
+            const bool explicit_driver = std::getenv("SDL_VIDEO_DRIVER") != nullptr;
+            return is_gnome && has_wayland && has_x11 && !explicit_driver;
+#else
+            return false;
+#endif
+        }
+
+        void reportSdlVideoInitFailure() {
+            std::cerr << "Failed to initialize SDL: " << SDL_GetError() << std::endl;
+
+#if defined(__linux__)
+            std::cerr << "Compiled SDL video drivers: " << compiledVideoDrivers() << std::endl;
+            if (!hasCompiledVideoDriver("x11") && !hasCompiledVideoDriver("wayland")) {
+                std::cerr
+                    << "This SDL build lacks both X11 and Wayland support. Install the Linux GUI build "
+                       "dependencies and rebuild SDL3."
+                    << std::endl;
+            }
+#endif
+        }
+    } // namespace
 
     void* WindowManager::callback_handler_ = nullptr;
 
@@ -38,10 +137,27 @@ namespace lfs::vis {
         SDL_Quit();
     }
 
+    void WindowManager::setInputController(InputController* ic) {
+        input_controller_ = ic;
+        input_router_.setInputController(ic);
+        if (input_controller_) {
+            input_controller_->setInputRouter(&input_router_);
+        }
+    }
+
     bool WindowManager::init() {
+        if (shouldPreferX11OnGnome()) {
+            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
+            LOG_INFO("GNOME Wayland session detected; preferring X11/Xwayland for native window decorations");
+        }
+
         if (!SDL_Init(SDL_INIT_VIDEO)) {
-            std::cerr << "Failed to initialize SDL: " << SDL_GetError() << std::endl;
+            reportSdlVideoInitFailure();
             return false;
+        }
+
+        if (const char* const video_driver = SDL_GetCurrentVideoDriver(); video_driver) {
+            LOG_INFO("SDL video driver: {}", video_driver);
         }
 
         SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
@@ -123,29 +239,38 @@ namespace lfs::vis {
     }
 
     void WindowManager::pollEvents() {
+        frame_input_.beginFrame();
         const bool imgui_ready = ImGui::GetCurrentContext() != nullptr;
+        const SDL_WindowID main_window_id = window_ ? SDL_GetWindowID(window_) : 0;
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (imgui_ready)
                 ImGui_ImplSDL3_ProcessEvent(&event);
+            frame_input_.processEvent(event, main_window_id);
             processEvent(event);
         }
+        frame_input_.finalize(window_);
     }
 
     void WindowManager::waitEvents(double timeout_seconds) {
+        frame_input_.beginFrame();
         const bool imgui_ready = ImGui::GetCurrentContext() != nullptr;
+        const SDL_WindowID main_window_id = window_ ? SDL_GetWindowID(window_) : 0;
         SDL_Event event;
         const int timeout_ms = static_cast<int>(timeout_seconds * 1000.0);
         if (SDL_WaitEventTimeout(&event, timeout_ms)) {
             if (imgui_ready)
                 ImGui_ImplSDL3_ProcessEvent(&event);
+            frame_input_.processEvent(event, main_window_id);
             processEvent(event);
             while (SDL_PollEvent(&event)) {
                 if (imgui_ready)
                     ImGui_ImplSDL3_ProcessEvent(&event);
+                frame_input_.processEvent(event, main_window_id);
                 processEvent(event);
             }
         }
+        frame_input_.finalize(window_);
     }
 
     bool WindowManager::shouldClose() const {
@@ -156,39 +281,44 @@ namespace lfs::vis {
         should_close_ = false;
     }
 
-    void WindowManager::requestRedraw() {
-        needs_redraw_ = true;
+    void WindowManager::wakeEventLoop() {
+        if (!SDL_WasInit(SDL_INIT_EVENTS)) {
+            return;
+        }
+
+        // Wake SDL_WaitEventTimeout so queued viewer-thread work is serviced promptly.
         SDL_Event event{};
         event.type = SDL_EVENT_USER;
         SDL_PushEvent(&event);
     }
 
-    bool WindowManager::needsRedraw() const {
-        bool result = needs_redraw_;
-        if (result) {
-            needs_redraw_ = false;
-        }
-        return result;
-    }
-
     void WindowManager::processEvent(const SDL_Event& event) {
+        const SDL_WindowID main_window_id = window_ ? SDL_GetWindowID(window_) : 0;
+
         switch (event.type) {
         case SDL_EVENT_QUIT:
             should_close_ = true;
             break;
 
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             should_close_ = true;
             break;
 
         case SDL_EVENT_WINDOW_FOCUS_LOST:
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             lfs::core::events::internal::WindowFocusLost{}.emit();
+            input_router_.onWindowFocusLost();
             if (input_controller_) {
                 input_controller_->onWindowFocusLost();
             }
             break;
 
         case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             if (window_) {
                 const float scale = SDL_GetWindowDisplayScale(window_);
                 lfs::core::events::internal::DisplayScaleChanged{.scale = scale}.emit();
@@ -197,21 +327,29 @@ namespace lfs::vis {
 
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP: {
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             if (!input_controller_)
                 break;
             const int button = input::sdlMouseButtonToApp(event.button.button);
             const int action = (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) ? input::ACTION_PRESS : input::ACTION_RELEASE;
+            input_router_.beginMouseButton(action, event.button.x, event.button.y);
             input_controller_->handleMouseButton(button, action, event.button.x, event.button.y);
+            input_router_.endMouseButton(action);
             break;
         }
 
         case SDL_EVENT_MOUSE_MOTION:
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             if (input_controller_) {
                 input_controller_->handleMouseMove(event.motion.x, event.motion.y);
             }
             break;
 
         case SDL_EVENT_MOUSE_WHEEL:
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             if (input_controller_) {
                 input_controller_->handleScroll(event.wheel.x, event.wheel.y);
             }
@@ -219,29 +357,38 @@ namespace lfs::vis {
 
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP: {
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             if (!input_controller_)
                 break;
-            const int key = input::sdlScancodeToAppKey(event.key.scancode);
+            const int physical_key = input::sdlScancodeToAppKey(event.key.scancode);
+            // Resolve the unmodified layout key so bindings keep modifiers separate
+            // (for example, '=' + Shift stays KEY_EQUAL plus a Shift modifier).
+            int logical_key = input::sdlKeycodeToAppKey(
+                SDL_GetKeyFromScancode(event.key.scancode, SDL_KMOD_NONE, false));
+            if (logical_key == input::KEY_UNKNOWN) {
+                logical_key = physical_key;
+            }
             const int action = event.key.down
                                    ? (event.key.repeat ? input::ACTION_REPEAT : input::ACTION_PRESS)
                                    : input::ACTION_RELEASE;
             const int mods = input::sdlModsToAppMods(event.key.mod);
-            input_controller_->handleKey(key, action, mods);
+            input_controller_->handleKey(
+                physical_key, logical_key, static_cast<int>(event.key.scancode), action, mods);
             break;
         }
 
-        case SDL_EVENT_TEXT_INPUT:
-            if (event.text.text)
-                gui::RmlPanelHost::pushTextInput(event.text.text);
-            break;
-
         case SDL_EVENT_DROP_FILE:
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             if (event.drop.data) {
                 pending_drop_files_.emplace_back(event.drop.data);
             }
             break;
 
         case SDL_EVENT_DROP_COMPLETE:
+            if (!eventTargetsWindow(event, main_window_id))
+                break;
             if (input_controller_ && !pending_drop_files_.empty()) {
                 input_controller_->handleFileDrop(pending_drop_files_);
                 pending_drop_files_.clear();
@@ -270,7 +417,7 @@ namespace lfs::vis {
         }
 
         updateWindowSize();
-        requestRedraw();
+        wakeEventLoop();
     }
 
 } // namespace lfs::vis

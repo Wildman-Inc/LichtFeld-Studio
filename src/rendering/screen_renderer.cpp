@@ -6,6 +6,7 @@
 #include "core/logger.hpp"
 #include "core/tensor.hpp"
 #include "gl_state_guard.hpp"
+#include "image_layout.hpp"
 
 #ifdef CUDA_GL_INTEROP_ENABLED
 #include "cuda_gl_interop.hpp"
@@ -98,53 +99,100 @@ namespace lfs::rendering {
     Result<void> ScreenQuadRenderer::render(ManagedShader& shader) const {
         LOG_TIMER_TRACE("ScreenQuadRenderer::render");
 
+        return renderTexture(
+            shader,
+            getTextureID(),
+            depth_params_,
+            getTexcoordScale(),
+            getTexcoordScale(),
+            getDepthTextureID(),
+            false,
+            false);
+    }
+
+    Result<void> ScreenQuadRenderer::renderQuad(ManagedShader& shader) const {
+        LOG_TIMER_TRACE("ScreenQuadRenderer::renderQuad");
+        (void)shader;
+
+        VAOBinder vao_bind(quadVAO_);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        return {};
+    }
+
+    Result<void> ScreenQuadRenderer::renderTexture(ManagedShader& shader,
+                                                   const GLuint color_texture,
+                                                   const DepthParams& depth_params,
+                                                   const glm::vec2 color_texcoord_scale,
+                                                   const glm::vec2 depth_texcoord_scale,
+                                                   const GLuint depth_texture,
+                                                   const bool flip_y,
+                                                   const bool enable_alpha_blending) const {
+        LOG_TIMER_TRACE("ScreenQuadRenderer::renderTexture");
+
         GLStateGuard state_guard;
         ShaderScope s(shader);
 
         VAOBinder vao_bind(quadVAO_);
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, getTextureID());
+        glBindTexture(GL_TEXTURE_2D, color_texture);
         if (auto result = shader.set("screenTexture", 0); !result) {
             return result;
         }
 
-        glm::vec2 texcoord_scale = getTexcoordScale();
-        if (auto result = shader.set("texcoord_scale", texcoord_scale); !result) {
-            LOG_TRACE("Uniform 'texcoord_scale' not found in shader: {}", result.error());
+        if (auto result = shader.set("color_texcoord_scale", color_texcoord_scale); !result) {
+            LOG_TRACE("Uniform 'color_texcoord_scale' not found in shader: {}", result.error());
+        }
+
+        if (auto result = shader.set("depth_texcoord_scale", depth_texcoord_scale); !result) {
+            LOG_TRACE("Uniform 'depth_texcoord_scale' not found in shader: {}", result.error());
+        }
+
+        if (auto result = shader.set("flip_y", flip_y); !result) {
+            LOG_TRACE("Uniform 'flip_y' not set: {}", result.error());
         }
 
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, getDepthTextureID());
+        glBindTexture(GL_TEXTURE_2D, depth_texture);
 
         if (auto result = shader.set("depthTexture", 1); !result) {
             LOG_TRACE("Uniform 'depthTexture' not set: {}", result.error());
         }
 
-        if (auto result = shader.set("has_depth", depth_params_.has_depth); !result) {
+        if (auto result = shader.set("has_depth", depth_params.has_depth); !result) {
             LOG_TRACE("Uniform 'has_depth' not set: {}", result.error());
         }
 
-        if (auto result = shader.set("near_plane", depth_params_.near_plane); !result) {
+        if (auto result = shader.set("near_plane", depth_params.near_plane); !result) {
             LOG_TRACE("Uniform 'near_plane' not set: {}", result.error());
         }
 
-        if (auto result = shader.set("far_plane", depth_params_.far_plane); !result) {
+        if (auto result = shader.set("far_plane", depth_params.far_plane); !result) {
             LOG_TRACE("Uniform 'far_plane' not set: {}", result.error());
         }
 
-        if (auto result = shader.set("orthographic", depth_params_.orthographic); !result) {
+        if (auto result = shader.set("orthographic", depth_params.orthographic); !result) {
             LOG_TRACE("Uniform 'orthographic' not set: {}", result.error());
         }
 
-        if (auto result = shader.set("depth_is_ndc", depth_params_.depth_is_ndc); !result) {
+        if (auto result = shader.set("depth_is_ndc", depth_params.depth_is_ndc); !result) {
             LOG_TRACE("Uniform 'depth_is_ndc' not set: {}", result.error());
         }
 
-        if (depth_params_.has_depth) {
+        if (enable_alpha_blending) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glBlendEquation(GL_FUNC_ADD);
+        } else {
+            glDisable(GL_BLEND);
+        }
+
+        if (depth_params.has_depth) {
             glEnable(GL_DEPTH_TEST);
             glDepthMask(GL_TRUE);
             glDepthFunc(GL_ALWAYS);
+        } else {
+            glDisable(GL_DEPTH_TEST);
         }
 
         glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -152,14 +200,14 @@ namespace lfs::rendering {
         return {};
     }
 
-    Result<void> ScreenQuadRenderer::uploadData(const unsigned char* image, int width_, int height_) {
+    Result<void> ScreenQuadRenderer::uploadData(const unsigned char* image, int width_, int height_, const int channels) {
         if (!framebuffer) {
             LOG_ERROR("Framebuffer not initialized");
             return std::unexpected("Framebuffer not initialized");
         }
 
         LOG_TRACE("Uploading image data: {}x{}", width_, height_);
-        framebuffer->uploadImage(image, width_, height_);
+        framebuffer->uploadImage(image, width_, height_, channels);
         return {};
     }
 
@@ -177,7 +225,9 @@ namespace lfs::rendering {
             cpu_image = (cpu_image.clamp(0.0f, 1.0f) * 255.0f).to(lfs::core::DataType::UInt8);
         }
         cpu_image = cpu_image.cpu().contiguous();
-        return uploadData(cpu_image.ptr<unsigned char>(), width, height);
+        const auto layout = detectImageLayout(cpu_image);
+        const int channels = layout == ImageLayout::Unknown ? 3 : imageChannels(cpu_image, layout);
+        return uploadData(cpu_image.ptr<unsigned char>(), width, height, channels);
     }
 
     bool ScreenQuadRenderer::isInteropEnabled() const {

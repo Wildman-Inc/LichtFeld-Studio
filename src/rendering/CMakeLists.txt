@@ -9,6 +9,7 @@ set(RENDERING_SOURCES
         rendering_engine_impl.cpp
         rendering_pipeline.cpp
         gs_rasterizer_tensor.cpp
+        vksplat_rasterizer.cpp
         point_cloud_renderer.cpp
         grid_renderer.cpp
         bbox_renderer.cpp
@@ -16,25 +17,26 @@ set(RENDERING_SOURCES
         axes_renderer.cpp
         pivot_renderer.cpp
         text_renderer.cpp
+        environment_renderer.cpp
         viewport_gizmo.cpp
         framebuffer_factory.cpp
         shader_manager.cpp
         screen_renderer.cpp
         split_view_renderer.cpp
+        cuda_gl_interop.cpp
         camera_frustum_renderer.cpp
         mesh_renderer.cpp
         mesh2splat.cpp
         depth_compositor.cpp
 )
 
-# Conditionally add CUDA GL interop
-if(CUDA_GL_INTEROP_ENABLED)
-    list(APPEND RENDERING_SOURCES
-        cuda_gl_interop.cpp
-        cuda_gl_kernels.cu)
+# CUDA GL interop kernels are optional, but the saturation adjustment kernel is
+# also implemented here and is used by the visualizer whenever a GPU backend is enabled.
+if(USE_CUDA OR USE_HIP)
+    list(APPEND RENDERING_SOURCES cuda_gl_kernels.cu)
 endif()
 
-add_library(lfs_rendering STATIC ${RENDERING_SOURCES})
+lfs_add_gpu_library(lfs_rendering STATIC ${RENDERING_SOURCES})
 
 target_link_libraries(lfs_rendering
         PUBLIC
@@ -42,14 +44,21 @@ target_link_libraries(lfs_rendering
         lfs_geometry            # LibTorch-free geometry module
         # gs_kernels              # Temporarily disabled - requires LibTorch
         PRIVATE
+        lfs_io
         lfs_rasterizer
         glm::glm
         glad::glad
         ${OPENGL_LIBRARIES}
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
+        OpenImageIO::OpenImageIO
         spdlog::spdlog
         Freetype::Freetype
 )
+
+if(LFS_HAS_VKSPLAT)
+    target_link_libraries(lfs_rendering PRIVATE lfs_vksplat)
+    target_compile_definitions(lfs_rendering PUBLIC LFS_VULKAN_VIEWER_RASTERIZATION=1)
+endif()
 
 # Since we're linking to lfs_core PUBLIC, we inherit its include directories
 # which include: ${CMAKE_BINARY_DIR}/include (for config.h)
@@ -89,10 +98,13 @@ target_compile_definitions(lfs_rendering PRIVATE
         SHADER_PATH="${RENDERING_BUILD_RESOURCE_DIR}/shaders"
         RENDERING_SOURCE_SHADER_PATH="${RENDERING_SOURCE_RESOURCE_DIR}/shaders"
         $<$<BOOL:${CUDA_GL_INTEROP_ENABLED}>:CUDA_GL_INTEROP_ENABLED>
+        $<$<BOOL:${LFS_HAS_VKSPLAT}>:LFS_HAS_VKSPLAT=1>
+        $<$<BOOL:${LFS_HAS_VKSPLAT}>:LFS_VKSPLAT_SHADER_PATH="${LFS_VKSPLAT_SOURCE_DIR}/shader/">
         $<$<PLATFORM_ID:Windows>:NOMINMAX>
 )
 
 if(NOT BUILD_PORTABLE)
     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/include/rendering/rendering.hpp
+                  ${CMAKE_CURRENT_SOURCE_DIR}/include/rendering/frame_contract.hpp
             DESTINATION include/rendering)
 endif()

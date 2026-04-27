@@ -1,3 +1,5 @@
+"""Scene graph API"""
+
 from collections.abc import Sequence
 import enum
 from typing import Annotated, overload
@@ -580,6 +582,15 @@ class Scene:
     def set_selection_mask(self, mask: lichtfeld.Tensor) -> None:
         """Set selection from boolean mask tensor [N]"""
 
+    def preview_selection_mask(self, mask: lichtfeld.Tensor) -> None:
+        """Preview a selection mask without pushing an undo step"""
+
+    def commit_selection_preview(self) -> None:
+        """Commit a transient selection update as one undo step"""
+
+    def cancel_selection_preview(self) -> None:
+        """Cancel a transient selection update and restore the original selection"""
+
     def clear_selection(self) -> None:
         """Clear all selected Gaussians"""
 
@@ -637,6 +648,13 @@ class Scene:
         """Check if training dataset is loaded"""
 
     @property
+    def is_point_cloud_modified(self) -> bool:
+        """Whether the point cloud has been modified since loading"""
+
+    @is_point_cloud_modified.setter
+    def is_point_cloud_modified(self, arg: bool, /) -> None: ...
+
+    @property
     def scene_center(self) -> lichtfeld.Tensor:
         """Scene center position as a [3] tensor"""
 
@@ -689,11 +707,11 @@ class Camera:
 
     @property
     def fov_x(self) -> float:
-        """Horizontal field of view in radians"""
+        """Horizontal field of view in degrees"""
 
     @property
     def fov_y(self) -> float:
-        """Vertical field of view in radians"""
+        """Vertical field of view in degrees"""
 
     @property
     def image_width(self) -> int:
@@ -732,24 +750,38 @@ class Camera:
         """Unique camera identifier"""
 
     @property
-    def R(self) -> lichtfeld.Tensor:
-        """Rotation matrix [3, 3]"""
+    def rotation(self) -> lichtfeld.Tensor:
+        """
+        Visualizer camera-to-world rotation [3, 3], directly usable with render_view()
+        """
 
     @property
-    def T(self) -> lichtfeld.Tensor:
-        """Translation vector [3]"""
+    def translation(self) -> lichtfeld.Tensor:
+        """Visualizer camera position [3], directly usable with render_view()"""
 
     @property
     def K(self) -> lichtfeld.Tensor:
         """Intrinsic matrix [3, 3]"""
 
     @property
+    def view_matrix(self) -> lichtfeld.Tensor:
+        """Visualizer world-to-camera view matrix [4, 4]"""
+
+    @property
+    def R(self) -> lichtfeld.Tensor:
+        """Deprecated raw dataset world-to-camera rotation [3, 3]"""
+
+    @property
+    def T(self) -> lichtfeld.Tensor:
+        """Deprecated raw dataset world-to-camera translation [3]"""
+
+    @property
     def world_view_transform(self) -> lichtfeld.Tensor:
-        """World-to-view transform [4, 4]"""
+        """Deprecated raw dataset world-to-camera transform [1, 4, 4]"""
 
     @property
     def cam_position(self) -> lichtfeld.Tensor:
-        """Camera position in world space [3]"""
+        """Deprecated raw dataset-world camera position [3]"""
 
     def load_image(self, resize_factor: int = 1, max_width: int = 3840) -> lichtfeld.Tensor:
         """Load image as tensor [C, H, W] on CUDA"""

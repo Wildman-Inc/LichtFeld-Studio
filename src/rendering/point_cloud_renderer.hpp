@@ -46,7 +46,8 @@ namespace lfs::rendering {
                             const std::vector<glm::mat4>& model_transforms = {},
                             const std::shared_ptr<lfs::core::Tensor>& transform_indices = nullptr,
                             bool equirectangular = false,
-                            const PointCloudCropParams& crop_params = {});
+                            const PointCloudCropParams& crop_params = {},
+                            bool transparent_background = false);
 
         Result<void> render(const lfs::core::PointCloud& point_cloud,
                             const glm::mat4& view,
@@ -56,18 +57,19 @@ namespace lfs::rendering {
                             const std::vector<glm::mat4>& model_transforms = {},
                             const std::shared_ptr<lfs::core::Tensor>& transform_indices = nullptr,
                             bool equirectangular = false,
-                            const PointCloudCropParams& crop_params = {});
+                            const PointCloudCropParams& crop_params = {},
+                            bool transparent_background = false);
 
         // Check if initialized
         bool isInitialized() const { return initialized_; }
 
     private:
         Result<void> createCubeGeometry();
-        static Tensor extractRGBFromSH(const Tensor& shs);
+        static lfs::core::Tensor extractRGBFromSH(const lfs::core::Tensor& shs);
 
         // Core rendering implementation (shared by both overloads)
-        Result<void> renderInternal(const Tensor& positions,
-                                    const Tensor& colors,
+        Result<void> renderInternal(const lfs::core::Tensor& positions,
+                                    const lfs::core::Tensor& colors,
                                     const glm::mat4& view,
                                     const glm::mat4& projection,
                                     float voxel_size,
@@ -75,20 +77,14 @@ namespace lfs::rendering {
                                     const std::vector<glm::mat4>& model_transforms,
                                     const std::shared_ptr<lfs::core::Tensor>& transform_indices,
                                     bool equirectangular,
-                                    const PointCloudCropParams& crop_params);
+                                    const PointCloudCropParams& crop_params,
+                                    bool transparent_background);
 
         // OpenGL resources using RAII
         VAO cube_vao_;
         VBO cube_vbo_;
         EBO cube_ebo_;
         VBO instance_vbo_; // For positions and colors
-
-        // Framebuffer resources using RAII
-        FBO fbo_;
-        Texture color_texture_;
-        Texture depth_texture_;
-        int fbo_width_ = 0;
-        int fbo_height_ = 0;
 
         // Shaders
         ManagedShader shader_;
@@ -98,7 +94,7 @@ namespace lfs::rendering {
         size_t current_point_count_ = 0;
 
         // Cached buffer to avoid per-frame allocation
-        Tensor interleaved_cache_;
+        lfs::core::Tensor interleaved_cache_;
 
 #ifdef CUDA_GL_INTEROP_ENABLED
         std::optional<CudaGLInteropBuffer> interop_buffer_;

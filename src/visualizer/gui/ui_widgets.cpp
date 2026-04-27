@@ -12,10 +12,16 @@
 #include "theme/theme.hpp"
 #include "training/training_manager.hpp"
 #include "visualizer_impl.hpp"
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
+#include <cstring>
 #include <glad/glad.h>
+#include <imgui_internal.h>
 #include <implot.h>
+#include <string>
+#include <unordered_map>
 #include <imgui.h>
 
 namespace lfs::vis::gui::widgets {
@@ -23,12 +29,28 @@ namespace lfs::vis::gui::widgets {
     using namespace lfs::core::events;
 
     namespace {
+        constexpr float CLICK_THRESHOLD_SQ = 5.0f * 5.0f;
+        constexpr float SCRUB_STYLE_ROUNDING = 6.0f;
+        constexpr const char* MULTI_COMPONENT_LABELS[4] = {"##X", "##Y", "##Z", "##W"};
+
         struct WidgetIcons {
             unsigned int reset = 0;
             bool initialized = false;
         };
 
         WidgetIcons g_icons;
+        ImGuiID g_pending_cancel_id = 0;
+        int g_snapshot_cleanup_frame = -1;
+
+        struct EditSnapshot {
+            std::string text;
+            std::array<double, 4> values = {0.0, 0.0, 0.0, 0.0};
+            int components = 0;
+            int last_seen_frame = -1;
+            bool is_text = false;
+        };
+
+        std::unordered_map<ImGuiID, EditSnapshot> g_edit_snapshots;
 
         void ensureIconsLoaded() {
             if (g_icons.initialized)
@@ -53,13 +75,375 @@ namespace lfs::vis::gui::widgets {
         ImVec4 getIconTint() {
             return theme().isLightTheme() ? ImVec4{0.2f, 0.2f, 0.2f, 0.9f} : ImVec4{1.0f, 1.0f, 1.0f, 0.9f};
         }
+
+        void cleanupEditSnapshots() {
+            ImGuiContext& g = *GImGui;
+            if (g_snapshot_cleanup_frame == g.FrameCount)
+                return;
+
+            g_snapshot_cleanup_frame = g.FrameCount;
+            for (auto it = g_edit_snapshots.begin(); it != g_edit_snapshots.end();) {
+                if (it->first == g.ActiveId || it->first == g_pending_cancel_id ||
+                    it->second.last_seen_frame >= g.FrameCount - 1) {
+                    ++it;
+                    continue;
+                }
+                it = g_edit_snapshots.erase(it);
+            }
+
+            const auto pending_it = g_edit_snapshots.find(g_pending_cancel_id);
+            if (g_pending_cancel_id != 0 &&
+                (pending_it == g_edit_snapshots.end() ||
+                 pending_it->second.last_seen_frame < g.FrameCount - 1)) {
+                g_pending_cancel_id = 0;
+            }
+        }
+
+        void markSnapshotSeen(const ImGuiID id) {
+            auto it = g_edit_snapshots.find(id);
+            if (it == g_edit_snapshots.end())
+                return;
+            it->second.last_seen_frame = GImGui->FrameCount;
+        }
+
+        template <typename T>
+        void storeNumericSnapshot(const ImGuiID id, const T* values, const int components) {
+            auto& snapshot = g_edit_snapshots[id];
+            snapshot.text.clear();
+            snapshot.components = components;
+            snapshot.is_text = false;
+            snapshot.last_seen_frame = GImGui->FrameCount;
+            for (int i = 0; i < components; ++i)
+                snapshot.values[i] = static_cast<double>(values[i]);
+        }
+
+        void storeTextSnapshot(const ImGuiID id, const char* buf) {
+            auto& snapshot = g_edit_snapshots[id];
+            snapshot.text = buf ? buf : "";
+            snapshot.components = 0;
+            snapshot.is_text = true;
+            snapshot.last_seen_frame = GImGui->FrameCount;
+        }
+
+        template <typename T>
+        bool restoreNumericSnapshotIfRequested(const ImGuiID id, T* values, const int components) {
+            cleanupEditSnapshots();
+            if (g_pending_cancel_id != id)
+                return false;
+
+            g_pending_cancel_id = 0;
+            const auto it = g_edit_snapshots.find(id);
+            if (it == g_edit_snapshots.end() || it->second.is_text)
+                return false;
+
+            bool restored = false;
+            const int count = std::min(components, it->second.components);
+            for (int i = 0; i < count; ++i) {
+                const T original = static_cast<T>(it->second.values[i]);
+                if (values[i] == original)
+                    continue;
+                values[i] = original;
+                restored = true;
+            }
+            g_edit_snapshots.erase(it);
+            return restored;
+        }
+
+        bool restoreTextSnapshotIfRequested(const ImGuiID id, char* buf, const std::size_t buf_size) {
+            cleanupEditSnapshots();
+            if (g_pending_cancel_id != id)
+                return false;
+
+            g_pending_cancel_id = 0;
+            const auto it = g_edit_snapshots.find(id);
+            if (it == g_edit_snapshots.end() || !it->second.is_text || buf_size == 0)
+                return false;
+
+            const std::string original = it->second.text;
+            g_edit_snapshots.erase(it);
+
+            const std::string current = buf ? std::string(buf) : std::string();
+            if (current == original)
+                return false;
+
+            std::fill_n(buf, buf_size, '\0');
+            std::strncpy(buf, original.c_str(), buf_size - 1);
+            return true;
+        }
+
+        void forgetDeactivatedSnapshot(const ImGuiID id) {
+            if (id == 0 || id == g_pending_cancel_id)
+                return;
+            g_edit_snapshots.erase(id);
+        }
+
+        void handleActiveTextInputShortcut() {
+            if (!ImGui::IsItemActive())
+                return;
+
+            ImGuiContext& g = *GImGui;
+            const ImGuiID id = ImGui::GetItemID();
+            if (id == 0 || g.ActiveId != id || g.InputTextState.ID != id)
+                return;
+
+            const ImGuiIO& io = ImGui::GetIO();
+            const bool primary_shortcut_pressed = io.KeyCtrl || (io.ConfigMacOSXBehaviors && io.KeySuper);
+            if (!primary_shortcut_pressed || !ImGui::IsKeyPressed(ImGuiKey_A, false))
+                return;
+
+            g.InputTextState.SelectAll();
+        }
+
+        void handleSliderClickToInput() {
+            if (!ImGui::IsItemDeactivated())
+                return;
+            if (g_pending_cancel_id == ImGui::GetItemID())
+                return;
+            if (!ImGui::IsItemHovered())
+                return;
+            if (ImGui::GetIO().MouseDragMaxDistanceSqr[0] > CLICK_THRESHOLD_SQ)
+                return;
+
+            ImGuiContext& g = *GImGui;
+            const ImGuiID id = ImGui::GetItemID();
+            g.TempInputId = id;
+            ImGui::SetActiveID(id, g.CurrentWindow);
+        }
+
+        template <typename DrawFn>
+        bool drawWithScrubStyle(const DrawFn& draw_widget) {
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, SCRUB_STYLE_ROUNDING);
+            ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, SCRUB_STYLE_ROUNDING);
+            const bool changed = draw_widget();
+            ImGui::PopStyleVar(2);
+            return changed;
+        }
+
+        template <typename T>
+        bool drawTrackedNumericWidget(const T* original_values, T* current_values, const int components,
+                                      const auto& draw_widget, const auto& post_draw) {
+            cleanupEditSnapshots();
+            const bool changed = draw_widget();
+
+            ImGuiContext& g = *GImGui;
+            const ImGuiID item_id = ImGui::GetItemID();
+            const ImGuiID active_id = ImGui::IsItemActive() ? g.ActiveId : 0;
+            const ImGuiID snapshot_id = active_id ? active_id : item_id;
+
+            if (ImGui::IsItemActivated() && snapshot_id != 0)
+                storeNumericSnapshot(snapshot_id, original_values, components);
+            if (active_id != 0)
+                markSnapshotSeen(active_id);
+
+            handleActiveTextInputShortcut();
+            post_draw();
+
+            const bool restored = restoreNumericSnapshotIfRequested(snapshot_id, current_values, components);
+
+            if (ImGui::IsItemDeactivated())
+                forgetDeactivatedSnapshot(g.DeactivatedItemData.ID ? g.DeactivatedItemData.ID : snapshot_id);
+
+            return changed || restored;
+        }
+
+        bool drawTrackedTextWidget(char* buf, const std::size_t buf_size,
+                                   const auto& draw_widget) {
+            cleanupEditSnapshots();
+            const std::string original = buf ? std::string(buf) : std::string();
+            const bool changed = draw_widget();
+
+            ImGuiContext& g = *GImGui;
+            const ImGuiID item_id = ImGui::GetItemID();
+            const ImGuiID active_id = ImGui::IsItemActive() ? g.ActiveId : 0;
+            const ImGuiID snapshot_id = active_id ? active_id : item_id;
+
+            if (ImGui::IsItemActivated() && snapshot_id != 0)
+                storeTextSnapshot(snapshot_id, original.c_str());
+            if (active_id != 0)
+                markSnapshotSeen(active_id);
+
+            handleActiveTextInputShortcut();
+            const bool restored = restoreTextSnapshotIfRequested(snapshot_id, buf, buf_size);
+
+            if (ImGui::IsItemDeactivated())
+                forgetDeactivatedSnapshot(g.DeactivatedItemData.ID ? g.DeactivatedItemData.ID : snapshot_id);
+
+            return changed || restored;
+        }
+
+        template <typename DrawComponent>
+        bool drawMultiComponentWidget(const char* label, const int components, DrawComponent&& draw_component) {
+            bool changed = false;
+            ImGui::BeginGroup();
+            ImGui::PushID(label);
+            ImGui::PushMultiItemsWidths(components, ImGui::CalcItemWidth());
+            for (int i = 0; i < components; ++i) {
+                ImGui::PushID(i);
+                changed |= draw_component(i, MULTI_COMPONENT_LABELS[i]);
+                ImGui::PopID();
+                ImGui::PopItemWidth();
+                if (i + 1 < components)
+                    ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+            }
+            ImGui::PopID();
+
+            const char* const label_end = ImGui::FindRenderedTextEnd(label);
+            if (label != label_end) {
+                ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+                ImGui::TextEx(label, label_end);
+            }
+            ImGui::EndGroup();
+            return changed;
+        }
     } // namespace
+
+    bool InputText(const char* label, char* buf, const std::size_t buf_size, const ImGuiInputTextFlags flags,
+                   ImGuiInputTextCallback callback, void* user_data) {
+        return drawTrackedTextWidget(
+            buf, buf_size,
+            [&]() { return ImGui::InputText(label, buf, buf_size, flags, callback, user_data); });
+    }
+
+    bool InputTextWithHint(const char* label, const char* hint, char* buf, const std::size_t buf_size,
+                           const ImGuiInputTextFlags flags, ImGuiInputTextCallback callback, void* user_data) {
+        return drawTrackedTextWidget(
+            buf, buf_size,
+            [&]() { return ImGui::InputTextWithHint(label, hint, buf, buf_size, flags, callback, user_data); });
+    }
+
+    bool InputFloat(const char* label, float* v, const float step, const float step_fast,
+                    const char* format, const ImGuiInputTextFlags flags) {
+        const float original = *v;
+        return drawTrackedNumericWidget<float>(
+            &original, v, 1,
+            [&]() { return ImGui::InputFloat(label, v, step, step_fast, format, flags); },
+            []() {});
+    }
+
+    bool InputInt(const char* label, int* v, const int step, const int step_fast,
+                  const ImGuiInputTextFlags flags) {
+        const int original = *v;
+        return drawTrackedNumericWidget<int>(
+            &original, v, 1,
+            [&]() { return ImGui::InputInt(label, v, step, step_fast, flags); },
+            []() {});
+    }
+
+    bool DragFloat(const char* label, float* v, const float speed, const float min, const float max,
+                   const char* format, const ImGuiSliderFlags flags) {
+        const float original = *v;
+        return drawTrackedNumericWidget<float>(
+            &original, v, 1,
+            [&]() {
+                return drawWithScrubStyle(
+                    [&]() { return ImGui::DragFloat(label, v, speed, min, max, format, flags); });
+            },
+            []() {});
+    }
+
+    bool DragInt(const char* label, int* v, const float speed, const int min, const int max,
+                 const char* format, const ImGuiSliderFlags flags) {
+        const int original = *v;
+        return drawTrackedNumericWidget<int>(
+            &original, v, 1,
+            [&]() {
+                return drawWithScrubStyle(
+                    [&]() { return ImGui::DragInt(label, v, speed, min, max, format, flags); });
+            },
+            []() {});
+    }
+
+    bool DragFloat2(const char* label, float v[2], const float speed, const float min, const float max,
+                    const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 2, [&](const int i, const char* component_label) {
+            return DragFloat(component_label, &v[i], speed, min, max, format, flags);
+        });
+    }
+
+    bool DragFloat3(const char* label, float v[3], const float speed, const float min, const float max,
+                    const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 3, [&](const int i, const char* component_label) {
+            return DragFloat(component_label, &v[i], speed, min, max, format, flags);
+        });
+    }
+
+    bool DragFloat4(const char* label, float v[4], const float speed, const float min, const float max,
+                    const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 4, [&](const int i, const char* component_label) {
+            return DragFloat(component_label, &v[i], speed, min, max, format, flags);
+        });
+    }
+
+    bool DragInt2(const char* label, int v[2], const float speed, const int min, const int max,
+                  const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 2, [&](const int i, const char* component_label) {
+            return DragInt(component_label, &v[i], speed, min, max, format, flags);
+        });
+    }
+
+    bool DragInt3(const char* label, int v[3], const float speed, const int min, const int max,
+                  const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 3, [&](const int i, const char* component_label) {
+            return DragInt(component_label, &v[i], speed, min, max, format, flags);
+        });
+    }
+
+    bool DragInt4(const char* label, int v[4], const float speed, const int min, const int max,
+                  const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 4, [&](const int i, const char* component_label) {
+            return DragInt(component_label, &v[i], speed, min, max, format, flags);
+        });
+    }
+
+    bool SliderFloat(const char* label, float* v, const float min, const float max,
+                     const char* format, const ImGuiSliderFlags flags) {
+        const float original = *v;
+        return drawTrackedNumericWidget<float>(
+            &original, v, 1,
+            [&]() {
+                return drawWithScrubStyle(
+                    [&]() { return ImGui::SliderFloat(label, v, min, max, format, flags); });
+            },
+            []() { handleSliderClickToInput(); });
+    }
+
+    bool SliderInt(const char* label, int* v, const int min, const int max,
+                   const char* format, const ImGuiSliderFlags flags) {
+        const int original = *v;
+        return drawTrackedNumericWidget<int>(
+            &original, v, 1,
+            [&]() {
+                return drawWithScrubStyle(
+                    [&]() { return ImGui::SliderInt(label, v, min, max, format, flags); });
+            },
+            []() { handleSliderClickToInput(); });
+    }
+
+    bool SliderFloat2(const char* label, float v[2], const float min, const float max,
+                      const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 2, [&](const int i, const char* component_label) {
+            return SliderFloat(component_label, &v[i], min, max, format, flags);
+        });
+    }
+
+    bool SliderFloat3(const char* label, float v[3], const float min, const float max,
+                      const char* format, const ImGuiSliderFlags flags) {
+        return drawMultiComponentWidget(label, 3, [&](const int i, const char* component_label) {
+            return SliderFloat(component_label, &v[i], min, max, format, flags);
+        });
+    }
+
+    void RequestActiveEditCancel() {
+        cleanupEditSnapshots();
+        if (g_edit_snapshots.contains(GImGui->ActiveId))
+            g_pending_cancel_id = GImGui->ActiveId;
+    }
 
     bool SliderWithReset(const char* label, float* v, float min, float max, float reset_value,
                          const char* tooltip, const char* format) {
         ensureIconsLoaded();
 
-        bool changed = ImGui::SliderFloat(label, v, min, max, format);
+        bool changed = SliderFloat(label, v, min, max, format);
         bool slider_hovered = ImGui::IsItemHovered();
 
         ImGui::SameLine();
@@ -98,7 +482,7 @@ namespace lfs::vis::gui::widgets {
                              const char* tooltip) {
         ensureIconsLoaded();
 
-        bool changed = ImGui::DragFloat3(label, v, speed);
+        bool changed = DragFloat3(label, v, speed);
         bool drag_hovered = ImGui::IsItemHovered();
 
         ImGui::SameLine();
@@ -288,56 +672,123 @@ namespace lfs::vis::gui::widgets {
         DrawModeStatus(ctx);
     }
 
-    void DrawWindowShadow(const ImVec2& pos, const ImVec2& size, const float rounding) {
+    void DrawShadowRect(ImDrawList* draw_list, const ImVec2& pos, const ImVec2& size,
+                        const float rounding, const float alpha_scale,
+                        const float blur_scale, const float offset_scale) {
         const auto& t = theme();
-        if (!t.shadows.enabled)
+        if (!t.shadows.enabled || !draw_list)
             return;
 
-        constexpr int LAYER_COUNT = 8;
-        constexpr float FALLOFF_SCALE = 0.18f;
-        constexpr float ROUNDING_SCALE = 0.3f;
+        constexpr int LAYER_COUNT = 12;
+        constexpr float FALLOFF_SCALE = 0.34f;
+        constexpr float ROUNDING_SCALE = 0.18f;
 
-        auto* const draw_list = ImGui::GetBackgroundDrawList();
+        const ImVec4 shadow_tint = t.isLightTheme()
+                                       ? ImVec4{0.08f, 0.10f, 0.16f, 1.0f}
+                                       : ImVec4{0.0f, 0.0f, 0.0f, 1.0f};
+        const float theme_alpha_scale = t.isLightTheme() ? 0.82f : 1.0f;
         const ImVec2& off = t.shadows.offset;
-        const float blur = t.shadows.blur;
-        const float base_alpha = t.shadows.alpha * 255.0f;
+        const float blur = std::max(0.0f, t.shadows.blur * blur_scale);
+        const float min_expand = std::max(1.0f, blur * 0.14f);
+        const float base_alpha =
+            std::clamp(t.shadows.alpha * theme_alpha_scale * alpha_scale, 0.0f, 1.0f);
 
         for (int i = 0; i < LAYER_COUNT; ++i) {
             const float t_val = static_cast<float>(i) / (LAYER_COUNT - 1);
             const float inv_t = 1.0f - t_val;
-            const float falloff = inv_t * inv_t * inv_t;
-            const int alpha = static_cast<int>(base_alpha * falloff * FALLOFF_SCALE);
-            if (alpha < 1)
+            const float falloff = std::pow(inv_t, 1.65f);
+            const float alpha = base_alpha * falloff * FALLOFF_SCALE;
+            if (alpha <= 0.0025f)
                 continue;
 
-            const float expand = blur * t_val;
-            const ImVec2 p1 = {pos.x + off.x - expand, pos.y + off.y - expand};
-            const ImVec2 p2 = {pos.x + size.x + off.x + expand, pos.y + size.y + off.y + expand};
-            draw_list->AddRectFilled(p1, p2, IM_COL32(0, 0, 0, alpha), rounding + expand * ROUNDING_SCALE);
+            const float expand = min_expand + blur * (0.2f + 0.8f * t_val);
+            const ImVec2 layer_off = {
+                off.x * offset_scale * (0.45f + 0.55f * t_val),
+                off.y * offset_scale * (0.45f + 0.55f * t_val)};
+            const ImVec2 p1 = {pos.x + layer_off.x - expand, pos.y + layer_off.y - expand};
+            const ImVec2 p2 = {pos.x + size.x + layer_off.x + expand, pos.y + size.y + layer_off.y + expand};
+            draw_list->AddRectFilled(p1, p2, toU32WithAlpha(shadow_tint, alpha),
+                                     rounding + expand * ROUNDING_SCALE);
         }
     }
 
-    void DrawViewportVignette(const ImVec2& pos, const ImVec2& size) {
+    void DrawShadowRectOutside(ImDrawList* draw_list, const ImVec2& pos, const ImVec2& size,
+                               const float rounding, const float alpha_scale,
+                               const float blur_scale, const float offset_scale) {
         const auto& t = theme();
-        if (!t.vignette.enabled)
+        if (!t.shadows.enabled || !draw_list)
             return;
 
-        constexpr float EDGE_SCALE = 0.5f;
-        constexpr ImU32 CLEAR_COLOR = IM_COL32(0, 0, 0, 0);
+        constexpr int LAYER_COUNT = 12;
+        constexpr float FALLOFF_SCALE = 0.34f;
+        constexpr float ROUNDING_SCALE = 0.18f;
 
-        auto* const draw_list = ImGui::GetBackgroundDrawList();
-        const float edge_mult = (1.0f - t.vignette.radius) * EDGE_SCALE * (1.0f + t.vignette.softness);
-        const float edge_w = size.x * edge_mult;
-        const float edge_h = size.y * edge_mult;
-        const ImU32 dark = IM_COL32(0, 0, 0, static_cast<int>(t.vignette.intensity * 255.0f));
+        const ImVec4 shadow_tint = t.isLightTheme()
+                                       ? ImVec4{0.08f, 0.10f, 0.16f, 1.0f}
+                                       : ImVec4{0.0f, 0.0f, 0.0f, 1.0f};
+        const float theme_alpha_scale = t.isLightTheme() ? 0.82f : 1.0f;
+        const ImVec2& off = t.shadows.offset;
+        const float blur = std::max(0.0f, t.shadows.blur * blur_scale);
+        const float min_expand = std::max(1.0f, blur * 0.14f);
+        const float base_alpha =
+            std::clamp(t.shadows.alpha * theme_alpha_scale * alpha_scale, 0.0f, 1.0f);
+        const ImVec2 inner_min = pos;
+        const ImVec2 inner_max = {pos.x + size.x, pos.y + size.y};
 
-        const float x1 = pos.x, y1 = pos.y;
-        const float x2 = pos.x + size.x, y2 = pos.y + size.y;
+        for (int i = 0; i < LAYER_COUNT; ++i) {
+            const float t_val = static_cast<float>(i) / (LAYER_COUNT - 1);
+            const float inv_t = 1.0f - t_val;
+            const float falloff = std::pow(inv_t, 1.65f);
+            const float alpha = base_alpha * falloff * FALLOFF_SCALE;
+            if (alpha <= 0.0025f)
+                continue;
 
-        draw_list->AddRectFilledMultiColor({x1, y1}, {x1 + edge_w, y2}, dark, CLEAR_COLOR, CLEAR_COLOR, dark);
-        draw_list->AddRectFilledMultiColor({x2 - edge_w, y1}, {x2, y2}, CLEAR_COLOR, dark, dark, CLEAR_COLOR);
-        draw_list->AddRectFilledMultiColor({x1, y1}, {x2, y1 + edge_h}, dark, dark, CLEAR_COLOR, CLEAR_COLOR);
-        draw_list->AddRectFilledMultiColor({x1, y2 - edge_h}, {x2, y2}, CLEAR_COLOR, CLEAR_COLOR, dark, dark);
+            const float expand = min_expand + blur * (0.2f + 0.8f * t_val);
+            const ImVec2 layer_off = {
+                off.x * offset_scale * (0.45f + 0.55f * t_val),
+                off.y * offset_scale * (0.45f + 0.55f * t_val)};
+            const ImVec2 p1 = {pos.x + layer_off.x - expand, pos.y + layer_off.y - expand};
+            const ImVec2 p2 = {pos.x + size.x + layer_off.x + expand,
+                               pos.y + size.y + layer_off.y + expand};
+            const float layer_rounding = rounding + expand * ROUNDING_SCALE;
+            const ImU32 col = toU32WithAlpha(shadow_tint, alpha);
+
+            const auto draw_band = [&](const ImVec2 clip_min, const ImVec2 clip_max) {
+                if (clip_max.x <= clip_min.x || clip_max.y <= clip_min.y)
+                    return;
+                draw_list->PushClipRect(clip_min, clip_max, true);
+                draw_list->AddRectFilled(p1, p2, col, layer_rounding);
+                draw_list->PopClipRect();
+            };
+
+            draw_band(p1, {p2.x, inner_min.y});
+            draw_band({p1.x, inner_max.y}, p2);
+            draw_band({p1.x, inner_min.y}, {inner_min.x, inner_max.y});
+            draw_band({inner_max.x, inner_min.y}, {p2.x, inner_max.y});
+        }
+    }
+
+    void DrawFloatingWindowShadow(ImDrawList* draw_list, const ImVec2& pos, const ImVec2& size,
+                                  const float rounding) {
+        DrawShadowRect(draw_list, pos, size, rounding, 0.36f, 0.82f, 0.58f);
+    }
+
+    void DrawFloatingWindowShadow(const ImVec2& pos, const ImVec2& size, const float rounding) {
+        DrawFloatingWindowShadow(ImGui::GetBackgroundDrawList(), pos, size, rounding);
+    }
+
+    void DrawPopoverShadowOverlay(ImDrawList* draw_list, const ImVec2& pos, const ImVec2& size,
+                                  const float rounding) {
+        DrawShadowRectOutside(draw_list, pos, size, rounding, 0.46f, 0.92f, 0.72f);
+    }
+
+    void DrawModalShadow(ImDrawList* draw_list, const ImVec2& pos, const ImVec2& size,
+                         const float rounding) {
+        DrawShadowRect(draw_list, pos, size, rounding, 0.68f, 1.08f, 0.92f);
+    }
+
+    void DrawWindowShadow(const ImVec2& pos, const ImVec2& size, const float rounding) {
+        DrawFloatingWindowShadow(pos, size, rounding);
     }
 
     bool IconButton(const char* id, const unsigned int texture, const ImVec2& size,
@@ -463,7 +914,7 @@ namespace lfs::vis::gui::widgets {
 
         bool changed = false;
         constexpr auto FLAGS = ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_AutoSelectAll;
-        if (ImGui::InputText("##input", buf, BUF_SIZE, FLAGS)) {
+        if (InputText("##input", buf, BUF_SIZE, FLAGS)) {
             int parsed = 0;
             bool has_digits = false;
             bool negative = false;

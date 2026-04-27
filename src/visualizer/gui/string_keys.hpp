@@ -28,27 +28,25 @@ namespace lichtfeld::Strings {
             inline constexpr const char* PREFERENCES = "menu.edit.preferences";
         } // namespace Edit
 
+        namespace Tools {
+            inline constexpr const char* MENU = "menu.tools";
+            inline constexpr const char* PYTHON_CONSOLE = "menu.tools.python_console";
+            inline constexpr const char* PLUGIN_MARKETPLACE = "menu.tools.plugin_marketplace";
+        } // namespace Tools
+
         namespace View {
             inline constexpr const char* MENU = "menu.view";
             inline constexpr const char* THEME = "menu.view.theme";
-            inline constexpr const char* THEME_DARK = "menu.view.theme.dark";
-            inline constexpr const char* THEME_LIGHT = "menu.view.theme.light";
-            inline constexpr const char* THEME_GRUVBOX = "menu.view.theme.gruvbox";
-            inline constexpr const char* THEME_CATPPUCCIN_MOCHA = "menu.view.theme.catppuccin_mocha";
-            inline constexpr const char* THEME_CATPPUCCIN_LATTE = "menu.view.theme.catppuccin_latte";
-            inline constexpr const char* THEME_NORD = "menu.view.theme.nord";
             inline constexpr const char* DEBUG_INFO = "menu.view.debug_info";
         } // namespace View
 
         namespace Help {
             inline constexpr const char* MENU = "menu.help";
-            inline constexpr const char* GETTING_STARTED = "menu.help.getting_started";
             inline constexpr const char* ABOUT = "menu.help.about";
         } // namespace Help
     } // namespace Menu
 
     namespace Window {
-        inline constexpr const char* GETTING_STARTED = "window.getting_started";
         inline constexpr const char* ABOUT = "window.about";
         inline constexpr const char* INPUT_SETTINGS = "window.input_settings";
         inline constexpr const char* DEBUG_INFO = "window.debug_info";
@@ -58,19 +56,6 @@ namespace lichtfeld::Strings {
         inline constexpr const char* TRAINING = "window.training";
         inline constexpr const char* PREFERENCES = "window.preferences";
     } // namespace Window
-
-    namespace GettingStarted {
-        inline constexpr const char* TITLE = "getting_started.title";
-        inline constexpr const char* DESCRIPTION = "getting_started.description";
-        inline constexpr const char* WIKI_SECTION = "getting_started.wiki_section";
-        inline constexpr const char* VIDEO_INTRO = "getting_started.video_intro";
-        inline constexpr const char* VIDEO_LATEST = "getting_started.video_latest";
-        inline constexpr const char* VIDEO_REALITY_SCAN = "getting_started.video_reality_scan";
-        inline constexpr const char* VIDEO_COLMAP = "getting_started.video_colmap";
-        inline constexpr const char* VIDEO_LICHTFELD = "getting_started.video_lichtfeld";
-        inline constexpr const char* VIDEO_MASKS = "getting_started.video_masks";
-        inline constexpr const char* LOADING = "getting_started.loading";
-    } // namespace GettingStarted
 
     namespace About {
         inline constexpr const char* TITLE = "about.title";
@@ -305,6 +290,9 @@ namespace lichtfeld::Strings {
         inline constexpr const char* RENAME = "scene.rename";
         inline constexpr const char* DUPLICATE_ITEM = "scene.duplicate";
         inline constexpr const char* GO_TO_CAMERA_VIEW = "scene.go_to_camera_view";
+        inline constexpr const char* GO_TO_IMAGE = "scene.go_to_image";
+        inline constexpr const char* OPEN_IN_GT_COMPARE = "scene.open_in_gt_compare";
+        inline constexpr const char* SHOW_IN_FILE_MANAGER = "scene.show_in_file_manager";
         inline constexpr const char* GO_TO_CAM_VIEW = "scene.go_to_cam_view";
         inline constexpr const char* FIT_TO_SCENE = "scene.fit_to_scene";
         inline constexpr const char* FIT_TO_SCENE_TRIMMED = "scene.fit_to_scene_trimmed";
@@ -350,6 +338,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* FORMAT_PLY_STANDARD = "export.format.ply_standard";
         inline constexpr const char* FORMAT_SOG_SUPERSPLAT = "export.format.sog_supersplat";
         inline constexpr const char* FORMAT_SPZ_NIANTIC = "export.format.spz_niantic";
+        inline constexpr const char* FORMAT_USD_OPENUSD = "export.format.usd_openusd";
         inline constexpr const char* FORMAT_HTML_VIEWER = "export.format.html_viewer";
         inline constexpr const char* SELECT_MODELS = "export.select_models";
         inline constexpr const char* ALL = "export.all";
@@ -397,6 +386,8 @@ namespace lichtfeld::Strings {
         inline constexpr const char* STEP = "status.step";
         inline constexpr const char* LOSS = "status.loss";
         inline constexpr const char* ETA = "status.eta";
+        inline constexpr const char* PSNR = "status.psnr";
+        inline constexpr const char* SSIM = "status.ssim";
         inline constexpr const char* UNKNOWN = "status.unknown";
         inline constexpr const char* DATASET_NO_TRAINER = "status.dataset_no_trainer";
         inline constexpr const char* DATASET_READY = "status.dataset_ready";
@@ -431,6 +422,19 @@ namespace lichtfeld::Strings {
         inline constexpr const char* WASD = "controls.wasd";
         inline constexpr const char* ZOOM = "controls.zoom";
     } // namespace Controls
+
+    namespace StatusBar {
+        inline constexpr const char* GT_COMPARE = "status_bar.gt_compare";
+        inline constexpr const char* CAMERA = "status_bar.camera";
+        inline constexpr const char* GROUND_TRUTH = "status_bar.ground_truth";
+        inline constexpr const char* GROUND_TRUTH_EXCLUDED = "status_bar.ground_truth_excluded";
+        inline constexpr const char* RENDERED = "status_bar.rendered";
+        inline constexpr const char* SPLIT_VIEW = "status_bar.split_view";
+        inline constexpr const char* PRIMARY_VIEW = "status_bar.primary_view";
+        inline constexpr const char* SECONDARY_VIEW = "status_bar.secondary_view";
+        inline constexpr const char* GPU = "status_bar.gpu";
+        inline constexpr const char* STRATEGY_DEFAULT = "status_bar.strategy_default";
+    } // namespace StatusBar
 
     namespace Preferences {
         inline constexpr const char* TITLE = "preferences.title";
@@ -588,6 +592,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* NO_SAVE_STEPS = "training_panel.no_save_steps";
         inline constexpr const char* SPARSITY = "training_panel.sparsity";
         inline constexpr const char* PRUNING_GROWING = "training_panel.pruning_growing";
+        inline constexpr const char* MRNF_PARAMS = "training_panel.mrnf_params";
     } // namespace TrainingPanel
 
     namespace Tooltip {
@@ -964,5 +969,16 @@ namespace lichtfeld::Strings {
         inline constexpr const char* RETRY = "disk_space_dialog.retry";
         inline constexpr const char* SELECT_OUTPUT_LOCATION = "disk_space_dialog.select_output_location";
     } // namespace DiskSpaceDialog
+
+    namespace FileAssociation {
+        inline constexpr const char* TITLE = "file_association.title";
+        inline constexpr const char* MESSAGE = "file_association.message";
+        inline constexpr const char* YES = "file_association.yes";
+        inline constexpr const char* NOT_NOW = "file_association.not_now";
+        inline constexpr const char* DONT_ASK = "file_association.dont_ask";
+        inline constexpr const char* SUCCESS = "file_association.success";
+        inline constexpr const char* MENU_REGISTER = "file_association.menu_register";
+        inline constexpr const char* MENU_UNREGISTER = "file_association.menu_unregister";
+    } // namespace FileAssociation
 
 } // namespace lichtfeld::Strings

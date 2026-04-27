@@ -13,6 +13,11 @@ endif()
 
 cmake_minimum_required(VERSION 3.30)
 
+option(LFS_ENFORCE_LINUX_GUI_BACKENDS "Fail configure when Linux SDL3 would lack X11 and Wayland support" ON)
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxGuiSanity.cmake")
+lfs_linux_preflight_gui_backends()
+
 # Suppress CMake developer warnings
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS ON CACHE BOOL "" FORCE)
 
@@ -25,7 +30,65 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
-project(LichtFeld-Studio LANGUAGES CUDA CXX C)
+set(LFS_GPU_BACKEND "CUDA" CACHE STRING "GPU backend")
+set_property(CACHE LFS_GPU_BACKEND PROPERTY STRINGS CUDA HIP)
+string(TOUPPER "${LFS_GPU_BACKEND}" LFS_GPU_BACKEND)
+if(NOT LFS_GPU_BACKEND MATCHES "^(CUDA|HIP)$")
+    message(FATAL_ERROR "LFS_GPU_BACKEND must be CUDA or HIP")
+endif()
+set(USE_CUDA OFF)
+set(USE_HIP OFF)
+if(LFS_GPU_BACKEND STREQUAL "CUDA")
+    set(USE_CUDA ON)
+else()
+    set(USE_HIP ON)
+endif()
+
+if(USE_HIP AND CMAKE_HOST_WIN32)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsROCm.cmake")
+    lfs_windows_rocm_find_root(_lfs_rocm_root)
+    if(NOT _lfs_rocm_root)
+        message(FATAL_ERROR "Windows ROCm/HIP SDK not found. Set LFS_ROCM_PATH, ROCM_PATH, or HIP_PATH.")
+    endif()
+    set(LFS_ROCM_PATH "${_lfs_rocm_root}" CACHE PATH "ROCm/HIP SDK root" FORCE)
+    lfs_windows_rocm_find_clang("${LFS_ROCM_PATH}" _lfs_hip_clang)
+    if(NOT _lfs_hip_clang)
+        message(FATAL_ERROR "HIP clang++ not found under ${LFS_ROCM_PATH}")
+    endif()
+    set(CMAKE_CXX_COMPILER "${_lfs_hip_clang}" CACHE FILEPATH "HIP clang++" FORCE)
+    get_filename_component(_lfs_hip_clang_dir "${_lfs_hip_clang}" DIRECTORY)
+    if(EXISTS "${_lfs_hip_clang_dir}/clang.exe")
+        set(CMAKE_C_COMPILER "${_lfs_hip_clang_dir}/clang.exe" CACHE FILEPATH "HIP clang" FORCE)
+    endif()
+endif()
+
+project(LichtFeld-Studio VERSION 0.5.2 LANGUAGES CXX C)
+
+if(USE_CUDA)
+    enable_language(CUDA)
+elseif(USE_HIP AND NOT WIN32)
+    enable_language(HIP)
+    set(CMAKE_HIP_SOURCE_FILE_EXTENSIONS hip cu)
+endif()
+
+# On Windows with a multi-config generator (MSVC/Visual Studio, Ninja Multi-Config),
+# route all build outputs to build/<Config>/ so Debug and Release binaries are
+# separated. Single-config generators (Ninja, NMake) use a flat binary dir —
+# the selected CMAKE_BUILD_TYPE is baked in at configure time, so no subdirectory
+# is needed; each target's per-target RUNTIME_OUTPUT_DIRECTORY (set to
+# ${CMAKE_BINARY_DIR}) ensures a flat layout under build/.
+# Linux: same per-target convention applies; no override needed here.
+# The else() branch explicitly sets to "" to override any stale cached value.
+get_property(_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(WIN32 AND _IS_MULTI_CONFIG)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
+else()
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "")
+endif()
 
 # Disable C++20 module scanning
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
@@ -39,12 +102,23 @@ execute_process(
     ERROR_QUIET
 )
 execute_process(
-    COMMAND git describe --dirty
+    COMMAND git describe --tags --dirty --always --match "v*"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE GIT_TAGGED_VERSION
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
 )
+if(NOT GIT_COMMIT_HASH_SHORT AND DEFINED ENV{GITHUB_SHA} AND NOT "$ENV{GITHUB_SHA}" STREQUAL "")
+    string(SUBSTRING "$ENV{GITHUB_SHA}" 0 7 GIT_COMMIT_HASH_SHORT)
+endif()
+if(NOT GIT_TAGGED_VERSION)
+    if(DEFINED ENV{GITHUB_REF_TYPE} AND "$ENV{GITHUB_REF_TYPE}" STREQUAL "tag" AND
+       DEFINED ENV{GITHUB_REF_NAME} AND NOT "$ENV{GITHUB_REF_NAME}" STREQUAL "")
+        set(GIT_TAGGED_VERSION "$ENV{GITHUB_REF_NAME}")
+    elseif(GIT_COMMIT_HASH_SHORT)
+        set(GIT_TAGGED_VERSION "${GIT_COMMIT_HASH_SHORT}")
+    endif()
+endif()
 if(NOT GIT_COMMIT_HASH_SHORT)
     set(GIT_COMMIT_HASH_SHORT "unknown")
 endif()
@@ -63,6 +137,10 @@ file(WRITE "${CMAKE_BINARY_DIR}/include/git_version.h"
 get_filename_component(PROJ_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}" ABSOLUTE)
 
 option(ENABLE_CUDA_GL_INTEROP "Enable CUDA-OpenGL interoperability" ON)
+option(LFS_ENABLE_NVIMAGECODEC "Enable NVIDIA nvImageCodec integration" ON)
+option(LFS_ENABLE_AMF "Enable AMD AMF image decode integration" ON)
+set(LFS_AMF_SDK_ROOT "" CACHE PATH "AMD AMF SDK root")
+option(LFS_ENABLE_VKSPLAT "Enable vksplat Vulkan viewer rasterization and compute backend" OFF)
 option(BUILD_TESTS "Build tests" OFF)
 option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path test (no CUDA)" OFF)
 option(ENABLE_ALLOCATION_PROFILING "Enable tensor allocation profiling" OFF)
@@ -72,6 +150,45 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(ENABLE_TENSOR_VALIDATION "Enable runtime tensor NaN/Inf validation" OFF)
 option(ENABLE_CUDA_DEBUG_SYNC "Enable synchronous CUDA kernel checking (slow)" OFF)
 option(ENABLE_TENSOR_OP_TRACING "Enable tensor operation tracing" OFF)
+
+if(USE_HIP)
+    set(LFS_ENABLE_NVIMAGECODEC OFF CACHE BOOL "Enable NVIDIA nvImageCodec integration" FORCE)
+endif()
+
+if(LFS_ENABLE_AMF)
+    if(NOT (WIN32 AND USE_HIP))
+        set(LFS_ENABLE_AMF OFF CACHE BOOL "Enable AMD AMF image decode integration" FORCE)
+    else()
+        set(_lfs_amf_sdk_candidates "")
+        if(LFS_AMF_SDK_ROOT)
+            list(APPEND _lfs_amf_sdk_candidates "${LFS_AMF_SDK_ROOT}")
+        endif()
+        list(APPEND _lfs_amf_sdk_candidates "${CMAKE_CURRENT_SOURCE_DIR}/external/AMF")
+
+        set(_lfs_amf_sdk_root "")
+        foreach(_candidate IN LISTS _lfs_amf_sdk_candidates)
+            file(TO_CMAKE_PATH "${_candidate}" _candidate_cmake)
+            if(EXISTS "${_candidate_cmake}/amf/public/common/AMFFactory.h"
+               AND EXISTS "${_candidate_cmake}/amf/public/include/components/VideoDecoderUVD.h")
+                set(_lfs_amf_sdk_root "${_candidate_cmake}")
+                break()
+            elseif(EXISTS "${_candidate_cmake}/public/common/AMFFactory.h"
+                   AND EXISTS "${_candidate_cmake}/public/include/components/VideoDecoderUVD.h")
+                get_filename_component(_lfs_amf_sdk_root "${_candidate_cmake}" DIRECTORY)
+                break()
+            endif()
+        endforeach()
+
+        if(_lfs_amf_sdk_root)
+            set(LFS_AMF_SDK_ROOT "${_lfs_amf_sdk_root}" CACHE PATH "AMD AMF SDK root" FORCE)
+            set(LFS_AMF_INCLUDE_DIR "${LFS_AMF_SDK_ROOT}/amf")
+            message(STATUS "AMD AMF image decode enabled: ${LFS_AMF_SDK_ROOT}")
+        else()
+            set(LFS_ENABLE_AMF OFF CACHE BOOL "Enable AMD AMF image decode integration" FORCE)
+            message(WARNING "AMD AMF SDK not found; AMF image decode disabled. Set LFS_AMF_SDK_ROOT to the AMF repository root.")
+        endif()
+    endif()
+endif()
 
 # Add -rdynamic for backtrace symbol resolution
 if(UNIX AND NOT APPLE)
@@ -86,39 +203,54 @@ option(BUILD_PORTABLE "Build portable distribution" OFF)
 if(BUILD_PORTABLE)
     set(BUILD_CUDA_PTX_ONLY ON CACHE BOOL "" FORCE)
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_compile_definitions(LFS_BUILD_PORTABLE=1)
     message(STATUS "Portable: PTX-only, tests disabled")
 endif()
 
-# Compiler cache (CUDA caching disabled on Windows due to nvcc compatibility issues)
-find_program(SCCACHE_PROGRAM sccache)
-find_program(CCACHE_PROGRAM ccache)
-if(SCCACHE_PROGRAM)
-    set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-    if(WIN32)
-        message(STATUS "Compiler cache: sccache (C/C++ only, CUDA uncached)")
+# Compiler cache is opt-in. Auto-enabling a broken local launcher can silently
+# poison object files and make the build non-reproducible.
+option(ENABLE_COMPILER_CACHE "Enable sccache/ccache compiler launchers when available" OFF)
+if(ENABLE_COMPILER_CACHE)
+    # CUDA caching disabled on Windows due to nvcc compatibility issues.
+    find_program(SCCACHE_PROGRAM sccache)
+    find_program(CCACHE_PROGRAM ccache)
+    if(SCCACHE_PROGRAM)
+        set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+        if(WIN32)
+            message(STATUS "Compiler cache: sccache (C/C++ only, CUDA uncached)")
+        else()
+            set(CMAKE_CUDA_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+            message(STATUS "Compiler cache: sccache")
+        endif()
+    elseif(CCACHE_PROGRAM)
+        set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        if(WIN32)
+            message(STATUS "Compiler cache: ccache (C/C++ only, CUDA uncached)")
+        else()
+            set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+            message(STATUS "Compiler cache: ccache")
+        endif()
     else()
-        set(CMAKE_CUDA_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-        message(STATUS "Compiler cache: sccache")
+        message(STATUS "Compiler cache: requested, but no launcher was found")
     endif()
-elseif(CCACHE_PROGRAM)
-    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-    if(WIN32)
-        message(STATUS "Compiler cache: ccache (C/C++ only, CUDA uncached)")
-    else()
-        set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-        message(STATUS "Compiler cache: ccache")
-    endif()
+else()
+    message(STATUS "Compiler cache: disabled")
 endif()
 
 # Minimum SM for PTX-only (75=Turing, 80=Ampere, 86=GA102, 89=Ada, 90=Hopper)
 set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
 
 set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+if(USE_CUDA)
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+elseif(USE_HIP AND NOT WIN32)
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+endif()
 
 # Parallel build
 include(ProcessorCount)
@@ -129,6 +261,7 @@ if(total_cores GREATER 1)
     message(STATUS "Building with ${used_cores} cores")
 endif()
 
+if(USE_CUDA)
 # CUDA setup
 # On Windows, nvidia-smi.exe is in System32, but CMake might be running as 32-bit
 # which causes WOW64 redirection. Explicitly search in Sysnative to avoid this.
@@ -149,6 +282,19 @@ if(NVIDIA_SMI)
             OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     string(REGEX REPLACE "\n.*" "" DETECTED_COMPUTE_CAP "${DETECTED_COMPUTE_CAP}")
+
+    execute_process(
+            COMMAND ${NVIDIA_SMI} --query-gpu=driver_version --format=csv,noheader
+            OUTPUT_VARIABLE NVIDIA_DRIVER_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    string(REGEX REPLACE "\n.*" "" NVIDIA_DRIVER_VERSION "${NVIDIA_DRIVER_VERSION}")
+    message(STATUS "Detected NVIDIA driver: ${NVIDIA_DRIVER_VERSION}")
+    if(NVIDIA_DRIVER_VERSION VERSION_LESS "570")
+        message(FATAL_ERROR "NVIDIA driver ${NVIDIA_DRIVER_VERSION} is too old. "
+            "CUDA Toolkit 12.8 requires driver >= 570. "
+            "Please update: https://www.nvidia.com/drivers")
+    endif()
 
     message(STATUS "Detected GPU compute capability: ${DETECTED_COMPUTE_CAP}")
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.1)
@@ -189,7 +335,6 @@ else()
     message(STATUS "CUDA: native (${LichtFeld-Studio_CUDA_ARCH})")
 endif()
 
-enable_language(CUDA)
 find_package(CUDAToolkit 12.8 REQUIRED)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr")
 if(WIN32)
@@ -223,6 +368,172 @@ if(NOT TARGET CUDA::nvToolsExt)
 endif()
 
 message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
+set(GPU_RUNTIME_LIBRARY CUDA::cudart)
+set(GPU_DRIVER_LIBRARY CUDA::cuda_driver)
+set(GPU_RAND_LIBRARY CUDA::curand)
+set(GPU_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
+else()
+    set(_lfs_default_amdgpu_arch "gfx1151")
+    set(LFS_AMDGPU_ARCH "${_lfs_default_amdgpu_arch}" CACHE STRING "AMDGPU target architecture")
+    set(HIP_ARCHITECTURES "${LFS_AMDGPU_ARCH}" CACHE STRING "HIP target architectures" FORCE)
+
+    if(WIN32)
+        lfs_windows_rocm_get_short_path("${LFS_ROCM_PATH}" _lfs_rocm_path)
+        lfs_windows_rocm_find_devel_root("${LFS_ROCM_PATH}" LFS_ROCM_DEVEL_PATH)
+        lfs_windows_rocm_find_runtime_dirs("${LFS_ROCM_PATH}" LFS_ROCM_RUNTIME_DIRS)
+        lfs_windows_rocm_read_hip_version("${LFS_ROCM_PATH}" HIP_VERSION HIP_VERSION_MAJOR HIP_VERSION_MINOR HIP_VERSION_PATCH)
+        lfs_windows_rocm_find_device_lib_path("${LFS_ROCM_PATH}" HIP_DEVICE_LIB_PATH)
+        set(HIP_INCLUDE_DIRS "${_lfs_rocm_path}/include")
+        if(LFS_ROCM_DEVEL_PATH AND NOT LFS_ROCM_DEVEL_PATH STREQUAL LFS_ROCM_PATH)
+            list(APPEND HIP_INCLUDE_DIRS "${LFS_ROCM_DEVEL_PATH}/include")
+        endif()
+        set(CUDAToolkit_INCLUDE_DIRS "${HIP_INCLUDE_DIRS}")
+        set(CUDAToolkit_BIN_DIR "${_lfs_rocm_path}/bin")
+
+        find_library(AMDHIP64_LIBRARY NAMES amdhip64 PATHS "${_lfs_rocm_path}/lib" NO_DEFAULT_PATH)
+        if(NOT AMDHIP64_LIBRARY)
+            message(FATAL_ERROR "amdhip64.lib not found under ${_lfs_rocm_path}/lib")
+        endif()
+
+        set(_lfs_rocm_library_paths "${_lfs_rocm_path}/lib")
+        if(LFS_ROCM_DEVEL_PATH)
+            list(APPEND _lfs_rocm_library_paths
+                "${LFS_ROCM_DEVEL_PATH}/lib"
+                "${LFS_ROCM_DEVEL_PATH}/bin")
+        endif()
+
+        find_library(HIPRAND_LIBRARY NAMES hiprand PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        find_library(ROCRAND_LIBRARY NAMES rocrand PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        file(GLOB _lfs_rocm_builtins_candidates
+            "${LFS_ROCM_PATH}/lib/llvm/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+        if(_lfs_rocm_builtins_candidates)
+            list(GET _lfs_rocm_builtins_candidates 0 CLANG_RT_BUILTINS_LIBRARY)
+        endif()
+
+        set(_lfs_rocm_base_libraries "${AMDHIP64_LIBRARY}")
+        if(CLANG_RT_BUILTINS_LIBRARY)
+            list(APPEND _lfs_rocm_base_libraries "${CLANG_RT_BUILTINS_LIBRARY}")
+        endif()
+
+        set(_lfs_rocm_rand_libraries ${_lfs_rocm_base_libraries})
+        if(HIPRAND_LIBRARY)
+            list(APPEND _lfs_rocm_rand_libraries "${HIPRAND_LIBRARY}")
+        else()
+            message(FATAL_ERROR "hiprand.lib not found in Windows ROCm SDK")
+        endif()
+        if(ROCRAND_LIBRARY)
+            list(APPEND _lfs_rocm_rand_libraries "${ROCRAND_LIBRARY}")
+        endif()
+
+        foreach(_target CUDA::cudart CUDA::cuda_driver CUDA::cupti)
+            if(NOT TARGET ${_target})
+                add_library(${_target} INTERFACE IMPORTED)
+                set_target_properties(${_target} PROPERTIES
+                    INTERFACE_LINK_LIBRARIES "${_lfs_rocm_base_libraries}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${HIP_INCLUDE_DIRS}")
+            endif()
+        endforeach()
+        if(NOT TARGET CUDA::curand)
+            add_library(CUDA::curand INTERFACE IMPORTED)
+            set_target_properties(CUDA::curand PROPERTIES
+                INTERFACE_LINK_LIBRARIES "${_lfs_rocm_rand_libraries}"
+                INTERFACE_INCLUDE_DIRECTORIES "${HIP_INCLUDE_DIRS}")
+        endif()
+
+        set(HIP_HIPCC_FLAGS "--rocm-path=${_lfs_rocm_path} --rocm-device-lib-path=${HIP_DEVICE_LIB_PATH}")
+        set(ENV{HIP_PATH} "${LFS_ROCM_PATH}")
+        set(ENV{ROCM_PATH} "${LFS_ROCM_PATH}")
+        set(ENV{HIP_PLATFORM} "amd")
+        set(ENV{HIP_CLANG_PATH} "${_lfs_hip_clang_dir}")
+        if(LFS_ROCM_RUNTIME_DIRS)
+            message(STATUS "Windows ROCm runtime DLL dirs: ${LFS_ROCM_RUNTIME_DIRS}")
+        endif()
+    else()
+        find_package(hip CONFIG REQUIRED)
+        find_package(hiprand CONFIG QUIET)
+        set(HIP_INCLUDE_DIRS "")
+        if(TARGET hip::device)
+            get_target_property(HIP_INCLUDE_DIRS hip::device INTERFACE_INCLUDE_DIRECTORIES)
+        endif()
+        if(NOT TARGET CUDA::cudart)
+            add_library(CUDA::cudart INTERFACE IMPORTED)
+            set_target_properties(CUDA::cudart PROPERTIES INTERFACE_LINK_LIBRARIES hip::device)
+        endif()
+        if(NOT TARGET CUDA::cuda_driver)
+            add_library(CUDA::cuda_driver INTERFACE IMPORTED)
+            set_target_properties(CUDA::cuda_driver PROPERTIES INTERFACE_LINK_LIBRARIES hip::device)
+        endif()
+        if(NOT TARGET CUDA::curand)
+            add_library(CUDA::curand INTERFACE IMPORTED)
+            set_target_properties(CUDA::curand PROPERTIES INTERFACE_LINK_LIBRARIES hip::device)
+        endif()
+    endif()
+
+    set(GPU_RUNTIME_LIBRARY CUDA::cudart)
+    set(GPU_DRIVER_LIBRARY CUDA::cuda_driver)
+    set(GPU_RAND_LIBRARY CUDA::curand)
+    set(GPU_INCLUDE_DIRS ${HIP_INCLUDE_DIRS})
+    set(CUDA_GL_INTEROP_FOUND FALSE)
+    set(CUDA_GL_INTEROP_ENABLED 0)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HIPUtils.cmake")
+    if(WIN32)
+        add_compile_definitions(WIN32 _USE_MATH_DEFINES NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    endif()
+    message(STATUS "ROCm/HIP ${HIP_VERSION} backend enabled (${HIP_ARCHITECTURES})")
+endif()
+
+function(lfs_add_gpu_library target_name lib_type)
+    if(USE_HIP)
+        lfs_hip_add_library(${target_name} ${lib_type} ${ARGN})
+    else()
+        add_library(${target_name} ${lib_type} ${ARGN})
+    endif()
+endfunction()
+
+function(lfs_get_windows_hip_runtime_search_dirs out_var)
+    set(_dirs "")
+    if(CUDAToolkit_BIN_DIR)
+        list(APPEND _dirs "${CUDAToolkit_BIN_DIR}" "${CUDAToolkit_BIN_DIR}/x64")
+    endif()
+    if(LFS_ROCM_RUNTIME_DIRS)
+        list(APPEND _dirs ${LFS_ROCM_RUNTIME_DIRS})
+    endif()
+    if(LFS_ROCM_DEVEL_PATH)
+        list(APPEND _dirs "${LFS_ROCM_DEVEL_PATH}/bin")
+    endif()
+
+    set(_existing_dirs "")
+    foreach(_dir IN LISTS _dirs)
+        if(_dir AND IS_DIRECTORY "${_dir}")
+            list(APPEND _existing_dirs "${_dir}")
+        endif()
+    endforeach()
+    if(_existing_dirs)
+        list(REMOVE_DUPLICATES _existing_dirs)
+    endif()
+    set(${out_var} "${_existing_dirs}" PARENT_SCOPE)
+endfunction()
+
+function(lfs_collect_windows_hip_runtime_dlls out_var)
+    lfs_get_windows_hip_runtime_search_dirs(_search_dirs)
+    set(_dlls "")
+    foreach(_dir IN LISTS _search_dirs)
+        file(GLOB _dir_dlls CONFIGURE_DEPENDS
+            "${_dir}/amdhip64*.dll"
+            "${_dir}/hiprtc*.dll"
+            "${_dir}/hiprtc-builtins*.dll"
+            "${_dir}/amd_comgr*.dll"
+            "${_dir}/hiprand*.dll"
+            "${_dir}/rocrand*.dll"
+            "${_dir}/rocm-openblas*.dll"
+            "${_dir}/rocm_kpack*.dll")
+        list(APPEND _dlls ${_dir_dlls})
+    endforeach()
+    if(_dlls)
+        list(REMOVE_DUPLICATES _dlls)
+    endif()
+    set(${out_var} "${_dlls}" PARENT_SCOPE)
+endfunction()
 
 # Find packages
 find_package(TBB REQUIRED)
@@ -230,9 +541,11 @@ find_package(Threads REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(glad REQUIRED)
 find_package(SDL3 REQUIRED)
+lfs_validate_linux_sdl_video_backends()
 find_package(glm REQUIRED)
 find_package(imgui REQUIRED)
 find_package(implot REQUIRED)
+find_package(nfd CONFIG REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(args REQUIRED)
 find_package(spdlog REQUIRED)
@@ -240,23 +553,23 @@ find_package(Freetype REQUIRED)
 find_package(WebP REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(OpenImageIO REQUIRED)
-find_package(Boost REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(pxr CONFIG REQUIRED)
 find_package(assimp REQUIRED)
 find_package(RmlUi CONFIG REQUIRED)
 
 # TORCH_CUDA_ARCH_LIST is already defined by Torch
 # use it here as the global default CUDA architecture list too
-if(LichtFeld-Studio_CUDA_ARCH)
+if(USE_CUDA AND LichtFeld-Studio_CUDA_ARCH)
     set(CMAKE_CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}" CACHE STRING "CUDA architectures" FORCE)
 endif()
 
-if(WIN32)
+if(WIN32 AND USE_CUDA)
     set(CMAKE_CUDA_RUNTIME_LIBRARY "Shared") # when using INTEROP in windows static and dynamic symbols are mixed
 endif()
 
 # Check for CUDA-OpenGL interop capability (only if enabled)
-if(ENABLE_CUDA_GL_INTEROP)
+if(USE_CUDA AND ENABLE_CUDA_GL_INTEROP)
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_INCLUDES ${CUDAToolkit_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
     set(CMAKE_REQUIRED_LIBRARIES ${CUDA_LIBRARIES} ${OPENGL_LIBRARIES})
@@ -314,15 +627,55 @@ endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
-    if(CUDA_DEVICE_DEBUG)
+    if(USE_CUDA AND CUDA_DEVICE_DEBUG)
         set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -g -G -O0")
-    else()
+    elseif(USE_CUDA)
         set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -g -O0")
     endif()
 endif()
 
 # External dependencies (EXCLUDE_FROM_ALL to handle install ourselves)
 add_subdirectory(external EXCLUDE_FROM_ALL)
+
+if(USE_HIP)
+    include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_shim")
+    add_compile_definitions(USE_HIP=1 LFS_USE_HIP=1 USE_ROCM=1 __HIP_PLATFORM_AMD__)
+endif()
+
+set(LFS_HAS_VKSPLAT OFF)
+set(LFS_VKSPLAT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/vksplat/vksplat")
+if(LFS_ENABLE_VKSPLAT AND EXISTS "${LFS_VKSPLAT_SOURCE_DIR}/src/gs_renderer.h")
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        add_library(lfs_vksplat STATIC
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/buffer.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/colmap_reader.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/knn.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/scheduler.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_pipeline.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_renderer.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/gs_trainer.cpp
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/perf_timer.cpp
+        )
+        set_source_files_properties(
+                ${LFS_VKSPLAT_SOURCE_DIR}/src/colmap_reader.cpp
+                PROPERTIES COMPILE_DEFINITIONS STB_IMAGE_STATIC
+        )
+        target_include_directories(lfs_vksplat PUBLIC "${LFS_VKSPLAT_SOURCE_DIR}/src")
+        target_link_libraries(lfs_vksplat PUBLIC Vulkan::Vulkan glm::glm)
+        target_compile_features(lfs_vksplat PUBLIC cxx_std_17)
+        target_compile_definitions(lfs_vksplat PRIVATE
+                $<$<PLATFORM_ID:Windows>:NOMINMAX>
+                $<$<PLATFORM_ID:Windows>:VK_USE_PLATFORM_WIN32_KHR>
+                $<$<AND:$<PLATFORM_ID:Linux>,$<NOT:$<PLATFORM_ID:Android>>>:VK_USE_PLATFORM_XLIB_KHR>
+                $<$<PLATFORM_ID:Darwin>:VK_USE_PLATFORM_MACOS_MVK>
+        )
+        set(LFS_HAS_VKSPLAT ON)
+        message(STATUS "vksplat Vulkan backend enabled: ${LFS_VKSPLAT_SOURCE_DIR}")
+    else()
+        message(WARNING "LFS_ENABLE_VKSPLAT is ON but Vulkan SDK was not found; vksplat disabled")
+    endif()
+endif()
 
 # =============================================================================
 # LIBRARY MODULES
@@ -348,16 +701,23 @@ add_subdirectory(src/python)
 add_executable(${PROJECT_NAME}
     src/app/main.cpp
     src/app/application.cpp
+    src/app/mcp_gui_tools.cpp
+    src/app/mcp_operator_tools.cpp
+    src/app/mcp_runtime_tools.cpp
+    src/app/mcp_sequencer_tools.cpp
+    src/app/mcp_ui_registry_tools.cpp
     src/app/converter.cpp
     src/app/splash_screen.cpp
     resources/lichtfeld-studio.rc
 )
 
 
-set_target_properties(${PROJECT_NAME} PROPERTIES
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION OFF
-)
+if(USE_CUDA)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 target_include_directories(${PROJECT_NAME}
         PRIVATE
@@ -365,31 +725,50 @@ target_include_directories(${PROJECT_NAME}
         ${CMAKE_CURRENT_BINARY_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/app/include  # For app headers
         ${CMAKE_CURRENT_SOURCE_DIR}/src              # For training/, visualizer/, etc.
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/visualizer   # For internal visualizer headers used by GUI MCP
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/rendering/include  # For rendering headers (MCP GUI tools)
         ${CMAKE_CURRENT_SOURCE_DIR}/external         # For external headers
 
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         ${OPENGL_INCLUDE_DIRS}
 )
 
-target_link_libraries(${PROJECT_NAME}
-        PRIVATE
+if(CMAKE_CXX_LINK_GROUP_USING_RESCAN_SUPPORTED)
+    set(LFS_APP_INTERNAL_LINK_LIBS
+        "$<LINK_GROUP:RESCAN,lfs_visualizer,lfs_mcp,lfs_sequencer,lfs_rendering,lfs_training,lfs_geometry,lfs_core,lfs_io,lfs_video,fastlfs_backend,lfs_python_utils>"
+    )
+else()
+    set(LFS_APP_INTERNAL_LINK_LIBS
         lfs_visualizer
         lfs_mcp
+        lfs_sequencer
+        lfs_rendering
         lfs_training
         lfs_geometry
         lfs_core
         lfs_io
+        lfs_video
         fastlfs_backend
         lfs_python_utils
+    )
+endif()
+
+target_link_libraries(${PROJECT_NAME}
+        PRIVATE
+        ${LFS_APP_INTERNAL_LINK_LIBS}
 
         ${OPENGL_LIBRARIES}
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         spdlog::spdlog
         taywee::args
         OpenImageIO::OpenImageIO
         glad::glad
         SDL3::SDL3
 )
+
+# The app embeds Python and loads the nanobind module at runtime for panels,
+# menus, and operators. Keep the runtime artifact in lockstep with the app.
+add_dependencies(${PROJECT_NAME} lfs_py)
 
 # Copy nvImageCodec shared libraries next to executable for easy deployment
 if(TARGET nvimgcodec)
@@ -441,7 +820,7 @@ if(WIN32)
 endif()
 
 # Copy CUDA runtime DLLs for Windows (needed for Python module loading)
-if(WIN32 AND CUDAToolkit_FOUND)
+if(WIN32 AND USE_CUDA AND CUDAToolkit_FOUND)
     file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
     file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
     set(CUDA_RUNTIME_DLLS ${CUDA_DLLS_1} ${CUDA_DLLS_2})
@@ -456,6 +835,77 @@ if(WIN32 AND CUDAToolkit_FOUND)
         endif()
     endforeach()
     message(STATUS "Post-build: CUDA DLLs will be copied from ${CUDAToolkit_BIN_DIR}")
+endif()
+
+if(WIN32 AND USE_HIP)
+    lfs_get_windows_hip_runtime_search_dirs(HIP_RUNTIME_SEARCH_DIRS)
+    lfs_collect_windows_hip_runtime_dlls(HIP_RUNTIME_DLLS)
+    foreach(HIP_DLL ${HIP_RUNTIME_DLLS})
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${HIP_DLL}"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+            COMMENT "Copying ${HIP_DLL} to executable directory"
+        )
+    endforeach()
+    if(HIP_RUNTIME_DLLS)
+        message(STATUS "Post-build: HIP DLLs will be copied from ${HIP_RUNTIME_SEARCH_DIRS}")
+    endif()
+endif()
+
+# =============================================================================
+# VCPKG DLL COPYING - Ensure all vcpkg DLLs are available at runtime
+# =============================================================================
+# vcpkg's VCPKG_APPLOCAL_DEPS feature may not copy all needed DLLs.
+# This explicitly copies vcpkg DLLs to ensure they're available at runtime.
+#
+# IMPORTANT: For Release builds, copy ONLY release DLLs to avoid loading debug CRT.
+# For Debug builds, copy both because some vcpkg packages (e.g., zlib) are release-only.
+if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
+    set(_vcpkg_debug_bin_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin")
+    set(_vcpkg_release_bin_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin")
+    file(GLOB _vcpkg_release_dlls CONFIGURE_DEPENDS "${_vcpkg_release_bin_dir}/*.dll")
+    file(GLOB _vcpkg_debug_dlls CONFIGURE_DEPENDS "${_vcpkg_debug_bin_dir}/*.dll")
+
+    # Always copy release DLLs - needed for both Release and Debug builds
+    if(_vcpkg_release_dlls)
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_vcpkg_release_dlls}
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+            COMMENT "Copying vcpkg release DLLs"
+        )
+    endif()
+
+    # Only copy debug DLLs for Debug builds (they link to debug CRT which breaks Release)
+    # For single-config generators (Ninja, Makefiles): check CMAKE_BUILD_TYPE
+    # For multi-config generators (VS, Xcode): use generator expression
+    get_property(_is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_is_multi_config)
+        # Multi-config: use generator expression to conditionally copy
+        if(_vcpkg_debug_dlls)
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E $<IF:$<CONFIG:Debug>,copy_if_different,true>
+                    ${_vcpkg_debug_dlls}
+                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+                COMMENT "Copying vcpkg debug DLLs (Debug config only)"
+            )
+        endif()
+        message(STATUS "Post-build: vcpkg DLLs - release always, debug for Debug config only (multi-config)")
+    else()
+        # Single-config: check CMAKE_BUILD_TYPE at configure time
+        if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND _vcpkg_debug_dlls)
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${_vcpkg_debug_dlls}
+                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+                COMMENT "Copying vcpkg debug DLLs"
+            )
+            message(STATUS "Post-build: vcpkg DLLs - copying both release and debug (Debug build)")
+        else()
+            message(STATUS "Post-build: vcpkg DLLs - copying release only (${CMAKE_BUILD_TYPE} build)")
+        endif()
+    endif()
 endif()
 
 # Before extension post-build copying: remove stale 'extensions' file if present (prevent mkdir failure)
@@ -572,18 +1022,89 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/core11-logo-dark.png"
         "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/volinga-logo.png"
+        "${RESOURCE_DIR}/assets/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/volinga-logo-dark.png"
+        "${RESOURCE_DIR}/assets/"
     COMMENT "Copying application assets"
 )
 
-# Copy locale files
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+# Copy locale files (named target so it can be run without rebuilding the exe)
+add_custom_target(copy_locale_files
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESOURCE_DIR}/locales"
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
         "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/locales"
         "${RESOURCE_DIR}/locales"
-    COMMENT "Copying locale files"
+    COMMENT "Syncing locale files"
 )
+add_dependencies(${PROJECT_NAME} copy_locale_files)
+
+# OpenUSD runtime resources (schema/file-format plugin metadata).
+# On Windows: copy to <exe>/usd/ so that relative LibraryPaths resolve to the
+# DLL copies already loaded from the exe directory.
+# On Linux: copy to <exe>/../lib/usd/ (conventional layout).
+set(_USD_PLUGIN_SOURCE_DIR "")
+foreach(_candidate
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/usd"
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/usd"
+    "${CMAKE_BINARY_DIR}/src/python/usd")
+    # Require an actual plugin sub-directory (not just the root index).
+    if(NOT _USD_PLUGIN_SOURCE_DIR AND EXISTS "${_candidate}/ar/resources/plugInfo.json")
+        set(_USD_PLUGIN_SOURCE_DIR "${_candidate}")
+    endif()
+endforeach()
+
+set(_USD_ROOT_INDEX "")
+foreach(_candidate
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/usd/plugInfo.json"
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/usd/plugInfo.json"
+    "${CMAKE_BINARY_DIR}/src/python/usd/plugInfo.json")
+    if(NOT _USD_ROOT_INDEX AND EXISTS "${_candidate}")
+        set(_USD_ROOT_INDEX "${_candidate}")
+    endif()
+endforeach()
+
+if(WIN32)
+    set(_USD_PLUGIN_DEST "$<TARGET_FILE_DIR:${PROJECT_NAME}>/usd")
+else()
+    set(_USD_PLUGIN_DEST "$<TARGET_FILE_DIR:${PROJECT_NAME}>/../lib/usd")
+endif()
+
+if(EXISTS "${_USD_PLUGIN_SOURCE_DIR}")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_USD_PLUGIN_DEST}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+            "${_USD_PLUGIN_SOURCE_DIR}"
+            "${_USD_PLUGIN_DEST}"
+        COMMENT "Copying OpenUSD plugin resources (per-module)"
+    )
+    message(STATUS "Post-build: OpenUSD plugin resources will be copied from ${_USD_PLUGIN_SOURCE_DIR}")
+endif()
+
+if(EXISTS "${_USD_ROOT_INDEX}")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_USD_ROOT_INDEX}"
+            "${_USD_PLUGIN_DEST}/plugInfo.json"
+        COMMENT "Copying OpenUSD root plugin index"
+    )
+endif()
 
 message(STATUS "Post-build: Resources will be copied to \${BUILD_DIR}/resources/")
+
+# Per-config output directory variants for the exe: multi-config only.
+# Single-config Ninja on Windows uses the flat binary dir (build/).
+get_property(_exe_is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(WIN32 AND _exe_is_multi_config)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG        "${CMAKE_BINARY_DIR}/Debug"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE      "${CMAKE_BINARY_DIR}/Release"
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL   "${CMAKE_BINARY_DIR}/MinSizeRel"
+    )
+endif()
 
 # Platform-specific settings
 if(UNIX)
@@ -596,23 +1117,59 @@ if(UNIX)
                 INSTALL_RPATH_USE_LINK_PATH FALSE
         )
     else()
+        set(_lichtfeld_runtime_rpath_common
+                "$ORIGIN"
+                "$ORIGIN/lib"
+                "${CUDAToolkit_LIBRARY_DIR}"
+        )
+        set(_lichtfeld_runtime_rpath_release "${_lichtfeld_runtime_rpath_common}")
+        set(_lichtfeld_runtime_rpath_debug "${_lichtfeld_runtime_rpath_common}")
+        if(DEFINED VCPKG_TARGET_TRIPLET)
+            set(_vcpkg_release_runtime_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+            if(EXISTS "${_vcpkg_release_runtime_dir}")
+                list(APPEND _lichtfeld_runtime_rpath_release "${_vcpkg_release_runtime_dir}")
+                list(APPEND _lichtfeld_runtime_rpath_debug "${_vcpkg_release_runtime_dir}")
+            endif()
+
+            set(_vcpkg_debug_runtime_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/lib")
+            if(EXISTS "${_vcpkg_debug_runtime_dir}")
+                list(APPEND _lichtfeld_runtime_rpath_debug "${_vcpkg_debug_runtime_dir}")
+            endif()
+        endif()
+
+        list(REMOVE_DUPLICATES _lichtfeld_runtime_rpath_release)
+        list(REMOVE_DUPLICATES _lichtfeld_runtime_rpath_debug)
+        list(JOIN _lichtfeld_runtime_rpath_release ":" _lichtfeld_runtime_rpath_release_string)
+        list(JOIN _lichtfeld_runtime_rpath_debug ":" _lichtfeld_runtime_rpath_debug_string)
+
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(_lichtfeld_runtime_rpath_string
+                    "$<$<CONFIG:Debug>:${_lichtfeld_runtime_rpath_debug_string}>$<$<NOT:$<CONFIG:Debug>>:${_lichtfeld_runtime_rpath_release_string}>")
+        elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+            set(_lichtfeld_runtime_rpath_string "${_lichtfeld_runtime_rpath_debug_string}")
+        else()
+            set(_lichtfeld_runtime_rpath_string "${_lichtfeld_runtime_rpath_release_string}")
+        endif()
+
         set_target_properties(${PROJECT_NAME} PROPERTIES
-                INSTALL_RPATH "$ORIGIN:$ORIGIN/lib:${CUDAToolkit_LIBRARY_DIR}"
+                INSTALL_RPATH "${_lichtfeld_runtime_rpath_string}"
                 BUILD_WITH_INSTALL_RPATH TRUE
                 INSTALL_RPATH_USE_LINK_PATH TRUE
         )
     endif()
 
 elseif(WIN32)
-    # On Windows, DLLs in the same directory as the .exe are automatically found
-    # For multi-config generators (MSVC), set all configs to same directory
-    set_target_properties(${PROJECT_NAME} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}"
-            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}"
-            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}"
-            RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}"
-    )
+    # On Windows, DLLs in the same directory as the .exe are automatically found.
+    # Multi-config generators use $<CONFIG> subdir; single-config (Ninja) uses
+    # the flat binary dir (build/) set via the global CMAKE_RUNTIME_OUTPUT_DIRECTORY.
+    if(_exe_is_multi_config)
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY              "${CMAKE_BINARY_DIR}/$<CONFIG>"
+        )
+    endif()
+    if(MSVC)
+        target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+    endif()
 endif()
 
 # Build type configuration function
@@ -665,6 +1222,12 @@ configure_build_type(lfs_io)
 configure_build_type(lfs_geometry)
 configure_build_type(${PROJECT_NAME})
 
+# Set the default startup project in Visual Studio to LichtFeld-Studio
+# (without this, VS defaults to ALL_BUILD when opening the solution)
+if(MSVC)
+    set_property(DIRECTORY ${CMAKE_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
+endif()
+
 # =============================================================================
 # TESTING (Optional)
 # =============================================================================
@@ -683,8 +1246,14 @@ endif()
 # =============================================================================
 message(STATUS "===========================================")
 message(STATUS "Build Configuration:")
-message(STATUS "  CUDA Version: ${CUDAToolkit_VERSION}")
-message(STATUS "  CUDA Archs: ${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "  GPU Backend: ${LFS_GPU_BACKEND}")
+if(USE_CUDA)
+    message(STATUS "  CUDA Version: ${CUDAToolkit_VERSION}")
+    message(STATUS "  CUDA Archs: ${CMAKE_CUDA_ARCHITECTURES}")
+else()
+    message(STATUS "  HIP Version: ${HIP_VERSION}")
+    message(STATUS "  AMDGPU Archs: ${HIP_ARCHITECTURES}")
+endif()
 message(STATUS "  OpenGL Found: ${OPENGL_FOUND}")
 message(STATUS "  FreeType Found: ${FREETYPE_FOUND}")
 message(STATUS "  WebP Found: ${WebP_FOUND}")
@@ -693,7 +1262,9 @@ message(STATUS "  CUDA-GL Interop Option: ${ENABLE_CUDA_GL_INTEROP}")
 message(STATUS "  CUDA-GL Interop Available: ${CUDA_GL_INTEROP_FOUND}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
-message(STATUS "  CUDA Standard: ${CMAKE_CUDA_STANDARD}")
+if(USE_CUDA)
+    message(STATUS "  CUDA Standard: ${CMAKE_CUDA_STANDARD}")
+endif()
 message(STATUS "  OpenImageIO Found: ${OpenImageIO_FOUND}")
 message(STATUS "  Tests: ${BUILD_TESTS}")
 message(STATUS "  Unicode Test Only: ${BUILD_UNICODE_TEST_ONLY}")
@@ -746,6 +1317,7 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/icon" DESTINATI
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/fonts" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(FILES "${CMAKE_SOURCE_DIR}/src/rendering/resources/assets/JetBrainsMono-Regular.ttf" DESTINATION "${INSTALL_RESOURCE_DIR}/assets/fonts")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/themes" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/environments" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-icon.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-logo.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-logo-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
@@ -753,8 +1325,27 @@ install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-lo
 install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/lichtfeld-splash-loading-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/core11-logo.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/core11-logo-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/volinga-logo.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/volinga-logo-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/rmlui/resources/" DESTINATION "${INSTALL_RESOURCE_DIR}/assets/rmlui")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/locales" DESTINATION "${INSTALL_RESOURCE_DIR}")
+
+# OpenUSD plugin resources (schema definitions + plugInfo.json files)
+# On Windows configure_usd_plugins() looks for <exe_dir>/usd → install next to the exe (bin/usd).
+# On Linux it looks for <exe_dir>/../lib/usd → install in lib/usd (unchanged).
+if(WIN32)
+    set(_USD_INSTALL_DEST "${CMAKE_INSTALL_BINDIR}/usd")
+else()
+    set(_USD_INSTALL_DEST "${CMAKE_INSTALL_LIBDIR}/usd")
+endif()
+if(EXISTS "${_USD_PLUGIN_SOURCE_DIR}")
+    install(DIRECTORY "${_USD_PLUGIN_SOURCE_DIR}/" DESTINATION "${_USD_INSTALL_DEST}"
+            PATTERN "__pycache__" EXCLUDE
+            PATTERN "*.pyc" EXCLUDE)
+endif()
+if(EXISTS "${_USD_ROOT_INDEX}")
+    install(FILES "${_USD_ROOT_INDEX}" DESTINATION "${_USD_INSTALL_DEST}")
+endif()
 
 # Plugin development documentation
 set(DOC_INSTALL_DIR "${CMAKE_INSTALL_DATADIR}/doc/LichtFeld-Studio")
@@ -800,9 +1391,15 @@ if(BUILD_PORTABLE)
             [[.*libnvimgcodec.*]] [[.*libnvjpeg_ext.*]])
 
     # Search directories for runtime dependencies (quoted for paths with spaces on Windows)
-    set(_SEARCH_DIRS_STR "\"${CMAKE_BINARY_DIR}\" \"${CMAKE_BINARY_DIR}/external/nvImageCodec\" \"${CUDAToolkit_BIN_DIR}\" \"${CUDAToolkit_LIBRARY_DIR}\"")
+    set(_SEARCH_DIRS_STR "\"${CMAKE_BINARY_DIR}\" \"${CMAKE_BINARY_DIR}/Release\" \"${CMAKE_BINARY_DIR}/external/nvImageCodec\" \"${CUDAToolkit_BIN_DIR}\" \"${CUDAToolkit_LIBRARY_DIR}\"")
 
-    # Helper: bundle runtime dependencies for a target
+    # Helper: bundle runtime dependencies for a target.
+    # On Windows DLLs must live beside the exe (bin/); on Linux they go in lib/.
+    if(WIN32)
+        set(_BUNDLE_DEST "${CMAKE_INSTALL_BINDIR}")
+    else()
+        set(_BUNDLE_DEST "${CMAKE_INSTALL_LIBDIR}")
+    endif()
     function(bundle_runtime_deps TARGET_FILE IS_LIBRARY)
         if(IS_LIBRARY)
             set(_type "LIBRARIES")
@@ -810,7 +1407,6 @@ if(BUILD_PORTABLE)
             set(_type "EXECUTABLES")
         endif()
         install(CODE "
-            set(_lib \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\")
             file(GET_RUNTIME_DEPENDENCIES
                 ${_type} \"${TARGET_FILE}\"
                 RESOLVED_DEPENDENCIES_VAR _deps
@@ -818,7 +1414,7 @@ if(BUILD_PORTABLE)
                 PRE_EXCLUDE_REGEXES ${_PRE_EXCLUDE}
                 POST_EXCLUDE_REGEXES ${_POST_EXCLUDE})
             foreach(_d IN LISTS _deps)
-                file(INSTALL \"\${_d}\" DESTINATION \"\${_lib}\" FOLLOW_SYMLINK_CHAIN)
+                file(INSTALL \"\${_d}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${_BUNDLE_DEST}\" FOLLOW_SYMLINK_CHAIN)
             endforeach()
         " COMPONENT runtime)
     endfunction()
@@ -835,13 +1431,7 @@ if(BUILD_PORTABLE)
                 @ONLY)
         install(PROGRAMS "${CMAKE_BINARY_DIR}/run_lichtfeld.sh" DESTINATION ${CMAKE_INSTALL_BINDIR})
     elseif(WIN32)
-        # Copy DLLs to bin/ for Windows search path
         install(CODE "
-            # Copy all DLLs from lib/ to bin/
-            file(GLOB _dlls \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/*.dll\")
-            foreach(_d IN LISTS _dlls)
-                file(INSTALL \"\${_d}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
-            endforeach()
             # Copy extensions/ from build to dist/extensions/
             # Handle both single-config (Ninja) and multi-config (VS) generators
             foreach(_cfg IN ITEMS \"\" \"Release\" \"Debug\" \"RelWithDebInfo\" \"MinSizeRel\")

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "python/python_runtime.hpp"
 #include "visualizer/input/input_bindings.hpp"
 
@@ -43,6 +44,7 @@ namespace lfs::python {
             .value("ZOOM_SPEED_UP", Action::ZOOM_SPEED_UP)
             .value("ZOOM_SPEED_DOWN", Action::ZOOM_SPEED_DOWN)
             .value("TOGGLE_SPLIT_VIEW", Action::TOGGLE_SPLIT_VIEW)
+            .value("TOGGLE_INDEPENDENT_SPLIT_VIEW", Action::TOGGLE_INDEPENDENT_SPLIT_VIEW)
             .value("TOGGLE_GT_COMPARISON", Action::TOGGLE_GT_COMPARISON)
             .value("TOGGLE_DEPTH_MODE", Action::TOGGLE_DEPTH_MODE)
             .value("CYCLE_PLY", Action::CYCLE_PLY)
@@ -57,6 +59,8 @@ namespace lfs::python {
             .value("PASTE_SELECTION", Action::PASTE_SELECTION)
             .value("DEPTH_ADJUST_FAR", Action::DEPTH_ADJUST_FAR)
             .value("DEPTH_ADJUST_SIDE", Action::DEPTH_ADJUST_SIDE)
+            .value("TOGGLE_SELECTION_DEPTH_FILTER", Action::TOGGLE_SELECTION_DEPTH_FILTER)
+            .value("TOGGLE_SELECTION_CROP_FILTER", Action::TOGGLE_SELECTION_CROP_FILTER)
             .value("BRUSH_RESIZE", Action::BRUSH_RESIZE)
             .value("CYCLE_BRUSH_MODE", Action::CYCLE_BRUSH_MODE)
             .value("CONFIRM_POLYGON", Action::CONFIRM_POLYGON)
@@ -85,7 +89,9 @@ namespace lfs::python {
             .value("TOOL_SCALE", Action::TOOL_SCALE)
             .value("TOOL_MIRROR", Action::TOOL_MIRROR)
             .value("TOOL_BRUSH", Action::TOOL_BRUSH)
-            .value("TOOL_ALIGN", Action::TOOL_ALIGN);
+            .value("TOOL_ALIGN", Action::TOOL_ALIGN)
+            .value("PIE_MENU", Action::PIE_MENU)
+            .value("DEPTH_ADJUST_NEAR", Action::DEPTH_ADJUST_NEAR);
 
         // Expose ToolMode enum
         nb::enum_<ToolMode>(keymap, "ToolMode")
@@ -239,9 +245,10 @@ namespace lfs::python {
         keymap.def(
             "export_profile",
             [](const std::string& path) {
+                const auto path_fs = lfs::core::utf8_to_path(path);
                 if (!get_keymap_bindings())
                     return false;
-                return get_keymap_bindings()->saveProfileToFile(path);
+                return get_keymap_bindings()->saveProfileToFile(path_fs);
             },
             nb::arg("path"),
             "Export current profile to file");
@@ -249,9 +256,10 @@ namespace lfs::python {
         keymap.def(
             "import_profile",
             [](const std::string& path) {
+                const auto path_fs = lfs::core::utf8_to_path(path);
                 if (!get_keymap_bindings())
                     return false;
-                return get_keymap_bindings()->loadProfileFromFile(path);
+                return get_keymap_bindings()->loadProfileFromFile(path_fs);
             },
             nb::arg("path"),
             "Import profile from file");

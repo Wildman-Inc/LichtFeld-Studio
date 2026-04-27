@@ -103,12 +103,12 @@ namespace lfs::rendering {
         return {};
     }
 
-    Tensor PointCloudRenderer::extractRGBFromSH(const Tensor& shs) {
+    lfs::core::Tensor PointCloudRenderer::extractRGBFromSH(const lfs::core::Tensor& shs) {
         constexpr float SH_C0 = 0.28209479177387814f;
 
-        const Tensor features_dc = shs.slice(1, 0, 1).squeeze(1);
+        const lfs::core::Tensor features_dc = shs.slice(1, 0, 1).squeeze(1);
 
-        const Tensor colors = features_dc * SH_C0 + 0.5f;
+        const lfs::core::Tensor colors = features_dc * SH_C0 + 0.5f;
 
         return colors.clamp(0.0f, 1.0f);
     }
@@ -121,16 +121,17 @@ namespace lfs::rendering {
                                             const std::vector<glm::mat4>& model_transforms,
                                             const std::shared_ptr<lfs::core::Tensor>& transform_indices,
                                             const bool equirectangular,
-                                            const PointCloudCropParams& crop_params) {
+                                            const PointCloudCropParams& crop_params,
+                                            const bool transparent_background) {
         if (splat_data.size() == 0)
             return {};
 
         const auto& positions = splat_data.get_means();
-        const auto& shs = splat_data.get_shs();
-        const auto colors = extractRGBFromSH(shs);
+        const auto colors = extractRGBFromSH(splat_data.sh0_raw());
 
         return renderInternal(positions, colors, view, projection, voxel_size, background_color,
-                              model_transforms, transform_indices, equirectangular, crop_params);
+                              model_transforms, transform_indices, equirectangular, crop_params,
+                              transparent_background);
     }
 
     Result<void> PointCloudRenderer::render(const lfs::core::PointCloud& point_cloud,
@@ -141,7 +142,8 @@ namespace lfs::rendering {
                                             const std::vector<glm::mat4>& model_transforms,
                                             const std::shared_ptr<lfs::core::Tensor>& transform_indices,
                                             const bool equirectangular,
-                                            const PointCloudCropParams& crop_params) {
+                                            const PointCloudCropParams& crop_params,
+                                            const bool transparent_background) {
         if (point_cloud.size() == 0)
             return {};
 
@@ -152,11 +154,12 @@ namespace lfs::rendering {
         }
 
         return renderInternal(positions, colors, view, projection, voxel_size, background_color,
-                              model_transforms, transform_indices, equirectangular, crop_params);
+                              model_transforms, transform_indices, equirectangular, crop_params,
+                              transparent_background);
     }
 
-    Result<void> PointCloudRenderer::renderInternal(const Tensor& positions,
-                                                    const Tensor& colors,
+    Result<void> PointCloudRenderer::renderInternal(const lfs::core::Tensor& positions,
+                                                    const lfs::core::Tensor& colors,
                                                     const glm::mat4& view,
                                                     const glm::mat4& projection,
                                                     const float voxel_size,
@@ -164,7 +167,8 @@ namespace lfs::rendering {
                                                     const std::vector<glm::mat4>& model_transforms,
                                                     const std::shared_ptr<lfs::core::Tensor>& transform_indices,
                                                     const bool equirectangular,
-                                                    const PointCloudCropParams& crop_params) {
+                                                    const PointCloudCropParams& crop_params,
+                                                    const bool transparent_background) {
         if (!initialized_) {
             return std::unexpected("Renderer not initialized");
         }
@@ -182,10 +186,12 @@ namespace lfs::rendering {
 
         // Build interleaved GPU buffer: [pos(3f), color(3f), transform_index(1f)]
         if (interleaved_cache_.size(0) != static_cast<int64_t>(num_points)) {
-            interleaved_cache_ = Tensor::empty({num_points, 7}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+            interleaved_cache_ = lfs::core::Tensor::empty({num_points, 7}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
         }
-        interleaved_cache_.slice(1, 0, 3).copy_(positions);
-        interleaved_cache_.slice(1, 3, 6).copy_(colors);
+        const auto pos_cuda = positions.cuda();
+        const auto col_cuda = colors.cuda();
+        interleaved_cache_.slice(1, 0, 3).copy_(pos_cuda);
+        interleaved_cache_.slice(1, 3, 6).copy_(col_cuda);
         if (transform_indices && transform_indices->size(0) == static_cast<int64_t>(num_points)) {
             interleaved_cache_.slice(1, 6, 7).copy_(transform_indices->unsqueeze(1));
         } else {
@@ -224,7 +230,7 @@ namespace lfs::rendering {
         if (!use_interop_)
 #endif
         {
-            const Tensor cpu_data = interleaved_cache_.cpu();
+            const lfs::core::Tensor cpu_data = interleaved_cache_.cpu();
             BufferBinder<GL_ARRAY_BUFFER> bind(instance_vbo_);
             glBufferData(GL_ARRAY_BUFFER, buffer_size, cpu_data.data_ptr(), GL_DYNAMIC_DRAW);
         }
@@ -232,7 +238,8 @@ namespace lfs::rendering {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LESS);
         glDepthMask(GL_TRUE);
-        glClearColor(background_color.r, background_color.g, background_color.b, 1.0f);
+        glClearColor(background_color.r, background_color.g, background_color.b,
+                     transparent_background ? 0.0f : 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         ShaderScope s(shader_);

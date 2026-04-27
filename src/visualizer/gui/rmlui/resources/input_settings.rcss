@@ -11,13 +11,12 @@
 .is-section-title {
     font-size: 10dp;
     font-weight: bold;
-    color: #89b4fa;
     margin-bottom: 2dp;
 }
 
 .is-hint {
-    font-size: 9dp;
-    color: #a6adc8;
+    display: block;
+    font-size: 11dp;
     margin-bottom: 4dp;
 }
 
@@ -31,7 +30,6 @@
 .is-label {
     min-width: 100dp;
     font-size: 10dp;
-    color: #cdd6f4;
 }
 
 .is-select {
@@ -48,11 +46,9 @@
 
 .is-binding-section {
     display: block;
-    font-size: 9dp;
+    font-size: 11dp;
     font-weight: bold;
-    color: #89b4fa;
     padding: 3dp 4dp;
-    background-color: rgba(137, 180, 250, 40);
     margin-top: 4dp;
 }
 
@@ -66,25 +62,19 @@
 .is-action-name {
     width: 160dp;
     font-size: 10dp;
-    color: #cdd6f4;
     flex-shrink: 0;
 }
 
 .is-binding-desc {
     flex: 1;
     font-size: 10dp;
-    color: #89b4fa;
     min-width: 0;
-}
-
-.is-binding-desc.is-capturing {
-    color: #f9e2af;
 }
 
 .is-rebind-btn {
     flex-shrink: 0;
     min-width: 60dp;
-    font-size: 9dp;
+    font-size: 11dp;
     padding: 1dp 6dp;
 }
 

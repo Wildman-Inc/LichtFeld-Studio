@@ -5,8 +5,8 @@
 #pragma once
 
 #include "gui/rmlui/rml_fbo.hpp"
+#include <cstddef>
 #include <string>
-#include <imgui.h>
 
 namespace Rml {
     class Context;
@@ -14,28 +14,36 @@ namespace Rml {
     class Element;
 } // namespace Rml
 
+namespace lfs::vis {
+    struct Theme;
+}
 namespace lfs::vis::gui {
 
     class RmlUIManager;
 
+    struct ShellRect {
+        float x = 0;
+        float y = 0;
+        float w = 0;
+        float h = 0;
+    };
+
     struct ShellRegions {
-        ImVec2 menu_pos{0, 0};
-        ImVec2 menu_size{0, 0};
-        ImVec2 right_panel_pos{0, 0};
-        ImVec2 right_panel_size{0, 0};
-        ImVec2 status_pos{0, 0};
-        ImVec2 status_size{0, 0};
+        ShellRect screen;
+        ShellRect menu;
+        ShellRect right_panel;
+        ShellRect status;
     };
 
     class RmlShellFrame {
     public:
         void init(RmlUIManager* mgr);
         void shutdown();
+        void reloadResources();
         void render(const ShellRegions& regions);
 
     private:
         void updateTheme();
-        std::string generateThemeRCSS() const;
 
         RmlUIManager* rml_manager_ = nullptr;
         Rml::Context* rml_context_ = nullptr;
@@ -47,7 +55,8 @@ namespace lfs::vis::gui {
 
         RmlFBO fbo_;
 
-        std::string last_theme_;
+        std::size_t last_theme_signature_ = 0;
+        bool has_theme_signature_ = false;
         std::string base_rcss_;
     };
 

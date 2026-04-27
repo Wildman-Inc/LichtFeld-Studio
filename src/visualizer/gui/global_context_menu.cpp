@@ -8,21 +8,23 @@
 
 #include "gui/global_context_menu.hpp"
 #include "core/logger.hpp"
+#include "gui/gui_focus_state.hpp"
 #include "gui/panel_layout.hpp"
-#include "gui/rmlui/rml_input_utils.hpp"
+#include "gui/rmlui/rml_document_utils.hpp"
 #include "gui/rmlui/rml_theme.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/rmlui/rmlui_render_interface.hpp"
 #include "internal/resource_paths.hpp"
 #include "theme/theme.hpp"
 
+#include "gui/rmlui/sdl_rml_key_mapping.hpp"
+
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
 #include <RmlUi/Core/Input.h>
+#include <algorithm>
 #include <cassert>
-#include <cstring>
 #include <format>
-#include <imgui.h>
 
 namespace lfs::vis::gui {
 
@@ -33,6 +35,9 @@ namespace lfs::vis::gui {
     }
 
     GlobalContextMenu::~GlobalContextMenu() {
+        menu_model_ = {};
+        items_.clear();
+        pending_items_.clear();
         fbo_.destroy();
         if (ctx_ && mgr_)
             mgr_->destroyContext("global_context_menu");
@@ -48,11 +53,24 @@ namespace lfs::vis::gui {
             return;
         }
 
-        ctx_->EnableMouseCursor(false);
+        auto ctor = ctx_->CreateDataModel("global_context_menu");
+        assert(ctor);
+
+        if (auto handle = ctor.RegisterStruct<ContextMenuItem>()) {
+            handle.RegisterMember("label", &ContextMenuItem::label);
+            handle.RegisterMember("action", &ContextMenuItem::action);
+            handle.RegisterMember("separator_before", &ContextMenuItem::separator_before);
+            handle.RegisterMember("is_label", &ContextMenuItem::is_label);
+            handle.RegisterMember("is_submenu_item", &ContextMenuItem::is_submenu_item);
+            handle.RegisterMember("is_active", &ContextMenuItem::is_active);
+        }
+        ctor.RegisterArray<std::vector<ContextMenuItem>>();
+        ctor.Bind("items", &items_);
+        menu_model_ = ctor.GetModelHandle();
 
         try {
             const auto rml_path = lfs::vis::getAssetPath("rmlui/global_context_menu.rml");
-            doc_ = ctx_->LoadDocument(rml_path.string());
+            doc_ = rml_documents::loadDocument(ctx_, rml_path);
             if (!doc_) {
                 LOG_ERROR("GlobalContextMenu: failed to load global_context_menu.rml");
                 return;
@@ -74,75 +92,81 @@ namespace lfs::vis::gui {
         }
     }
 
-    std::string GlobalContextMenu::generateThemeRCSS() const {
-        using rml_theme::colorToRml;
-        using rml_theme::colorToRmlAlpha;
-        const auto& p = lfs::vis::theme().palette;
-        const auto& t = lfs::vis::theme();
+    void GlobalContextMenu::reloadResources() {
+        if (!ctx_)
+            return;
 
-        const auto surface = colorToRmlAlpha(p.surface, 0.95f);
-        const auto border = colorToRmlAlpha(p.border, 0.4f);
-        const auto text = colorToRml(p.text);
-        const auto text_dim = colorToRml(p.text_dim);
-        const int rounding = static_cast<int>(t.sizes.window_rounding);
+        hide();
+        open_ = false;
+        pending_open_ = false;
+        focus_first_item_ = false;
+        callback_ = {};
 
-        return std::format(
-            ".context-menu {{ background-color: {}; border-color: {}; border-radius: {}dp; }}\n"
-            ".context-menu-item {{ color: {}; }}\n"
-            ".context-menu-label {{ color: {}; }}\n"
-            ".context-menu-separator {{ background-color: {}; }}\n",
-            surface, border, rounding,
-            text, text_dim,
-            colorToRmlAlpha(p.border, 0.5f));
+        if (doc_) {
+            ctx_->UnloadDocument(doc_);
+            ctx_->Update();
+        }
+
+        doc_ = nullptr;
+        el_backdrop_ = nullptr;
+        el_ctx_menu_ = nullptr;
+        base_rcss_.clear();
+        has_theme_signature_ = false;
+        width_ = 0;
+        height_ = 0;
+
+        try {
+            const auto rml_path = lfs::vis::getAssetPath("rmlui/global_context_menu.rml");
+            doc_ = rml_documents::loadDocument(ctx_, rml_path);
+            if (!doc_) {
+                LOG_ERROR("GlobalContextMenu: failed to reload global_context_menu.rml");
+                return;
+            }
+            doc_->Show();
+
+            el_backdrop_ = doc_->GetElementById("backdrop");
+            el_ctx_menu_ = doc_->GetElementById("ctx-menu");
+
+            if (!el_backdrop_ || !el_ctx_menu_) {
+                LOG_ERROR("GlobalContextMenu: missing DOM elements after reload");
+                return;
+            }
+
+            el_backdrop_->AddEventListener(Rml::EventId::Click, &listener_);
+            el_ctx_menu_->AddEventListener(Rml::EventId::Click, &listener_);
+        } catch (const std::exception& e) {
+            LOG_ERROR("GlobalContextMenu: resource not found during reload: {}", e.what());
+            return;
+        }
+
+        menu_model_.DirtyVariable("items");
+        syncTheme();
     }
 
     void GlobalContextMenu::syncTheme() {
         if (!doc_)
             return;
 
-        const auto& p = lfs::vis::theme().palette;
-        if (std::memcmp(last_synced_text_, &p.text, sizeof(last_synced_text_)) == 0)
+        const std::size_t theme_signature = rml_theme::currentThemeSignature();
+        if (has_theme_signature_ && theme_signature == last_theme_signature_)
             return;
-        std::memcpy(last_synced_text_, &p.text, sizeof(last_synced_text_));
+        last_theme_signature_ = theme_signature;
+        has_theme_signature_ = true;
 
         if (base_rcss_.empty())
             base_rcss_ = rml_theme::loadBaseRCSS("rmlui/global_context_menu.rcss");
 
-        rml_theme::applyTheme(doc_, base_rcss_, generateThemeRCSS());
+        rml_theme::applyTheme(doc_, base_rcss_, rml_theme::loadBaseRCSS("rmlui/global_context_menu.theme.rcss"));
     }
 
-    std::string GlobalContextMenu::buildInnerRML(const std::vector<ContextMenuItem>& items) const {
-        std::string html;
-        html.reserve(512);
-
-        for (const auto& item : items) {
-            if (item.separator_before)
-                html += R"(<div class="context-menu-separator"></div>)";
-
-            if (item.is_label) {
-                html += std::format(R"(<div class="context-menu-label">{}</div>)", item.label);
-                continue;
-            }
-
-            std::string cls = "context-menu-item";
-            if (item.is_submenu_item)
-                cls += " submenu-item";
-            if (item.is_active)
-                cls += " active";
-
-            html += std::format(
-                R"(<div class="{}" data-ctx-action="{}">{}</div>)",
-                cls, item.action, item.label);
-        }
-
-        return html;
-    }
-
-    void GlobalContextMenu::request(std::vector<ContextMenuItem> items, float screen_x, float screen_y) {
+    void GlobalContextMenu::request(std::vector<ContextMenuItem> items, float screen_x, float screen_y,
+                                    ActionCallback callback) {
         pending_items_ = std::move(items);
+        callback_ = std::move(callback);
         pending_x_ = screen_x;
         pending_y_ = screen_y;
         pending_open_ = true;
+        focus_first_item_ = true;
     }
 
     std::string GlobalContextMenu::pollResult() {
@@ -156,36 +180,73 @@ namespace lfs::vis::gui {
             return;
 
         open_ = false;
+        focus_first_item_ = false;
+        callback_ = {};
         el_ctx_menu_->SetClass("visible", false);
         el_backdrop_->SetProperty("display", "none");
+    }
+
+    void GlobalContextMenu::focusFirstItem() {
+        if (!el_ctx_menu_)
+            return;
+
+        Rml::ElementList items;
+        el_ctx_menu_->GetElementsByClassName(items, "context-menu-item");
+        for (auto* item : items) {
+            if (item && item->Focus())
+                break;
+        }
     }
 
     void GlobalContextMenu::processInput(const PanelInputState& input) {
         if (!open_ || !ctx_ || !doc_ || !el_backdrop_ || !el_ctx_menu_)
             return;
+        if (mgr_)
+            mgr_->trackContextFrame(ctx_, 0, 0);
 
-        const float mx = input.mouse_x;
-        const float my = input.mouse_y;
+        const float mx = input.mouse_x - input.screen_x;
+        const float my = input.mouse_y - input.screen_y;
 
-        ctx_->ProcessMouseMove(static_cast<int>(mx), static_cast<int>(my), 0);
+        const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
+                                      input.key_alt, input.key_super);
+
+        ctx_->ProcessMouseMove(static_cast<int>(mx), static_cast<int>(my), mods);
 
         if (input.mouse_clicked[0])
-            ctx_->ProcessMouseButtonDown(0, 0);
+            ctx_->ProcessMouseButtonDown(0, mods);
         if (input.mouse_released[0])
-            ctx_->ProcessMouseButtonUp(0, 0);
+            ctx_->ProcessMouseButtonUp(0, mods);
 
         if (input.mouse_clicked[1]) {
             hide();
             return;
         }
 
-        ImGui::GetIO().WantCaptureMouse = true;
+        auto& focus = guiFocusState();
+        focus.want_capture_mouse = true;
+        focus.want_capture_keyboard = true;
 
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
-            hide();
+        for (const int sc : input.keys_pressed) {
+            if (sc == SDL_SCANCODE_ESCAPE) {
+                hide();
+                return;
+            }
+            const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
+            if (rml_key != Rml::Input::KI_UNKNOWN)
+                ctx_->ProcessKeyDown(rml_key, mods);
+        }
+        for (const int sc : input.keys_released) {
+            const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
+            if (rml_key != Rml::Input::KI_UNKNOWN)
+                ctx_->ProcessKeyUp(rml_key, mods);
+        }
+
+        if (input.mouse_clicked[0] || input.mouse_clicked[1])
+            focus_first_item_ = false;
     }
 
-    void GlobalContextMenu::render(int screen_w, int screen_h) {
+    void GlobalContextMenu::render(int screen_w, int screen_h,
+                                   float screen_x, float screen_y) {
         if (!open_ && !pending_open_)
             return;
 
@@ -199,10 +260,11 @@ namespace lfs::vis::gui {
             pending_open_ = false;
 
             if (el_ctx_menu_ && el_backdrop_) {
-                const std::string html = buildInnerRML(pending_items_);
-                el_ctx_menu_->SetInnerRML(html);
-                el_ctx_menu_->SetProperty("left", std::format("{:.0f}dp", pending_x_));
-                el_ctx_menu_->SetProperty("top", std::format("{:.0f}dp", pending_y_));
+                items_ = pending_items_;
+                menu_model_.DirtyVariable("items");
+                const float dp = std::max(mgr_ ? mgr_->getDpRatio() : 1.0f, 1.0f);
+                el_ctx_menu_->SetProperty("left", std::format("{:.0f}dp", (pending_x_ - screen_x) / dp));
+                el_ctx_menu_->SetProperty("top", std::format("{:.0f}dp", (pending_y_ - screen_y) / dp));
                 el_ctx_menu_->SetClass("visible", true);
                 el_backdrop_->SetProperty("display", "block");
                 open_ = true;
@@ -229,6 +291,11 @@ namespace lfs::vis::gui {
             }
 
             ctx_->Update();
+            if (focus_first_item_) {
+                focusFirstItem();
+                focus_first_item_ = false;
+                ctx_->Update();
+            }
 
             fbo_.ensure(w, h);
             if (!fbo_.valid())
@@ -240,20 +307,19 @@ namespace lfs::vis::gui {
 
             GLint prev_fbo = 0;
             fbo_.bind(&prev_fbo);
+            render_iface->SetTargetFramebuffer(fbo_.fbo());
 
             render_iface->BeginFrame();
             ctx_->Render();
             render_iface->EndFrame();
 
+            render_iface->SetTargetFramebuffer(0);
             fbo_.unbind(prev_fbo);
         }
 
-        if (fbo_.valid()) {
-            auto* vp = ImGui::GetMainViewport();
-            const ImVec2 pos(0, 0);
-            const ImVec2 size(static_cast<float>(screen_w), static_cast<float>(screen_h));
-            fbo_.blitToDrawList(ImGui::GetForegroundDrawList(vp), pos, size);
-        }
+        if (fbo_.valid())
+            fbo_.blitToScreen(0.0f, 0.0f, static_cast<float>(screen_w), static_cast<float>(screen_h),
+                              screen_w, screen_h);
     }
 
     void GlobalContextMenu::destroyGLResources() {
@@ -275,8 +341,13 @@ namespace lfs::vis::gui {
 
         const auto action = target->GetAttribute<Rml::String>("data-ctx-action", "");
         if (!action.empty()) {
-            owner->result_ = action;
+            auto callback = owner->callback_;
             owner->hide();
+            if (callback) {
+                callback(action);
+            } else {
+                owner->result_ = action;
+            }
         }
     }
 

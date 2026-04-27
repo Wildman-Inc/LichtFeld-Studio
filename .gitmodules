@@ -1,3 +1,6 @@
 [submodule "external/libvterm"]
 	path = external/libvterm
 	url = https://github.com/neovim/libvterm.git
+[submodule "external/vksplat"]
+	path = external/vksplat
+	url = https://github.com/harry7557558/vksplat.git

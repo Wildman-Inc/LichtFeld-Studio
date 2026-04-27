@@ -8,18 +8,35 @@
 #include "gui/rmlui/elements/color_picker_element.hpp"
 #include "gui/rmlui/elements/crf_curve_element.hpp"
 #include "gui/rmlui/elements/loss_graph_element.hpp"
+#include "gui/rmlui/elements/python_editor_element.hpp"
+#include "gui/rmlui/elements/scene_graph_element.hpp"
+#include "gui/rmlui/elements/terminal_element.hpp"
 #include "gui/rmlui/rml_fbo.hpp"
+#include "gui/rmlui/rml_text_input_handler.hpp"
 #include "gui/rmlui/rmlui_render_interface.hpp"
 #include "gui/rmlui/rmlui_system_interface.hpp"
 #include "internal/resource_paths.hpp"
+#include "python/python_runtime.hpp"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/ElementInstancer.h>
 #include <RmlUi/Core/Factory.h>
+#include <RmlUi/Debugger.h>
 #include <cassert>
+#include <cstdlib>
 #include <filesystem>
+#include <string_view>
 
 namespace lfs::vis::gui {
+
+    namespace {
+        bool envFlagEnabled(const char* name) {
+            const char* value = std::getenv(name);
+            if (!value || !*value)
+                return false;
+            return std::string_view(value) != "0";
+        }
+    } // namespace
 
     RmlUIManager::RmlUIManager() = default;
 
@@ -35,12 +52,15 @@ namespace lfs::vis::gui {
 
         dp_ratio_ = dp_ratio;
         window_ = window;
+        debugger_enabled_ = envFlagEnabled("LFS_RML_DEBUGGER");
 
         system_interface_ = std::make_unique<RmlSystemInterface>(window);
         render_interface_ = std::make_unique<RmlRenderInterface>();
+        text_input_handler_ = std::make_unique<RmlTextInputHandler>();
 
         Rml::SetSystemInterface(system_interface_.get());
         Rml::SetRenderInterface(render_interface_.get());
+        Rml::SetTextInputHandler(text_input_handler_.get());
 
         if (!Rml::Initialise()) {
             LOG_ERROR("Failed to initialize RmlUI");
@@ -51,10 +71,16 @@ namespace lfs::vis::gui {
         static Rml::ElementInstancerGeneric<ColorPickerElement> color_picker_instancer;
         static Rml::ElementInstancerGeneric<CRFCurveElement> crf_curve_instancer;
         static Rml::ElementInstancerGeneric<LossGraphElement> loss_graph_instancer;
+        static Rml::ElementInstancerGeneric<PythonEditorElement> python_editor_instancer;
+        static Rml::ElementInstancerGeneric<SceneGraphElement> scene_graph_instancer;
+        static Rml::ElementInstancerGeneric<TerminalElement> terminal_instancer;
         Rml::Factory::RegisterElementInstancer("chromaticity-diagram", &chromaticity_instancer);
         Rml::Factory::RegisterElementInstancer("color-picker", &color_picker_instancer);
         Rml::Factory::RegisterElementInstancer("crf-curve", &crf_curve_instancer);
         Rml::Factory::RegisterElementInstancer("loss-graph", &loss_graph_instancer);
+        Rml::Factory::RegisterElementInstancer("python-editor-view", &python_editor_instancer);
+        Rml::Factory::RegisterElementInstancer("scene-graph", &scene_graph_instancer);
+        Rml::Factory::RegisterElementInstancer("terminal-view", &terminal_instancer);
 
         try {
             const auto regular_path = lfs::vis::getAssetPath("fonts/Inter-Regular.ttf");
@@ -83,6 +109,13 @@ namespace lfs::vis::gui {
             } else {
                 LOG_WARN("RmlUI: failed to load NotoSansKR-Regular.ttf");
             }
+
+            const auto mono_path = lfs::vis::getAssetPath("fonts/JetBrainsMono-Regular.ttf");
+            if (Rml::LoadFontFace(mono_path.string(), false)) {
+                LOG_INFO("RmlUI: loaded font {}", mono_path.string());
+            } else {
+                LOG_WARN("RmlUI: failed to load JetBrainsMono-Regular.ttf");
+            }
         } catch (const std::exception& e) {
             LOG_WARN("RmlUI: font not found: {}", e.what());
         }
@@ -96,13 +129,19 @@ namespace lfs::vis::gui {
         if (!initialized_)
             return;
 
-        for (auto& [name, ctx] : contexts_) {
-            Rml::RemoveContext(name);
+        if (debugger_initialized_) {
+            Rml::Debugger::Shutdown();
+            debugger_initialized_ = false;
         }
-        contexts_.clear();
 
+        while (!contexts_.empty())
+            destroyContext(contexts_.begin()->first);
+
+        if (Rml::GetTextInputHandler() == text_input_handler_.get())
+            Rml::SetTextInputHandler(nullptr);
         Rml::Shutdown();
         render_interface_.reset();
+        text_input_handler_.reset();
         system_interface_.reset();
         resize_deferring_ = false;
         initialized_ = false;
@@ -135,6 +174,20 @@ namespace lfs::vis::gui {
         }
 
         ctx->SetDensityIndependentPixelRatio(dp_ratio_);
+        ctx->SetDefaultScrollBehavior(Rml::ScrollBehavior::Instant, 1.0f);
+        if (!active_theme_id_.empty())
+            ctx->ActivateTheme(active_theme_id_, true);
+
+        if (debugger_enabled_ && !debugger_initialized_) {
+            debugger_initialized_ = Rml::Debugger::Initialise(ctx);
+            if (debugger_initialized_) {
+                Rml::Debugger::SetVisible(true);
+                LOG_INFO("RmlUI debugger enabled on context '{}'", name);
+            } else {
+                LOG_WARN("RmlUI debugger requested but failed to initialize on context '{}'", name);
+            }
+        }
+
         contexts_[name] = ctx;
         return ctx;
     }
@@ -145,11 +198,46 @@ namespace lfs::vis::gui {
     }
 
     void RmlUIManager::destroyContext(const std::string& name) {
+        if (!initialized_)
+            return;
+
         auto it = contexts_.find(name);
         if (it != contexts_.end()) {
+            if (system_interface_)
+                system_interface_->releaseContext(it->second);
+            if (auto fn = lfs::python::get_rml_context_destroy_handler())
+                fn(it->second);
             Rml::RemoveContext(name);
             contexts_.erase(it);
         }
+    }
+
+    void RmlUIManager::activateTheme(const std::string& theme_id) {
+        if (theme_id == active_theme_id_)
+            return;
+        for (auto& [name, ctx] : contexts_) {
+            if (!active_theme_id_.empty())
+                ctx->ActivateTheme(active_theme_id_, false);
+            ctx->ActivateTheme(theme_id, true);
+        }
+        active_theme_id_ = theme_id;
+    }
+
+    void RmlUIManager::beginFrameCursorTracking() {
+        if (system_interface_)
+            system_interface_->beginFrame();
+    }
+
+    void RmlUIManager::trackContextFrame(const Rml::Context* const context,
+                                         const int window_x,
+                                         const int window_y) {
+        if (system_interface_)
+            system_interface_->trackContext(context, window_x, window_y);
+    }
+
+    RmlCursorRequest RmlUIManager::consumeCursorRequest() {
+        return system_interface_ ? system_interface_->consumeCursorRequest()
+                                 : RmlCursorRequest::None;
     }
 
     bool RmlUIManager::shouldDeferFboUpdate(const RmlFBO& fbo) const {

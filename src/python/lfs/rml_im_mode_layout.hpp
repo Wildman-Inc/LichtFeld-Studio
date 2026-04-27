@@ -11,6 +11,7 @@
 #include <nanobind/nanobind.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -98,6 +99,7 @@ namespace lfs::python {
     public:
         explicit SlotEventListener(SlotEventState* state) : state_(state) {}
         void ProcessEvent(Rml::Event& event) override;
+        void OnDetach(Rml::Element*) override { delete this; }
 
     private:
         SlotEventState* state_;
@@ -168,7 +170,8 @@ namespace lfs::python {
         std::tuple<bool, float> stepper_float(const std::string& label, float value,
                                               const std::vector<float>& steps = {1.0f, 0.1f, 0.01f});
         std::tuple<bool, std::string> path_input(const std::string& label, const std::string& value,
-                                                 bool folder_mode = true, const std::string& dialog_title = "");
+                                                 bool folder_mode = true,
+                                                 const std::string& dialog_title = "");
 
         // --- Color ---
         std::tuple<bool, std::tuple<float, float, float>> color_edit3(const std::string& label,
@@ -399,6 +402,8 @@ namespace lfs::python {
 
         bool is_active() const { return doc_ != nullptr; }
 
+        void release_elements();
+
     private:
         Slot& ensure_slot(SlotType type, const std::string& key);
         Rml::Element* create_element(SlotType type, const std::string& key);
@@ -406,7 +411,9 @@ namespace lfs::python {
         void finish_current_line();
         void prune_excess_slots(ContainerLevel& level);
         std::string build_id(const std::string& key) const;
+        std::string build_slot_id(const char* prefix, const std::string* label = nullptr) const;
         std::string color_to_css(nb::object color) const;
+        static std::string stable_label_token(const std::string& label);
 
         void warn_unsupported(const char* method);
 
@@ -420,9 +427,14 @@ namespace lfs::python {
         int disabled_depth_ = 0;
         std::vector<std::string> id_stack_;
         bool force_next_open_ = false;
+        struct ChildSlotCache {
+            Rml::Element* container = nullptr;
+            std::deque<Slot> slots;
+        };
 
-        std::vector<std::unique_ptr<SlotEventListener>> listeners_;
         std::vector<Rml::ElementPtr> removed_elements_;
+        std::unordered_map<std::string, ChildSlotCache> child_slots_;
+        std::vector<std::string> child_key_stack_;
         std::unordered_set<std::string> warned_methods_;
 
         Rml::Element* last_element_ = nullptr;
@@ -430,6 +442,10 @@ namespace lfs::python {
 
         Rml::Element* tooltip_el_ = nullptr;
         bool tooltip_shown_ = false;
+        Rml::Element* tooltip_hover_el_ = nullptr;
+        std::string tooltip_text_;
+        std::chrono::steady_clock::time_point tooltip_hover_started_at_{};
+        bool tooltip_candidate_seen_ = false;
 
         std::unordered_map<std::string, bool> popup_open_;
         std::string active_popup_id_;
@@ -439,6 +455,9 @@ namespace lfs::python {
         MouseState mouse_;
         std::optional<TableState> table_;
         float cached_line_height_ = 18.0f;
+
+        std::vector<float> item_width_stack_;
+        void apply_item_width(Rml::Element* el);
     };
 
     enum class RmlLayoutDirection : uint8_t { Row,

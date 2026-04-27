@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "camera_frustum_renderer.hpp"
-#include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "gl_state_guard.hpp"
-#include "io/nvcodec_image_loader.hpp"
+#include "io/pipelined_image_loader.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 
 namespace lfs::rendering {
@@ -19,11 +19,19 @@ namespace lfs::rendering {
         constexpr float MIN_RENDER_ALPHA = 0.01f;
         constexpr float WIREFRAME_WIDTH = 1.5f;
         constexpr int PICKING_SAMPLE_SIZE = 3;
-        constexpr int NVCODEC_DECODER_POOL_SIZE = 4;
         constexpr int INITIAL_TEXTURE_ARRAY_CAPACITY = 256;
         constexpr float EQUIRECTANGULAR_DISPLAY_FOV = 1.0472f; // 60 degrees
 
-        const glm::mat4 GL_TO_COLMAP = glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, -1.0f, -1.0f));
+        [[nodiscard]] std::vector<glm::mat4> resolveSceneTransforms(
+            const size_t camera_count,
+            const glm::mat4& fallback_scene_transform,
+            const std::span<const glm::mat4> scene_transforms) {
+            if (scene_transforms.size() == camera_count) {
+                return std::vector<glm::mat4>(scene_transforms.begin(), scene_transforms.end());
+            }
+            return std::vector<glm::mat4>(camera_count, fallback_scene_transform);
+        }
+
     } // namespace
 
     CameraFrustumRenderer::~CameraFrustumRenderer() {
@@ -34,7 +42,8 @@ namespace lfs::rendering {
     }
 
     void CameraFrustumRenderer::clearThumbnailCache() {
-        const std::scoped_lock lock(pending_mutex_, load_queue_mutex_, ready_queue_mutex_);
+        thumbnail_generation_.fetch_add(1, std::memory_order_acq_rel);
+        const std::scoped_lock lock(shared_loader_mutex_, pending_mutex_, load_queue_mutex_, ready_queue_mutex_);
 
         thumbnail_pending_.clear();
         thumbnail_load_queue_ = {};
@@ -49,6 +58,8 @@ namespace lfs::rendering {
         camera_ids_.clear();
         camera_positions_.clear();
         last_scale_ = -1.0f;
+        last_scene_transforms_.clear();
+        fallback_loader_.reset();
     }
 
     Result<void> CameraFrustumRenderer::init() {
@@ -296,106 +307,135 @@ namespace lfs::rendering {
         const float scale,
         const glm::vec3& train_color,
         const glm::vec3& eval_color,
+        const std::span<const glm::vec3> per_camera_colors,
         const bool for_picking,
         const glm::vec3& view_position,
         const glm::mat4& scene_transform,
+        const std::span<const glm::mat4> scene_transforms,
         const std::unordered_set<int>& disabled_uids,
-        const std::unordered_set<int>& selected_uids) {
+        const std::unordered_set<int>& emphasized_uids) {
+
+        const auto resolved_scene_transforms =
+            resolveSceneTransforms(cameras.size(), scene_transform, scene_transforms);
 
         const bool needs_regeneration =
             cached_instances_.size() != cameras.size() ||
             last_scale_ != scale ||
-            last_train_color_ != train_color ||
-            last_eval_color_ != eval_color ||
-            last_scene_transform_ != scene_transform ||
-            last_disabled_uids_ != disabled_uids ||
-            last_selected_uids_ != selected_uids;
+            last_scene_transforms_ != resolved_scene_transforms;
 
-        if (!needs_regeneration && !cached_instances_.empty()) {
-            updateInstanceVisibility(view_position);
-            return;
+        if (needs_regeneration) {
+            cached_instances_.clear();
+            cached_instances_.reserve(cameras.size());
+            camera_ids_.clear();
+            camera_ids_.reserve(cameras.size());
+            camera_positions_.clear();
+            camera_positions_.reserve(cameras.size());
+
+            for (size_t camera_index = 0; camera_index < cameras.size(); ++camera_index) {
+                const auto& cam = cameras[camera_index];
+                if (!cam) {
+                    continue;
+                }
+                auto R_tensor = cam->R();
+                auto T_tensor = cam->T();
+
+                if (!R_tensor.is_valid() || !T_tensor.is_valid())
+                    continue;
+
+                if (R_tensor.device() != lfs::core::Device::CPU)
+                    R_tensor = R_tensor.cpu();
+                if (T_tensor.device() != lfs::core::Device::CPU)
+                    T_tensor = T_tensor.cpu();
+
+                glm::mat4 w2c(1.0f);
+                auto R_acc = R_tensor.accessor<float, 2>();
+                auto T_acc = T_tensor.accessor<float, 1>();
+
+                for (int i = 0; i < 3; ++i) {
+                    for (int j = 0; j < 3; ++j) {
+                        w2c[j][i] = R_acc(i, j);
+                    }
+                    w2c[3][i] = T_acc(i);
+                }
+
+                const glm::mat4 transformed_c2w =
+                    resolved_scene_transforms[camera_index] * glm::inverse(w2c);
+                const glm::mat4 visualizer_c2w = transformed_c2w * DATA_TO_VISUALIZER_CAMERA_AXES_4;
+                const glm::vec3 cam_pos = glm::vec3(visualizer_c2w[3]);
+                camera_positions_.push_back(cam_pos);
+
+                const float aspect = static_cast<float>(cam->image_width()) / static_cast<float>(cam->image_height());
+                const bool is_equirect = cam->camera_model_type() == lfs::core::CameraModelType::EQUIRECTANGULAR;
+                const float fov_y = is_equirect ? EQUIRECTANGULAR_DISPLAY_FOV
+                                                : lfs::core::focal2fov(cam->focal_y(), cam->image_height());
+                const float half_height = std::tan(fov_y * 0.5f);
+                const float half_width = half_height * aspect;
+
+                const glm::mat4 fov_scale = glm::scale(
+                    glm::mat4(1.0f),
+                    glm::vec3(half_width * 2.0f * scale, half_height * 2.0f * scale, scale));
+                const glm::mat4 model = visualizer_c2w * fov_scale;
+
+                cached_instances_.push_back(
+                    {model, train_color, 1.0f, 0, 0u, is_equirect ? 1u : 0u, 0u, 0u});
+                camera_ids_.push_back(cam->uid());
+            }
         }
 
-        cached_instances_.clear();
-        cached_instances_.reserve(cameras.size());
-        camera_ids_.clear();
-        camera_ids_.reserve(cameras.size());
-        camera_positions_.clear();
-        camera_positions_.reserve(cameras.size());
+        updateInstanceAppearance(cameras, train_color, eval_color, per_camera_colors,
+                                 disabled_uids, emphasized_uids);
 
-        for (const auto& cam : cameras) {
-            auto R_tensor = cam->R();
-            auto T_tensor = cam->T();
-
-            if (!R_tensor.is_valid() || !T_tensor.is_valid())
-                continue;
-
-            if (R_tensor.device() != lfs::core::Device::CPU)
-                R_tensor = R_tensor.cpu();
-            if (T_tensor.device() != lfs::core::Device::CPU)
-                T_tensor = T_tensor.cpu();
-
-            glm::mat4 w2c(1.0f);
-            auto R_acc = R_tensor.accessor<float, 2>();
-            auto T_acc = T_tensor.accessor<float, 1>();
-
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    w2c[j][i] = R_acc(i, j);
-                }
-                w2c[3][i] = T_acc(i);
-            }
-
-            const glm::mat4 transformed_c2w = scene_transform * glm::inverse(w2c);
-            const glm::vec3 cam_pos = glm::vec3(transformed_c2w[3]);
-            camera_positions_.push_back(cam_pos);
-
-            const float aspect = static_cast<float>(cam->image_width()) / static_cast<float>(cam->image_height());
-            const bool is_equirect = cam->camera_model_type() == lfs::core::CameraModelType::EQUIRECTANGULAR;
-            const float fov_y = is_equirect ? EQUIRECTANGULAR_DISPLAY_FOV
-                                            : lfs::core::focal2fov(cam->focal_y(), cam->image_height());
-            const float half_height = std::tan(fov_y * 0.5f);
-            const float half_width = half_height * aspect;
-
-            const glm::mat4 fov_scale = glm::scale(glm::mat4(1.0f), glm::vec3(half_width * 2.0f * scale, half_height * 2.0f * scale, scale));
-            const glm::mat4 model = transformed_c2w * GL_TO_COLMAP * fov_scale;
-
-            const bool is_validation = cam->image_name().find("test") != std::string::npos;
-            const glm::vec3 color = is_validation ? eval_color : train_color;
-
-            float alpha = 1.0f;
-            if (!for_picking) {
-                const float distance = glm::length(cam_pos - view_position);
-                const float fade_start = FADE_START_MULTIPLIER * scale;
-                const float fade_end = FADE_END_MULTIPLIER * scale;
-                const float min_visible = MIN_VISIBLE_MULTIPLIER * scale;
-
-                if (distance < min_visible) {
-                    alpha = 0.0f;
-                } else if (distance < fade_end) {
-                    alpha = MIN_VISIBLE_ALPHA;
-                } else if (distance < fade_start) {
-                    const float t = (distance - fade_end) / (fade_start - fade_end);
-                    alpha = MIN_VISIBLE_ALPHA + (1.0f - MIN_VISIBLE_ALPHA) * (t * t * (3.0f - 2.0f * t));
-                }
-            }
-
-            const bool is_disabled = disabled_uids.count(cam->uid()) > 0;
-            if (is_disabled)
-                alpha *= 0.4f;
-
-            const bool is_selected = selected_uids.count(cam->uid()) > 0;
-            cached_instances_.push_back({model, color, alpha, 0, is_validation ? 1u : 0u, is_equirect ? 1u : 0u, is_disabled ? 1u : 0u, is_selected ? 1u : 0u});
-            camera_ids_.push_back(cam->uid());
+        if (!for_picking) {
+            updateInstanceVisibility(view_position);
         }
 
         last_scale_ = scale;
         last_train_color_ = train_color;
         last_eval_color_ = eval_color;
-        last_view_position_ = view_position;
-        last_scene_transform_ = scene_transform;
-        last_disabled_uids_ = disabled_uids;
-        last_selected_uids_ = selected_uids;
+        last_scene_transforms_ = resolved_scene_transforms;
+    }
+
+    void CameraFrustumRenderer::updateInstanceAppearance(
+        const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
+        const glm::vec3& train_color,
+        const glm::vec3& eval_color,
+        const std::span<const glm::vec3> per_camera_colors,
+        const std::unordered_set<int>& disabled_uids,
+        const std::unordered_set<int>& emphasized_uids) {
+
+        const bool has_overrides = per_camera_colors.size() == cameras.size();
+        size_t instance_index = 0;
+
+        for (size_t i = 0; i < cameras.size() && instance_index < cached_instances_.size(); ++i) {
+            const auto& cam = cameras[i];
+            if (!cam) {
+                continue;
+            }
+            auto R_tensor = cam->R();
+            auto T_tensor = cam->T();
+            if (!R_tensor.is_valid() || !T_tensor.is_valid()) {
+                continue;
+            }
+            const bool is_validation = cam->image_name().find("test") != std::string::npos;
+
+            glm::vec3 color = is_validation ? eval_color : train_color;
+            if (has_overrides) {
+                const glm::vec3 override_color = per_camera_colors[i];
+                if (std::isfinite(override_color.x) &&
+                    std::isfinite(override_color.y) &&
+                    std::isfinite(override_color.z)) {
+                    color = override_color;
+                }
+            }
+
+            cached_instances_[instance_index].color = color;
+            cached_instances_[instance_index].is_validation = is_validation ? 1u : 0u;
+            cached_instances_[instance_index].is_training_disabled =
+                disabled_uids.count(cam->uid()) > 0 ? 1u : 0u;
+            cached_instances_[instance_index].is_emphasized =
+                emphasized_uids.count(cam->uid()) > 0 ? 1u : 0u;
+            ++instance_index;
+        }
     }
 
     void CameraFrustumRenderer::updateInstanceVisibility(const glm::vec3& view_position) {
@@ -418,9 +458,10 @@ namespace lfs::rendering {
                 const float t = (distance - fade_end) / (fade_start - fade_end);
                 alpha = MIN_VISIBLE_ALPHA + (1.0f - MIN_VISIBLE_ALPHA) * (t * t * (3.0f - 2.0f * t));
             }
+            if (cached_instances_[i].is_training_disabled > 0u)
+                alpha *= 0.4f;
             cached_instances_[i].alpha = alpha;
         }
-        last_view_position_ = view_position;
     }
 
     Result<void> CameraFrustumRenderer::render(
@@ -430,10 +471,12 @@ namespace lfs::rendering {
         const float scale,
         const glm::vec3& train_color,
         const glm::vec3& eval_color,
+        const std::span<const glm::vec3> per_camera_colors,
         const glm::mat4& scene_transform,
+        const std::span<const glm::mat4> scene_transforms,
         const bool equirectangular_view,
         const std::unordered_set<int>& disabled_uids,
-        const std::unordered_set<int>& selected_uids) {
+        const std::unordered_set<int>& emphasized_uids) {
 
         if (!initialized_ || cameras.empty())
             return {};
@@ -441,7 +484,9 @@ namespace lfs::rendering {
         uploadReadyThumbnails();
 
         const glm::vec3 view_position = glm::vec3(glm::inverse(view)[3]);
-        prepareInstances(cameras, scale, train_color, eval_color, false, view_position, scene_transform, disabled_uids, selected_uids);
+        prepareInstances(cameras, scale, train_color, eval_color, per_camera_colors, false,
+                         view_position, scene_transform, scene_transforms,
+                         disabled_uids, emphasized_uids);
 
         if (cached_instances_.empty())
             return {};
@@ -513,7 +558,7 @@ namespace lfs::rendering {
 
             glEnableVertexAttribArray(11);
             glVertexAttribIPointer(11, 1, GL_UNSIGNED_INT, sizeof(InstanceData),
-                                   reinterpret_cast<void*>(offsetof(InstanceData, is_selected)));
+                                   reinterpret_cast<void*>(offsetof(InstanceData, is_emphasized)));
             glVertexAttribDivisor(11, 1);
         };
 
@@ -532,16 +577,16 @@ namespace lfs::rendering {
 
         const glm::mat4 view_proj = projection * view;
 
-        const auto findHighlightIndex = [this](const std::vector<int>& indices) -> int {
+        const auto findFocusedIndex = [this](const std::vector<int>& indices) -> int {
             for (size_t i = 0; i < indices.size(); ++i) {
-                if (indices[i] == highlighted_camera_)
+                if (indices[i] == focused_camera_)
                     return static_cast<int>(i);
             }
             return -1;
         };
 
-        const int frustum_highlight = findHighlightIndex(frustum_indices);
-        const int sphere_highlight = findHighlightIndex(sphere_indices);
+        const int frustum_focus = findFocusedIndex(frustum_indices);
+        const int sphere_focus = findFocusedIndex(sphere_indices);
 
         if (show_images_) {
             for (size_t i = 0; i < frustum_instances.size() && i < frustum_cameras.size(); ++i)
@@ -570,7 +615,7 @@ namespace lfs::rendering {
             shader->set("cameraTextures", 0);
 
             if (!frustum_instances.empty()) {
-                shader->set("highlightIndex", frustum_highlight);
+                shader->set("focusIndex", frustum_focus);
                 VAOBinder vao_bind(vao_);
                 setupInstanceAttributes(frustum_instances);
                 BufferBinder<GL_ELEMENT_ARRAY_BUFFER> face_bind(face_ebo_);
@@ -580,7 +625,7 @@ namespace lfs::rendering {
             }
 
             if (!sphere_instances.empty()) {
-                shader->set("highlightIndex", sphere_highlight);
+                shader->set("focusIndex", sphere_focus);
                 VAOBinder vao_bind(sphere_vao_);
                 setupInstanceAttributes(sphere_instances);
                 BufferBinder<GL_ELEMENT_ARRAY_BUFFER> face_bind(sphere_face_ebo_);
@@ -607,7 +652,7 @@ namespace lfs::rendering {
             glLineWidth(WIREFRAME_WIDTH);
 
             if (!frustum_instances.empty()) {
-                shader->set("highlightIndex", frustum_highlight);
+                shader->set("focusIndex", frustum_focus);
                 VAOBinder vao_bind(vao_);
                 setupInstanceAttributes(frustum_instances);
                 BufferBinder<GL_ELEMENT_ARRAY_BUFFER> edge_bind(edge_ebo_);
@@ -617,7 +662,7 @@ namespace lfs::rendering {
             }
 
             if (!sphere_instances.empty()) {
-                shader->set("highlightIndex", sphere_highlight);
+                shader->set("focusIndex", sphere_focus);
                 VAOBinder vao_bind(sphere_vao_);
                 setupInstanceAttributes(sphere_instances);
                 BufferBinder<GL_ELEMENT_ARRAY_BUFFER> edge_bind(sphere_edge_ebo_);
@@ -638,17 +683,17 @@ namespace lfs::rendering {
         const glm::mat4& view,
         const glm::mat4& projection,
         const float scale,
-        const glm::mat4& scene_transform) {
+        const glm::mat4& scene_transform,
+        const std::span<const glm::mat4> scene_transforms) {
 
         if (!initialized_ || cameras.empty())
             return -1;
 
-        if (cached_instances_.empty() || camera_ids_.size() != cameras.size()) {
-            const glm::vec3 view_position = glm::vec3(glm::inverse(view)[3]);
-            prepareInstances(cameras, scale, last_train_color_, last_eval_color_, false, view_position, scene_transform);
-            if (cached_instances_.empty())
-                return -1;
-        }
+        const glm::vec3 view_position = glm::vec3(glm::inverse(view)[3]);
+        prepareInstances(cameras, scale, last_train_color_, last_eval_color_, {},
+                         true, view_position, scene_transform, scene_transforms);
+        if (cached_instances_.empty())
+            return -1;
 
         const int vp_width = static_cast<int>(viewport_size.x);
         const int vp_height = static_cast<int>(viewport_size.y);
@@ -737,7 +782,7 @@ namespace lfs::rendering {
 
             glEnableVertexAttribArray(11);
             glVertexAttribIPointer(11, 1, GL_UNSIGNED_INT, sizeof(InstanceData),
-                                   reinterpret_cast<void*>(offsetof(InstanceData, is_selected)));
+                                   reinterpret_cast<void*>(offsetof(InstanceData, is_emphasized)));
             glVertexAttribDivisor(11, 1);
         };
 
@@ -886,56 +931,56 @@ namespace lfs::rendering {
         }
     }
 
+    void CameraFrustumRenderer::setImageLoader(std::shared_ptr<lfs::io::PipelinedImageLoader> loader,
+                                               const bool allow_fallback) {
+        std::lock_guard lock(shared_loader_mutex_);
+        shared_loader_ = std::move(loader);
+        allow_fallback_loader_ = allow_fallback;
+        if (shared_loader_ || !allow_fallback_loader_) {
+            fallback_loader_.reset();
+        }
+    }
+
     void CameraFrustumRenderer::thumbnailLoaderWorker() {
-        constexpr auto IDLE_TIMEOUT = std::chrono::seconds(5);
-        constexpr auto POLL_INTERVAL = std::chrono::milliseconds(500);
-
-        std::unique_ptr<lfs::io::NvCodecImageLoader> nvcodec;
-        const bool nvcodec_supported = lfs::io::NvCodecImageLoader::is_available();
-        auto last_activity = std::chrono::steady_clock::now();
-
-        const auto create_nvcodec = [&]() -> bool {
-            if (nvcodec || !nvcodec_supported)
-                return nvcodec != nullptr;
-            try {
-                lfs::io::NvCodecImageLoader::Options opts;
-                opts.device_id = 0;
-                opts.decoder_pool_size = NVCODEC_DECODER_POOL_SIZE;
-                nvcodec = std::make_unique<lfs::io::NvCodecImageLoader>(opts);
-                return true;
-            } catch (const std::exception& e) {
-                LOG_WARN("nvImageCodec init failed: {}", e.what());
-                return false;
+        const auto get_loader = [&]() -> std::shared_ptr<lfs::io::PipelinedImageLoader> {
+            std::lock_guard lock(shared_loader_mutex_);
+            if (shared_loader_) {
+                return shared_loader_;
             }
+            if (!allow_fallback_loader_) {
+                return {};
+            }
+            if (!fallback_loader_) {
+                lfs::io::PipelinedLoaderConfig config;
+                config.io_threads = 0;
+                config.cold_process_threads = 0;
+                config.max_cache_bytes = 64ULL * 1024 * 1024;
+                fallback_loader_ = std::make_shared<lfs::io::PipelinedImageLoader>(config);
+            }
+            return fallback_loader_;
         };
 
         while (thumbnail_loader_running_) {
             ThumbnailRequest request;
-            bool has_work = false;
 
             {
                 std::unique_lock lock(load_queue_mutex_);
-                load_queue_cv_.wait_for(lock, POLL_INTERVAL, [this] {
+                load_queue_cv_.wait(lock, [this] {
                     return !thumbnail_load_queue_.empty() || !thumbnail_loader_running_;
                 });
 
                 if (!thumbnail_loader_running_)
                     break;
 
-                if (!thumbnail_load_queue_.empty()) {
-                    request = std::move(thumbnail_load_queue_.front());
-                    thumbnail_load_queue_.pop();
-                    has_work = true;
-                    last_activity = std::chrono::steady_clock::now();
-                }
+                if (thumbnail_load_queue_.empty())
+                    continue;
+
+                request = std::move(thumbnail_load_queue_.front());
+                thumbnail_load_queue_.pop();
             }
 
-            // Release nvcodec after idle timeout to free CUDA resources for training
-            if (!has_work) {
-                if (nvcodec && (std::chrono::steady_clock::now() - last_activity) > IDLE_TIMEOUT) {
-                    LOG_DEBUG("Releasing idle thumbnail nvcodec");
-                    nvcodec.reset();
-                }
+            const uint64_t current_generation = thumbnail_generation_.load(std::memory_order_acquire);
+            if (request.generation != current_generation) {
                 continue;
             }
 
@@ -943,71 +988,43 @@ namespace lfs::rendering {
             loaded.camera_uid = request.camera_uid;
 
             try {
-                std::string ext = request.image_path.extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-
-                bool loaded_with_nvcodec = false;
-                const bool is_jpeg = (ext == ".jpg" || ext == ".jpeg");
-
-                if (is_jpeg && create_nvcodec()) {
-                    try {
-                        const int max_dim = std::max(request.image_width, request.image_height);
-                        int pot_resize = 1;
-                        while (pot_resize * 2 <= max_dim / THUMBNAIL_SIZE) {
-                            pot_resize *= 2;
-                        }
-
-                        auto tensor = nvcodec->load_image_gpu(request.image_path, pot_resize, THUMBNAIL_SIZE);
-                        auto cpu_tensor = tensor.cpu().contiguous();
-                        const auto shape = cpu_tensor.shape();
-                        const int c = shape[0], h = shape[1], w = shape[2];
-
-                        if (c != 3)
-                            throw std::runtime_error("Expected 3 channels");
-
-                        loaded.width = w;
-                        loaded.height = h;
-                        loaded.pixel_data.resize(w * h * 3);
-
-                        // CHW (channel-first) to HWC (interleaved) with Y-flip
-                        const float* src = cpu_tensor.ptr<float>();
-                        const int plane_size = h * w;
-                        const float* r_plane = src;
-                        const float* g_plane = src + plane_size;
-                        const float* b_plane = src + 2 * plane_size;
-
-                        for (int y = 0; y < h; ++y) {
-                            const int src_y = h - 1 - y;
-                            uint8_t* dst_row = loaded.pixel_data.data() + y * w * 3;
-                            const float* r_row = r_plane + src_y * w;
-                            const float* g_row = g_plane + src_y * w;
-                            const float* b_row = b_plane + src_y * w;
-
-                            for (int x = 0; x < w; ++x) {
-                                dst_row[x * 3] = static_cast<uint8_t>(std::clamp(r_row[x] * 255.0f, 0.0f, 255.0f));
-                                dst_row[x * 3 + 1] = static_cast<uint8_t>(std::clamp(g_row[x] * 255.0f, 0.0f, 255.0f));
-                                dst_row[x * 3 + 2] = static_cast<uint8_t>(std::clamp(b_row[x] * 255.0f, 0.0f, 255.0f));
-                            }
-                        }
-                        loaded_with_nvcodec = true;
-                    } catch (...) {}
+                auto loader = get_loader();
+                if (!loader) {
+                    if (request.generation == thumbnail_generation_.load(std::memory_order_acquire)) {
+                        std::lock_guard lock(pending_mutex_);
+                        thumbnail_pending_.erase(request.camera_uid);
+                    }
+                    continue;
                 }
 
-                if (!loaded_with_nvcodec) {
-                    auto [data, width, height, channels] = lfs::core::load_image(request.image_path, -1, THUMBNAIL_SIZE);
-                    if (!data)
-                        continue;
+                lfs::io::LoadParams params;
+                params.max_width = THUMBNAIL_SIZE;
 
-                    loaded.width = width;
-                    loaded.height = height;
-                    loaded.pixel_data.resize(width * height * 3);
+                auto tensor = loader->load_image_immediate(request.image_path, params);
+                if (request.generation != thumbnail_generation_.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                assert(tensor.ndim() == 3);
 
-                    for (int y = 0; y < height; ++y) {
-                        std::memcpy(loaded.pixel_data.data() + y * width * 3,
-                                    data + (height - 1 - y) * width * 3,
-                                    width * 3);
-                    }
-                    lfs::core::free_image(data);
+                // float32 [C,H,W] on GPU → uint8 [H,W,C] on CPU with Y-flip
+                auto hwc = tensor.permute({1, 2, 0}).contiguous();
+                hwc = (hwc.clamp(0.0f, 1.0f) * 255.0f).to(lfs::core::DataType::UInt8).contiguous();
+                hwc = hwc.cpu().contiguous();
+
+                const int h = static_cast<int>(hwc.shape()[0]);
+                const int w = static_cast<int>(hwc.shape()[1]);
+                const int ch = static_cast<int>(hwc.shape()[2]);
+                assert(ch == 3);
+
+                loaded.width = w;
+                loaded.height = h;
+                loaded.pixel_data.resize(static_cast<size_t>(w) * h * 3);
+
+                const auto* src = hwc.ptr<uint8_t>();
+                const size_t row_bytes = static_cast<size_t>(w) * 3;
+                for (int y = 0; y < h; ++y) {
+                    std::memcpy(loaded.pixel_data.data() + y * row_bytes,
+                                src + (h - 1 - y) * row_bytes, row_bytes);
                 }
 
                 {
@@ -1017,8 +1034,10 @@ namespace lfs::rendering {
 
             } catch (const std::exception& e) {
                 LOG_WARN("Thumbnail load failed for camera {}: {}", request.camera_uid, e.what());
-                std::lock_guard lock(pending_mutex_);
-                thumbnail_pending_.erase(request.camera_uid);
+                if (request.generation == thumbnail_generation_.load(std::memory_order_acquire)) {
+                    std::lock_guard lock(pending_mutex_);
+                    thumbnail_pending_.erase(request.camera_uid);
+                }
             }
         }
     }
@@ -1038,7 +1057,8 @@ namespace lfs::rendering {
             .camera_uid = uid,
             .image_path = camera.image_path(),
             .image_width = camera.image_width(),
-            .image_height = camera.image_height()};
+            .image_height = camera.image_height(),
+            .generation = thumbnail_generation_.load(std::memory_order_acquire)};
 
         {
             std::lock_guard lock(load_queue_mutex_);

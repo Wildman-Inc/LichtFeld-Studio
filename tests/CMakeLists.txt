@@ -62,16 +62,18 @@ if(BUILD_UNICODE_TEST_ONLY)
 endif()
 
 # Find LibTorch for tensor comparison tests
-# Set Torch_DIR based on platform
+# Set Torch_DIR based on platform unless the caller provided one.
 get_filename_component(PROJ_ROOT_DIR "${CMAKE_SOURCE_DIR}" ABSOLUTE)
-if(WIN32)
-    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
-        set(Torch_DIR "${PROJ_ROOT_DIR}/external/release/libtorch/share/cmake/Torch")
+if(NOT Torch_DIR)
+    if(WIN32)
+        if(CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
+            set(Torch_DIR "${PROJ_ROOT_DIR}/external/release/libtorch/share/cmake/Torch")
+        else()
+            set(Torch_DIR "${PROJ_ROOT_DIR}/external/debug/libtorch/share/cmake/Torch")
+        endif()
     else()
-        set(Torch_DIR "${PROJ_ROOT_DIR}/external/debug/libtorch/share/cmake/Torch")
+        set(Torch_DIR "${PROJ_ROOT_DIR}/external/libtorch/share/cmake/Torch")
     endif()
-else()
-    set(Torch_DIR "${PROJ_ROOT_DIR}/external/libtorch/share/cmake/Torch")
 endif()
 find_package(Torch REQUIRED)
 message(STATUS "Tests: LibTorch ${Torch_VERSION} found for tensor comparison tests")
@@ -83,7 +85,6 @@ message(STATUS "Tests: LibTorch ${Torch_VERSION} found for tensor comparison tes
 # Benchmark sources (performance measurement focused)
 set(BENCHMARK_FILES
     benchmark_background_blend.cpp
-    benchmark_adc.cpp
     benchmark_grad_alpha_layout.cpp
     benchmark_pipelined_loader.cpp
     benchmark_slice_assignment.cpp
@@ -91,6 +92,7 @@ set(BENCHMARK_FILES
     benchmark_scheduler.cpp
     benchmark_losses.cpp
     benchmark_ppisp_controller.cpp
+    benchmark_selection_modes.cpp
     # profile_adam_optimizer.cpp  # Disabled - missing header
     test_tensor_benchmark.cpp
     test_memory_pool_benchmark.cpp
@@ -158,13 +160,14 @@ set(TEST_FILES
     test_expression_templates.cpp
     test_lfs_adam_optimizer.cpp
     test_lfs_scheduler.cpp
+    test_mrnf_strategy.cpp
     test_lfs_losses.cpp
     test_mcmc_kernels.cpp
     test_tensor_bool.cpp
     test_dataloader_lfs.cpp
     test_bilateral_grid.cpp
     test_sparsity_debug.cpp
-    test_adc.cpp
+    test_sparsity_optimizer.cpp
     test_dtype_operations_comprehensive.cpp
     test_tensor_bugs.cpp
     test_densification_performance.cpp
@@ -194,14 +197,25 @@ set(TEST_FILES
     test_sog_html_export.cpp
     test_gsplat_rasterizer.cpp
     test_spz_format.cpp
+    test_converter_usd.cpp
+    test_usd_format.cpp
+    test_nurec_usdz_format.cpp
     test_unicode_paths_windows.cpp
     test_interleaved_slice_copy.cpp
-    test_adc_tensor_ops.cpp
+    test_densification_tensor_ops.cpp
     test_tensor_zero_dimension.cpp
     test_mask_loss.cpp
     test_checkpoint_resume.cpp
+    test_parameter_manager.cpp
+    test_mcp_protocol.cpp
+    test_mcp_app_utils.cpp
+    test_mcp_shared_scene_tools.cpp
+    test_mcp_sequencer_tools.cpp
+    test_video_export_utils.cpp
+    test_visualizer_post_work.cpp
     test_video_color_convert.cpp
     test_python_integration.cpp
+    test_python_lsp_client.cpp
     test_uv_runner.cpp
     test_uv_runner_proof.cpp
     test_pytorch_install_proof.cpp
@@ -217,7 +231,6 @@ set(TEST_FILES
     test_cpu_dtype_conversions.cpp
     test_cpu_large_tensor_bugs.cpp
     test_curand_buffer_overflow.cpp
-    test_adc_comparison.cpp
     test_gradient_accumulation.cpp
     test_image_resize_parallel.cpp
     test_tensor_cat_bug.cpp
@@ -233,9 +246,25 @@ set(TEST_FILES
     test_extended_unary_ops_vs_torch.cpp
     # test_property_system.cpp  # Disabled: needs API update after merge
     test_scene_validity.cpp
+    test_render_settings_defaults.cpp
+    test_selection_rasterization_ops.cpp
+    test_rendering_refactor_services.cpp
+    test_theme_registry.cpp
+    test_viewport.cpp
+    test_input_controller_focus.cpp
+    test_input_controller_dataset_load.cpp
+    test_selection_service_interactions.cpp
+    test_undo_history.cpp
+    test_selection_command_dispatch.cpp
+    test_selection_operator_modal.cpp
+    test_operator_registry_props.cpp
     test_fastgs_analytical_gradients.cpp
     test_background_image.cpp
     test_operator_return_value.cpp
+    test_sdl_rml_key_mapping.cpp
+    test_rml_path_utils.cpp
+    test_rml_static_style_boundaries.cpp
+    test_sequencer_regressions.cpp
     test_tensor_storage_version.cpp
     test_modal_registry_regression.cpp
     # test_property_schema_thread_safety.cpp  # Disabled: API mismatch after merge
@@ -243,12 +272,17 @@ set(TEST_FILES
     test_tensor_nn_ops.cpp
     test_ppisp_controller.cpp
     test_ppisp_regularization.cpp
+    test_ppisp_sidecar.cpp
     test_ppisp_cuda_vs_torch.cpp
     test_controller_memory.cpp
     test_undistort.cpp
+    test_viewport_region_utils.cpp
     test_mesh_data.cpp
     test_openmesh_bridge.cpp
     test_mesh_loader.cpp
+    test_colmap_image_layout.cpp
+    test_splat_simplify.cpp
+    test_rml_text_input_handler.cpp
     test_rotated_sh_correctness.cpp
     test_tensor_stream.cpp
     test_tensor_memory_planner.cpp
@@ -265,6 +299,8 @@ endforeach()
 # PyModalRegistry data layer (no ImGui) for lock-order regression tests.
 list(APPEND TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/python/lfs/py_modal_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/mcp_sequencer_tools.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/converter.cpp
 )
 
 # Build benchmark sources list
@@ -294,6 +330,7 @@ target_include_directories(lichtfeld_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/tests
     ${CMAKE_SOURCE_DIR}/src/training   # For training headers
     ${CMAKE_SOURCE_DIR}/src            # For module headers
+    ${CMAKE_SOURCE_DIR}/src/app/include
     ${CMAKE_SOURCE_DIR}/src/visualizer # For visualizer-relative headers (e.g. gui/ui_widgets.hpp)
     ${CMAKE_SOURCE_DIR}/external/spz   # SPZ library headers
     ${NB_DIR}/include
@@ -307,26 +344,36 @@ target_compile_definitions(lichtfeld_tests PRIVATE
     PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}"
 )
 
+if(CMAKE_CXX_LINK_GROUP_USING_RESCAN_SUPPORTED)
+    set(LFS_TEST_INTERNAL_LINK_LIBS
+        "$<LINK_GROUP:RESCAN,lfs_mcp,lfs_visualizer,lfs_sequencer,lfs_rendering,lfs_training,lfs_core,lfs_geometry,lfs_io,lfs_video,fastlfs_backend,spz_lib,lfs_python_utils>"
+    )
+else()
+    set(LFS_TEST_INTERNAL_LINK_LIBS
+        lfs_mcp
+        lfs_visualizer
+        lfs_sequencer
+        lfs_rendering
+        lfs_training
+        lfs_core
+        lfs_geometry
+        lfs_io
+        lfs_video
+        fastlfs_backend
+        spz_lib
+        lfs_python_utils
+    )
+endif()
+
 # Link libraries
 target_link_libraries(lichtfeld_tests PRIVATE
-    # LFS modules
-    lfs_visualizer
-    lfs_rendering
-    lfs_training
-    lfs_core
-    lfs_geometry
-    lfs_io
-    lfs_video
-
-
-    # Backend libraries
-    fastlfs_backend
-    spz_lib  # Niantic SPZ format library
-    lfs_python_utils
+    ${LFS_TEST_INTERNAL_LINK_LIBS}
 
     # External libraries
     GTest::gtest
     nanobind-static
+    imgui::imgui
+    implot::implot
     ${TORCH_LIBRARIES}
     ${OPENGL_LIBRARIES}
     OpenImageIO::OpenImageIO
@@ -380,16 +427,26 @@ target_compile_definitions(lichtfeld_benchmarks PRIVATE
     PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}"
 )
 
-target_link_libraries(lichtfeld_benchmarks PRIVATE
-    lfs_visualizer
-    lfs_rendering
-    lfs_training
-    lfs_core
-    lfs_geometry
-    lfs_io
+if(CMAKE_CXX_LINK_GROUP_USING_RESCAN_SUPPORTED)
+    set(LFS_BENCH_INTERNAL_LINK_LIBS
+        "$<LINK_GROUP:RESCAN,lfs_visualizer,lfs_rendering,lfs_training,lfs_core,lfs_geometry,lfs_io,fastlfs_backend,spz_lib>"
+    )
+else()
+    set(LFS_BENCH_INTERNAL_LINK_LIBS
+        lfs_visualizer
+        lfs_rendering
+        lfs_training
+        lfs_core
+        lfs_geometry
+        lfs_io
+        fastlfs_backend
+        spz_lib
+    )
+endif()
 
-    fastlfs_backend
-    spz_lib
+target_link_libraries(lichtfeld_benchmarks PRIVATE
+    ${LFS_BENCH_INTERNAL_LINK_LIBS}
+
     GTest::gtest
     ${TORCH_LIBRARIES}
     ${OPENGL_LIBRARIES}

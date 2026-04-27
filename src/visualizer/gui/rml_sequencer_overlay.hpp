@@ -5,12 +5,13 @@
 #pragma once
 
 #include "gui/rmlui/rml_fbo.hpp"
+#include "gui/sequencer_viewport_edit_mode.hpp"
 #include "sequencer/rml_sequencer_panel.hpp"
 #include <RmlUi/Core/EventListener.h>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
-#include <ImGuizmo.h>
 
 namespace Rml {
     class Context;
@@ -19,8 +20,9 @@ namespace Rml {
 } // namespace Rml
 
 namespace lfs::vis {
+    struct Theme;
     class SequencerController;
-}
+} // namespace lfs::vis
 
 namespace lfs::vis::gui {
 
@@ -37,7 +39,7 @@ namespace lfs::vis::gui {
             SET_ROTATE,
             SET_EASING,
             DELETE_KEYFRAME,
-            DESELECT_KEYFRAME,
+            CLOSE_EDIT_PANEL,
             APPLY_EDIT,
             REVERT_EDIT
         };
@@ -46,6 +48,7 @@ namespace lfs::vis::gui {
             Action action{};
             size_t keyframe_index = 0;
             int easing_value = 0;
+            float time = 0.0f;
         };
 
         struct EditResult {
@@ -61,7 +64,8 @@ namespace lfs::vis::gui {
 
         void showContextMenu(float screen_x, float screen_y,
                              std::optional<size_t> keyframe_index,
-                             ImGuizmo::OPERATION gizmo_op);
+                             float time,
+                             SequencerViewportEditMode edit_mode);
         void hideContextMenu();
 
         void showTimeEdit(size_t index, float current_time);
@@ -70,14 +74,26 @@ namespace lfs::vis::gui {
         void updateEditOverlay(size_t selected, float pos_delta, float rot_delta,
                                float right_x, float top_y);
         void hideEditOverlay();
+        void showPreviewWindow(float left, float top, float width, float height,
+                               const std::string& title, bool playing,
+                               unsigned int texture_id);
+        void hidePreviewWindow();
 
         void processInput(const lfs::vis::PanelInputState& input);
         void render(int screen_w, int screen_h);
+        void compositeToScreen(int screen_w, int screen_h) const;
         void destroyGLResources();
+        void reloadResources();
 
         [[nodiscard]] bool isContextMenuOpen() const { return context_menu_open_; }
         [[nodiscard]] bool isPopupOpen() const { return time_edit_active_ || focal_edit_active_; }
         [[nodiscard]] bool wantsInput() const { return wants_input_; }
+        [[nodiscard]] bool isMouseOverEditOverlay(float mx, float my) const {
+            if (!edit_overlay_visible_)
+                return false;
+            return mx >= overlay_px_left_ && mx <= overlay_px_left_ + overlay_px_width_ &&
+                   my >= overlay_px_top_ && my <= overlay_px_top_ + overlay_px_height_;
+        }
 
         [[nodiscard]] std::optional<PendingAction> consumeAction();
         [[nodiscard]] std::optional<EditResult> consumeTimeEdit();
@@ -85,12 +101,12 @@ namespace lfs::vis::gui {
 
     private:
         void initContext();
+        [[nodiscard]] bool ensureContextReady();
         void syncTheme();
         void syncLocalization();
-        std::string generateThemeRCSS() const;
         void cacheElements();
         std::string buildContextMenuHTML(std::optional<size_t> keyframe,
-                                         ImGuizmo::OPERATION gizmo_op) const;
+                                         SequencerViewportEditMode edit_mode) const;
         void submitTimeEdit();
         void submitFocalEdit();
 
@@ -119,6 +135,9 @@ namespace lfs::vis::gui {
         Rml::Element* el_edit_delta_ = nullptr;
         Rml::Element* el_edit_apply_ = nullptr;
         Rml::Element* el_edit_revert_ = nullptr;
+        Rml::Element* el_preview_window_ = nullptr;
+        Rml::Element* el_preview_title_ = nullptr;
+        Rml::Element* el_preview_image_ = nullptr;
         Rml::Element* el_time_popup_title_ = nullptr;
         Rml::Element* el_focal_popup_title_ = nullptr;
         Rml::Element* el_time_ok_ = nullptr;
@@ -128,6 +147,7 @@ namespace lfs::vis::gui {
 
         bool context_menu_open_ = false;
         std::optional<size_t> context_menu_keyframe_;
+        float context_menu_time_ = 0.0f;
 
         bool time_edit_active_ = false;
         size_t time_edit_index_ = 0;
@@ -136,20 +156,28 @@ namespace lfs::vis::gui {
         size_t focal_edit_index_ = 0;
 
         bool edit_overlay_visible_ = false;
+        bool preview_visible_ = false;
         bool wants_input_ = false;
         bool has_text_focus_ = false;
         bool elements_cached_ = false;
         bool skip_next_click_ = false;
+        std::string preview_source_;
 
         std::vector<PendingAction> pending_actions_;
         std::optional<EditResult> pending_time_edit_;
         std::optional<EditResult> pending_focal_edit_;
 
         std::string base_rcss_;
-        float last_synced_text_[4] = {};
+        std::size_t last_theme_signature_ = 0;
+        bool has_theme_signature_ = false;
 
         int width_ = 0;
         int height_ = 0;
+
+        float overlay_px_left_ = 0.0f;
+        float overlay_px_top_ = 0.0f;
+        float overlay_px_width_ = 0.0f;
+        float overlay_px_height_ = 0.0f;
     };
 
 } // namespace lfs::vis::gui

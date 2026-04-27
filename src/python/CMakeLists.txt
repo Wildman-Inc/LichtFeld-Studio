@@ -8,48 +8,70 @@ message(STATUS "Configuring Python components (runner + nanobind module)")
 find_package(Python REQUIRED COMPONENTS Interpreter Development Development.Module Development.SABIModule)
 find_package(nanobind CONFIG REQUIRED)
 
+option(LFS_DEV_IMPORT_SOURCE_PYTHON
+    "Import built-in Python packages from src/python in non-portable builds"
+    ON)
+
 # vcpkg extension modules use release ABI; debug libpython has Py_DEBUG which
 # changes _PyRuntimeState layout, causing ABI mismatch crashes.
-get_target_property(_py_debug_lib Python::Python IMPORTED_LOCATION_DEBUG)
-if(_py_debug_lib AND _py_debug_lib MATCHES "python3\\.([0-9]+)d\\.a$")
-    # Linux: libpython3.XXd.a -> libpython3.XX.a
-    string(REGEX REPLACE "debug/lib/libpython3\\.([0-9]+)d\\.a$"
-                         "lib/libpython3.\\1.a" _py_release_lib "${_py_debug_lib}")
-    if(EXISTS "${_py_release_lib}")
-        set_target_properties(Python::Python PROPERTIES
-            IMPORTED_LOCATION_DEBUG "${_py_release_lib}")
-        message(STATUS "Python: forced release ABI for debug build (Linux)")
+# Force release Python library for debug builds on both Python::Python and Python::Module
+# (nanobind uses Python::Module for extension modules)
+function(lfs_force_python_release_abi target_name)
+    # On Windows, check the import library (.lib); on Linux, check the library location
+    if(WIN32)
+        get_target_property(_py_debug_lib ${target_name} IMPORTED_IMPLIB_DEBUG)
+    else()
+        get_target_property(_py_debug_lib ${target_name} IMPORTED_LOCATION_DEBUG)
     endif()
-elseif(_py_debug_lib AND _py_debug_lib MATCHES "python3([0-9]+)_?d\\.lib$")
-    # Windows: python312_d.lib or python312d.lib -> python312.lib
-    string(REGEX REPLACE "python3([0-9]+)_?d\\.lib$"
-                         "python3\\1.lib" _py_release_lib "${_py_debug_lib}")
-    # Also check debug/ -> lib/ path variant
-    string(REPLACE "/debug/lib/" "/lib/" _py_release_lib_alt "${_py_release_lib}")
-    if(EXISTS "${_py_release_lib}")
-        set(_py_win_release "${_py_release_lib}")
-    elseif(EXISTS "${_py_release_lib_alt}")
-        set(_py_win_release "${_py_release_lib_alt}")
+    if(NOT _py_debug_lib)
+        return()
     endif()
-    if(_py_win_release)
-        set_target_properties(Python::Python PROPERTIES
-            IMPORTED_LOCATION_DEBUG "${_py_win_release}")
-        # Override import library for Windows linker
-        get_target_property(_py_debug_implib Python::Python IMPORTED_IMPLIB_DEBUG)
-        if(_py_debug_implib)
-            string(REGEX REPLACE "python3([0-9]+)_?d\\.lib$"
-                                 "python3\\1.lib" _py_release_implib "${_py_debug_implib}")
-            string(REPLACE "/debug/lib/" "/lib/" _py_release_implib_alt "${_py_release_implib}")
-            if(EXISTS "${_py_release_implib}")
-                set_target_properties(Python::Python PROPERTIES
-                    IMPORTED_IMPLIB_DEBUG "${_py_release_implib}")
-            elseif(EXISTS "${_py_release_implib_alt}")
-                set_target_properties(Python::Python PROPERTIES
-                    IMPORTED_IMPLIB_DEBUG "${_py_release_implib_alt}")
-            endif()
+
+    if(_py_debug_lib MATCHES "python3\\.([0-9]+)d\\.a$")
+        # Linux: libpython3.XXd.a -> libpython3.XX.a
+        string(REGEX REPLACE "debug/lib/libpython3\\.([0-9]+)d\\.a$"
+                             "lib/libpython3.\\1.a" _py_release_lib "${_py_debug_lib}")
+        if(EXISTS "${_py_release_lib}")
+            set_target_properties(${target_name} PROPERTIES
+                IMPORTED_LOCATION_DEBUG "${_py_release_lib}")
+            message(STATUS "Python: forced release ABI for ${target_name} (Linux)")
         endif()
-        message(STATUS "Python: forced release ABI for debug build (Windows)")
+    elseif(_py_debug_lib MATCHES "python3([0-9]+)_?d\\.lib$")
+        # Windows: python312_d.lib -> python312.lib (import library)
+        # We already have _py_debug_lib as the import library path
+        string(REGEX REPLACE "python3([0-9]+)_?d\\.lib$"
+                             "python3\\1.lib" _py_release_implib "${_py_debug_lib}")
+        string(REPLACE "/debug/lib/" "/lib/" _py_release_implib "${_py_release_implib}")
+
+        if(EXISTS "${_py_release_implib}")
+            # Set the release import library for Debug config
+            set_target_properties(${target_name} PROPERTIES
+                IMPORTED_IMPLIB_DEBUG "${_py_release_implib}")
+
+            # Also update the DLL location to use release python312.dll
+            get_target_property(_py_debug_dll ${target_name} IMPORTED_LOCATION_DEBUG)
+            if(_py_debug_dll)
+                string(REGEX REPLACE "python3([0-9]+)_?d\\.dll$"
+                                     "python3\\1.dll" _py_release_dll "${_py_debug_dll}")
+                string(REPLACE "/debug/bin/" "/bin/" _py_release_dll "${_py_release_dll}")
+                if(EXISTS "${_py_release_dll}")
+                    set_target_properties(${target_name} PROPERTIES
+                        IMPORTED_LOCATION_DEBUG "${_py_release_dll}")
+                endif()
+            endif()
+
+            message(STATUS "Python: forced release ABI for ${target_name} (Windows) - using ${_py_release_implib}")
+        endif()
     endif()
+endfunction()
+
+# Apply to both Python::Python (for embedded Python) and Python::Module (for nanobind)
+lfs_force_python_release_abi(Python::Python)
+if(TARGET Python::Module)
+    lfs_force_python_release_abi(Python::Module)
+endif()
+if(TARGET Python::SABIModule)
+    lfs_force_python_release_abi(Python::SABIModule)
 endif()
 
 # Shared library for Python runtime state - must be shared to avoid duplicate statics
@@ -84,15 +106,23 @@ set_target_properties(lfs_python_runtime PROPERTIES
     CXX_STANDARD_REQUIRED ON
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL ${CMAKE_BINARY_DIR}
 )
+get_property(_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(WIN32 AND _IS_MULTI_CONFIG)
+    set_target_properties(lfs_python_runtime PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY              ${CMAKE_BINARY_DIR}/$<CONFIG>
+        RUNTIME_OUTPUT_DIRECTORY              ${CMAKE_BINARY_DIR}/$<CONFIG>
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG        ${CMAKE_BINARY_DIR}/Debug
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE      ${CMAKE_BINARY_DIR}/Release
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR}/RelWithDebInfo
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL   ${CMAKE_BINARY_DIR}/MinSizeRel
+    )
+endif()
 
 # Static library for other Python utilities
 add_library(lfs_python_utils STATIC
     runner.cpp
+    python_buffer_analysis.cpp
     package_manager.cpp
     plugin_runner.cpp
     subprocess.cpp
@@ -110,11 +140,23 @@ target_link_libraries(lfs_python_utils
         Python::Python
         lfs_core
         lfs_python_runtime
+        lfs::tree_sitter
+        lfs::tree_sitter_python
 )
+
+set(LFS_PYTHON_UTILS_DEFINITIONS
+    LFS_PYTHON_EXECUTABLE="${Python_EXECUTABLE}"
+)
+if(LFS_DEV_IMPORT_SOURCE_PYTHON AND NOT BUILD_PORTABLE)
+    list(APPEND LFS_PYTHON_UTILS_DEFINITIONS
+        LFS_DEV_PYTHON_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    message(STATUS "Python dev mode: built-in Python imports from ${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 target_compile_definitions(lfs_python_utils
     PUBLIC
-        LFS_PYTHON_EXECUTABLE="${Python_EXECUTABLE}"
+        ${LFS_PYTHON_UTILS_DEFINITIONS}
 )
 
 set_target_properties(lfs_python_utils PROPERTIES
@@ -162,6 +204,7 @@ nanobind_add_module(
     lfs/py_mcp.cpp
     lfs/py_mesh.cpp
     lfs/py_mesh2splat.cpp
+    lfs/py_splat_simplify.cpp
     lfs/openmesh/handles.cpp
     lfs/openmesh/io.cpp
     lfs/py_rendering.cpp
@@ -178,33 +221,55 @@ nanobind_add_module(
 )
 
 set_target_properties(lfs_py PROPERTIES
-    CUDA_ARCHITECTURES ""
-    CUDA_SEPARABLE_COMPILATION OFF
     LINKER_LANGUAGE CXX
     POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
     OUTPUT_NAME lichtfeld
 )
+if(USE_CUDA)
+    set_target_properties(lfs_py PROPERTIES
+        CUDA_ARCHITECTURES ""
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
+# Do not add --exclude-libs,ALL here while lfs_visualizer is static on Linux.
+# The embedded app and the lichtfeld extension currently share GUI registries
+# and hook bridges through ELF symbol interposition.
 target_compile_definitions(lfs_py PRIVATE
     LFS_PYTHON_EXECUTABLE="${Python_EXECUTABLE}"
+    $<$<CONFIG:Debug>:DEBUG_BUILD>
+    $<$<CONFIG:Release>:RELEASE_BUILD>
 )
 
+
+if(CMAKE_CXX_LINK_GROUP_USING_RESCAN_SUPPORTED)
+    set(LFS_PY_INTERNAL_LINK_LIBS
+        "$<LINK_GROUP:RESCAN,lfs_core,lfs_event_bridge,lfs_geometry,lfs_visualizer,lfs_mcp,lfs_python_runtime,lfs_training,lfs_io,lfs_rendering,lfs_sequencer>"
+    )
+else()
+    set(LFS_PY_INTERNAL_LINK_LIBS
+        lfs_core
+        lfs_event_bridge
+        lfs_geometry
+        lfs_visualizer
+        lfs_mcp
+        lfs_python_runtime
+        lfs_training
+        lfs_io
+        lfs_rendering
+        lfs_sequencer
+    )
+endif()
+
 target_link_libraries(lfs_py PRIVATE
-    lfs_core
-    lfs_event_bridge
-    lfs_geometry
-    lfs_visualizer
-    lfs_mcp
-    lfs_python_runtime
-    lfs_training
-    lfs_io
-    lfs_rendering
+    ${LFS_PY_INTERNAL_LINK_LIBS}
     $<IF:$<PLATFORM_ID:Windows>,OpenMeshCore,OpenMeshCoreStatic>
     $<IF:$<PLATFORM_ID:Windows>,OpenMeshTools,OpenMeshToolsStatic>
-    lfs_sequencer
     OpenImageIO::OpenImageIO
-    CUDA::cudart
-    CUDA::curand
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
     ${CMAKE_DL_LIBS}
     imgui::imgui
     implot::implot
@@ -243,11 +308,16 @@ if(WIN32)
         COMMENT "Copying project DLLs to Python module directory"
     )
 
-    # Copy CUDA DLLs
-    file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
-    file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
-    set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
-    foreach(DLL ${CUDA_DLLS_FOR_PYD})
+    if(USE_CUDA)
+        file(GLOB GPU_DLLS_FOR_PYD
+            "${CUDAToolkit_BIN_DIR}/cudart64*.dll"
+            "${CUDAToolkit_BIN_DIR}/curand64*.dll"
+            "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll"
+            "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
+    elseif(USE_HIP AND WIN32)
+        lfs_collect_windows_hip_runtime_dlls(GPU_DLLS_FOR_PYD)
+    endif()
+    foreach(DLL ${GPU_DLLS_FOR_PYD})
         if(EXISTS "${DLL}")
             add_custom_command(TARGET lfs_py POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
@@ -258,14 +328,14 @@ if(WIN32)
 
     # Copy vcpkg runtime DLLs
     add_custom_command(TARGET lfs_py POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/bin"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin"
             "${CMAKE_CURRENT_BINARY_DIR}"
         COMMENT "Copying vcpkg DLLs to Python module directory"
     )
 
     # Copy nvimgcodec
-    if(TARGET nvimgcodec)
+    if(LFS_ENABLE_NVIMAGECODEC AND TARGET nvimgcodec)
         add_custom_command(TARGET lfs_py POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:nvimgcodec>"
@@ -277,7 +347,25 @@ endif()
 
 # Type stubs for IDE support (output to typings/ to avoid runtime conflicts)
 option(BUILD_PYTHON_STUBS "Generate Python type stubs (requires loading the module)" ON)
+
+# Skip stubgen for Debug builds on Windows: vcpkg provides a release Python
+# interpreter, while Debug extension loading still has ABI-sensitive edges.
+# Stubs are primarily useful for IDE support and can be generated from Release builds.
+get_property(LFS_GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(WIN32 AND NOT LFS_GENERATOR_IS_MULTI_CONFIG AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(STATUS "Skipping Python stubs for Debug build (vcpkg Python is release-only)")
+    set(BUILD_PYTHON_STUBS OFF)
+endif()
+
 if(BUILD_PYTHON_STUBS)
+    set(GENERATED_STUBS_DIR "${CMAKE_CURRENT_BINARY_DIR}/typings")
+    set(COMMITTED_STUBS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/stubs")
+    set(PYTHON_STUB_WORKFLOW_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/scripts/manage_stubs.py")
+    set(GENERATED_STUBS_MARKER "${GENERATED_STUBS_DIR}/lichtfeld/py.typed")
+    if(WIN32 AND LFS_GENERATOR_IS_MULTI_CONFIG)
+        set(GENERATED_STUBS_MARKER "${GENERATED_STUBS_DIR}/$<CONFIG>/lichtfeld/py.typed")
+    endif()
+
     if(WIN32)
         # On Windows, we need to set PATH for DLL loading before running stubgen
         # Find the stubgen script (NB_DIR is set by find_package(nanobind))
@@ -291,20 +379,35 @@ if(BUILD_PYTHON_STUBS)
         endif()
 
         if(BUILD_PYTHON_STUBS)
+            set(LFS_HIP_STUBGEN_DLL_DIRS_PY "")
+            if(USE_HIP)
+                lfs_get_windows_hip_runtime_search_dirs(_lfs_hip_stubgen_dll_dirs)
+                foreach(_dir IN LISTS _lfs_hip_stubgen_dll_dirs)
+                    string(APPEND LFS_HIP_STUBGEN_DLL_DIRS_PY "    r'${_dir}',\n")
+                endforeach()
+            endif()
+
             # Python 3.8+ on Windows requires os.add_dll_directory() for DLL loading
             # Create a wrapper script that sets up DLL paths before running stubgen
             # Use file(GENERATE) to evaluate generator expressions at generation time
             set(STUBGEN_WRAPPER "${CMAKE_CURRENT_BINARY_DIR}/run_stubgen_$<CONFIG>.py")
             file(GENERATE OUTPUT "${STUBGEN_WRAPPER}" CONTENT "
-import os, sys
+import os, pathlib, sys
+
+stub_marker = pathlib.Path(r'${GENERATED_STUBS_MARKER}')
+if '$<CONFIG>' == 'Debug':
+    stub_marker.parent.mkdir(parents=True, exist_ok=True)
+    stub_marker.touch()
+    sys.exit(0)
 
 # Add DLL directories (Python 3.8+ requirement on Windows)
 dll_dirs = [
     r'$<TARGET_FILE_DIR:lfs_python_runtime>',
-    r'${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/bin',
+    r'${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin',
     r'${CMAKE_BINARY_DIR}/external/nvImageCodec/src',
     r'${CUDAToolkit_BIN_DIR}',
     r'${CUDAToolkit_BIN_DIR}/x64',
+${LFS_HIP_STUBGEN_DLL_DIRS_PY}
 ]
 
 for d in dll_dirs:
@@ -317,14 +420,14 @@ sys.path.insert(0, r'$<TARGET_FILE_DIR:lfs_py>')
 # Run stubgen
 import runpy
 sys.argv = ['stubgen', '-m', 'lichtfeld',
-            '-M', r'${CMAKE_CURRENT_BINARY_DIR}/typings/lichtfeld/py.typed',
-            '-O', r'${CMAKE_CURRENT_BINARY_DIR}/typings',
+            '-M', r'${GENERATED_STUBS_DIR}/lichtfeld/py.typed',
+            '-O', r'${GENERATED_STUBS_DIR}',
             '-r']
 runpy.run_path(r'${NB_STUBGEN}', run_name='__main__')
 
 # Normalize CRLF -> LF and add space after comma in templates for consistency with linux
 import glob, pathlib, re
-for pyi in glob.glob(r'${CMAKE_CURRENT_BINARY_DIR}/typings/**/*.pyi', recursive=True):
+for pyi in glob.glob(r'${GENERATED_STUBS_DIR}/**/*.pyi', recursive=True):
     p = pathlib.Path(pyi)
     content = p.read_bytes().decode('utf-8').replace('\\r\\n', '\\n')
     # Add space after comma in C++ templates (e.g., VectorT<float,3> -> VectorT<float, 3>)
@@ -333,42 +436,109 @@ for pyi in glob.glob(r'${CMAKE_CURRENT_BINARY_DIR}/typings/**/*.pyi', recursive=
         if count == 0:
             break
     p.write_bytes(content.encode('utf-8'))
+
+stub_marker.parent.mkdir(parents=True, exist_ok=True)
+stub_marker.touch()
 ")
 
             add_custom_command(
-                OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/typings/lichtfeld/py.typed
+                OUTPUT "${GENERATED_STUBS_MARKER}"
                 COMMAND "${Python_EXECUTABLE}" "${STUBGEN_WRAPPER}"
                 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
                 DEPENDS lfs_py lfs_python_runtime "${NB_STUBGEN}"
                 COMMENT "Generating Python stubs for lichtfeld (Windows)"
             )
-            add_custom_target(lichtfeld_stub ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/typings/lichtfeld/py.typed)
+            add_custom_target(lichtfeld_stub ALL DEPENDS "${GENERATED_STUBS_MARKER}")
         endif()
     else()
         nanobind_add_stub(lichtfeld_stub
             MODULE lichtfeld
-            OUTPUT_PATH ${CMAKE_CURRENT_BINARY_DIR}/typings
+            OUTPUT_PATH ${GENERATED_STUBS_DIR}
             PYTHON_PATH ${CMAKE_CURRENT_BINARY_DIR}
             DEPENDS lfs_py
             RECURSIVE
-            MARKER_FILE ${CMAKE_CURRENT_BINARY_DIR}/typings/lichtfeld/py.typed
+            MARKER_FILE ${GENERATED_STUBS_DIR}/lichtfeld/py.typed
         )
     endif()
 
-    add_custom_command(TARGET lichtfeld_stub POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_BINARY_DIR}/typings/"
-            "${CMAKE_CURRENT_SOURCE_DIR}/stubs/"
-        COMMENT "Syncing stubs to source tree"
+    file(GLOB_RECURSE COMMITTED_STUB_FILES CONFIGURE_DEPENDS "${COMMITTED_STUBS_DIR}/*")
+
+    add_custom_target(refresh_python_stubs
+        COMMAND "${Python_EXECUTABLE}" "${PYTHON_STUB_WORKFLOW_SCRIPT}"
+            sync
+            --generated "${GENERATED_STUBS_DIR}"
+            --committed "${COMMITTED_STUBS_DIR}"
+        DEPENDS lichtfeld_stub "${PYTHON_STUB_WORKFLOW_SCRIPT}"
+        COMMENT "Syncing generated Python stubs into the source tree"
+        VERBATIM
+    )
+
+    set(PYTHON_STUB_CHECK_STAMP "${CMAKE_CURRENT_BINARY_DIR}/python_stub_check.stamp")
+    set(PYTHON_STUB_CHECK_COMMAND
+        "${Python_EXECUTABLE}" "${PYTHON_STUB_WORKFLOW_SCRIPT}"
+        check
+        --generated "${GENERATED_STUBS_DIR}"
+        --committed "${COMMITTED_STUBS_DIR}"
+    )
+    if(WIN32 AND LFS_GENERATOR_IS_MULTI_CONFIG)
+        set(PYTHON_STUB_CHECK_STAMP "${CMAKE_CURRENT_BINARY_DIR}/python_stub_check_$<CONFIG>.stamp")
+        set(PYTHON_STUB_CHECK_WRAPPER "${CMAKE_CURRENT_BINARY_DIR}/check_python_stubs_$<CONFIG>.py")
+        file(GENERATE OUTPUT "${PYTHON_STUB_CHECK_WRAPPER}" CONTENT "
+import pathlib, subprocess, sys
+
+stamp = pathlib.Path(r'${PYTHON_STUB_CHECK_STAMP}')
+if '$<CONFIG>' == 'Debug':
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    sys.exit(0)
+
+result = subprocess.run([
+    r'${Python_EXECUTABLE}',
+    r'${PYTHON_STUB_WORKFLOW_SCRIPT}',
+    'check',
+    '--generated', r'${GENERATED_STUBS_DIR}',
+    '--committed', r'${COMMITTED_STUBS_DIR}',
+])
+if result.returncode != 0:
+    sys.exit(result.returncode)
+stamp.parent.mkdir(parents=True, exist_ok=True)
+stamp.touch()
+")
+        set(PYTHON_STUB_CHECK_COMMAND "${Python_EXECUTABLE}" "${PYTHON_STUB_CHECK_WRAPPER}")
+    endif()
+
+    add_custom_command(
+        OUTPUT "${PYTHON_STUB_CHECK_STAMP}"
+        COMMAND ${PYTHON_STUB_CHECK_COMMAND}
+        COMMAND ${CMAKE_COMMAND} -E touch "${PYTHON_STUB_CHECK_STAMP}"
+        DEPENDS lichtfeld_stub "${PYTHON_STUB_WORKFLOW_SCRIPT}" ${COMMITTED_STUB_FILES}
+        COMMENT "Checking committed Python stubs against generated stubs"
+        VERBATIM
+    )
+    add_custom_target(check_python_stubs ALL
+        DEPENDS "${PYTHON_STUB_CHECK_STAMP}"
     )
 endif()
 
 # Copy lfs_plugins Python module to build directory (recursively to include subdirectories)
 add_custom_target(lfs_plugins_copy ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/lfs_plugins ${CMAKE_CURRENT_BINARY_DIR}/lfs_plugins
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${CMAKE_CURRENT_SOURCE_DIR}/lfs_plugins $<TARGET_FILE_DIR:lfs_py>/lfs_plugins
     COMMENT "Copying lfs_plugins Python module"
 )
-add_dependencies(lfs_py lfs_plugins_copy)
+
+add_custom_target(lfs_python_support_copy ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:lfs_py>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_CURRENT_SOURCE_DIR}/_lfs_panel_contract.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/lfs_splat_lod_hierarchy.py
+        $<TARGET_FILE_DIR:lfs_py>
+    COMMENT "Copying internal Python support modules"
+)
+
+add_dependencies(lfs_py lfs_plugins_copy lfs_python_support_copy)
+if(TARGET lichtfeld_stub)
+    add_dependencies(lichtfeld_stub lfs_python_support_copy)
+endif()
 
 # UV package manager for Python package installation support
 include(${CMAKE_SOURCE_DIR}/cmake/FetchUV.cmake)
@@ -409,16 +579,22 @@ if(BUILD_PORTABLE)
         DESTINATION "${CMAKE_INSTALL_BINDIR}"
         FILES_MATCHING PATTERN "*.py"
     )
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/_lfs_panel_contract.py"
+        DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
 else()
     install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/lfs_plugins"
         DESTINATION "${PYTHON_INSTALL_DIR}"
         FILES_MATCHING PATTERN "*.py"
     )
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/_lfs_panel_contract.py"
+        DESTINATION "${PYTHON_INSTALL_DIR}"
+    )
 endif()
 
 # Stubs: use generated when available, otherwise committed from source tree
 if(BUILD_PYTHON_STUBS)
-    set(STUBS_DIR "${CMAKE_CURRENT_BINARY_DIR}/typings")
+    set(STUBS_DIR "${GENERATED_STUBS_DIR}")
 else()
     set(STUBS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/stubs")
 endif()

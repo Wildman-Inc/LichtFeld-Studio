@@ -12,6 +12,10 @@ else()
     set(LFS_VIS_LIB_TYPE STATIC)
 endif()
 
+option(LFS_DEV_IMPORT_SOURCE_RESOURCES
+        "Load RmlUI resources and locales from source in non-portable builds"
+        ON)
+
 add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         # Core
         visualizer.cpp
@@ -26,9 +30,24 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         window/window_manager.cpp
 
         # Rendering
+        rendering/camera_interaction_service.cpp
+        rendering/gt_texture_cache.cpp
+        rendering/image_texture_loader.cpp
+        rendering/render_frame_coordinator.cpp
+        rendering/render_pass_graph.cpp
         rendering/rendering_manager.cpp
+        rendering/rendering_manager_events.cpp
+        rendering/rendering_manager_frame.cpp
+        rendering/rendering_manager_viewport.cpp
+        rendering/split_view_composition.cpp
+        rendering/split_view_service.cpp
+        rendering/viewport_artifact_service.cpp
+        rendering/viewport_frame_lifecycle_service.cpp
         rendering/render_pass.cpp
+        rendering/viewport_appearance_correction.cpp
+        rendering/viewport_request_builder.cpp
         rendering/framerate_controller.cpp
+        rendering/passes/environment_pass.cpp
         rendering/passes/overlay_pass.cpp
         rendering/passes/splat_raster_pass.cpp
         rendering/passes/mesh_pass.cpp
@@ -49,6 +68,11 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/native_panels.cpp
         gui/layout_state.cpp
         gui/async_task_manager.cpp
+        gui/bounds_gizmo.cpp
+        gui/rotation_gizmo.cpp
+        gui/scale_gizmo.cpp
+        gui/translation_gizmo.cpp
+        gui/video_export_utils.cpp
         gui/startup_overlay.cpp
         gui/rml_menu_bar.cpp
         gui/rml_right_panel.cpp
@@ -65,24 +89,23 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/keyframe_scene_sync.cpp
         gui/gizmo_transform.cpp
         gui/html_viewer_export.cpp
+        gui/scene_panel_native.cpp
         gui/ui_widgets.cpp
+        gui_capabilities.cpp
         gui/panels/windows_console_utils.cpp
         gui/panels/tools_panel.cpp
         gui/panels/python_console_panel.cpp
         gui/panels/python_scripts_panel.cpp
-        gui/panels/mesh2splat_panel.cpp
-        gui/editor/python_language_def.cpp
-        gui/editor/editor_theme.cpp
-        gui/editor/autocomplete/static_providers.cpp
-        gui/editor/autocomplete/autocomplete_manager.cpp
-        gui/editor/autocomplete/python_introspector.cpp
+        gui/editor/python_lsp_client.cpp
         gui/editor/python_editor.cpp
-        gui/editor/console_output.cpp
+        gui/editor/zep_rml_display.cpp
+        gui/editor/stdio_process.cpp
 
         # Terminal emulator
         gui/terminal/pty_process.cpp
         gui/terminal/terminal_widget.cpp
         gui/windows/video_extractor_dialog.cpp
+        gui/video_widget_factory.cpp
 
         # Scene management
         scene/scene_manager.cpp
@@ -90,6 +113,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
 
         # Input handling
         input/input_controller.cpp
+        input/input_router.cpp
         input/input_bindings.cpp
         input/sdl_key_mapping.cpp
 
@@ -113,6 +137,8 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         # Sequencer (camera animation)
         sequencer/sequencer_controller.cpp
         sequencer/rml_sequencer_panel.cpp
+        sequencer/rml_sequencer_panel_timeline.cpp
+        sequencer/rml_sequencer_panel_timeline_input.cpp
 
         # Operator system (Blender-style)
         operator/operator_context.cpp
@@ -122,6 +148,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         operator/ops/align_ops.cpp
         operator/ops/brush_ops.cpp
         operator/ops/edit_ops.cpp
+        operator/ops/scene_ops.cpp
         operator/ops/selection_ops.cpp
         operator/ops/transform_ops.cpp
 
@@ -137,27 +164,49 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         # Python hook invoker (DLL boundary singleton)
         ${CMAKE_SOURCE_DIR}/src/python/ui_hooks.cpp
 
-        # IPC for MCP integration
-        ipc/selection_server.cpp
+        # View/render bridge for plugin capabilities
         ipc/view_context.cpp
 
         gui/panels/menu_bar.cpp
         gui/panels/menu_bar.hpp
-        gui/utils/windows_utils.cpp
+        gui/utils/native_file_dialog.cpp
         gui/utils/drag_drop_native.cpp
+        gui/utils/file_association.cpp
 
         # RmlUI integration
         gui/rmlui/rmlui_system_interface.cpp
+        gui/rmlui/rml_text_input_handler.cpp
         gui/rmlui/rmlui_render_interface.cpp
+        gui/rmlui/rmlui_gl3_backend.cpp
         gui/rmlui/rmlui_manager.cpp
         gui/rmlui/rml_fbo.cpp
+        gui/rmlui/rml_document_utils.cpp
         gui/rmlui/rml_panel_host.cpp
         gui/rmlui/rml_theme.cpp
         gui/rmlui/elements/chromaticity_element.cpp
         gui/rmlui/elements/color_picker_element.cpp
         gui/rmlui/elements/crf_curve_element.cpp
         gui/rmlui/elements/loss_graph_element.cpp
+        gui/rmlui/elements/python_editor_element.cpp
+        gui/rmlui/elements/scene_graph_element.cpp
+        gui/rmlui/elements/terminal_element.cpp
 )
+
+set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/gui/rmlui/rmlui_gl3_backend.cpp
+        PROPERTIES COMPILE_DEFINITIONS "RMLUI_GL3_CUSTOM_LOADER=<glad/glad.h>"
+)
+
+# MSVC 14.44 ICEs (C1001 in msc1.cpp:1589) on the sequencer panel TUs under
+# /std:c++latest in both Debug (/Od /RTC1) and Release (/O2 /Ob2). Pin them to
+# /std:c++23 (not "latest") and add /bigobj for the heavy tensor + RmlUI + fmt instantiations.
+if(MSVC)
+    set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/sequencer/rml_sequencer_panel.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/sequencer/rml_sequencer_panel_timeline.cpp
+            PROPERTIES COMPILE_OPTIONS "/std:c++23;/bigobj"
+    )
+endif()
 
 # Set include directories
 target_include_directories(lfs_visualizer
@@ -174,6 +223,7 @@ target_include_directories(lfs_visualizer
 target_link_libraries(lfs_visualizer
         PRIVATE
         lfs_core
+        lfs_video
         lfs_geometry
         lfs_io
         lfs_rendering
@@ -185,15 +235,15 @@ target_link_libraries(lfs_visualizer
         SDL3::SDL3
         imgui::imgui
         implot::implot
-        imguizmo::imguizmo
-        imgui_textedit
+        Zep::Zep
         glm::glm
         TBB::tbb
         spdlog::spdlog
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
+        nfd::nfd
         ${OPENGL_LIBRARIES}
         vterm
 )
@@ -236,25 +286,34 @@ if(NOT WIN32)
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 
-    target_link_libraries(lfs_visualizer PRIVATE lfs_rmlui)
+    target_link_libraries(lfs_visualizer PUBLIC lfs_rmlui)
 else()
-    target_link_libraries(lfs_visualizer PRIVATE RmlUi::RmlUi)
+    target_link_libraries(lfs_visualizer PUBLIC RmlUi::RmlUi)
 endif()
 
 # Set C++ standard
 target_compile_features(lfs_visualizer PUBLIC cxx_std_23)
 
+set_target_properties(lfs_visualizer PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)
 if(WIN32)
     set_target_properties(lfs_visualizer PROPERTIES
         POSITION_INDEPENDENT_CODE ON
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
-        RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}
-        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}
-        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR}
-        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL ${CMAKE_BINARY_DIR}
+    )
+endif()
+get_property(_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(WIN32 AND _IS_MULTI_CONFIG)
+    set_target_properties(lfs_visualizer PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY              ${CMAKE_BINARY_DIR}/$<CONFIG>
+        RUNTIME_OUTPUT_DIRECTORY              ${CMAKE_BINARY_DIR}/$<CONFIG>
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG        ${CMAKE_BINARY_DIR}/Debug
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE      ${CMAKE_BINARY_DIR}/Release
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR}/RelWithDebInfo
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL   ${CMAKE_BINARY_DIR}/MinSizeRel
     )
 endif()
 
@@ -275,14 +334,14 @@ file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/shaders")
 file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets")
 
 # Copy shaders to build directory
-file(GLOB SHADER_FILES "${VISUALIZER_SOURCE_RESOURCE_DIR}/shaders/*")
+file(GLOB SHADER_FILES CONFIGURE_DEPENDS "${VISUALIZER_SOURCE_RESOURCE_DIR}/shaders/*")
 foreach (SHADER_FILE ${SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER_FILE} NAME)
     configure_file(${SHADER_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/shaders/${SHADER_NAME}" COPYONLY)
 endforeach ()
 
 # Copy assets from resources/assets if they exist
-file(GLOB ASSET_FILES "${VISUALIZER_SOURCE_RESOURCE_DIR}/assets/*")
+file(GLOB ASSET_FILES CONFIGURE_DEPENDS "${VISUALIZER_SOURCE_RESOURCE_DIR}/assets/*")
 foreach (ASSET_FILE ${ASSET_FILES})
     get_filename_component(ASSET_NAME ${ASSET_FILE} NAME)
     configure_file(${ASSET_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/${ASSET_NAME}" COPYONLY)
@@ -302,7 +361,7 @@ endforeach ()
 
 # Copy icon files
 file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon")
-file(GLOB ICON_FILES "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/icon/*.png")
+file(GLOB ICON_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/icon/*.png")
 foreach (ICON_FILE ${ICON_FILES})
     get_filename_component(ICON_NAME ${ICON_FILE} NAME)
     configure_file(${ICON_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon/${ICON_NAME}" COPYONLY)
@@ -310,7 +369,7 @@ endforeach ()
 
 # Copy scene icon files (used by RmlUI scene panel)
 file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon/scene")
-file(GLOB SCENE_ICON_FILES "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/icon/scene/*.png")
+file(GLOB SCENE_ICON_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/icon/scene/*.png")
 foreach (ICON_FILE ${SCENE_ICON_FILES})
     get_filename_component(ICON_NAME ${ICON_FILE} NAME)
     configure_file(${ICON_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon/scene/${ICON_NAME}" COPYONLY)
@@ -318,20 +377,32 @@ endforeach ()
 
 # Copy sequencer icon files (used by RmlUI sequencer panel)
 file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon/sequencer")
-file(GLOB SEQUENCER_ICON_FILES "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/icon/sequencer/*.png")
+file(GLOB SEQUENCER_ICON_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/icon/sequencer/*.png")
 foreach (ICON_FILE ${SEQUENCER_ICON_FILES})
     get_filename_component(ICON_NAME ${ICON_FILE} NAME)
     configure_file(${ICON_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon/sequencer/${ICON_NAME}" COPYONLY)
 endforeach ()
 
+# Copy bundled environment maps
+file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/environments")
+file(GLOB ENVIRONMENT_ASSET_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/environments/*")
+foreach (ENVIRONMENT_ASSET_FILE ${ENVIRONMENT_ASSET_FILES})
+    if (EXISTS ${ENVIRONMENT_ASSET_FILE} AND NOT IS_DIRECTORY ${ENVIRONMENT_ASSET_FILE})
+        get_filename_component(ENVIRONMENT_ASSET_NAME ${ENVIRONMENT_ASSET_FILE} NAME)
+        configure_file(${ENVIRONMENT_ASSET_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/environments/${ENVIRONMENT_ASSET_NAME}" COPYONLY)
+    endif ()
+endforeach ()
+
 # Copy RmlUI resources (re-copy on every build so edits are picked up)
 file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/rmlui")
-file(GLOB RMLUI_RESOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/gui/rmlui/resources/*")
+file(GLOB RMLUI_RESOURCE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gui/rmlui/resources/*")
 foreach (RMLUI_FILE ${RMLUI_RESOURCE_FILES})
     get_filename_component(RMLUI_NAME ${RMLUI_FILE} NAME)
     configure_file(${RMLUI_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/rmlui/${RMLUI_NAME}" COPYONLY)
 endforeach ()
 add_custom_target(copy_rmlui_resources ALL
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/rmlui"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/rmlui"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${RMLUI_RESOURCE_FILES}
         "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/rmlui/"
@@ -341,11 +412,21 @@ add_dependencies(lfs_visualizer copy_rmlui_resources)
 
 # Copy locale files
 file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/locales")
-file(GLOB LOCALE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/gui/resources/locales/*.json")
+file(GLOB LOCALE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gui/resources/locales/*.json")
 foreach (LOCALE_FILE ${LOCALE_FILES})
     get_filename_component(LOCALE_NAME ${LOCALE_FILE} NAME)
     configure_file(${LOCALE_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/locales/${LOCALE_NAME}" COPYONLY)
 endforeach ()
+
+set(LFS_VISUALIZER_DEV_RESOURCE_DEFINITIONS)
+if(LFS_DEV_IMPORT_SOURCE_RESOURCES AND NOT BUILD_PORTABLE)
+    list(APPEND LFS_VISUALIZER_DEV_RESOURCE_DEFINITIONS
+            LFS_DEV_RMLUI_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gui/rmlui/resources"
+            LFS_DEV_LOCALE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gui/resources/locales"
+    )
+    message(STATUS "Resource dev mode: RmlUI imports from ${CMAKE_CURRENT_SOURCE_DIR}/gui/rmlui/resources")
+    message(STATUS "Resource dev mode: locales import from ${CMAKE_CURRENT_SOURCE_DIR}/gui/resources/locales")
+endif()
 
 # Compile definitions
 target_compile_definitions(lfs_visualizer PRIVATE
@@ -357,6 +438,7 @@ target_compile_definitions(lfs_visualizer PRIVATE
         VISUALIZER_LOCALE_PATH="${VISUALIZER_BUILD_RESOURCE_DIR}/locales"
         VISUALIZER_SOURCE_SHADER_PATH="${VISUALIZER_SOURCE_RESOURCE_DIR}/shaders"
         VISUALIZER_SOURCE_ASSET_PATH="${VISUALIZER_SOURCE_RESOURCE_DIR}/assets"
+        ${LFS_VISUALIZER_DEV_RESOURCE_DEFINITIONS}
         $<$<CONFIG:Debug>:DEBUG_BUILD>
         $<$<CONFIG:Release>:RELEASE_BUILD>
 )
@@ -369,6 +451,7 @@ if (WIN32)
     )
     target_link_libraries(lfs_visualizer PRIVATE
             Ole32       # OLE drag-drop (IDropTarget)
+            Shell32     # SHChangeNotify (file association)
             dxgi        # DXGI per-process VRAM query
     )
 elseif (UNIX AND NOT APPLE)

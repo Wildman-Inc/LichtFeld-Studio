@@ -367,6 +367,9 @@ namespace lfs::training {
         if (!view.trainer) {
             return std::unexpected("No active trainer available for model command");
         }
+        if (!view.trainer->has_strategy()) {
+            return std::unexpected("Active trainer does not expose a CUDA/HIP strategy model");
+        }
         auto& strategy = view.trainer->get_strategy_mutable();
         auto& model = strategy.get_model();
 
@@ -441,6 +444,9 @@ namespace lfs::training {
     std::expected<void, std::string> CommandCenter::exec_optimizer(const Command& cmd, TrainingSnapshot& view) {
         if (!view.trainer) {
             return std::unexpected("No active trainer available for optimizer command");
+        }
+        if (!view.trainer->has_strategy()) {
+            return std::unexpected("Active trainer does not expose a CUDA/HIP optimizer");
         }
         auto& opt = view.trainer->get_strategy_mutable().get_optimizer();
         if (cmd.op == "set_lr") {

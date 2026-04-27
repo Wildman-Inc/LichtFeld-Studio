@@ -1,14 +1,21 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include <array>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <iterator>
+#include <stdexcept>
+#include <vector>
 
 #include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
 #include "io/exporter.hpp"
+#include "io/formats/ply.hpp"
 #include "io/loader.hpp"
+#include "tinyply.hpp"
 
 namespace fs = std::filesystem;
 using namespace lfs::core;
@@ -29,6 +36,36 @@ protected:
 
     void TearDown() override {
         fs::remove_all(temp_dir);
+    }
+
+    void write_text_file(const fs::path& path, const std::string& contents) const {
+        fs::create_directories(path.parent_path());
+        std::ofstream out(path, std::ios::binary);
+        ASSERT_TRUE(out.is_open()) << "Failed to open " << path;
+        out << contents;
+        out.close();
+        ASSERT_TRUE(out.good()) << "Failed to write " << path;
+    }
+
+    void write_png(const fs::path& path) const {
+        static const std::vector<unsigned char> png_1x1 = {
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+            0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41,
+            0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0,
+            0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
+            0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+            0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82};
+
+        fs::create_directories(path.parent_path());
+        std::ofstream out(path, std::ios::binary);
+        ASSERT_TRUE(out.is_open()) << "Failed to open " << path;
+        out.write(reinterpret_cast<const char*>(png_1x1.data()),
+                  static_cast<std::streamsize>(png_1x1.size()));
+        out.close();
+        ASSERT_TRUE(out.good()) << "Failed to write " << path;
     }
 
     static SplatData create_test_splat(size_t num_points, int sh_degree = 0) {
@@ -90,6 +127,133 @@ protected:
             std::move(opacity),
             1.0f);
     }
+
+    static SplatData create_layout_test_splat() {
+        auto means = Tensor::from_vector(std::vector<float>{1.0f, 2.0f, 3.0f}, {size_t{1}, size_t{3}}, Device::CPU);
+        auto sh0 = Tensor::from_vector(std::vector<float>{10.0f, 20.0f, 30.0f}, {size_t{1}, size_t{1}, size_t{3}}, Device::CPU);
+        auto shN = Tensor::from_vector(
+            std::vector<float>{
+                100.0f, 200.0f, 300.0f,
+                101.0f, 201.0f, 301.0f,
+                102.0f, 202.0f, 302.0f},
+            {size_t{1}, size_t{3}, size_t{3}}, Device::CPU);
+        auto scaling = Tensor::zeros({size_t{1}, size_t{3}}, Device::CPU, DataType::Float32);
+        auto rotation = Tensor::from_vector(std::vector<float>{1.0f, 0.0f, 0.0f, 0.0f}, {size_t{1}, size_t{4}}, Device::CPU);
+        auto opacity = Tensor::from_vector(std::vector<float>{0.25f}, {size_t{1}, size_t{1}}, Device::CPU);
+
+        return SplatData(
+            1,
+            std::move(means),
+            std::move(sh0),
+            std::move(shN),
+            std::move(scaling),
+            std::move(rotation),
+            std::move(opacity),
+            1.0f);
+    }
+
+    static std::string read_ply_header(const fs::path& path) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open PLY header");
+        }
+
+        std::string header_text;
+        std::string line;
+        while (std::getline(file, line) && line != "end_header") {
+            header_text += line + "\n";
+        }
+        return header_text;
+    }
+
+    static std::vector<float> read_ply_float_property(const fs::path& path, const std::string& property_name) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open PLY file");
+        }
+
+        tinyply::PlyFile ply;
+        ply.parse_header(file);
+        auto property = ply.request_properties_from_element("vertex", {property_name});
+        ply.read(file);
+
+        if (property->t != tinyply::Type::FLOAT32) {
+            throw std::runtime_error("Expected float32 PLY property");
+        }
+
+        std::vector<float> values(property->count);
+        std::memcpy(values.data(), property->buffer.get(), values.size() * sizeof(float));
+        return values;
+    }
+
+    static void write_external_sh_layout_test_ply(const fs::path& path) {
+        std::ofstream out(path, std::ios::binary);
+        if (!out.is_open()) {
+            throw std::runtime_error("Failed to open test PLY for writing");
+        }
+
+        std::string header =
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            "element vertex 1\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property float f_dc_0\n"
+            "property float f_dc_1\n"
+            "property float f_dc_2\n"
+            "property float f_rest_0\n"
+            "property float f_rest_1\n"
+            "property float f_rest_2\n"
+            "property float f_rest_3\n"
+            "property float f_rest_4\n"
+            "property float f_rest_5\n"
+            "property float f_rest_6\n"
+            "property float f_rest_7\n"
+            "property float f_rest_8\n"
+            "end_header\n";
+        out.write(header.data(), static_cast<std::streamsize>(header.size()));
+
+        const std::array<float, 15> vertex{
+            1.0f, 2.0f, 3.0f,
+            10.0f, 20.0f, 30.0f,
+            100.0f, 101.0f, 102.0f,
+            200.0f, 201.0f, 202.0f,
+            300.0f, 301.0f, 302.0f};
+        out.write(reinterpret_cast<const char*>(vertex.data()),
+                  static_cast<std::streamsize>(vertex.size() * sizeof(float)));
+        if (!out.good()) {
+            throw std::runtime_error("Failed to write test PLY");
+        }
+    }
+
+    static std::vector<float> read_binary_ply_body_as_floats(const fs::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open()) {
+            throw std::runtime_error("Failed to open test PLY for reading");
+        }
+
+        const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const size_t header_pos = bytes.find("end_header");
+        if (header_pos == std::string::npos) {
+            throw std::runtime_error("Missing end_header in test PLY");
+        }
+
+        const size_t newline_pos = bytes.find('\n', header_pos);
+        if (newline_pos == std::string::npos) {
+            throw std::runtime_error("Malformed PLY header");
+        }
+
+        const size_t body_offset = newline_pos + 1;
+        const size_t body_bytes = bytes.size() - body_offset;
+        if (body_bytes % sizeof(float) != 0) {
+            throw std::runtime_error("PLY body is not float-aligned");
+        }
+
+        std::vector<float> values(body_bytes / sizeof(float));
+        std::memcpy(values.data(), bytes.data() + body_offset, body_bytes);
+        return values;
+    }
 };
 
 // Test Loader creation
@@ -129,6 +293,97 @@ TEST_F(PythonIOTest, DatasetTypeDetection) {
 
     auto unknown_type = Loader::getDatasetType(temp_dir);
     EXPECT_EQ(unknown_type, DatasetType::Unknown);
+}
+
+TEST_F(PythonIOTest, LoadTransformsDatasetConvertsPointCloudToColmapWorld) {
+    const fs::path dataset_dir = temp_dir / "transforms_dataset";
+    write_png(dataset_dir / "frame_0001.png");
+    write_text_file(
+        dataset_dir / "transforms_train.json",
+        R"json({
+  "w": 1,
+  "h": 1,
+  "camera_angle_x": 0.78539816339,
+  "ply_file_path": "pointcloud.ply",
+  "frames": [
+    {
+      "file_path": "frame_0001.png",
+      "transform_matrix": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ]
+    }
+  ]
+})json");
+    write_text_file(
+        dataset_dir / "pointcloud.ply",
+        R"ply(ply
+format ascii 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+end_header
+0 1 -2 255 0 0
+1 -3 4 0 255 0
+)ply");
+
+    auto loader = Loader::create();
+    auto result = loader->load(dataset_dir);
+    ASSERT_TRUE(result.has_value()) << "Failed to load: " << result.error().format();
+    ASSERT_TRUE(std::holds_alternative<LoadedScene>(result->data));
+
+    const auto& scene = std::get<LoadedScene>(result->data);
+    ASSERT_EQ(scene.cameras.size(), 1u);
+    ASSERT_TRUE(scene.point_cloud);
+    ASSERT_EQ(scene.point_cloud->size(), 2u);
+
+    auto means_cpu = scene.point_cloud->means.cpu().contiguous();
+    auto acc = means_cpu.accessor<float, 2>();
+    EXPECT_NEAR(acc(0, 0), 0.0f, EPSILON);
+    EXPECT_NEAR(acc(0, 1), -1.0f, EPSILON);
+    EXPECT_NEAR(acc(0, 2), 2.0f, EPSILON);
+    EXPECT_NEAR(acc(1, 0), 1.0f, EPSILON);
+    EXPECT_NEAR(acc(1, 1), 3.0f, EPSILON);
+    EXPECT_NEAR(acc(1, 2), -4.0f, EPSILON);
+}
+
+TEST_F(PythonIOTest, LoadTransformsDatasetCanBeCancelled) {
+    const fs::path dataset_dir = temp_dir / "cancelled_transforms_dataset";
+    write_text_file(
+        dataset_dir / "transforms_train.json",
+        R"json({
+  "w": 1,
+  "h": 1,
+  "camera_angle_x": 0.78539816339,
+  "frames": [
+    {
+      "file_path": "frame_0001.png",
+      "transform_matrix": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ]
+    }
+  ]
+})json");
+
+    int cancel_checks = 0;
+    auto loader = Loader::create();
+    auto result = loader->load(dataset_dir, {
+                                                .cancel_requested = [&cancel_checks]() {
+                                                    return ++cancel_checks >= 3;
+                                                },
+                                            });
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code, ErrorCode::CANCELLED);
 }
 
 // Test loading COLMAP dataset
@@ -192,6 +447,76 @@ TEST_F(PythonIOTest, PlySaveLoadRoundtrip) {
 
     for (size_t i = 0; i < std::min(size_t(100), num_points * 3); ++i) {
         EXPECT_NEAR(orig_ptr[i], load_ptr[i], PLY_TOLERANCE) << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(PythonIOTest, PlyLoadMapsExternalChannelMajorShOrderToInternalLayout) {
+    const fs::path input_path = temp_dir / "external_channel_major_sh.ply";
+    write_external_sh_layout_test_ply(input_path);
+
+    auto loaded = load_ply(input_path);
+    ASSERT_TRUE(loaded.has_value()) << "Failed to load test PLY: " << loaded.error();
+
+    EXPECT_EQ(loaded->size(), 1UL);
+    EXPECT_EQ(loaded->get_max_sh_degree(), 1);
+
+    const auto sh0 = loaded->sh0().cpu().contiguous();
+    ASSERT_EQ(sh0.ndim(), 3);
+    ASSERT_EQ(sh0.size(0), 1);
+    ASSERT_EQ(sh0.size(1), 1);
+    ASSERT_EQ(sh0.size(2), 3);
+
+    const auto* sh0_ptr = sh0.ptr<float>();
+    EXPECT_FLOAT_EQ(sh0_ptr[0], 10.0f);
+    EXPECT_FLOAT_EQ(sh0_ptr[1], 20.0f);
+    EXPECT_FLOAT_EQ(sh0_ptr[2], 30.0f);
+
+    const auto shN = loaded->shN().cpu().contiguous();
+    ASSERT_TRUE(shN.is_valid());
+    ASSERT_EQ(shN.ndim(), 3);
+    ASSERT_EQ(shN.size(0), 1);
+    ASSERT_EQ(shN.size(1), 3);
+    ASSERT_EQ(shN.size(2), 3);
+
+    const std::array<float, 9> expected_rest{
+        100.0f, 200.0f, 300.0f,
+        101.0f, 201.0f, 301.0f,
+        102.0f, 202.0f, 302.0f};
+    const auto* shN_ptr = shN.ptr<float>();
+    for (size_t i = 0; i < expected_rest.size(); ++i) {
+        EXPECT_FLOAT_EQ(shN_ptr[i], expected_rest[i]) << "Mismatch at shN index " << i;
+    }
+}
+
+TEST_F(PythonIOTest, PlySaveUsesExternalChannelMajorShOrder) {
+    auto splat = create_layout_test_splat();
+    const fs::path output_path = temp_dir / "channel_major_export.ply";
+
+    PlySaveOptions save_options;
+    save_options.output_path = output_path;
+    save_options.binary = true;
+
+    auto save_result = save_ply(splat, save_options);
+    ASSERT_TRUE(save_result.has_value()) << "Failed to save test PLY: " << save_result.error().format();
+
+    const auto values = read_binary_ply_body_as_floats(output_path);
+    ASSERT_GE(values.size(), 18UL);
+
+    EXPECT_FLOAT_EQ(values[0], 1.0f);
+    EXPECT_FLOAT_EQ(values[1], 2.0f);
+    EXPECT_FLOAT_EQ(values[2], 3.0f);
+
+    const std::array<float, 3> expected_dc{10.0f, 20.0f, 30.0f};
+    for (size_t i = 0; i < expected_dc.size(); ++i) {
+        EXPECT_FLOAT_EQ(values[6 + i], expected_dc[i]) << "Mismatch at f_dc_" << i;
+    }
+
+    const std::array<float, 9> expected_rest{
+        100.0f, 101.0f, 102.0f,
+        200.0f, 201.0f, 202.0f,
+        300.0f, 301.0f, 302.0f};
+    for (size_t i = 0; i < expected_rest.size(); ++i) {
+        EXPECT_FLOAT_EQ(values[9 + i], expected_rest[i]) << "Mismatch at f_rest_" << i;
     }
 }
 
@@ -380,12 +705,7 @@ TEST_F(PythonIOTest, PlySaveWithColorsUint8) {
     ASSERT_TRUE(result.has_value()) << result.error().format();
 
     // Verify header contains red/green/blue properties
-    std::ifstream file(output_path, std::ios::binary);
-    std::string header_text;
-    std::string line;
-    while (std::getline(file, line) && line != "end_header") {
-        header_text += line + "\n";
-    }
+    const std::string header_text = read_ply_header(output_path);
     EXPECT_NE(header_text.find("property uchar red"), std::string::npos);
     EXPECT_NE(header_text.find("property uchar green"), std::string::npos);
     EXPECT_NE(header_text.find("property uchar blue"), std::string::npos);
@@ -419,12 +739,7 @@ TEST_F(PythonIOTest, PlySaveWithColorsFloat32) {
     ASSERT_TRUE(result.has_value()) << result.error().format();
 
     // Verify header has uchar color properties (float32 should be converted)
-    std::ifstream file(output_path, std::ios::binary);
-    std::string header_text;
-    std::string line;
-    while (std::getline(file, line) && line != "end_header") {
-        header_text += line + "\n";
-    }
+    const std::string header_text = read_ply_header(output_path);
     EXPECT_NE(header_text.find("property uchar red"), std::string::npos);
 }
 
@@ -455,14 +770,177 @@ TEST_F(PythonIOTest, PlySaveFallbackAttributeNames) {
     ASSERT_TRUE(result.has_value()) << result.error().format();
 
     // Parse header and verify fallback names are present
-    std::ifstream file(output_path, std::ios::binary);
-    std::string header_text;
-    std::string line;
-    while (std::getline(file, line) && line != "end_header") {
-        header_text += line + "\n";
-    }
+    const std::string header_text = read_ply_header(output_path);
     EXPECT_NE(header_text.find("property float x"), std::string::npos);
     EXPECT_NE(header_text.find("property float y"), std::string::npos);
     EXPECT_NE(header_text.find("property float z"), std::string::npos);
     EXPECT_NE(header_text.find("property float opacity"), std::string::npos);
+}
+
+TEST_F(PythonIOTest, PlySaveWritesExtraAttributePayloads) {
+    PointCloud pc;
+    pc.means = Tensor::from_vector(
+        std::vector<float>{0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        {size_t{2}, size_t{3}}, Device::CPU);
+    pc.attribute_names = {"x", "y", "z"};
+
+    PlySaveOptions options;
+    options.output_path = temp_dir / "extra_attributes_payload.ply";
+    options.binary = true;
+    options.extra_attributes = {
+        PlyAttributeBlock{
+            .values = Tensor::from_vector(std::vector<float>{0.25f, 0.75f}, {size_t{2}}, Device::CPU),
+            .names = {"confidence"},
+        },
+        PlyAttributeBlock{
+            .values = Tensor::from_vector(
+                std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f},
+                {size_t{2}, size_t{3}}, Device::CPU),
+            .names = {"velocity_0", "velocity_1", "velocity_2"},
+        },
+    };
+
+    const auto result = save_ply(pc, options);
+    ASSERT_TRUE(result.has_value()) << result.error().format();
+
+    const std::string header_text = read_ply_header(options.output_path);
+    EXPECT_NE(header_text.find("property float confidence"), std::string::npos);
+    EXPECT_NE(header_text.find("property float velocity_0"), std::string::npos);
+    EXPECT_NE(header_text.find("property float velocity_1"), std::string::npos);
+    EXPECT_NE(header_text.find("property float velocity_2"), std::string::npos);
+
+    EXPECT_EQ(read_ply_float_property(options.output_path, "confidence"),
+              (std::vector<float>{0.25f, 0.75f}));
+    EXPECT_EQ(read_ply_float_property(options.output_path, "velocity_0"),
+              (std::vector<float>{1.0f, 4.0f}));
+    EXPECT_EQ(read_ply_float_property(options.output_path, "velocity_1"),
+              (std::vector<float>{2.0f, 5.0f}));
+    EXPECT_EQ(read_ply_float_property(options.output_path, "velocity_2"),
+              (std::vector<float>{3.0f, 6.0f}));
+}
+
+TEST_F(PythonIOTest, PlySaveFiltersExtraAttributesWhenDeletedMaskPresent) {
+    auto splat = create_test_splat(3);
+    splat.deleted() = Tensor::from_vector(std::vector<bool>{false, true, false}, {size_t{3}}, Device::CPU);
+
+    PlySaveOptions options;
+    options.output_path = temp_dir / "deleted_mask_extra_attributes.ply";
+    options.binary = true;
+    options.extra_attributes = {
+        PlyAttributeBlock{
+            .values = Tensor::from_vector(std::vector<float>{10.0f, 20.0f, 30.0f}, {size_t{3}}, Device::CPU),
+            .names = {"confidence"},
+        },
+    };
+
+    const auto result = save_ply(splat, options);
+    ASSERT_TRUE(result.has_value()) << result.error().format();
+
+    EXPECT_EQ(read_ply_float_property(options.output_path, "x"),
+              (std::vector<float>{0.0f, 2.0f}));
+    EXPECT_EQ(read_ply_float_property(options.output_path, "confidence"),
+              (std::vector<float>{10.0f, 30.0f}));
+}
+
+TEST_F(PythonIOTest, PlySaveRejectsReservedExtraAttributeNames) {
+    PointCloud pc;
+    pc.means = Tensor::zeros({size_t{2}, size_t{3}}, Device::CPU, DataType::Float32);
+    pc.attribute_names = {"x", "y", "z"};
+
+    PlySaveOptions options;
+    options.output_path = temp_dir / "reserved_extra_name.ply";
+    options.binary = true;
+    options.extra_attributes = {
+        PlyAttributeBlock{
+            .values = Tensor::ones({size_t{2}}, Device::CPU, DataType::Float32),
+            .names = {"opacity"},
+        },
+    };
+
+    const auto result = save_ply(pc, options);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().format().find("reserved"), std::string::npos);
+}
+
+TEST_F(PythonIOTest, PlySaveRejectsDuplicateExtraAttributeNames) {
+    PointCloud pc;
+    pc.means = Tensor::zeros({size_t{2}, size_t{3}}, Device::CPU, DataType::Float32);
+    pc.attribute_names = {"x", "y", "z"};
+
+    PlySaveOptions options;
+    options.output_path = temp_dir / "duplicate_extra_name.ply";
+    options.binary = true;
+    options.extra_attributes = {
+        PlyAttributeBlock{
+            .values = Tensor::ones({size_t{2}}, Device::CPU, DataType::Float32),
+            .names = {"confidence"},
+        },
+        PlyAttributeBlock{
+            .values = Tensor::full({size_t{2}}, 2.0f, Device::CPU, DataType::Float32),
+            .names = {"confidence"},
+        },
+    };
+
+    const auto result = save_ply(pc, options);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().format().find("Duplicate PLY property name 'confidence'"), std::string::npos);
+}
+
+TEST_F(PythonIOTest, PlySaveRejectsWhitespaceInExtraAttributeNames) {
+    PointCloud pc;
+    pc.means = Tensor::zeros({size_t{2}, size_t{3}}, Device::CPU, DataType::Float32);
+    pc.attribute_names = {"x", "y", "z"};
+
+    PlySaveOptions options;
+    options.output_path = temp_dir / "invalid_extra_name.ply";
+    options.binary = true;
+    options.extra_attributes = {
+        PlyAttributeBlock{
+            .values = Tensor::ones({size_t{2}}, Device::CPU, DataType::Float32),
+            .names = {"bad name"},
+        },
+    };
+
+    const auto result = save_ply(pc, options);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().format().find("without whitespace"), std::string::npos);
+}
+
+TEST_F(PythonIOTest, PlySaveRejectsExtraAttributeRowCountMismatch) {
+    PointCloud pc;
+    pc.means = Tensor::zeros({size_t{2}, size_t{3}}, Device::CPU, DataType::Float32);
+    pc.attribute_names = {"x", "y", "z"};
+
+    PlySaveOptions options;
+    options.output_path = temp_dir / "mismatched_extra_rows.ply";
+    options.binary = true;
+    options.extra_attributes = {
+        PlyAttributeBlock{
+            .values = Tensor::ones({size_t{1}}, Device::CPU, DataType::Float32),
+            .names = {"confidence"},
+        },
+    };
+
+    const auto result = save_ply(pc, options);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().format().find("row count 1 does not match point count 2"), std::string::npos);
+}
+
+TEST_F(PythonIOTest, PlySaveRejectsEmptyExtraAttributesWhenDeletedMaskPresent) {
+    auto splat = create_test_splat(3);
+    splat.deleted() = Tensor::from_vector(std::vector<bool>{false, true, false}, {size_t{3}}, Device::CPU);
+
+    PlySaveOptions options;
+    options.output_path = temp_dir / "empty_extra_with_deleted_mask.ply";
+    options.binary = true;
+    options.extra_attributes = {
+        PlyAttributeBlock{
+            .values = Tensor(),
+            .names = {"confidence"},
+        },
+    };
+
+    const auto result = save_ply(splat, options);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().format().find("must not be empty"), std::string::npos);
 }

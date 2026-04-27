@@ -5,11 +5,14 @@
 #pragma once
 #include "core/event_bridge/event_bridge.hpp"
 #include "geometry/bounding_box.hpp"
+#include <cstdint>
 #include <filesystem>
 #include <glm/glm.hpp>
 #include <optional>
 #include <string>
 #include <unordered_map>
+
+class Viewport;
 
 namespace lfs::core {
 
@@ -17,10 +20,13 @@ namespace lfs::core {
     class Scene;
 
     // Export format enum
-    enum class ExportFormat { PLY,
-                              SOG,
-                              SPZ,
-                              HTML_VIEWER };
+    enum class ExportFormat { PLY = 0,
+                              SOG = 1,
+                              SPZ = 2,
+                              HTML_VIEWER = 3,
+                              USD = 4,
+                              NUREC_USDZ = 5,
+                              RAD = 6 };
 
 // Event macro using shared event bridge (solves singleton duplication between exe and Python module)
 #define EVENT(Name, ...)                                   \
@@ -57,7 +63,7 @@ namespace lfs::core {
             EVENT(LoadConfigFile, std::filesystem::path path;);
             EVENT(ShowDatasetLoadPopup, std::filesystem::path dataset_path;);
             EVENT(ShowResumeCheckpointPopup, std::filesystem::path checkpoint_path;);
-            EVENT(ClearScene, );
+            EVENT(NewProject, );
             EVENT(RequestExit, );
             EVENT(ForceExit, );
             EVENT(SwitchToEditMode, );
@@ -65,6 +71,7 @@ namespace lfs::core {
             EVENT(ShowWindow, std::string window_name; bool show;);
             EVENT(ExecuteConsole, std::string command;);
             EVENT(GoToCamView, int cam_id;);
+            EVENT(OpenCameraPreview, int cam_id;);
             EVENT(PrepareTrainingFromScene, );
             EVENT(AddPLY, std::filesystem::path path; std::string name;);
             EVENT(RemovePLY, std::string name; bool keep_children = false;);
@@ -91,6 +98,7 @@ namespace lfs::core {
             EVENT(CyclePLY, );
             EVENT(CycleSelectionVisualization, );
             EVENT(ToggleSplitView, );
+            EVENT(ToggleIndependentSplitView, const Viewport* viewport;);
             EVENT(ToggleGTComparison, );
             EVENT(Undo, );
             EVENT(Redo, );
@@ -100,7 +108,11 @@ namespace lfs::core {
             EVENT(SelectAll, );
             EVENT(CopySelection, );
             EVENT(PasteSelection, );
+            EVENT(SelectBrush, float x; float y; float radius; int camera_index; std::string mode;);
             EVENT(SelectRect, float x0; float y0; float x1; float y1; int camera_index; std::string mode;);
+            EVENT(SelectPolygon, std::vector<float> points; int camera_index; std::string mode;);
+            EVENT(SelectLasso, std::vector<float> points; int camera_index; std::string mode;);
+            EVENT(SelectRing, float x; float y; int camera_index; std::string mode;);
             EVENT(SelectByDescription, std::string description; int camera_index;);
             EVENT(ApplySelectionMask, std::vector<uint8_t> mask;);
             // Sequencer
@@ -148,14 +160,14 @@ namespace lfs::core {
                   enum class Type{PLY, Dataset, SOG, SPZ, Checkpoint} type;
                   size_t num_gaussians;
                   int checkpoint_iteration = 0;);
-            EVENT(SceneCleared, );
+            EVENT(SceneCleared, bool from_history = false;);
             EVENT(ModelUpdated, int iteration; size_t num_gaussians;);
-            EVENT(SceneChanged, );
+            EVENT(SceneChanged, uint32_t mutation_flags = 0;);
             EVENT(SelectionChanged, bool has_selection; int count;);
             // node_type: 0=SPLAT, 1=GROUP, 2=CROPBOX
-            EVENT(PLYAdded, std::string name; size_t node_gaussians; size_t total_gaussians; bool is_visible; std::string parent_name; bool is_group; int node_type;);
-            EVENT(PLYRemoved, std::string name; bool children_kept = false; std::string parent_of_removed;);
-            EVENT(NodeReparented, std::string name; std::string old_parent; std::string new_parent;);
+            EVENT(PLYAdded, std::string name; size_t node_gaussians; size_t total_gaussians; bool is_visible; std::string parent_name; bool is_group; int node_type; bool from_history = false;);
+            EVENT(PLYRemoved, std::string name; bool children_kept = false; std::string parent_of_removed; bool from_history = false;);
+            EVENT(NodeReparented, std::string name; std::string old_parent; std::string new_parent; bool from_history = false;);
 
             // Data loading
             EVENT(DatasetLoadStarted, std::filesystem::path path;);
@@ -181,7 +193,15 @@ namespace lfs::core {
                   int num_gaussians;);
 
             // System state
+            EVENT(EditorScriptStarted, std::filesystem::path path; size_t code_chars;);
+            EVENT(EditorScriptCompleted,
+                  std::filesystem::path path;
+                  size_t code_chars;
+                  size_t output_chars;
+                  bool success;
+                  bool interrupted;);
             EVENT(CheckpointSaved, int iteration; std::filesystem::path path;);
+            EVENT(ExportCompleted, std::filesystem::path path; ExportFormat format;);
             EVENT(DiskSpaceSaveFailed,
                   int iteration;
                   std::filesystem::path path;
@@ -201,7 +221,9 @@ namespace lfs::core {
             EVENT(KeyframeListChanged, size_t count;);
 
             EVENT(ExportFailed, std::string error;);
+            EVENT(VideoExportCompleted, std::filesystem::path path; int total_frames;);
             EVENT(VideoExportFailed, std::string error;);
+            EVENT(Mesh2SplatCompleted, std::string source_name; std::string node_name; size_t num_gaussians;);
             EVENT(Mesh2SplatFailed, std::string error;);
 
             // CUDA version check
@@ -247,7 +269,6 @@ namespace lfs::core {
             EVENT(EllipsoidVisibilityChanged, bool visible;);
             EVENT(ConsoleResult, std::string command; std::string result;);
             EVENT(SplitPositionChanged, float position;);
-            EVENT(GTComparisonModeChanged, bool enabled;);
             EVENT(FocusTrainingPanel, );
             EVENT(ToggleUI, );
             EVENT(ToggleFullscreen, );

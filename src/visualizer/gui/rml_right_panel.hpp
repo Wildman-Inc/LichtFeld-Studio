@@ -5,6 +5,8 @@
 #pragma once
 
 #include "gui/rmlui/rml_fbo.hpp"
+#include <RmlUi/Core/DataModelHandle.h>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <glm/glm.hpp>
@@ -17,13 +19,18 @@ namespace Rml {
     class Element;
 } // namespace Rml
 
+namespace lfs::vis {
+    struct Theme;
+}
 namespace lfs::vis::gui {
 
     class RmlUIManager;
 
     struct TabSnapshot {
-        std::string idname;
+        std::string id;
         std::string label;
+        std::string dom_id;
+        bool operator==(const TabSnapshot&) const = default;
     };
 
     enum class CursorRequest : uint8_t;
@@ -42,11 +49,17 @@ namespace lfs::vis::gui {
         void shutdown();
 
         void processInput(const RightPanelLayout& layout, const PanelInputState& input);
+        void reloadResources();
         void render(const RightPanelLayout& layout,
                     const std::vector<TabSnapshot>& tabs,
-                    const std::string& active_tab);
+                    const std::string& active_tab,
+                    float screen_x, float screen_y,
+                    int screen_w, int screen_h);
+        void blurFocus();
 
         bool wantsInput() const { return wants_input_; }
+        bool wantsKeyboard() const { return wants_keyboard_; }
+        bool needsAnimationFrame() const;
         CursorRequest getCursorRequest() const;
 
         std::function<void(const std::string&)> on_tab_changed;
@@ -57,8 +70,10 @@ namespace lfs::vis::gui {
 
     private:
         bool updateTheme();
-        std::string generateThemeRCSS() const;
-        bool rebuildTabs(const std::vector<TabSnapshot>& tabs, const std::string& active_tab);
+        bool syncTabData(const std::vector<TabSnapshot>& tabs, const std::string& active_tab);
+        bool syncTabScrollState();
+        void syncTabNavigation();
+        void scrollTabs(float delta);
 
         RmlUIManager* rml_manager_ = nullptr;
         Rml::Context* rml_context_ = nullptr;
@@ -68,19 +83,25 @@ namespace lfs::vis::gui {
         Rml::Element* left_border_el_ = nullptr;
         Rml::Element* splitter_el_ = nullptr;
         Rml::Element* tab_bar_el_ = nullptr;
+        Rml::Element* tab_strip_viewport_el_ = nullptr;
         Rml::Element* tab_separator_el_ = nullptr;
 
         RmlFBO fbo_;
+        Rml::DataModelHandle tab_model_;
+        std::vector<TabSnapshot> tabs_;
+        Rml::String active_tab_;
+        float tab_scroll_left_ = 0.0f;
+        bool tabs_overflow_ = false;
+        bool can_scroll_tabs_left_ = false;
+        bool can_scroll_tabs_right_ = false;
 
-        std::string last_theme_;
+        std::size_t last_theme_signature_ = 0;
+        bool has_theme_signature_ = false;
         std::string base_rcss_;
         bool wants_input_ = false;
-
-        std::vector<TabSnapshot> last_tabs_;
-        std::string last_active_tab_;
+        bool wants_keyboard_ = false;
 
         bool splitter_dragging_ = false;
-        float drag_start_y_ = 0;
 
         bool resize_dragging_ = false;
 

@@ -15,13 +15,17 @@ set(FASTLFS_SOURCES
 )
 
 # One unified library - renamed from fastgs_backend to fastlfs_backend
-add_library(fastlfs_backend STATIC ${FASTLFS_SOURCES})
+lfs_add_gpu_library(fastlfs_backend STATIC ${FASTLFS_SOURCES})
 
-set_target_properties(fastlfs_backend PROPERTIES
-        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION OFF
-        POSITION_INDEPENDENT_CODE ON
-)
+if(USE_CUDA)
+    set_target_properties(fastlfs_backend PROPERTIES
+            CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+            CUDA_SEPARABLE_COMPILATION OFF
+            POSITION_INDEPENDENT_CODE ON
+    )
+else()
+    set_target_properties(fastlfs_backend PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 target_include_directories(fastlfs_backend
         PUBLIC
@@ -29,16 +33,16 @@ target_include_directories(fastlfs_backend
         ${CMAKE_CURRENT_SOURCE_DIR}/optimizer/include
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
         ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
         PRIVATE
 )
 
 # Pure CUDA libraries only
 target_link_libraries(fastlfs_backend
         PUBLIC
-        CUDA::cudart
-        CUDA::curand
-        ${CUDA_CUDA_LIBRARY}
+        ${GPU_RUNTIME_LIBRARY}
+        ${GPU_RAND_LIBRARY}
+        ${GPU_DRIVER_LIBRARY}
         lfs_core_cuda  # CUDA utilities from core module (memory arena)
 )
 

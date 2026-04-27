@@ -34,6 +34,10 @@ namespace lfs::vis::op {
     struct ModalEvent;
 }
 
+namespace Rml {
+    class ElementDocument;
+}
+
 namespace lfs::python {
 
     class PyOperatorReturnValue {
@@ -368,7 +372,8 @@ namespace lfs::python {
         std::tuple<bool, float> stepper_float(const std::string& label, float value,
                                               const std::vector<float>& steps = {1.0f, 0.1f, 0.01f});
         std::tuple<bool, std::string> path_input(const std::string& label, const std::string& value,
-                                                 bool folder_mode = true, const std::string& dialog_title = "");
+                                                 bool folder_mode = true,
+                                                 const std::string& dialog_title = "");
 
         // Color
         std::tuple<bool, std::tuple<float, float, float>> color_edit3(const std::string& label,
@@ -662,8 +667,6 @@ namespace lfs::python {
 
     using PollDependency = lfs::vis::op::PollDependency;
 
-    class PythonPanelAdapter;
-
     namespace gui = lfs::vis::gui;
 
     class PyPanelRegistry {
@@ -671,8 +674,8 @@ namespace lfs::python {
         static PyPanelRegistry& instance();
 
         void register_panel(nb::object panel_class);
-        void register_rml_panel(nb::object panel_class, void* rml_manager);
         void unregister_panel(nb::object panel_class);
+        void unregister_for_module(const std::string& prefix);
         void unregister_all();
 
     private:
@@ -681,9 +684,13 @@ namespace lfs::python {
         PyPanelRegistry(const PyPanelRegistry&) = delete;
         PyPanelRegistry& operator=(const PyPanelRegistry&) = delete;
 
+        struct RegisteredPanel {
+            std::shared_ptr<gui::IPanel> adapter;
+            std::string module_prefix;
+        };
+
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, std::shared_ptr<PythonPanelAdapter>> adapters_;
-        std::unordered_map<std::string, std::shared_ptr<gui::IPanel>> rml_adapters_;
+        std::unordered_map<std::string, RegisteredPanel> panels_;
     };
 
     // Theme palette wrapper (read-only)
@@ -726,11 +733,19 @@ namespace lfs::python {
         float toolbar_spacing;
     };
 
+    struct PyThemeVignette {
+        bool enabled;
+        float intensity;
+        float radius;
+        float softness;
+    };
+
     // Theme wrapper (read-only)
     struct PyTheme {
         std::string name;
         PyThemePalette palette;
         PyThemeSizes sizes;
+        PyThemeVignette vignette;
     };
 
     // Get current theme
@@ -768,6 +783,10 @@ namespace lfs::python {
         void invoke(const std::string& panel,
                     const std::string& section,
                     PyHookPosition position);
+        void invoke_document(const std::string& panel,
+                             const std::string& section,
+                             Rml::ElementDocument* document,
+                             PyHookPosition position);
 
         // Check if hooks exist
         bool has_hooks(const std::string& panel, const std::string& section) const;

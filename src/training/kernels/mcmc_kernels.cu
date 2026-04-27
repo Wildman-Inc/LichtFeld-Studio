@@ -4,6 +4,7 @@
 
 #include "core/tensor.hpp"
 #include "mcmc_kernels.hpp"
+#include <cmath>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -18,6 +19,12 @@
 #include <thrust/sort.h>
 
 namespace lfs::training::mcmc {
+
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+    constexpr unsigned long long FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
+#else
+    constexpr unsigned int FULL_WARP_MASK = 0xFFFFFFFFu;
+#endif
 
     // GLM type aliases for CUDA (matching gsplat)
     using vec2 = glm::vec<2, float>;
@@ -35,7 +42,7 @@ namespace lfs::training::mcmc {
             float binom = 1.0f;
             for (int k = 0; k <= n; k++) {
                 const float sign = (k % 2 == 0) ? 1.0f : -1.0f;
-                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * rsqrtf(static_cast<float>(k + 1));
+                coeffs[n * RELOCATION_N_MAX + k] = binom * sign / std::sqrt(static_cast<float>(k + 1));
                 if (k < n)
                     binom *= static_cast<float>(n - k) / static_cast<float>(k + 1);
             }
@@ -640,7 +647,7 @@ namespace lfs::training::mcmc {
 
         // Warp-level reduction to sum counts
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            count += __shfl_down_sync(0xffffffff, count, offset);
+            count += __shfl_down_sync(FULL_WARP_MASK, count, offset, WARP_SIZE);
         }
 
         // First lane writes the result
@@ -1180,56 +1187,6 @@ namespace lfs::training::mcmc {
             rotations,
             mag_sq,
             N);
-    }
-
-    // Fused dead mask computation kernel (ZERO intermediate allocations)
-    __global__ void compute_dead_mask_kernel(
-        const float* opacities, // [N]
-        const float* rotations, // [N, 4]
-        uint8_t* dead_mask,     // [N]
-        size_t N,
-        float min_opacity) {
-
-        size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-        if (idx >= N)
-            return;
-
-        // Check opacity condition: opacity <= min_opacity
-        bool is_dead = opacities[idx] <= min_opacity;
-
-        // Check rotation magnitude condition: ||rotation||^2 < 1e-8
-        if (!is_dead) {
-            const float* q = &rotations[idx * 4];
-            float mag_sq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
-            is_dead = mag_sq < 1e-8f;
-        }
-
-        dead_mask[idx] = is_dead ? 1 : 0;
-    }
-
-    void launch_compute_dead_mask(
-        const float* opacities,
-        const float* rotations,
-        uint8_t* dead_mask,
-        size_t N,
-        float min_opacity,
-        void* stream) {
-
-        if (N == 0) {
-            return;
-        }
-
-        dim3 threads(256);
-        dim3 grid((N + threads.x - 1) / threads.x);
-
-        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : nullptr;
-
-        compute_dead_mask_kernel<<<grid, threads, 0, cuda_stream>>>(
-            opacities,
-            rotations,
-            dead_mask,
-            N,
-            min_opacity);
     }
 
     __global__ void elementwise_max_inplace_kernel(

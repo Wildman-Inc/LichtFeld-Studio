@@ -6,6 +6,7 @@
 
 #include "core/cuda_version.hpp"
 #include "core/events.hpp"
+#include "core/export.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
 #include "gui/async_task_manager.hpp"
@@ -26,20 +27,35 @@
 #include "gui/startup_overlay.hpp"
 #include "gui/ui_context.hpp"
 #include "gui/utils/drag_drop_native.hpp"
-#include "windows/video_extractor_dialog.hpp"
+#include "visualizer/gui/video_widget_interface.hpp"
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <imgui.h>
+
+struct SDL_Cursor;
 
 namespace lfs::vis {
     class VisualizerImpl;
 
     namespace gui {
-        class GuiManager {
+        struct GuiHitTestResult {
+            bool blocks_pointer = false;
+            bool takes_keyboard_focus = false;
+        };
+
+        struct GuiInputState {
+            bool has_keyboard_focus = false;
+            bool text_input_active = false;
+            bool modal_open = false;
+        };
+
+        class LFS_VIS_API GuiManager {
         public:
             GuiManager(VisualizerImpl* viewer);
             ~GuiManager();
@@ -70,6 +86,9 @@ namespace lfs::vis {
             glm::vec2 getViewportSize() const;
             bool isViewportFocused() const;
             bool isPositionInViewport(double x, double y) const;
+            bool isPositionOverFloatingPanel(double x, double y) const;
+            [[nodiscard]] GuiHitTestResult hitTestPointer(double x, double y) const;
+            [[nodiscard]] GuiInputState inputState() const;
 
             bool isForceExit() const { return force_exit_; }
             void setForceExit(bool value) { force_exit_ = value; }
@@ -90,7 +109,7 @@ namespace lfs::vis {
             bool isModalWindowOpen() const;
             [[nodiscard]] bool isStartupVisible() const { return startup_overlay_.isVisible(); }
             void dismissStartupOverlay();
-            void captureKey(int key, int mods);
+            void captureKey(int physical_key, int logical_key, int mods);
             void captureMouseButton(int button, int mods);
 
             // Thumbnail system (delegates to MenuBar)
@@ -114,17 +133,28 @@ namespace lfs::vis {
             void applyDefaultStyle();
             void initMenuBar();
             void registerNativePanels();
-            void updateInputOverrides(bool mouse_in_viewport);
+            void updateInputOverrides(const PanelInputState& input, bool mouse_in_viewport);
             void applyUiScale(float scale);
             void rebuildFonts(float scale);
+            void loadImGuiSettings();
+            void saveImGuiSettings() const;
+            void persistImGuiSettingsIfNeeded();
+            void initCustomCursors();
+            void destroyCustomCursors();
+            void applyRmlCursorRequest(RmlCursorRequest req);
+            void initDevResourceHotReload();
+            void pollDevResourceHotReload();
+            std::pair<bool, bool> scanDevResourceFiles(bool detect_changes);
+            bool shouldDeferDevResourceHotReload() const;
+            bool reloadLocalizationResources();
+            void reloadRmlResources();
 
             // Core dependencies
             VisualizerImpl* viewer_;
 
             // Owned components
             std::unique_ptr<RmlModalOverlay> rml_modal_overlay_;
-            std::unique_ptr<lfs::gui::VideoExtractorDialog> video_extractor_dialog_;
-            std::optional<std::jthread> video_extraction_thread_;
+            std::unique_ptr<lfs::gui::IVideoExtractorWidget> video_widget_;
 
             // UI state only
             std::unordered_map<std::string, bool> window_states_;
@@ -153,6 +183,7 @@ namespace lfs::vis {
             ImFont* font_monospace_ = nullptr;
             ImFont* mono_fonts_[FontSet::MONO_SIZE_COUNT] = {};
             float mono_font_scales_[FontSet::MONO_SIZE_COUNT] = {};
+            std::filesystem::path imgui_ini_path_;
             FontSet buildFontSet() const;
 
             // Async task management
@@ -177,11 +208,41 @@ namespace lfs::vis {
             // Deferred CUDA version warning (emitted on first drawFrame)
             std::optional<lfs::core::CudaVersionInfo> pending_cuda_warning_;
 
+            // File association prompt (Windows only, one-shot)
+            bool file_association_checked_ = false;
+            void promptFileAssociation();
+
             // RmlUI integration
             RmlUIManager rmlui_manager_;
+            SDL_Cursor* pipette_cursor_ = nullptr;
 
             // Native panel wrapper storage (registered with PanelRegistry)
             std::vector<std::shared_ptr<IPanel>> native_panel_storage_;
+            uint64_t panel_frame_serial_ = 0;
+            uint8_t ui_layout_settle_frames_ = 0;
+            glm::vec2 last_ui_layout_work_pos_{-1.0f, -1.0f};
+            glm::vec2 last_ui_layout_work_size_{-1.0f, -1.0f};
+            float last_ui_layout_right_panel_w_ = -1.0f;
+            float last_ui_layout_scene_ratio_ = -1.0f;
+            float last_ui_layout_python_console_w_ = -1.0f;
+            float last_ui_layout_bottom_dock_h_ = -1.0f;
+            bool last_ui_layout_show_main_panel_ = false;
+            bool last_ui_layout_ui_hidden_ = false;
+            bool last_ui_layout_python_console_visible_ = false;
+            bool last_ui_layout_bottom_dock_visible_ = false;
+            std::string last_ui_layout_active_tab_;
+
+            struct DevResourceWatchState {
+                bool enabled = false;
+                std::filesystem::path rml_dir;
+                std::filesystem::path locale_dir;
+                std::unordered_map<std::string, std::filesystem::file_time_type> file_times;
+                std::chrono::steady_clock::time_point next_scan{};
+                bool pending_rml_reload = false;
+                bool pending_locale_reload = false;
+            };
+
+            DevResourceWatchState dev_resource_watch_;
         };
     } // namespace gui
 } // namespace lfs::vis

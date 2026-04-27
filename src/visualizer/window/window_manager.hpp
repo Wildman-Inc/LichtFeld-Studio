@@ -4,7 +4,8 @@
 
 #pragma once
 
-#include <atomic>
+#include "input/frame_input_buffer.hpp"
+#include "input/input_router.hpp"
 #include <filesystem>
 #include <glm/glm.hpp>
 #include <string>
@@ -39,8 +40,7 @@ namespace lfs::vis {
         bool shouldClose() const;
         void requestClose() { should_close_ = true; }
         void cancelClose();
-        void requestRedraw();
-        bool needsRedraw() const;
+        void wakeEventLoop();
 
         SDL_Window* getWindow() const { return window_; }
         SDL_GLContext getGLContext() const { return gl_context_; }
@@ -50,7 +50,9 @@ namespace lfs::vis {
         void toggleFullscreen();
 
         void setCallbackHandler(void* handler) { callback_handler_ = handler; }
-        void setInputController(InputController* ic) { input_controller_ = ic; }
+        void setInputController(InputController* ic);
+        [[nodiscard]] const FrameInputBuffer& frameInput() const { return frame_input_; }
+        [[nodiscard]] const input::InputRouter& inputRouter() const { return input_router_; }
 
     private:
         void processEvent(const ::SDL_Event& event);
@@ -71,7 +73,8 @@ namespace lfs::vis {
 
         static void* callback_handler_;
         InputController* input_controller_ = nullptr;
-        mutable std::atomic<bool> needs_redraw_{false};
+        input::InputRouter input_router_;
+        FrameInputBuffer frame_input_;
         std::vector<std::string> pending_drop_files_;
     };
 

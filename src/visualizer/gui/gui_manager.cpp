@@ -15,18 +15,29 @@
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "gui/bounds_gizmo.hpp"
 #include "gui/editor/python_editor.hpp"
+#include "gui/layout_state.hpp"
 #include "gui/native_panels.hpp"
+#include "gui/panel_input_utils.hpp"
 #include "gui/panel_registry.hpp"
-#include "gui/panels/mesh2splat_panel.hpp"
 #include "gui/panels/python_console_panel.hpp"
 #include "gui/rmlui/rml_panel_host.hpp"
+#include "gui/rmlui/rml_theme.hpp"
+#include "gui/rmlui/rmlui_render_interface.hpp"
+#include "gui/rmlui/rmlui_system_interface.hpp"
+#include "gui/rotation_gizmo.hpp"
+#include "gui/scale_gizmo.hpp"
+#include "gui/scene_panel_native.hpp"
 #include "gui/string_keys.hpp"
+#include "gui/translation_gizmo.hpp"
 #include "gui/ui_widgets.hpp"
-#include "gui/utils/windows_utils.hpp"
-#include "io/video_frame_extractor.hpp"
+#include "gui/utils/file_association.hpp"
+#include "gui/utils/native_file_dialog.hpp"
 #include <implot.h>
 
+#include "gui/gui_focus_state.hpp"
+#include "input/frame_input_buffer.hpp"
 #include "input/input_controller.hpp"
 #include "internal/resource_paths.hpp"
 #include "tools/align_tool.hpp"
@@ -37,66 +48,299 @@
 #include "python/package_manager.hpp"
 #include "python/python_runtime.hpp"
 #include "python/ui_hooks.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
 #include "theme/theme.hpp"
 #include "tools/brush_tool.hpp"
 #include "tools/selection_tool.hpp"
 #include "visualizer_impl.hpp"
+#include <OpenImageIO/imageio.h>
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <format>
+#include <fstream>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_internal.h>
-#include <ImGuizmo.h>
+#include <iterator>
+#include <string_view>
+#include <unordered_set>
 
 namespace lfs::vis::gui {
 
     namespace {
-        int imguiKeyToSDLScancode(ImGuiKey key) {
-            // clang-format off
-            switch (key) {
-            case ImGuiKey_Space:      return SDL_SCANCODE_SPACE;
-            case ImGuiKey_Backspace:  return SDL_SCANCODE_BACKSPACE;
-            case ImGuiKey_Tab:        return SDL_SCANCODE_TAB;
-            case ImGuiKey_Enter:      return SDL_SCANCODE_RETURN;
-            case ImGuiKey_Escape:     return SDL_SCANCODE_ESCAPE;
-            case ImGuiKey_Delete:     return SDL_SCANCODE_DELETE;
-            case ImGuiKey_Insert:     return SDL_SCANCODE_INSERT;
-            case ImGuiKey_Home:       return SDL_SCANCODE_HOME;
-            case ImGuiKey_End:        return SDL_SCANCODE_END;
-            case ImGuiKey_PageUp:     return SDL_SCANCODE_PAGEUP;
-            case ImGuiKey_PageDown:   return SDL_SCANCODE_PAGEDOWN;
-            case ImGuiKey_LeftArrow:  return SDL_SCANCODE_LEFT;
-            case ImGuiKey_UpArrow:    return SDL_SCANCODE_UP;
-            case ImGuiKey_RightArrow: return SDL_SCANCODE_RIGHT;
-            case ImGuiKey_DownArrow:  return SDL_SCANCODE_DOWN;
-            case ImGuiKey_F1:  return SDL_SCANCODE_F1;
-            case ImGuiKey_F2:  return SDL_SCANCODE_F2;
-            case ImGuiKey_F3:  return SDL_SCANCODE_F3;
-            case ImGuiKey_F4:  return SDL_SCANCODE_F4;
-            case ImGuiKey_F5:  return SDL_SCANCODE_F5;
-            case ImGuiKey_F6:  return SDL_SCANCODE_F6;
-            case ImGuiKey_F7:  return SDL_SCANCODE_F7;
-            case ImGuiKey_F8:  return SDL_SCANCODE_F8;
-            case ImGuiKey_F9:  return SDL_SCANCODE_F9;
-            case ImGuiKey_F10: return SDL_SCANCODE_F10;
-            case ImGuiKey_F11: return SDL_SCANCODE_F11;
-            case ImGuiKey_F12: return SDL_SCANCODE_F12;
-            default: break;
-            }
-            // clang-format on
+        const FrameInputBuffer* s_frame_input = nullptr;
 
-            if (key >= ImGuiKey_A && key <= ImGuiKey_Z)
-                return SDL_SCANCODE_A + (key - ImGuiKey_A);
-            if (key == ImGuiKey_0)
-                return SDL_SCANCODE_0;
-            if (key >= ImGuiKey_1 && key <= ImGuiKey_9)
-                return SDL_SCANCODE_1 + (key - ImGuiKey_1);
-            return -1;
+        [[nodiscard]] bool isTransformGizmoOverOrUsing() {
+            return isBoundsGizmoHovered() ||
+                   isBoundsGizmoActive() ||
+                   isRotationGizmoHovered() ||
+                   isRotationGizmoActive() ||
+                   isScaleGizmoHovered() ||
+                   isScaleGizmoActive() ||
+                   isTranslationGizmoHovered() ||
+                   isTranslationGizmoActive();
+        }
+
+        enum class DevResourceKind {
+            None,
+            Rml,
+            Locale
+        };
+
+        [[nodiscard]] DevResourceKind devResourceKindForPath(const std::filesystem::path& path) {
+            std::string ext = lfs::core::path_to_utf8(path.extension());
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+
+            if (ext == ".json")
+                return DevResourceKind::Locale;
+            if (ext == ".rml" || ext == ".rcss")
+                return DevResourceKind::Rml;
+            return DevResourceKind::None;
+        }
+
+#ifndef LFS_BUILD_PORTABLE
+        [[nodiscard]] bool envFlagEnabled(const char* name, const bool default_value) {
+            const char* value = std::getenv(name);
+            if (!value || !*value)
+                return default_value;
+            return std::string_view(value) != "0";
+        }
+
+        [[nodiscard]] bool envFlagEnabled(const char* name) {
+            return envFlagEnabled(name, false);
+        }
+#endif
+
+        std::string makeRmlTabDomId(const std::string& id) {
+            std::string result = "rp-tab-";
+            result.reserve(result.size() + id.size());
+            for (const char ch : id) {
+                const bool keep = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                                  (ch >= '0' && ch <= '9') || ch == '-' || ch == '_';
+                result.push_back(keep ? ch : '-');
+            }
+            return result;
+        }
+
+        PanelInputState maskInputForBlockedUi(PanelInputState input) {
+            input.mouse_x = -1.0e9f;
+            input.mouse_y = -1.0e9f;
+            for (auto& value : input.mouse_down)
+                value = false;
+            for (auto& value : input.mouse_clicked)
+                value = false;
+            for (auto& value : input.mouse_released)
+                value = false;
+            input.mouse_wheel = 0.0f;
+            input.key_ctrl = false;
+            input.key_shift = false;
+            input.key_alt = false;
+            input.key_super = false;
+            input.viewport_keyboard_focus = false;
+            input.keys_pressed.clear();
+            input.keys_repeated.clear();
+            input.keys_released.clear();
+            input.text_codepoints.clear();
+            input.text_inputs.clear();
+            input.text_editing.clear();
+            input.text_editing_start = -1;
+            input.text_editing_length = -1;
+            input.has_text_editing = false;
+            return input;
+        }
+
+        void applyFrameInputCapture(RmlRightPanel* right_panel = nullptr) {
+            const bool panel_hosts_want_keyboard = RmlPanelHost::consumeFrameWantsKeyboard();
+            const bool panel_hosts_want_text_input = RmlPanelHost::consumeFrameWantsTextInput();
+            if ((panel_hosts_want_keyboard || panel_hosts_want_text_input) && right_panel)
+                right_panel->blurFocus();
+
+            auto& focus = guiFocusState();
+            if (panel_hosts_want_keyboard)
+                focus.want_capture_keyboard = true;
+            if (panel_hosts_want_text_input)
+                focus.want_text_input = true;
+        }
+
+        void syncWindowTextInput(SDL_Window* window) {
+            if (!window)
+                return;
+
+            const bool wants_text_input = guiFocusState().want_text_input;
+            const bool text_input_active = SDL_TextInputActive(window);
+            if (wants_text_input == text_input_active)
+                return;
+
+            if (wants_text_input)
+                SDL_StartTextInput(window);
+            else
+                SDL_StopTextInput(window);
+        }
+
+        SDL_Cursor* systemCursorForImGuiCursor(const ImGuiMouseCursor cursor) {
+            switch (cursor) {
+            case ImGuiMouseCursor_TextInput: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
+                return value;
+            }
+            case ImGuiMouseCursor_Hand: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+                return value;
+            }
+            case ImGuiMouseCursor_ResizeEW: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
+                return value;
+            }
+            case ImGuiMouseCursor_ResizeNS: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
+                return value;
+            }
+            case ImGuiMouseCursor_ResizeNWSE: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NWSE_RESIZE);
+                return value;
+            }
+            case ImGuiMouseCursor_ResizeNESW: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NESW_RESIZE);
+                return value;
+            }
+            case ImGuiMouseCursor_ResizeAll: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_MOVE);
+                return value;
+            }
+            case ImGuiMouseCursor_NotAllowed: {
+                static SDL_Cursor* const value = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NOT_ALLOWED);
+                return value;
+            }
+            default:
+                return nullptr;
+            }
+        }
+
+        void drawFrameTooltip(const std::string& tip, int screen_w, int screen_h) {
+            if (tip.empty())
+                return;
+
+            const auto& p = lfs::vis::theme().palette;
+            auto* font = ImGui::GetFont();
+            const float font_size = ImGui::GetFontSize();
+            const ImVec2 mouse = s_frame_input
+                                     ? ImVec2(s_frame_input->mouse_x, s_frame_input->mouse_y)
+                                     : ImVec2(0, 0);
+            const ImVec2 pad(8, 6);
+            const ImVec2 text_size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, tip.c_str());
+            const float box_w = text_size.x + pad.x * 2;
+            const float box_h = text_size.y + pad.y * 2;
+
+            const float sw = static_cast<float>(screen_w);
+            const float sh = static_cast<float>(screen_h);
+            ImVec2 box_min(mouse.x + 14, mouse.y + 18);
+            if (box_min.x + box_w > sw)
+                box_min.x = mouse.x - 14 - box_w;
+            if (box_min.y + box_h > sh)
+                box_min.y = mouse.y - 18 - box_h;
+
+            const ImVec2 box_max(box_min.x + box_w, box_min.y + box_h);
+            const ImU32 col_bg = ImGui::ColorConvertFloat4ToU32(p.surface_bright);
+            const ImU32 col_border = ImGui::ColorConvertFloat4ToU32(p.border);
+            const ImU32 col_text = ImGui::ColorConvertFloat4ToU32(p.text);
+
+            ImDrawList dl(ImGui::GetDrawListSharedData());
+            dl._ResetForNewFrame();
+            dl.PushTextureID(ImGui::GetIO().Fonts->TexID);
+            dl.PushClipRectFullScreen();
+            dl.AddRectFilled(box_min, box_max, col_bg, 4.0f);
+            dl.AddRect(box_min, box_max, col_border, 4.0f);
+            dl.AddText(font, font_size,
+                       ImVec2(box_min.x + pad.x, box_min.y + pad.y), col_text, tip.c_str());
+            dl.PopClipRect();
+
+            ImDrawData draw_data{};
+            draw_data.DisplayPos = ImVec2(0.0f, 0.0f);
+            draw_data.DisplaySize = ImVec2(sw, sh);
+            draw_data.FramebufferScale = ImGui::GetIO().DisplayFramebufferScale;
+            draw_data.Valid = true;
+            draw_data.AddDrawList(&dl);
+            ImGui_ImplOpenGL3_RenderDrawData(&draw_data);
+        }
+
+        SDL_Cursor* loadColorCursorFromAsset(const std::string& asset_name, int hot_x, int hot_y) {
+            try {
+                const auto path = lfs::vis::getAssetPath(asset_name);
+                const std::string path_utf8 = lfs::core::path_to_utf8(path);
+                std::unique_ptr<OIIO::ImageInput> in(OIIO::ImageInput::open(path_utf8));
+                if (!in)
+                    return nullptr;
+
+                const OIIO::ImageSpec& spec = in->spec();
+                const int width = spec.width;
+                const int height = spec.height;
+                const int channels = spec.nchannels;
+                if (width <= 0 || height <= 0 || channels <= 0) {
+                    in->close();
+                    return nullptr;
+                }
+
+                const int read_channels = std::clamp(channels, 1, 4);
+                std::vector<unsigned char> source_pixels(static_cast<size_t>(width) * height * read_channels);
+                if (!in->read_image(0, 0, 0, read_channels, OIIO::TypeDesc::UINT8, source_pixels.data())) {
+                    in->close();
+                    return nullptr;
+                }
+                in->close();
+
+                std::vector<unsigned char> rgba_pixels(static_cast<size_t>(width) * height * 4, 0);
+                for (int i = 0; i < width * height; ++i) {
+                    const size_t src = static_cast<size_t>(i) * read_channels;
+                    const size_t dst = static_cast<size_t>(i) * 4;
+                    switch (read_channels) {
+                    case 1:
+                        rgba_pixels[dst + 0] = source_pixels[src + 0];
+                        rgba_pixels[dst + 1] = source_pixels[src + 0];
+                        rgba_pixels[dst + 2] = source_pixels[src + 0];
+                        rgba_pixels[dst + 3] = 255;
+                        break;
+                    case 2:
+                        rgba_pixels[dst + 0] = source_pixels[src + 0];
+                        rgba_pixels[dst + 1] = source_pixels[src + 0];
+                        rgba_pixels[dst + 2] = source_pixels[src + 0];
+                        rgba_pixels[dst + 3] = source_pixels[src + 1];
+                        break;
+                    case 3:
+                        rgba_pixels[dst + 0] = source_pixels[src + 0];
+                        rgba_pixels[dst + 1] = source_pixels[src + 1];
+                        rgba_pixels[dst + 2] = source_pixels[src + 2];
+                        rgba_pixels[dst + 3] = 255;
+                        break;
+                    default:
+                        rgba_pixels[dst + 0] = source_pixels[src + 0];
+                        rgba_pixels[dst + 1] = source_pixels[src + 1];
+                        rgba_pixels[dst + 2] = source_pixels[src + 2];
+                        rgba_pixels[dst + 3] = source_pixels[src + 3];
+                        break;
+                    }
+                }
+
+                SDL_Surface* surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32,
+                                                             rgba_pixels.data(), width * 4);
+                if (!surface) {
+                    return nullptr;
+                }
+
+                SDL_Cursor* cursor = SDL_CreateColorCursor(surface, hot_x, hot_y);
+                SDL_DestroySurface(surface);
+                return cursor;
+            } catch (const std::exception& e) {
+                LOG_WARN("Could not load cursor asset '{}': {}", asset_name, e.what());
+                return nullptr;
+            }
         }
     } // namespace
 
@@ -113,47 +357,7 @@ namespace lfs::vis::gui {
         rml_modal_overlay_ = std::make_unique<RmlModalOverlay>(&rmlui_manager_);
         global_context_menu_ = std::make_unique<GlobalContextMenu>(&rmlui_manager_);
         lfs::python::set_global_context_menu(global_context_menu_.get());
-        video_extractor_dialog_ = std::make_unique<lfs::gui::VideoExtractorDialog>();
-
-        // Wire up video extractor dialog callback
-        video_extractor_dialog_->setOnStartExtraction([this](const lfs::gui::VideoExtractionParams& params) {
-            if (video_extraction_thread_ && video_extraction_thread_->joinable())
-                video_extraction_thread_->join();
-
-            auto* dialog = video_extractor_dialog_.get();
-            video_extraction_thread_.emplace([params, dialog]() {
-                lfs::io::VideoFrameExtractor extractor;
-
-                lfs::io::VideoFrameExtractor::Params extract_params;
-                extract_params.video_path = params.video_path;
-                extract_params.output_dir = params.output_dir;
-                extract_params.mode = params.mode;
-                extract_params.fps = params.fps;
-                extract_params.frame_interval = params.frame_interval;
-                extract_params.format = params.format;
-                extract_params.jpg_quality = params.jpg_quality;
-                extract_params.start_time = params.start_time;
-                extract_params.end_time = params.end_time;
-                extract_params.resolution_mode = params.resolution_mode;
-                extract_params.scale = params.scale;
-                extract_params.custom_width = params.custom_width;
-                extract_params.custom_height = params.custom_height;
-                extract_params.filename_pattern = params.filename_pattern;
-
-                extract_params.progress_callback = [dialog](int current, int total) {
-                    dialog->updateProgress(current, total);
-                };
-
-                std::string error;
-                if (!extractor.extract(extract_params, error)) {
-                    LOG_ERROR("Video frame extraction failed: {}", error);
-                    dialog->setExtractionError(error);
-                } else {
-                    LOG_INFO("Video frame extraction completed successfully");
-                    dialog->setExtractionComplete();
-                }
-            });
-        });
+        video_widget_ = lfs::gui::createVideoWidget();
 
         // Initialize window states
         window_states_["scene_panel"] = true;
@@ -180,7 +384,109 @@ namespace lfs::vis::gui {
         }
     }
 
+    void GuiManager::promptFileAssociation() {
+#ifdef _WIN32
+        if (file_association_checked_)
+            return;
+        file_association_checked_ = true;
+
+        LayoutState state;
+        state.load();
+        if (state.file_association == "declined")
+            return;
+        if (areFileAssociationsRegistered())
+            return;
+
+        using namespace lichtfeld::Strings;
+        lfs::core::ModalRequest req;
+        req.title = LOC(FileAssociation::TITLE);
+        req.body_rml = "<p>" + std::string(LOC(FileAssociation::MESSAGE)) + "</p>";
+        req.style = lfs::core::ModalStyle::Info;
+        req.buttons = {
+            {LOC(FileAssociation::YES), "primary"},
+            {LOC(FileAssociation::NOT_NOW), "secondary"},
+            {LOC(FileAssociation::DONT_ASK), "secondary"},
+        };
+        req.on_result = [](const lfs::core::ModalResult& result) {
+            LayoutState ls;
+            ls.load();
+
+            if (result.button_label == LOC(FileAssociation::YES)) {
+                registerFileAssociations();
+                openFileAssociationSettings();
+                return;
+            } else if (result.button_label == LOC(FileAssociation::DONT_ASK)) {
+                ls.file_association = "declined";
+            } else {
+                return;
+            }
+            ls.save();
+        };
+
+        rml_modal_overlay_->enqueue(std::move(req));
+#endif
+    }
+
     GuiManager::~GuiManager() = default;
+
+    void GuiManager::initCustomCursors() {
+        if (!pipette_cursor_) {
+            // The tip of the dropper sits near the lower-left corner in the 24x24 Tabler asset.
+            pipette_cursor_ = loadColorCursorFromAsset("icon/color-picker.png", 4, 19);
+            if (!pipette_cursor_)
+                LOG_WARN("Could not create pipette cursor from icon/color-picker.png");
+        }
+    }
+
+    void GuiManager::destroyCustomCursors() {
+        if (pipette_cursor_) {
+            SDL_SetCursor(SDL_GetDefaultCursor());
+            SDL_DestroyCursor(pipette_cursor_);
+            pipette_cursor_ = nullptr;
+        }
+    }
+
+    void GuiManager::applyRmlCursorRequest(const RmlCursorRequest req) {
+        if (req != RmlCursorRequest::Pipette && pipette_cursor_)
+            SDL_SetCursor(SDL_GetDefaultCursor());
+
+        switch (req) {
+        case RmlCursorRequest::Arrow:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
+            break;
+        case RmlCursorRequest::TextInput:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+            break;
+        case RmlCursorRequest::Hand:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            break;
+        case RmlCursorRequest::Pipette:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
+            if (pipette_cursor_)
+                SDL_SetCursor(pipette_cursor_);
+            break;
+        case RmlCursorRequest::ResizeEW:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            break;
+        case RmlCursorRequest::ResizeNS:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+            break;
+        case RmlCursorRequest::ResizeNWSE:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
+            break;
+        case RmlCursorRequest::ResizeNESW:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNESW);
+            break;
+        case RmlCursorRequest::ResizeAll:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+            break;
+        case RmlCursorRequest::NotAllowed:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_NotAllowed);
+            break;
+        case RmlCursorRequest::None:
+            break;
+        }
+    }
 
     void GuiManager::initMenuBar() {
         menu_bar_->setOnShowPythonConsole([this]() {
@@ -200,7 +506,7 @@ namespace lfs::vis::gui {
     void GuiManager::rebuildFonts(float scale) {
         ImGuiIO& io = ImGui::GetIO();
 
-        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_DestroyDeviceObjects();
         io.Fonts->Clear();
 
         const auto& t = theme();
@@ -317,25 +623,90 @@ namespace lfs::vis::gui {
             font_regular_ = font_bold_ = font_heading_ = font_small_ = font_section_ = fallback;
         }
 
-        io.Fonts->TexDesiredWidth = 2048;
+        io.Fonts->TexMinWidth = 2048;
         if (!io.Fonts->Build()) {
             LOG_ERROR("Font atlas build failed — CJK glyphs may be missing");
         }
-        ImGui_ImplOpenGL3_CreateFontsTexture();
+        ImGui_ImplOpenGL3_CreateDeviceObjects();
     }
 
     void GuiManager::applyUiScale(float scale) {
         scale = std::clamp(scale, 1.0f, 4.0f);
+        const float previous_scale = current_ui_scale_;
 
         rmlui_manager_.setDpRatio(scale);
         lfs::vis::setThemeDpiScale(scale);
         lfs::python::set_shared_dpi_scale(scale);
+        PanelRegistry::instance().rescale_floating_panels(previous_scale, scale);
         applyDefaultStyle();
         rebuildFonts(scale);
-        menu_bar_->setFonts(buildFontSet());
         current_ui_scale_ = scale;
 
         LOG_INFO("UI scale applied: {:.2f}", scale);
+    }
+
+    void GuiManager::loadImGuiSettings() {
+        if (imgui_ini_path_.empty())
+            return;
+
+        try {
+            if (!std::filesystem::exists(imgui_ini_path_))
+                return;
+
+            std::ifstream file;
+            if (!lfs::core::open_file_for_read(imgui_ini_path_, std::ios::binary, file)) {
+                LOG_WARN("Failed to open ImGui settings file: {}", lfs::core::path_to_utf8(imgui_ini_path_));
+                return;
+            }
+
+            const std::string ini_data((std::istreambuf_iterator<char>(file)),
+                                       std::istreambuf_iterator<char>());
+            ImGui::LoadIniSettingsFromMemory(ini_data.c_str(), ini_data.size());
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to load ImGui settings: {}", e.what());
+        } catch (...) {
+            LOG_WARN("Failed to load ImGui settings: unknown error");
+        }
+    }
+
+    void GuiManager::saveImGuiSettings() const {
+        if (imgui_ini_path_.empty() || !ImGui::GetCurrentContext())
+            return;
+
+        try {
+            std::filesystem::create_directories(imgui_ini_path_.parent_path());
+
+            size_t ini_size = 0;
+            const char* ini_data = ImGui::SaveIniSettingsToMemory(&ini_size);
+
+            std::ofstream file;
+            if (!lfs::core::open_file_for_write(imgui_ini_path_,
+                                                std::ios::binary | std::ios::trunc,
+                                                file)) {
+                LOG_WARN("Failed to open ImGui settings for writing: {}",
+                         lfs::core::path_to_utf8(imgui_ini_path_));
+                return;
+            }
+
+            file.write(ini_data, static_cast<std::streamsize>(ini_size));
+            if (!file) {
+                LOG_WARN("Failed to write ImGui settings: {}",
+                         lfs::core::path_to_utf8(imgui_ini_path_));
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to save ImGui settings: {}", e.what());
+        } catch (...) {
+            LOG_WARN("Failed to save ImGui settings: unknown error");
+        }
+    }
+
+    void GuiManager::persistImGuiSettingsIfNeeded() {
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.WantSaveIniSettings)
+            return;
+
+        saveImGuiSettings();
+        io.WantSaveIniSettings = false;
     }
 
     void GuiManager::init() {
@@ -409,10 +780,14 @@ namespace lfs::vis::gui {
             });
 
         ImGuiIO& io = ImGui::GetIO();
+        imgui_ini_path_ = LayoutState::getConfigDir() / "imgui.ini";
+        io.IniFilename = nullptr;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // Enable Docking
         io.ConfigWindowsMoveFromTitleBarOnly = true;
+        io.ConfigDragClickToInputText = true;
+        loadImGuiSettings();
 
         // Platform/Renderer initialization
         ImGui_ImplSDL3_InitForOpenGL(viewer_->getWindow(), SDL_GL_GetCurrentContext());
@@ -420,7 +795,19 @@ namespace lfs::vis::gui {
 
         // Initialize localization system
         auto& loc = lfs::event::LocalizationManager::getInstance();
-        const std::string locale_path = lfs::core::path_to_utf8(lfs::core::getLocalesDir());
+        std::filesystem::path locale_dir = lfs::core::getLocalesDir();
+#ifdef LFS_DEV_LOCALE_SOURCE_DIR
+        {
+            const auto source_locale_dir = lfs::core::utf8_to_path(LFS_DEV_LOCALE_SOURCE_DIR);
+            if (std::filesystem::exists(source_locale_dir) &&
+                std::filesystem::is_directory(source_locale_dir)) {
+                locale_dir = source_locale_dir;
+                LOG_INFO("Localization dev source enabled: {}",
+                         lfs::core::path_to_utf8(locale_dir));
+            }
+        }
+#endif
+        const std::string locale_path = lfs::core::path_to_utf8(locale_dir);
         if (!loc.initialize(locale_path)) {
             LOG_WARN("Failed to initialize localization system, using default strings");
         } else {
@@ -434,6 +821,7 @@ namespace lfs::vis::gui {
 
         lfs::python::set_shared_dpi_scale(current_ui_scale_);
         lfs::vis::setThemeDpiScale(current_ui_scale_);
+        initCustomCursors();
 
         // Set application icon
         try {
@@ -454,7 +842,6 @@ namespace lfs::vis::gui {
         rebuildFonts(current_ui_scale_);
 
         initMenuBar();
-        menu_bar_->setFonts(buildFontSet());
 
         if (!drag_drop_.init(viewer_->getWindow())) {
             LOG_WARN("Native drag-drop initialization failed, drag-drop will use SDL events only");
@@ -469,13 +856,30 @@ namespace lfs::vis::gui {
         });
 
         rmlui_manager_.init(viewer_->getWindow(), current_ui_scale_);
+        lfs::vis::setThemeChangeCallback([this](const std::string& theme_id) {
+            rmlui_manager_.activateTheme(theme_id);
+            if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr) {
+                rendering->markDirty(DirtyFlag::OVERLAY);
+            }
+        });
         lfs::python::set_rml_manager(&rmlui_manager_);
+        initDevResourceHotReload();
 
         startup_overlay_.init(&rmlui_manager_);
+#ifdef LFS_BUILD_PORTABLE
+        const bool startup_overlay_enabled = true;
+#else
+        const bool startup_overlay_enabled =
+            viewer_->options_.show_startup_overlay && !envFlagEnabled("LFS_DISABLE_STARTUP_OVERLAY");
+#endif
+        if (!startup_overlay_enabled) {
+            LOG_INFO("Startup overlay disabled");
+            startup_overlay_.dismiss();
+        }
         rml_shell_frame_.init(&rmlui_manager_);
         rml_right_panel_.init(&rmlui_manager_);
-        rml_right_panel_.on_tab_changed = [this](const std::string& idname) {
-            panel_layout_.setActiveTab(idname);
+        rml_right_panel_.on_tab_changed = [this](const std::string& id) {
+            panel_layout_.setActiveTab(id);
         };
         rml_right_panel_.on_splitter_delta = [this](float delta_y) {
             viewer_->getRenderingManager()->setViewportResizeActive(true);
@@ -504,12 +908,20 @@ namespace lfs::vis::gui {
         rml_status_bar_.init(&rmlui_manager_);
 
         lfs::python::RmlPanelHostOps ops{};
-        ops.create = [](void* mgr, const char* name, const char* rml) -> void* {
+        ops.create = [](void* mgr, const char* name, const char* rml,
+                        const char* inline_rcss) -> void* {
             return new RmlPanelHost(static_cast<RmlUIManager*>(mgr),
-                                    std::string(name), std::string(rml));
+                                    std::string(name), std::string(rml),
+                                    inline_rcss ? std::string(inline_rcss) : std::string{});
         };
         ops.destroy = [](void* host) {
-            delete static_cast<RmlPanelHost*>(host);
+            if (lfs::python::on_gl_thread()) {
+                delete static_cast<RmlPanelHost*>(host);
+            } else {
+                lfs::python::schedule_gl_callback([host]() {
+                    delete static_cast<RmlPanelHost*>(host);
+                });
+            }
         };
         ops.draw = [](void* host, const void* ctx) {
             auto* h = static_cast<RmlPanelHost*>(host);
@@ -518,23 +930,8 @@ namespace lfs::vis::gui {
             ImVec2 pos = ImGui::GetCursorScreenPos();
 
             PanelInputState fallback;
-            if (!h->hasInput()) {
-                auto* mvp = ImGui::GetMainViewport();
-                const auto& fio = ImGui::GetIO();
-                fallback.mouse_x = fio.MousePos.x;
-                fallback.mouse_y = fio.MousePos.y;
-                fallback.mouse_down[0] = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-                fallback.mouse_clicked[0] = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-                fallback.mouse_released[0] = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
-                fallback.mouse_clicked[1] = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
-                fallback.mouse_released[1] = ImGui::IsMouseReleased(ImGuiMouseButton_Right);
-                fallback.mouse_wheel = fio.MouseWheel;
-                fallback.key_ctrl = fio.KeyCtrl;
-                fallback.key_shift = fio.KeyShift;
-                fallback.key_alt = fio.KeyAlt;
-                fallback.key_super = fio.KeySuper;
-                fallback.screen_w = static_cast<int>(mvp->Size.x);
-                fallback.screen_h = static_cast<int>(mvp->Size.y);
+            if (!h->hasInput() && s_frame_input) {
+                fallback = buildPanelInputFromSDL(*s_frame_input);
                 h->setInput(&fallback);
             }
             h->draw(*static_cast<const PanelDrawContext*>(ctx),
@@ -544,30 +941,28 @@ namespace lfs::vis::gui {
         ops.draw_direct = [](void* host, float x, float y, float w, float h) {
             auto* hp = static_cast<RmlPanelHost*>(host);
             PanelInputState fallback;
-            if (!hp->hasInput()) {
+            if (!hp->hasInput() && s_frame_input) {
+                fallback = buildPanelInputFromSDL(*s_frame_input);
                 auto* mvp = ImGui::GetMainViewport();
-                const auto& fio = ImGui::GetIO();
-                fallback.mouse_x = fio.MousePos.x;
-                fallback.mouse_y = fio.MousePos.y;
-                fallback.mouse_down[0] = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-                fallback.mouse_down[1] = ImGui::IsMouseDown(ImGuiMouseButton_Right);
-                fallback.mouse_clicked[0] = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-                fallback.mouse_clicked[1] = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
-                fallback.mouse_released[0] = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
-                fallback.mouse_released[1] = ImGui::IsMouseReleased(ImGuiMouseButton_Right);
-                fallback.mouse_wheel = fio.MouseWheel;
-                fallback.key_ctrl = fio.KeyCtrl;
-                fallback.key_shift = fio.KeyShift;
-                fallback.key_alt = fio.KeyAlt;
-                fallback.key_super = fio.KeySuper;
-                fallback.screen_w = static_cast<int>(mvp->Size.x);
-                fallback.screen_h = static_cast<int>(mvp->Size.y);
                 fallback.bg_draw_list = ImGui::GetForegroundDrawList(mvp);
                 fallback.fg_draw_list = ImGui::GetForegroundDrawList(mvp);
                 hp->setInput(&fallback);
             }
             hp->drawDirect(x, y, w, h);
             hp->setInput(nullptr);
+        };
+        ops.prepare_direct = [](void* host, float w, float h) {
+            auto* hp = static_cast<RmlPanelHost*>(host);
+            PanelInputState fallback;
+            if (!hp->hasInput() && s_frame_input) {
+                fallback = buildPanelInputFromSDL(*s_frame_input);
+                hp->setInput(&fallback);
+            }
+            hp->prepareDirect(w, h);
+            hp->setInput(nullptr);
+        };
+        ops.prepare_layout = [](void* host, float w, float h) {
+            static_cast<RmlPanelHost*>(host)->syncDirectLayout(w, h);
         };
         ops.get_document = [](void* host) -> void* {
             return static_cast<RmlPanelHost*>(host)->getDocument();
@@ -577,13 +972,19 @@ namespace lfs::vis::gui {
         };
         ops.set_height_mode = [](void* host, int mode) {
             static_cast<RmlPanelHost*>(host)->setHeightMode(
-                static_cast<HeightMode>(mode));
+                static_cast<PanelHeightMode>(mode));
         };
         ops.get_content_height = [](void* host) -> float {
             return static_cast<RmlPanelHost*>(host)->getContentHeight();
         };
         ops.ensure_context = [](void* host) -> bool {
             return static_cast<RmlPanelHost*>(host)->ensureContext();
+        };
+        ops.ensure_document = [](void* host) -> bool {
+            return static_cast<RmlPanelHost*>(host)->ensureDocumentLoaded();
+        };
+        ops.reload_document = [](void* host) -> bool {
+            return static_cast<RmlPanelHost*>(host)->reloadDocument();
         };
         ops.get_context = [](void* host) -> void* {
             return static_cast<RmlPanelHost*>(host)->getContext();
@@ -601,17 +1002,231 @@ namespace lfs::vis::gui {
             static_cast<RmlPanelHost*>(host)->setInput(
                 static_cast<const PanelInputState*>(input));
         };
+        ops.set_forced_height = [](void* host, float h) {
+            static_cast<RmlPanelHost*>(host)->setForcedHeight(h);
+        };
+        ops.needs_animation = [](void* host) -> bool {
+            return static_cast<RmlPanelHost*>(host)->needsAnimationFrame();
+        };
         lfs::python::set_rml_panel_host_ops(ops);
 
         registerNativePanels();
     }
 
+    void GuiManager::initDevResourceHotReload() {
+        dev_resource_watch_ = {};
+
+#if !defined(LFS_BUILD_PORTABLE) && (defined(LFS_DEV_RMLUI_SOURCE_DIR) || defined(LFS_DEV_LOCALE_SOURCE_DIR))
+        if (!envFlagEnabled("LFS_RESOURCE_HOT_RELOAD", true))
+            return;
+
+#ifdef LFS_DEV_RMLUI_SOURCE_DIR
+        {
+            const auto dir = lfs::core::utf8_to_path(LFS_DEV_RMLUI_SOURCE_DIR);
+            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir))
+                dev_resource_watch_.rml_dir = dir;
+        }
+#endif
+#ifdef LFS_DEV_LOCALE_SOURCE_DIR
+        {
+            const auto dir = lfs::core::utf8_to_path(LFS_DEV_LOCALE_SOURCE_DIR);
+            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir))
+                dev_resource_watch_.locale_dir = dir;
+        }
+#endif
+
+        dev_resource_watch_.enabled =
+            !dev_resource_watch_.rml_dir.empty() || !dev_resource_watch_.locale_dir.empty();
+        if (!dev_resource_watch_.enabled)
+            return;
+
+        scanDevResourceFiles(false);
+        dev_resource_watch_.next_scan = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        LOG_INFO("Resource hot reload enabled (RmlUI: '{}', locales: '{}')",
+                 dev_resource_watch_.rml_dir.empty() ? std::string("<disabled>")
+                                                     : lfs::core::path_to_utf8(dev_resource_watch_.rml_dir),
+                 dev_resource_watch_.locale_dir.empty() ? std::string("<disabled>")
+                                                        : lfs::core::path_to_utf8(dev_resource_watch_.locale_dir));
+#endif
+    }
+
+    std::pair<bool, bool> GuiManager::scanDevResourceFiles(const bool detect_changes) {
+        std::unordered_map<std::string, std::filesystem::file_time_type> next_times;
+        bool rml_changed = false;
+        bool locale_changed = false;
+
+        const auto scan_dir =
+            [&](const std::filesystem::path& dir, const bool locale_dir) {
+                if (dir.empty())
+                    return;
+
+                std::error_code ec;
+                if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec))
+                    return;
+
+                std::filesystem::recursive_directory_iterator it(
+                    dir, std::filesystem::directory_options::skip_permission_denied, ec);
+                const std::filesystem::recursive_directory_iterator end;
+                for (; !ec && it != end; it.increment(ec)) {
+                    std::error_code entry_ec;
+                    if (!it->is_regular_file(entry_ec) || entry_ec)
+                        continue;
+
+                    const auto kind = devResourceKindForPath(it->path());
+                    const bool watched = locale_dir
+                                             ? kind == DevResourceKind::Locale
+                                             : kind == DevResourceKind::Rml;
+                    if (!watched)
+                        continue;
+
+                    const auto mtime = std::filesystem::last_write_time(it->path(), entry_ec);
+                    if (entry_ec)
+                        continue;
+
+                    const std::string key = lfs::core::path_to_utf8(it->path().lexically_normal());
+                    next_times[key] = mtime;
+
+                    if (!detect_changes)
+                        continue;
+
+                    const auto old = dev_resource_watch_.file_times.find(key);
+                    if (old == dev_resource_watch_.file_times.end() || old->second != mtime) {
+                        if (locale_dir)
+                            locale_changed = true;
+                        else
+                            rml_changed = true;
+                    }
+                }
+            };
+
+        scan_dir(dev_resource_watch_.rml_dir, false);
+        scan_dir(dev_resource_watch_.locale_dir, true);
+
+        if (detect_changes) {
+            for (const auto& [key, unused] : dev_resource_watch_.file_times) {
+                (void)unused;
+                if (next_times.contains(key))
+                    continue;
+
+                const auto kind = devResourceKindForPath(lfs::core::utf8_to_path(key));
+                if (kind == DevResourceKind::Locale)
+                    locale_changed = true;
+                else if (kind == DevResourceKind::Rml)
+                    rml_changed = true;
+            }
+        }
+
+        dev_resource_watch_.file_times = std::move(next_times);
+        return {rml_changed, locale_changed};
+    }
+
+    bool GuiManager::reloadLocalizationResources() {
+        if (dev_resource_watch_.locale_dir.empty())
+            return false;
+
+        auto& loc = lfs::event::LocalizationManager::getInstance();
+        const std::string current_language = loc.getCurrentLanguage();
+        const std::string locale_path = lfs::core::path_to_utf8(dev_resource_watch_.locale_dir);
+        if (!loc.initialize(locale_path)) {
+            LOG_WARN("Failed to reload localization resources from {}", locale_path);
+            return false;
+        }
+
+        if (!current_language.empty() && current_language != loc.getCurrentLanguage()) {
+            const auto available = loc.getAvailableLanguages();
+            if (std::find(available.begin(), available.end(), current_language) != available.end())
+                loc.setLanguage(current_language);
+        }
+
+        return true;
+    }
+
+    void GuiManager::reloadRmlResources() {
+        rml_theme::invalidateBaseRcssCache();
+        rml_theme::invalidateThemeMediaCache();
+
+        startup_overlay_.reloadResources();
+        rml_shell_frame_.reloadResources();
+        rml_right_panel_.reloadResources();
+        rml_viewport_overlay_.reloadResources();
+        rml_menu_bar_.reloadResources();
+        rml_status_bar_.reloadResources();
+        sequencer_ui_.reloadRmlResources();
+        PanelRegistry::instance().reload_rml_resources();
+
+        if (rml_modal_overlay_)
+            rml_modal_overlay_->reloadResources();
+        if (global_context_menu_)
+            global_context_menu_->reloadResources();
+
+        if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr)
+            rendering->markDirty(DirtyFlag::OVERLAY);
+    }
+
+    bool GuiManager::shouldDeferDevResourceHotReload() const {
+        if (ImGui::GetCurrentContext()) {
+            const ImGuiIO& io = ImGui::GetIO();
+            if (io.WantTextInput || ImGui::IsAnyItemActive() ||
+                ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+                ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
+                ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
+                return true;
+            }
+        }
+
+        if (!ui_hidden_ && rml_menu_bar_.isOpen())
+            return true;
+        if (global_context_menu_ && global_context_menu_->isOpen())
+            return true;
+        if (rml_modal_overlay_ && rml_modal_overlay_->isOpen())
+            return true;
+
+        return false;
+    }
+
+    void GuiManager::pollDevResourceHotReload() {
+        if (!dev_resource_watch_.enabled)
+            return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (dev_resource_watch_.next_scan != std::chrono::steady_clock::time_point{} &&
+            now < dev_resource_watch_.next_scan) {
+            return;
+        }
+        dev_resource_watch_.next_scan = now + std::chrono::seconds(1);
+
+        const auto [rml_changed, locale_changed] = scanDevResourceFiles(true);
+        dev_resource_watch_.pending_rml_reload |= rml_changed;
+        dev_resource_watch_.pending_locale_reload |= locale_changed;
+
+        if (!dev_resource_watch_.pending_rml_reload &&
+            !dev_resource_watch_.pending_locale_reload) {
+            return;
+        }
+
+        if (shouldDeferDevResourceHotReload())
+            return;
+
+        const bool reload_rml = dev_resource_watch_.pending_rml_reload;
+        const bool reload_locale = dev_resource_watch_.pending_locale_reload;
+        dev_resource_watch_.pending_rml_reload = false;
+        dev_resource_watch_.pending_locale_reload = false;
+
+        if (reload_locale)
+            reloadLocalizationResources();
+        if (reload_rml || reload_locale)
+            reloadRmlResources();
+
+        LOG_INFO("Hot-reloaded dev resources{}{}",
+                 reload_rml ? " (RmlUI)" : "",
+                 reload_locale ? " (locales)" : "");
+    }
+
     void GuiManager::shutdown() {
         panel_layout_.saveState();
 
-        if (video_extraction_thread_ && video_extraction_thread_->joinable())
-            video_extraction_thread_->join();
-        video_extraction_thread_.reset();
+        if (video_widget_)
+            video_widget_->shutdown();
 
         async_tasks_.shutdown();
 
@@ -620,14 +1235,18 @@ namespace lfs::vis::gui {
             lfs::python::acquire_gil_main_thread();
 
         lfs::python::shutdown_python_gl_resources();
+        lfs::python::set_modal_enqueue_callback({});
 
         global_context_menu_->destroyGLResources();
+        rml_modal_overlay_.reset();
+        panels::ShutdownPythonConsoleRml();
         rml_status_bar_.shutdown();
         rml_menu_bar_.shutdown();
         rml_viewport_overlay_.shutdown();
         rml_right_panel_.shutdown();
         rml_shell_frame_.shutdown();
         startup_overlay_.shutdown();
+        PanelRegistry::instance().unregister_all_non_native();
         rmlui_manager_.shutdown();
 
         if (need_gil)
@@ -635,8 +1254,10 @@ namespace lfs::vis::gui {
 
         sequencer_ui_.destroyGLResources();
         drag_drop_.shutdown();
+        destroyCustomCursors();
 
         if (ImGui::GetCurrentContext()) {
+            saveImGuiSettings();
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplSDL3_Shutdown();
             ImPlot::DestroyContext();
@@ -654,13 +1275,13 @@ namespace lfs::vis::gui {
             return ptr;
         };
 
-        auto reg_panel = [&](const std::string& idname, const std::string& label,
+        auto reg_panel = [&](const std::string& id, const std::string& label,
                              std::shared_ptr<IPanel> panel, PanelSpace space, int order,
                              uint32_t options = 0, float initial_width = 0, float initial_height = 0) {
             PanelInfo info;
             info.panel = std::move(panel);
             info.label = label;
-            info.idname = idname;
+            info.id = id;
             info.space = space;
             info.order = order;
             info.options = options;
@@ -670,18 +1291,20 @@ namespace lfs::vis::gui {
             reg.register_panel(std::move(info));
         };
 
-        constexpr uint32_t SELF = static_cast<uint32_t>(PanelOption::SELF_MANAGED);
-
         // Floating panels (self-managed windows)
-        reg_panel("native.video_extractor", "Video Extractor",
-                  make_panel(VideoExtractorPanel(video_extractor_dialog_.get())),
-                  PanelSpace::Floating, 11, 0, 750.0f);
-        reg.set_panel_enabled("native.video_extractor", false);
+        {
+            auto panel = std::static_pointer_cast<IPanel>(
+                std::make_shared<NativeScenePanel>(&rmlui_manager_));
+            native_panel_storage_.push_back(panel);
+            reg_panel("lfs.scene", "Scene", panel, PanelSpace::SceneHeader, 0);
+        }
 
-        reg_panel("native.mesh2splat", "Mesh to Splat",
-                  make_panel(panels::Mesh2SplatPanel(viewer_)),
-                  PanelSpace::Floating, 12, 0, 400.0f);
-        reg.set_panel_enabled("native.mesh2splat", false);
+        reg_panel("native.video_extractor", "Video Extractor",
+                  make_panel(VideoExtractorPanel(video_widget_.get())),
+                  PanelSpace::Floating, 11,
+                  static_cast<uint32_t>(PanelOption::SELF_MANAGED),
+                  750.0f);
+        reg.set_panel_enabled("native.video_extractor", false);
 
         // Viewport overlays (ordered by draw priority)
         reg_panel("native.selection_overlay", "Selection Overlay",
@@ -702,7 +1325,8 @@ namespace lfs::vis::gui {
 
         reg_panel("native.sequencer", "Sequencer",
                   make_panel(SequencerPanel(&sequencer_ui_, &panel_layout_)),
-                  PanelSpace::ViewportOverlay, 500);
+                  PanelSpace::BottomDock, 500,
+                  0, 8192.0f);
 
         reg_panel("native.python_overlay", "Python Overlay",
                   make_panel(PythonOverlayPanel(this)),
@@ -722,14 +1346,16 @@ namespace lfs::vis::gui {
 
         reg_panel("native.startup_overlay", "Startup Overlay",
                   make_panel(StartupOverlayPanel(&startup_overlay_, &drag_drop_hovering_)),
-                  PanelSpace::ViewportOverlay, 1000);
-
-        reg_panel("native.status_bar", "##StatusBar",
-                  make_panel(RmlStatusBarPanel(&rml_status_bar_)),
-                  PanelSpace::StatusBar, 0);
+                  PanelSpace::ViewportOverlay, 0);
     }
 
     void GuiManager::render() {
+        if (auto* ri = rmlui_manager_.getRenderInterface()) {
+            auto* sm = viewer_->getSceneManager();
+            ri->set_scene_manager(sm);
+            ri->process_pending_preview_uploads();
+        }
+
         if (pending_cuda_warning_) {
             constexpr int MIN_MAJOR = lfs::core::MIN_CUDA_VERSION / 1000;
             constexpr int MIN_MINOR = (lfs::core::MIN_CUDA_VERSION % 1000) / 10;
@@ -742,6 +1368,8 @@ namespace lfs::vis::gui {
             pending_cuda_warning_.reset();
         }
 
+        promptFileAssociation();
+
         if (pending_ui_scale_ > 0.0f) {
             applyUiScale(pending_ui_scale_);
             pending_ui_scale_ = 0.0f;
@@ -750,43 +1378,72 @@ namespace lfs::vis::gui {
         drag_drop_.pollEvents();
         drag_drop_hovering_ = drag_drop_.isDragHovering();
 
+        if (auto* input_controller = viewer_->getInputController()) {
+            input_controller->getBindings().updateCapture();
+        }
+
         // Start frame
         ImGui_ImplOpenGL3_NewFrame();
 
         ImGui_ImplSDL3_NewFrame();
+        const auto& sdl_input = viewer_->getWindowManager()->frameInput();
 
         // Check mouse state before ImGui::NewFrame() updates WantCaptureMouse
-        ImVec2 mouse_pos = ImGui::GetMousePos();
-        bool mouse_in_viewport = isPositionInViewport(mouse_pos.x, mouse_pos.y);
+        const bool mouse_in_viewport = isPositionInViewport(sdl_input.mouse_x, sdl_input.mouse_y);
 
         ImGui::NewFrame();
 
+        {
+            auto& focus = guiFocusState();
+            focus.reset();
+            focus.want_capture_mouse = ImGui::GetIO().WantCaptureMouse;
+            focus.want_capture_keyboard = ImGui::GetIO().WantCaptureKeyboard;
+            focus.want_text_input = ImGui::GetIO().WantTextInput;
+        }
+
+        // Run queued Python/UI mutations before panel registries take draw snapshots.
+        python::flush_gl_callbacks();
+
+        rmlui_manager_.beginFrameCursorTracking();
+        const bool modal_overlay_open = rml_modal_overlay_->isOpen();
+        const bool context_menu_open = global_context_menu_ && global_context_menu_->isOpen();
+        const bool block_underlay_input = modal_overlay_open || context_menu_open;
+
         if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
-            ImGui::ClearActiveID();
-            if (auto* editor = panels::PythonConsoleState::getInstance().getEditor()) {
-                editor->unfocus();
+            auto* console_state = panels::PythonConsoleState::tryGetInstance();
+            auto* editor = console_state ? console_state->getEditor() : nullptr;
+            const bool editor_owns_escape =
+                editor && (editor->isFocused() || editor->hasActiveCompletion());
+            if (!editor_owns_escape) {
+                widgets::RequestActiveEditCancel();
+                ImGui::ClearActiveID();
+                if (editor != nullptr) {
+                    editor->unfocus();
+                }
             }
         }
 
         // Check for async import completion (must happen on main thread)
         async_tasks_.pollImportCompletion();
         async_tasks_.pollMesh2SplatCompletion();
+        async_tasks_.pollSplatSimplifyCompletion();
 
         // Poll UV package manager for async operations
         python::PackageManager::instance().poll();
+
+        pollDevResourceHotReload();
 
         // Hot-reload themes (check once per second)
         {
             static auto last_check = std::chrono::steady_clock::now();
             const auto now = std::chrono::steady_clock::now();
             if (now - last_check > std::chrono::seconds(1)) {
-                checkThemeFileChanges();
+                if (checkThemeFileChanges()) {
+                    rml_theme::invalidateThemeMediaCache();
+                }
                 last_check = now;
             }
         }
-
-        // Initialize ImGuizmo for this frame
-        ImGuizmo::BeginFrame();
 
         if (menu_bar_ && !ui_hidden_) {
             menu_bar_->render();
@@ -815,63 +1472,33 @@ namespace lfs::vis::gui {
                 vp->UpdateWorkRect();
             }
 
-            const auto& io = ImGui::GetIO();
-            PanelInputState menu_input;
-            menu_input.mouse_x = io.MousePos.x;
-            menu_input.mouse_y = io.MousePos.y;
-            menu_input.mouse_down[0] = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-            menu_input.mouse_clicked[0] = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-            menu_input.screen_w = static_cast<int>(ImGui::GetMainViewport()->Size.x);
-            menu_input.screen_h = static_cast<int>(ImGui::GetMainViewport()->Size.y);
+            PanelInputState menu_input = buildPanelInputFromSDL(sdl_input);
+            if (const ImGuiViewport* const main_viewport = ImGui::GetMainViewport()) {
+                menu_input.screen_x = main_viewport->Pos.x;
+                menu_input.screen_y = main_viewport->Pos.y;
+                menu_input.screen_w = static_cast<int>(main_viewport->Size.x);
+                menu_input.screen_h = static_cast<int>(main_viewport->Size.y);
+            }
+            if (block_underlay_input)
+                menu_input = maskInputForBlockedUi(std::move(menu_input));
 
             rml_menu_bar_.processInput(menu_input);
 
             if (rml_menu_bar_.wantsInput())
-                ImGui::GetIO().WantCaptureMouse = true;
+                guiFocusState().want_capture_mouse = true;
 
             rml_menu_bar_.draw(menu_input.screen_w, menu_input.screen_h);
-
-            if (rml_menu_bar_.fbo().valid() && !rml_menu_bar_.isOpen()) {
-                auto* dl = ImGui::GetForegroundDrawList();
-                auto* mvp = ImGui::GetMainViewport();
-                ImVec2 pos = mvp->Pos;
-                float sw = static_cast<float>(menu_input.screen_w);
-                rml_menu_bar_.fbo().blitToDrawList(dl, pos, {sw, rml_menu_bar_.barHeight()});
-            }
+        } else {
+            rml_menu_bar_.suspend();
         }
 
-        updateInputOverrides(mouse_in_viewport);
+        PanelInputState frame_input = buildPanelInputFromSDL(sdl_input);
+        updateInputOverrides(frame_input, mouse_in_viewport);
+        if (auto* const wm = viewer_->getWindowManager()) {
+            frame_input.viewport_keyboard_focus = wm->inputRouter().isViewportKeyboardFocused();
+        }
 
-        // Create main dockspace
-        const ImGuiViewport* main_viewport = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(main_viewport->WorkPos);
-        ImGui::SetNextWindowSize(main_viewport->WorkSize);
-        ImGui::SetNextWindowViewport(main_viewport->ID);
-
-        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoDocking |
-                                        ImGuiWindowFlags_NoTitleBar |
-                                        ImGuiWindowFlags_NoCollapse |
-                                        ImGuiWindowFlags_NoResize |
-                                        ImGuiWindowFlags_NoMove |
-                                        ImGuiWindowFlags_NoBringToFrontOnFocus |
-                                        ImGuiWindowFlags_NoNavFocus |
-                                        ImGuiWindowFlags_NoBackground;
-
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-
-        ImGui::Begin("DockSpace", nullptr, window_flags);
-        ImGui::PopStyleVar(3);
-
-        // DockSpace ID
-        ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
-
-        // Create dockspace
-        ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode;
-        ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
-
-        ImGui::End();
+        auto& reg = PanelRegistry::instance();
 
         if (!ui_hidden_) {
             const auto* mvp = ImGui::GetMainViewport();
@@ -879,17 +1506,26 @@ namespace lfs::vis::gui {
             const float panel_h = mvp->WorkSize.y - status_bar_h;
 
             ShellRegions shell_regions;
-            shell_regions.menu_pos = mvp->Pos;
-            shell_regions.menu_size = {mvp->Size.x, mvp->WorkPos.y - mvp->Pos.y};
+            shell_regions.screen = {mvp->Pos.x, mvp->Pos.y, mvp->Size.x, mvp->Size.y};
+            shell_regions.menu = {mvp->Pos.x, mvp->Pos.y,
+                                  mvp->Size.x, mvp->WorkPos.y - mvp->Pos.y};
 
             if (show_main_panel_) {
                 const float rpw = panel_layout_.getRightPanelWidth();
-                shell_regions.right_panel_pos = {mvp->WorkPos.x + mvp->WorkSize.x - rpw, mvp->WorkPos.y};
-                shell_regions.right_panel_size = {rpw, panel_h};
+                shell_regions.right_panel = {
+                    mvp->WorkPos.x + mvp->WorkSize.x - rpw,
+                    mvp->WorkPos.y,
+                    rpw,
+                    panel_h,
+                };
             }
 
-            shell_regions.status_pos = {mvp->WorkPos.x, mvp->WorkPos.y + mvp->WorkSize.y - status_bar_h};
-            shell_regions.status_size = {mvp->WorkSize.x, status_bar_h};
+            shell_regions.status = {
+                mvp->WorkPos.x,
+                mvp->WorkPos.y + mvp->WorkSize.y - status_bar_h,
+                mvp->WorkSize.x,
+                status_bar_h,
+            };
 
             rml_shell_frame_.render(shell_regions);
         }
@@ -904,6 +1540,7 @@ namespace lfs::vis::gui {
             .window_states = &window_states_,
             .editor = &editor_ctx,
             .sequencer_controller = &sequencer_ui_.controller(),
+            .rml_manager = &rmlui_manager_,
             .fonts = buildFontSet()};
 
         // Build draw context for panel registry
@@ -916,57 +1553,66 @@ namespace lfs::vis::gui {
         draw_ctx.viewport = &viewport_layout_;
         draw_ctx.scene = scene;
         draw_ctx.ui_hidden = ui_hidden_;
+        draw_ctx.frame_serial = ++panel_frame_serial_;
         draw_ctx.scene_generation = python::get_scene_generation();
         if (auto* sm = ctx.viewer->getSceneManager())
             draw_ctx.has_selection = sm->hasSelectedNode();
         if (auto* cc = lfs::event::command_center())
             draw_ctx.is_training = cc->snapshot().is_running;
 
-        auto& reg = PanelRegistry::instance();
+        reg.preload_panels(PanelSpace::SceneHeader, draw_ctx);
+        reg.preload_panels(PanelSpace::SidePanel, draw_ctx);
 
-        const auto* mvp_input = ImGui::GetMainViewport();
-        const auto& io = ImGui::GetIO();
-        PanelInputState panel_input;
-        panel_input.mouse_x = io.MousePos.x;
-        panel_input.mouse_y = io.MousePos.y;
-        panel_input.mouse_down[0] = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-        panel_input.mouse_down[1] = ImGui::IsMouseDown(ImGuiMouseButton_Right);
-        panel_input.mouse_down[2] = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
-        panel_input.mouse_clicked[0] = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-        panel_input.mouse_clicked[1] = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
-        panel_input.mouse_clicked[2] = ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
-        panel_input.mouse_released[0] = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
-        panel_input.mouse_released[1] = ImGui::IsMouseReleased(ImGuiMouseButton_Right);
-        panel_input.mouse_released[2] = ImGui::IsMouseReleased(ImGuiMouseButton_Middle);
-        panel_input.screen_w = static_cast<int>(mvp_input->Size.x);
-        panel_input.screen_h = static_cast<int>(mvp_input->Size.y);
-        panel_input.bg_draw_list = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
-        panel_input.fg_draw_list = ImGui::GetForegroundDrawList(ImGui::GetMainViewport());
-        panel_input.mouse_wheel = io.MouseWheel;
-        panel_input.key_ctrl = io.KeyCtrl;
-        panel_input.key_shift = io.KeyShift;
-        panel_input.key_alt = io.KeyAlt;
-        panel_input.key_super = io.KeySuper;
-
-        for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
-            auto imgui_key = static_cast<ImGuiKey>(k);
-            int sc = imguiKeyToSDLScancode(imgui_key);
-            if (sc < 0)
-                continue;
-            if (ImGui::IsKeyPressed(imgui_key, false))
-                panel_input.keys_pressed.push_back(sc);
-            if (ImGui::IsKeyReleased(imgui_key))
-                panel_input.keys_released.push_back(sc);
-        }
-
-        global_context_menu_->processInput(panel_input);
-        if (global_context_menu_->isOpen())
-            panel_input.mouse_wheel = 0;
+        auto* mvp_input = ImGui::GetMainViewport();
+        s_frame_input = &sdl_input;
+        PanelInputState panel_input = frame_input;
+        panel_input.screen_x = mvp_input->Pos.x;
+        panel_input.screen_y = mvp_input->Pos.y;
+        panel_input.bg_draw_list = ImGui::GetBackgroundDrawList(mvp_input);
+        panel_input.fg_draw_list = ImGui::GetForegroundDrawList(mvp_input);
+        PanelInputState raw_panel_input = panel_input;
+        if (block_underlay_input)
+            panel_input = maskInputForBlockedUi(std::move(panel_input));
+        RmlPanelHost::clearQueuedForegroundComposites();
+        if (!modal_overlay_open)
+            global_context_menu_->processInput(raw_panel_input);
 
         ScreenState screen;
         screen.work_pos = {mvp_input->WorkPos.x, mvp_input->WorkPos.y};
         screen.work_size = {mvp_input->WorkSize.x, mvp_input->WorkSize.y};
         screen.any_item_active = ImGui::IsAnyItemActive();
+
+        constexpr uint8_t kUiLayoutSettleFrames = 3;
+        const bool python_console_visible = window_states_["python_console"];
+        const bool ui_layout_changed =
+            std::abs(screen.work_pos.x - last_ui_layout_work_pos_.x) > 0.5f ||
+            std::abs(screen.work_pos.y - last_ui_layout_work_pos_.y) > 0.5f ||
+            std::abs(screen.work_size.x - last_ui_layout_work_size_.x) > 0.5f ||
+            std::abs(screen.work_size.y - last_ui_layout_work_size_.y) > 0.5f ||
+            std::abs(panel_layout_.getRightPanelWidth() - last_ui_layout_right_panel_w_) > 0.5f ||
+            std::abs(panel_layout_.getScenePanelRatio() - last_ui_layout_scene_ratio_) > 0.0001f ||
+            std::abs(panel_layout_.getPythonConsoleWidth() - last_ui_layout_python_console_w_) > 0.5f ||
+            std::abs(panel_layout_.getBottomDockHeight() - last_ui_layout_bottom_dock_h_) > 0.5f ||
+            show_main_panel_ != last_ui_layout_show_main_panel_ ||
+            ui_hidden_ != last_ui_layout_ui_hidden_ ||
+            python_console_visible != last_ui_layout_python_console_visible_ ||
+            panel_layout_.isBottomDockVisible() != last_ui_layout_bottom_dock_visible_ ||
+            panel_layout_.getActiveTab() != last_ui_layout_active_tab_;
+
+        if (ui_layout_changed) {
+            ui_layout_settle_frames_ = kUiLayoutSettleFrames;
+            last_ui_layout_work_pos_ = screen.work_pos;
+            last_ui_layout_work_size_ = screen.work_size;
+            last_ui_layout_right_panel_w_ = panel_layout_.getRightPanelWidth();
+            last_ui_layout_scene_ratio_ = panel_layout_.getScenePanelRatio();
+            last_ui_layout_python_console_w_ = panel_layout_.getPythonConsoleWidth();
+            last_ui_layout_bottom_dock_h_ = panel_layout_.getBottomDockHeight();
+            last_ui_layout_show_main_panel_ = show_main_panel_;
+            last_ui_layout_ui_hidden_ = ui_hidden_;
+            last_ui_layout_python_console_visible_ = python_console_visible;
+            last_ui_layout_bottom_dock_visible_ = panel_layout_.isBottomDockVisible();
+            last_ui_layout_active_tab_ = panel_layout_.getActiveTab();
+        }
 
         if (show_main_panel_ && !ui_hidden_) {
             const float sbh = PanelLayoutManager::STATUS_BAR_HEIGHT * current_ui_scale_;
@@ -983,37 +1629,54 @@ namespace lfs::vis::gui {
             rp_layout.scene_h = scene_h + 8.0f;
             rp_layout.splitter_h = splitter_h;
 
-            rml_right_panel_.processInput(rp_layout, panel_input);
+            const bool float_blocks_rp = reg.isPositionOverFloatingPanel(
+                panel_input.mouse_x, panel_input.mouse_y);
+            if (float_blocks_rp) {
+                PanelInputState masked_input = panel_input;
+                masked_input.mouse_x = -1.0e9f;
+                masked_input.mouse_y = -1.0e9f;
+                for (auto& v : masked_input.mouse_clicked)
+                    v = false;
+                for (auto& v : masked_input.mouse_released)
+                    v = false;
+                for (auto& v : masked_input.mouse_down)
+                    v = false;
+                masked_input.mouse_wheel = 0;
+                rml_right_panel_.processInput(rp_layout, masked_input);
+            } else {
+                rml_right_panel_.processInput(rp_layout, panel_input);
+            }
 
-            if (rml_right_panel_.wantsInput())
-                ImGui::GetIO().WantCaptureMouse = true;
+            if (rml_right_panel_.wantsInput() && !float_blocks_rp)
+                guiFocusState().want_capture_mouse = true;
+            if (rml_right_panel_.wantsKeyboard())
+                guiFocusState().want_capture_keyboard = true;
 
             const auto main_tabs = reg.get_panels_for_space(PanelSpace::MainPanelTab);
+            panel_layout_.syncActiveTab(main_tabs, focus_panel_name_);
             std::vector<TabSnapshot> tab_snaps;
             tab_snaps.reserve(main_tabs.size());
-            for (const auto& t : main_tabs)
-                tab_snaps.push_back({t.idname, t.label});
+            for (size_t i = 0; i < main_tabs.size(); ++i) {
+                const auto& t = main_tabs[i];
+                tab_snaps.push_back({
+                    .id = t.id,
+                    .label = t.label,
+                    .dom_id = makeRmlTabDomId(t.id),
+                });
+            }
 
-            rml_right_panel_.render(rp_layout, tab_snaps, panel_layout_.getActiveTab());
+            rml_right_panel_.render(rp_layout, tab_snaps, panel_layout_.getActiveTab(),
+                                    panel_input.screen_x, panel_input.screen_y,
+                                    panel_input.screen_w, panel_input.screen_h);
         }
 
         panel_layout_.renderRightPanel(ctx, draw_ctx, show_main_panel_, ui_hidden_,
                                        window_states_, focus_panel_name_, panel_input, screen);
+        panel_layout_.renderBottomDock(draw_ctx, show_main_panel_, ui_hidden_,
+                                       panel_input, screen);
 
-        {
-            auto tip = RmlPanelHost::consumeFrameTooltip();
-            if (!tip.empty()) {
-                ImGui::BeginTooltip();
-                ImGui::TextUnformatted(tip.c_str());
-                ImGui::EndTooltip();
-            }
-            if (RmlPanelHost::consumeFrameWantsKeyboard()) {
-                ImGui::GetIO().WantCaptureKeyboard = true;
-                ImGui::GetIO().WantTextInput = true;
-            }
-        }
+        applyFrameInputCapture(&rml_right_panel_);
 
-        // Apply cursor requests from right panel and panel layout
         auto apply_cursor = [](CursorRequest req) {
             switch (req) {
             case CursorRequest::ResizeEW: ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW); break;
@@ -1021,60 +1684,183 @@ namespace lfs::vis::gui {
             default: break;
             }
         };
-        apply_cursor(rml_right_panel_.getCursorRequest());
-        apply_cursor(panel_layout_.getCursorRequest());
-
         python::set_viewport_bounds(viewport_layout_.pos.x, viewport_layout_.pos.y,
                                     viewport_layout_.size.x, viewport_layout_.size.y);
 
-        reg.draw_panels(PanelSpace::Floating, draw_ctx);
-        reg.draw_panels(PanelSpace::Dockable, draw_ctx);
+        PanelInputState floating_input = panel_input;
+        floating_input.bg_draw_list = ImGui::GetForegroundDrawList(ImGui::GetMainViewport());
+        reg.draw_panels(PanelSpace::Floating, draw_ctx, &floating_input);
+
+        applyFrameInputCapture(&rml_right_panel_);
 
         gizmo_manager_.updateToolState(ctx, ui_hidden_);
         gizmo_manager_.updateCropFlash();
 
-        rml_viewport_overlay_.setViewportBounds(viewport_layout_.pos, viewport_layout_.size);
-        rml_viewport_overlay_.processInput();
+        float primary_toolbar_x = 0.0f;
+        float primary_toolbar_width = viewport_layout_.size.x;
+        bool show_secondary_toolbar = false;
+        float secondary_toolbar_x = 0.0f;
+        float secondary_toolbar_width = 0.0f;
+        if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
+            rendering && rendering->isIndependentSplitViewActive()) {
+            if (const auto primary_panel = rendering->resolveViewerPanel(
+                    viewer_->getViewport(),
+                    viewport_layout_.pos, viewport_layout_.size, std::nullopt, SplitViewPanelId::Left)) {
+                primary_toolbar_x = primary_panel->x - viewport_layout_.pos.x;
+                primary_toolbar_width = primary_panel->width;
+            }
+            if (const auto secondary_panel = rendering->resolveViewerPanel(
+                    viewer_->getViewport(),
+                    viewport_layout_.pos, viewport_layout_.size, std::nullopt, SplitViewPanelId::Right)) {
+                show_secondary_toolbar = secondary_panel->valid();
+                secondary_toolbar_x = secondary_panel->x - viewport_layout_.pos.x;
+                secondary_toolbar_width = secondary_panel->width;
+            }
+        }
+
+        rml_viewport_overlay_.setToolbarPanels(primary_toolbar_x,
+                                               primary_toolbar_width,
+                                               show_secondary_toolbar,
+                                               secondary_toolbar_x,
+                                               secondary_toolbar_width);
+        rml_viewport_overlay_.setViewportBounds(
+            viewport_layout_.pos, viewport_layout_.size,
+            {panel_input.screen_x, panel_input.screen_y});
+        RmlViewportOverlay::GTMetricsOverlayState gt_metrics_overlay;
+        if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr) {
+            const auto settings = rendering->getSettings();
+            if (rendering->isGTComparisonActive() &&
+                settings.camera_metrics_mode != RenderSettings::CameraMetricsMode::Off) {
+                gt_metrics_overlay.visible = true;
+                gt_metrics_overlay.psnr_text = "--";
+                gt_metrics_overlay.show_ssim =
+                    settings.camera_metrics_mode == RenderSettings::CameraMetricsMode::PSNRSSIM;
+                gt_metrics_overlay.ssim_text = "--";
+
+                const auto content_bounds = rendering->getContentBounds(glm::ivec2(
+                    std::max(static_cast<int>(viewport_layout_.size.x), 0),
+                    std::max(static_cast<int>(viewport_layout_.size.y), 0)));
+                gt_metrics_overlay.x =
+                    content_bounds.x + content_bounds.width * settings.split_position + 18.0f;
+                gt_metrics_overlay.y = content_bounds.y + 18.0f;
+
+                const int current_camera_id = rendering->getCurrentCameraId();
+                if (const auto metrics = rendering->getLatestCameraMetrics();
+                    metrics && metrics->camera_id == current_camera_id) {
+                    gt_metrics_overlay.psnr_text = std::format("{:.2f}", metrics->psnr);
+                    if (gt_metrics_overlay.show_ssim && metrics->ssim.has_value()) {
+                        gt_metrics_overlay.ssim_text = std::format("{:.4f}", *metrics->ssim);
+                    }
+                }
+            }
+        }
+        rml_viewport_overlay_.setGTMetricsOverlay(std::move(gt_metrics_overlay));
+        startup_overlay_.setInput(&panel_input);
+        if (startup_overlay_.isVisible()) {
+            auto& focus = guiFocusState();
+            focus.want_capture_mouse = true;
+            focus.want_capture_keyboard = true;
+        }
+        rml_viewport_overlay_.processInput(panel_input);
+        if (rml_viewport_overlay_.wantsInput() && panel_input.mouse_clicked[0]) {
+            if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
+                rendering && rendering->isIndependentSplitViewActive()) {
+                if (const auto target_panel = rendering->resolveViewerPanel(
+                        viewer_->getViewport(),
+                        viewport_layout_.pos,
+                        viewport_layout_.size,
+                        glm::vec2(panel_input.mouse_x, panel_input.mouse_y))) {
+                    if (auto* const input_controller = viewer_->getInputController()) {
+                        input_controller->setFocusedSplitPanel(target_panel->panel);
+                    } else {
+                        rendering->setFocusedSplitPanel(target_panel->panel);
+                    }
+                }
+            }
+        }
+        if (lfs::python::has_python_hooks("viewport_overlay", "draw")) {
+            lfs::python::invoke_python_hooks("viewport_overlay", "draw", true);
+            lfs::python::invoke_python_hooks("viewport_overlay", "draw", false);
+        }
         reg.draw_panels(PanelSpace::ViewportOverlay, draw_ctx);
 
         rml_viewport_overlay_.render();
 
-        if (rml_menu_bar_.isOpen() && rml_menu_bar_.fbo().valid()) {
-            auto* mvp = ImGui::GetMainViewport();
-            rml_menu_bar_.fbo().blitToDrawList(
-                ImGui::GetForegroundDrawList(), mvp->Pos, mvp->Size);
-        }
+        applyFrameInputCapture();
+        const std::string frame_tooltip = RmlPanelHost::consumeFrameTooltip();
 
         // Recompute viewport layout
         viewport_layout_ = panel_layout_.computeViewportLayout(
             show_main_panel_, ui_hidden_, window_states_["python_console"], screen);
 
         if (!ui_hidden_) {
-            reg.draw_panels(PanelSpace::StatusBar, draw_ctx);
+            const float status_bar_h =
+                PanelLayoutManager::STATUS_BAR_HEIGHT * lfs::python::get_shared_dpi_scale();
+            rml_status_bar_.render(draw_ctx,
+                                   screen.work_pos.x,
+                                   screen.work_pos.y + screen.work_size.y - status_bar_h,
+                                   screen.work_size.x,
+                                   status_bar_h,
+                                   panel_input.screen_w,
+                                   panel_input.screen_h);
+            reg.draw_panels(PanelSpace::StatusBar, draw_ctx, &panel_input);
         }
 
         python::draw_python_modals(scene);
         python::draw_python_popups(scene);
 
-        global_context_menu_->render(panel_input.screen_w, panel_input.screen_h);
-
-        {
-            const auto* mvp_modal = ImGui::GetMainViewport();
-            rml_modal_overlay_->processInput();
-            rml_modal_overlay_->render(static_cast<int>(mvp_modal->Size.x),
-                                       static_cast<int>(mvp_modal->Size.y),
-                                       viewport_layout_.pos.x, viewport_layout_.pos.y,
-                                       viewport_layout_.size.x, viewport_layout_.size.y);
-        }
+        rml_modal_overlay_->processInput(raw_panel_input);
+        rml_viewport_overlay_.compositeToScreen(panel_input.screen_w, panel_input.screen_h);
+        if (ImGui::GetMouseCursor() == ImGuiMouseCursor_Arrow)
+            applyRmlCursorRequest(rmlui_manager_.consumeCursorRequest());
+        apply_cursor(rml_right_panel_.getCursorRequest());
+        apply_cursor(panel_layout_.getCursorRequest());
+        if (SDL_Cursor* const cursor = systemCursorForImGuiCursor(ImGui::GetMouseCursor()))
+            SDL_SetCursor(cursor);
+        syncWindowTextInput(viewer_->getWindow());
 
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        guiFocusState().any_item_active |= ImGui::IsAnyItemActive();
 
         // Clean up GL state after ImGui rendering (ImGui can leave VAO/shader bindings corrupted)
         glBindVertexArray(0);
         glUseProgram(0);
         glBindTexture(GL_TEXTURE_2D, 0);
         // Clear any errors ImGui might have generated
+        while (glGetError() != GL_NO_ERROR) {}
+
+        RmlPanelHost::flushQueuedForegroundComposites(panel_input.screen_w, panel_input.screen_h);
+        sequencer_ui_.compositeOverlays(panel_input.screen_w, panel_input.screen_h);
+        drawFrameTooltip(frame_tooltip, panel_input.screen_w, panel_input.screen_h);
+
+        if (menu_bar_ && !ui_hidden_ && rml_menu_bar_.fbo().valid()) {
+            const float menu_height = rml_menu_bar_.isOpen()
+                                          ? static_cast<float>(panel_input.screen_h)
+                                          : rml_menu_bar_.barHeight();
+            rml_menu_bar_.fbo().blitToScreen(
+                0.0f, 0.0f,
+                static_cast<float>(panel_input.screen_w),
+                menu_height,
+                panel_input.screen_w, panel_input.screen_h);
+        }
+
+        global_context_menu_->render(panel_input.screen_w, panel_input.screen_h,
+                                     panel_input.screen_x, panel_input.screen_y);
+
+        {
+            const auto* mvp_modal = ImGui::GetMainViewport();
+            rml_modal_overlay_->render(static_cast<int>(mvp_modal->Size.x),
+                                       static_cast<int>(mvp_modal->Size.y),
+                                       mvp_modal->Pos.x, mvp_modal->Pos.y,
+                                       viewport_layout_.pos.x, viewport_layout_.pos.y,
+                                       viewport_layout_.size.x, viewport_layout_.size.y);
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
         while (glGetError() != GL_NO_ERROR) {}
 
         // Update and Render additional Platform Windows (for multi-viewport)
@@ -1091,6 +1877,11 @@ namespace lfs::vis::gui {
             glBindTexture(GL_TEXTURE_2D, 0);
             while (glGetError() != GL_NO_ERROR) {}
         }
+
+        if (!ui_layout_changed && ui_layout_settle_frames_ > 0)
+            --ui_layout_settle_frames_;
+
+        persistImGuiSettingsIfNeeded();
     }
 
     void GuiManager::renderSelectionOverlays(const UIContext& ctx) {
@@ -1101,27 +1892,106 @@ namespace lfs::vis::gui {
             tool->renderUI(ctx, nullptr);
         }
 
-        const bool mouse_over_ui = ImGui::GetIO().WantCaptureMouse;
+        const bool mouse_over_ui = guiFocusState().want_capture_mouse;
         if (!ui_hidden_ && !mouse_over_ui && viewport_layout_.size.x > 0 && viewport_layout_.size.y > 0) {
             auto* rm = ctx.viewer->getRenderingManager();
             auto* draw_list = ImGui::GetForegroundDrawList();
+            const glm::ivec2 rendered_size = rm ? rm->getRenderedSize() : glm::ivec2(0);
+            struct PreviewPanelContext {
+                float x = 0.0f;
+                float y = 0.0f;
+                float width = 0.0f;
+                float height = 0.0f;
+                int render_width = 0;
+                int render_height = 0;
+                const Viewport* viewport = nullptr;
+            };
+            const auto resolve_preview_panel = [&](const std::optional<SplitViewPanelId> panel) {
+                PreviewPanelContext panel_ctx{
+                    .x = viewport_layout_.pos.x,
+                    .y = viewport_layout_.pos.y,
+                    .width = viewport_layout_.size.x,
+                    .height = viewport_layout_.size.y,
+                    .render_width =
+                        rendered_size.x > 0 ? rendered_size.x : static_cast<int>(ctx.viewer->getViewport().windowSize.x),
+                    .render_height =
+                        rendered_size.y > 0 ? rendered_size.y : static_cast<int>(ctx.viewer->getViewport().windowSize.y),
+                    .viewport = &ctx.viewer->getViewport(),
+                };
+                if (!rm || !panel || !rm->isIndependentSplitViewActive()) {
+                    return panel_ctx;
+                }
 
-            if (rm && rm->isBrushActive()) {
+                const auto info = rm->resolveViewerPanel(
+                    ctx.viewer->getViewport(),
+                    {viewport_layout_.pos.x, viewport_layout_.pos.y},
+                    {viewport_layout_.size.x, viewport_layout_.size.y},
+                    std::nullopt,
+                    panel);
+                if (!info) {
+                    return panel_ctx;
+                }
+
+                panel_ctx.x = info->x;
+                panel_ctx.y = info->y;
+                panel_ctx.width = info->width;
+                panel_ctx.height = info->height;
+                panel_ctx.render_width = info->render_width;
+                panel_ctx.render_height = info->render_height;
+                panel_ctx.viewport = info->viewport;
+                return panel_ctx;
+            };
+            const auto render_to_screen = [&](const PreviewPanelContext& panel_ctx, const float x, const float y) {
+                const float render_to_screen_x =
+                    (panel_ctx.render_width > 0)
+                        ? (panel_ctx.width / static_cast<float>(panel_ctx.render_width))
+                        : (1.0f / std::max(rm ? rm->getSettings().render_scale : 1.0f, 0.001f));
+                const float render_to_screen_y =
+                    (panel_ctx.render_height > 0)
+                        ? (panel_ctx.height / static_cast<float>(panel_ctx.render_height))
+                        : (1.0f / std::max(rm ? rm->getSettings().render_scale : 1.0f, 0.001f));
+                return ImVec2(panel_ctx.x + x * render_to_screen_x,
+                              panel_ctx.y + y * render_to_screen_y);
+            };
+            // Keep preview overlays inside the live viewport region so docked panels stay in front.
+            const auto push_preview_clip = [&](const PreviewPanelContext& panel_ctx) {
+                const ImVec2 clip_min(panel_ctx.x, panel_ctx.y);
+                float clip_bottom = panel_ctx.y + panel_ctx.height;
+                const float bottom_dock_top = panel_layout_.bottomDockTopY();
+                if (bottom_dock_top > 0.0f) {
+                    clip_bottom = std::min(clip_bottom, bottom_dock_top);
+                }
+
+                const ImVec2 clip_max(panel_ctx.x + panel_ctx.width, clip_bottom);
+                if (clip_max.x <= clip_min.x || clip_max.y <= clip_min.y) {
+                    return false;
+                }
+
+                draw_list->PushClipRect(clip_min, clip_max, true);
+                return true;
+            };
+
+            if (rm && rm->isCursorPreviewActive()) {
                 const auto& t = theme();
                 float bx, by, br;
                 bool add_mode;
-                rm->getBrushState(bx, by, br, add_mode);
+                rm->getCursorPreviewState(bx, by, br, add_mode);
+                const auto panel_ctx = resolve_preview_panel(rm->getCursorPreviewPanel());
 
-                const float render_scale = rm->getSettings().render_scale;
-                const ImVec2 screen_pos(viewport_layout_.pos.x + bx / render_scale,
-                                        viewport_layout_.pos.y + by / render_scale);
-                const float screen_radius = br / render_scale;
+                const ImVec2 screen_pos = render_to_screen(panel_ctx, bx, by);
+                const float screen_radius =
+                    (panel_ctx.render_width > 0)
+                        ? br * (panel_ctx.width / static_cast<float>(panel_ctx.render_width))
+                        : br;
 
                 const ImU32 brush_color = add_mode
                                               ? toU32WithAlpha(t.palette.success, 0.8f)
                                               : toU32WithAlpha(t.palette.error, 0.8f);
-                draw_list->AddCircle(screen_pos, screen_radius, brush_color, 32, 2.0f);
-                draw_list->AddCircleFilled(screen_pos, 3.0f, brush_color);
+                if (push_preview_clip(panel_ctx)) {
+                    draw_list->AddCircle(screen_pos, screen_radius, brush_color, 32, 2.0f);
+                    draw_list->AddCircleFilled(screen_pos, 3.0f, brush_color);
+                    draw_list->PopClipRect();
+                }
             }
 
             if (rm && rm->isRectPreviewActive()) {
@@ -1129,10 +1999,10 @@ namespace lfs::vis::gui {
                 float rx0, ry0, rx1, ry1;
                 bool add_mode;
                 rm->getRectPreview(rx0, ry0, rx1, ry1, add_mode);
+                const auto panel_ctx = resolve_preview_panel(rm->getRectPreviewPanel());
 
-                const float render_scale = rm->getSettings().render_scale;
-                const ImVec2 p0(viewport_layout_.pos.x + rx0 / render_scale, viewport_layout_.pos.y + ry0 / render_scale);
-                const ImVec2 p1(viewport_layout_.pos.x + rx1 / render_scale, viewport_layout_.pos.y + ry1 / render_scale);
+                const ImVec2 p0 = render_to_screen(panel_ctx, rx0, ry0);
+                const ImVec2 p1 = render_to_screen(panel_ctx, rx1, ry1);
 
                 const ImU32 fill_color = add_mode
                                              ? toU32WithAlpha(t.palette.success, 0.15f)
@@ -1141,110 +2011,152 @@ namespace lfs::vis::gui {
                                                ? toU32WithAlpha(t.palette.success, 0.8f)
                                                : toU32WithAlpha(t.palette.error, 0.8f);
 
-                draw_list->AddRectFilled(p0, p1, fill_color);
-                draw_list->AddRect(p0, p1, border_color, 0.0f, 0, 2.0f);
+                if (push_preview_clip(panel_ctx)) {
+                    draw_list->AddRectFilled(p0, p1, fill_color);
+                    draw_list->AddRect(p0, p1, border_color, 0.0f, 0, 2.0f);
+                    draw_list->PopClipRect();
+                }
             }
 
             if (rm && rm->isPolygonPreviewActive()) {
                 const auto& t = theme();
+                const auto& points = rm->getPolygonPoints();
                 const auto& world_points = rm->getPolygonWorldPoints();
                 const bool closed = rm->isPolygonClosed();
                 const bool add_mode = rm->isPolygonAddMode();
+                const auto panel_ctx = resolve_preview_panel(rm->getPolygonPreviewPanel());
 
-                if (!world_points.empty()) {
-                    const auto& viewport = ctx.viewer->getViewport();
-                    const glm::mat4 view = viewport.getViewMatrix();
-                    const glm::mat4 proj = viewport.getProjectionMatrix(rm->getFocalLengthMm());
-                    const glm::mat4 vp_mat = proj * view;
-
+                if (!points.empty() || !world_points.empty()) {
                     const ImU32 line_color = add_mode
                                                  ? toU32WithAlpha(t.palette.success, 0.8f)
                                                  : toU32WithAlpha(t.palette.error, 0.8f);
                     const ImU32 fill_color = add_mode
                                                  ? toU32WithAlpha(t.palette.success, 0.15f)
                                                  : toU32WithAlpha(t.palette.error, 0.15f);
-                    const ImU32 vertex_color = add_mode
-                                                   ? toU32WithAlpha(t.palette.success, 1.0f)
-                                                   : toU32WithAlpha(t.palette.error, 1.0f);
+                    const ImU32 vertex_color = t.polygon_vertex_u32();
+                    const ImU32 vertex_hover_color = t.polygon_vertex_hover_u32();
+                    const ImU32 close_hint_color = t.polygon_close_hint_u32();
                     const ImU32 line_to_mouse_color = add_mode
                                                           ? toU32WithAlpha(t.palette.success, 0.5f)
                                                           : toU32WithAlpha(t.palette.error, 0.5f);
 
                     std::vector<ImVec2> screen_points;
-                    screen_points.reserve(world_points.size());
-                    bool all_visible = true;
-                    for (const auto& wp : world_points) {
-                        const glm::vec4 clip = vp_mat * glm::vec4(wp, 1.0f);
-                        if (clip.w <= 0.0f) {
-                            all_visible = false;
-                            break;
+                    if (rm->isPolygonPreviewWorldSpace()) {
+                        const auto render_settings = rm->getSettings();
+                        screen_points.reserve(world_points.size());
+
+                        if (!panel_ctx.viewport) {
+                            screen_points.clear();
                         }
-                        const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-                        screen_points.emplace_back(
-                            viewport_layout_.pos.x + (ndc.x * 0.5f + 0.5f) * viewport_layout_.size.x,
-                            viewport_layout_.pos.y + (1.0f - (ndc.y * 0.5f + 0.5f)) * viewport_layout_.size.y);
-                    }
-                    if (!all_visible) {
-                        screen_points.clear();
-                    }
+                        Viewport projection_viewport = panel_ctx.viewport ? *panel_ctx.viewport : ctx.viewer->getViewport();
+                        projection_viewport.windowSize = {std::max(panel_ctx.render_width, 1),
+                                                          std::max(panel_ctx.render_height, 1)};
 
-                    const ImVec2 clip_min(viewport_layout_.pos.x, viewport_layout_.pos.y);
-                    float clip_bottom = viewport_layout_.pos.y + viewport_layout_.size.y;
-                    if (panel_layout_.isShowSequencer()) {
-                        const float seq_top = sequencer_ui_.panelTopY();
-                        if (seq_top > 0.0f) {
-                            clip_bottom = std::min(clip_bottom, seq_top);
+                        bool all_visible = true;
+                        for (const auto& world_point : world_points) {
+                            const auto projected = lfs::rendering::projectWorldPoint(
+                                projection_viewport.camera.R,
+                                projection_viewport.camera.t,
+                                projection_viewport.windowSize,
+                                world_point,
+                                render_settings.focal_length_mm,
+                                render_settings.orthographic,
+                                render_settings.ortho_scale);
+                            if (!projected) {
+                                all_visible = false;
+                                break;
+                            }
+
+                            screen_points.emplace_back(
+                                panel_ctx.x + projected->x * (panel_ctx.width / static_cast<float>(projection_viewport.windowSize.x)),
+                                panel_ctx.y + projected->y * (panel_ctx.height / static_cast<float>(projection_viewport.windowSize.y)));
+                        }
+
+                        if (!all_visible) {
+                            screen_points.clear();
+                        }
+                    } else {
+                        screen_points.reserve(points.size());
+                        for (const auto& [px, py] : points) {
+                            screen_points.push_back(render_to_screen(panel_ctx, px, py));
                         }
                     }
-                    const ImVec2 clip_max(viewport_layout_.pos.x + viewport_layout_.size.x, clip_bottom);
-                    draw_list->PushClipRect(clip_min, clip_max, true);
 
-                    if (closed && screen_points.size() >= 3) {
-                        draw_list->AddConvexPolyFilled(screen_points.data(), static_cast<int>(screen_points.size()), fill_color);
-                    }
+                    if (push_preview_clip(panel_ctx)) {
+                        if (closed && screen_points.size() >= 3) {
+                            draw_list->AddConvexPolyFilled(screen_points.data(), static_cast<int>(screen_points.size()), fill_color);
+                        }
 
-                    for (size_t i = 0; i + 1 < screen_points.size(); ++i) {
-                        draw_list->AddLine(screen_points[i], screen_points[i + 1], line_color, 2.0f);
-                    }
-                    if (closed && screen_points.size() >= 3) {
-                        draw_list->AddLine(screen_points.back(), screen_points.front(), line_color, 2.0f);
-                    }
+                        for (size_t i = 0; i + 1 < screen_points.size(); ++i) {
+                            draw_list->AddLine(screen_points[i], screen_points[i + 1], line_color, 2.0f);
+                        }
+                        if (closed && screen_points.size() >= 3) {
+                            draw_list->AddLine(screen_points.back(), screen_points.front(), line_color, 2.0f);
+                        }
 
-                    if (!closed) {
-                        const ImVec2 mouse_pos = ImGui::GetMousePos();
-                        draw_list->AddLine(screen_points.back(), mouse_pos, line_to_mouse_color, 1.0f);
-
+                        const ImVec2 mouse_pos =
+                            s_frame_input
+                                ? ImVec2(s_frame_input->mouse_x, s_frame_input->mouse_y)
+                                : ImVec2(viewport_layout_.pos.x, viewport_layout_.pos.y);
                         constexpr float CLOSE_THRESHOLD = 12.0f;
-                        if (screen_points.size() >= 3) {
-                            const float dx = mouse_pos.x - screen_points.front().x;
-                            const float dy = mouse_pos.y - screen_points.front().y;
-                            if (dx * dx + dy * dy < CLOSE_THRESHOLD * CLOSE_THRESHOLD) {
-                                draw_list->AddCircle(screen_points.front(), 9.0f, vertex_color, 16, 2.0f);
+                        constexpr float VERTEX_RADIUS = 5.0f;
+                        const auto distance_sq = [](const ImVec2 a, const ImVec2 b) {
+                            const float dx = a.x - b.x;
+                            const float dy = a.y - b.y;
+                            return dx * dx + dy * dy;
+                        };
+                        const bool can_close = !closed && screen_points.size() >= 3 &&
+                                               distance_sq(mouse_pos, screen_points.front()) <
+                                                   CLOSE_THRESHOLD * CLOSE_THRESHOLD;
+                        int hovered_idx = -1;
+                        for (size_t i = 0; i < screen_points.size(); ++i) {
+                            if (distance_sq(mouse_pos, screen_points[i]) <= VERTEX_RADIUS * VERTEX_RADIUS) {
+                                hovered_idx = static_cast<int>(i);
+                                break;
                             }
                         }
-                    }
 
-                    for (const auto& sp : screen_points) {
-                        draw_list->AddCircleFilled(sp, 5.0f, vertex_color);
-                    }
+                        if (!closed && !screen_points.empty()) {
+                            draw_list->AddLine(screen_points.back(), mouse_pos, line_to_mouse_color, 1.0f);
 
-                    if (closed && screen_points.size() >= 3) {
-                        float cx = 0.0f, cy = 0.0f;
-                        for (const auto& sp : screen_points) {
-                            cx += sp.x;
-                            cy += sp.y;
+                            if (can_close) {
+                                draw_list->AddCircle(screen_points.front(), 9.0f, close_hint_color, 16, 2.0f);
+                            }
                         }
-                        cx /= static_cast<float>(screen_points.size());
-                        cy /= static_cast<float>(screen_points.size());
 
-                        const char* hint = "Enter to confirm";
-                        const ImVec2 text_size = ImGui::CalcTextSize(hint);
-                        draw_list->AddText(
-                            ImVec2(cx - text_size.x * 0.5f, cy - text_size.y * 0.5f),
-                            toU32WithAlpha(t.palette.text, 0.9f), hint);
+                        for (size_t i = 0; i < screen_points.size(); ++i) {
+                            const ImU32 color = (static_cast<int>(i) == hovered_idx || (can_close && i == 0))
+                                                    ? vertex_hover_color
+                                                    : vertex_color;
+                            draw_list->AddCircleFilled(screen_points[i], VERTEX_RADIUS, color);
+                            draw_list->AddCircle(screen_points[i], VERTEX_RADIUS, line_color, 16, 1.5f);
+                        }
+
+                        if (!screen_points.empty()) {
+                            const float initial_ring_radius = can_close ? 9.0f : 8.0f;
+                            const float initial_ring_thickness = can_close ? 2.0f : 1.5f;
+                            draw_list->AddCircle(screen_points.front(), initial_ring_radius,
+                                                 close_hint_color, 24, initial_ring_thickness);
+                        }
+
+                        if (closed && screen_points.size() >= 3) {
+                            float cx = 0.0f, cy = 0.0f;
+                            for (const auto& sp : screen_points) {
+                                cx += sp.x;
+                                cy += sp.y;
+                            }
+                            cx /= static_cast<float>(screen_points.size());
+                            cy /= static_cast<float>(screen_points.size());
+
+                            const char* hint = "Enter to confirm\nShift-click edge: add\nCtrl-click vertex: remove";
+                            const ImVec2 text_size = ImGui::CalcTextSize(hint);
+                            draw_list->AddText(
+                                ImVec2(cx - text_size.x * 0.5f, cy - text_size.y * 0.5f),
+                                toU32WithAlpha(t.palette.text, 0.9f), hint);
+                        }
+
+                        draw_list->PopClipRect();
                     }
-
-                    draw_list->PopClipRect();
                 }
             }
 
@@ -1252,20 +2164,21 @@ namespace lfs::vis::gui {
                 const auto& t = theme();
                 const auto& points = rm->getLassoPoints();
                 const bool add_mode = rm->isLassoAddMode();
+                const auto panel_ctx = resolve_preview_panel(rm->getLassoPreviewPanel());
 
                 if (points.size() >= 2) {
-                    const float render_scale = rm->getSettings().render_scale;
                     const ImU32 line_color = add_mode
                                                  ? toU32WithAlpha(t.palette.success, 0.8f)
                                                  : toU32WithAlpha(t.palette.error, 0.8f);
 
-                    ImVec2 prev(viewport_layout_.pos.x + points[0].first / render_scale,
-                                viewport_layout_.pos.y + points[0].second / render_scale);
-                    for (size_t i = 1; i < points.size(); ++i) {
-                        ImVec2 curr(viewport_layout_.pos.x + points[i].first / render_scale,
-                                    viewport_layout_.pos.y + points[i].second / render_scale);
-                        draw_list->AddLine(prev, curr, line_color, 2.0f);
-                        prev = curr;
+                    if (push_preview_clip(panel_ctx)) {
+                        ImVec2 prev = render_to_screen(panel_ctx, points[0].first, points[0].second);
+                        for (size_t i = 1; i < points.size(); ++i) {
+                            ImVec2 curr = render_to_screen(panel_ctx, points[i].first, points[i].second);
+                            draw_list->AddLine(prev, curr, line_color, 2.0f);
+                            prev = curr;
+                        }
+                        draw_list->PopClipRect();
                     }
                 }
             }
@@ -1288,12 +2201,6 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::renderViewportDecorations() {
-        if (viewport_layout_.size.x > 0 && viewport_layout_.size.y > 0) {
-            const ImVec2 vp_pos(viewport_layout_.pos.x, viewport_layout_.pos.y);
-            const ImVec2 vp_size(viewport_layout_.size.x, viewport_layout_.size.y);
-            widgets::DrawViewportVignette(vp_pos, vp_size);
-        }
-
         if (!ui_hidden_ && viewport_layout_.size.x > 0 && viewport_layout_.size.y > 0) {
             const auto& t = theme();
             const float r = t.viewport.corner_radius;
@@ -1333,29 +2240,73 @@ namespace lfs::vis::gui {
                 }
             }
         }
+
+        auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
+        if (!rendering || viewport_layout_.size.x <= 0.0f || viewport_layout_.size.y <= 0.0f) {
+            return;
+        }
+
+        if (!rendering->isSplitViewActive()) {
+            return;
+        }
+
+        const auto& t = theme();
+        auto* const draw_list = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
+        const auto divider_x = rendering->getSplitDividerScreenX(viewport_layout_.pos, viewport_layout_.size);
+        if (!divider_x) {
+            return;
+        }
+        constexpr float kSplitDividerMinWidthPx = 10.0f;
+        const float divider_width =
+            std::max(kSplitDividerMinWidthPx * current_ui_scale_,
+                     std::round(t.viewport.border_size * current_ui_scale_ * 4.0f));
+        const float divider_left = std::round(*divider_x - divider_width * 0.5f);
+        const float divider_right = std::round(*divider_x + divider_width * 0.5f);
+        const ImU32 divider_fill_color = toU32(t.menu_background());
+
+        draw_list->PushClipRect(
+            ImVec2(viewport_layout_.pos.x, viewport_layout_.pos.y),
+            ImVec2(viewport_layout_.pos.x + viewport_layout_.size.x,
+                   viewport_layout_.pos.y + viewport_layout_.size.y),
+            true);
+        draw_list->AddRectFilled(
+            ImVec2(divider_left, viewport_layout_.pos.y),
+            ImVec2(divider_right, viewport_layout_.pos.y + viewport_layout_.size.y),
+            divider_fill_color);
+        draw_list->PopClipRect();
     }
 
-    void GuiManager::updateInputOverrides(bool mouse_in_viewport) {
-        const bool any_popup_or_modal_open = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-        const bool imgui_wants_input = ImGui::GetIO().WantTextInput || ImGui::GetIO().WantCaptureKeyboard;
+    void GuiManager::updateInputOverrides(const PanelInputState& input,
+                                          bool mouse_in_viewport) {
+        if (rml_menu_bar_.wantsInput())
+            return;
 
-        if ((ImGuizmo::IsOver() || ImGuizmo::IsUsing()) && !any_popup_or_modal_open) {
-            ImGui::GetIO().WantCaptureMouse = false;
-            ImGui::GetIO().WantCaptureKeyboard = false;
+        auto& focus = guiFocusState();
+        const bool any_popup_or_modal_open =
+            ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ||
+            isModalWindowOpen() ||
+            (global_context_menu_ && global_context_menu_->isOpen());
+        const bool imgui_wants_input = focus.want_text_input || focus.want_capture_keyboard;
+
+        if (isTransformGizmoOverOrUsing() && !any_popup_or_modal_open) {
+            focus.want_capture_mouse = false;
+            focus.want_capture_keyboard = false;
         }
 
         if (mouse_in_viewport && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
             !any_popup_or_modal_open && !imgui_wants_input) {
-            if (ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
-                ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
-                ImGui::GetIO().WantCaptureMouse = false;
+            if (input.mouse_down[1] || input.mouse_down[2]) {
+                focus.want_capture_mouse = false;
             }
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-                ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            if (input.mouse_clicked[0] || input.mouse_clicked[1]) {
                 ImGui::ClearActiveID();
-                ImGui::GetIO().WantCaptureKeyboard = false;
-                if (auto* editor = panels::PythonConsoleState::getInstance().getEditor()) {
-                    editor->unfocus();
+                focus.want_capture_keyboard = false;
+                auto* console_state = panels::PythonConsoleState::tryGetInstance();
+                if (console_state != nullptr) {
+                    auto* editor = console_state->getEditor();
+                    if (editor != nullptr) {
+                        editor->unfocus();
+                    }
                 }
             }
         }
@@ -1366,8 +2317,8 @@ namespace lfs::vis::gui {
             if (settings.point_cloud_mode && mouse_in_viewport &&
                 !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
                 !any_popup_or_modal_open && !imgui_wants_input) {
-                ImGui::GetIO().WantCaptureMouse = false;
-                ImGui::GetIO().WantCaptureKeyboard = false;
+                focus.want_capture_mouse = false;
+                focus.want_capture_keyboard = false;
             }
         }
     }
@@ -1396,6 +2347,47 @@ namespace lfs::vis::gui {
                 rel_x < viewport_layout_.pos.x + viewport_layout_.size.x &&
                 rel_y >= viewport_layout_.pos.y &&
                 rel_y < viewport_layout_.pos.y + viewport_layout_.size.y);
+    }
+
+    bool GuiManager::isPositionOverFloatingPanel(const double x, const double y) const {
+        return PanelRegistry::instance().isPositionOverFloatingPanel(x, y);
+    }
+
+    GuiHitTestResult GuiManager::hitTestPointer(const double x, const double y) const {
+        if (isCapturingInput() || isModalWindowOpen() || startup_overlay_.isVisible() ||
+            (global_context_menu_ && global_context_menu_->isOpen())) {
+            return {.blocks_pointer = true, .takes_keyboard_focus = true};
+        }
+
+        if (panel_layout_.isResizingPanel() || isPositionOverFloatingPanel(x, y)) {
+            return {.blocks_pointer = true, .takes_keyboard_focus = true};
+        }
+
+        if (sequencer_ui_.blocksPointer(x, y) || rml_viewport_overlay_.blocksPointer(x, y)) {
+            return {.blocks_pointer = true, .takes_keyboard_focus = true};
+        }
+
+        if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+            return {.blocks_pointer = true, .takes_keyboard_focus = true};
+        }
+
+        return {};
+    }
+
+    GuiInputState GuiManager::inputState() const {
+        const auto& focus = guiFocusState();
+        const bool modal_open =
+            isCapturingInput() ||
+            isModalWindowOpen() ||
+            startup_overlay_.isVisible() ||
+            (global_context_menu_ && global_context_menu_->isOpen()) ||
+            sequencer_ui_.blocksKeyboard();
+
+        return {
+            .has_keyboard_focus = focus.any_item_active || focus.want_capture_keyboard,
+            .text_input_active = focus.want_text_input,
+            .modal_open = modal_open,
+        };
     }
 
     void GuiManager::setupEventHandlers() {
@@ -1514,8 +2506,7 @@ namespace lfs::vis::gui {
                         }
                     }
                 } else if (result.button_label == LOC(DiskSpaceDialog::CHANGE_LOCATION)) {
-                    std::filesystem::path new_location = SelectFolderDialog(
-                        LOC(DiskSpaceDialog::SELECT_OUTPUT_LOCATION), path.parent_path());
+                    std::filesystem::path new_location = PickFolderDialog(path.parent_path());
                     if (!new_location.empty() && is_checkpoint) {
                         if (auto* tm = viewer_->getTrainerManager()) {
                             if (auto* trainer = tm->getTrainer()) {
@@ -1573,9 +2564,9 @@ namespace lfs::vis::gui {
                rml_modal_overlay_->isOpen();
     }
 
-    void GuiManager::captureKey(int key, int mods) {
+    void GuiManager::captureKey(int physical_key, int logical_key, int mods) {
         if (auto* input_controller = viewer_->getInputController()) {
-            input_controller->getBindings().captureKey(key, mods);
+            input_controller->getBindings().captureKey(physical_key, logical_key, mods);
         }
     }
 
@@ -1613,11 +2604,11 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::applyDefaultStyle() {
-        // Initialize theme system using saved preference
         const std::string preferred_theme = loadThemePreferenceName();
         if (!setThemeByName(preferred_theme)) {
             setTheme(darkTheme());
         }
+        rmlui_manager_.activateTheme(currentThemeId());
     }
 
     void GuiManager::showWindow(const std::string& name, bool show) {
@@ -1627,7 +2618,13 @@ namespace lfs::vis::gui {
     bool GuiManager::needsAnimationFrame() const {
         if (startup_overlay_.needsAnimationFrame())
             return true;
-        if (video_extractor_dialog_ && video_extractor_dialog_->isVideoPlaying())
+        if (video_widget_ && video_widget_->isVideoPlaying())
+            return true;
+        if (ui_layout_settle_frames_ > 0)
+            return true;
+        if (rml_right_panel_.needsAnimationFrame())
+            return true;
+        if (PanelRegistry::instance().needsAnimationFrame())
             return true;
         return false;
     }

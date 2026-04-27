@@ -5,10 +5,15 @@
 #pragma once
 
 #include "geometry/euclidean_transform.hpp"
+#include "rendering/frame_contract.hpp"
 #include "rendering/render_constants.hpp"
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <glm/glm.hpp>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace lfs::vis {
 
@@ -17,7 +22,90 @@ namespace lfs::vis {
     enum class SplitViewMode {
         Disabled,
         PLYComparison,
-        GTComparison
+        GTComparison,
+        IndependentDual
+    };
+
+    enum class SplitViewPanelId : uint8_t {
+        Left = 0,
+        Right = 1
+    };
+
+    enum class EnvironmentBackgroundMode {
+        SolidColor = 0,
+        Equirectangular = 1,
+    };
+
+    inline constexpr std::string_view kDefaultEnvironmentMapPath =
+        "environments/kloofendal_48d_partly_cloudy_puresky_1k.hdr";
+
+    [[nodiscard]] inline bool splitViewEnabled(const SplitViewMode mode) {
+        return mode != SplitViewMode::Disabled;
+    }
+
+    [[nodiscard]] inline bool splitViewUsesComparisonPanels(const SplitViewMode mode) {
+        return mode == SplitViewMode::PLYComparison || mode == SplitViewMode::GTComparison;
+    }
+
+    [[nodiscard]] inline bool splitViewUsesPLYComparison(const SplitViewMode mode) {
+        return mode == SplitViewMode::PLYComparison;
+    }
+
+    [[nodiscard]] inline bool splitViewUsesGTComparison(const SplitViewMode mode) {
+        return mode == SplitViewMode::GTComparison;
+    }
+
+    [[nodiscard]] inline bool splitViewUsesIndependentPanels(const SplitViewMode mode) {
+        return mode == SplitViewMode::IndependentDual;
+    }
+
+    struct SplitViewPanelLayout {
+        SplitViewPanelId panel = SplitViewPanelId::Left;
+        int x = 0;
+        int width = 0;
+        float start_position = 0.0f;
+        float end_position = 1.0f;
+    };
+
+    [[nodiscard]] inline size_t splitViewPanelIndex(const SplitViewPanelId panel) {
+        return panel == SplitViewPanelId::Right ? 1u : 0u;
+    }
+
+    [[nodiscard]] inline int splitViewDividerPixel(const int total_width, const float split_position) {
+        if (total_width <= 1) {
+            return std::max(total_width, 0);
+        }
+
+        return std::clamp(
+            static_cast<int>(std::lround(static_cast<float>(total_width) * split_position)),
+            1,
+            total_width - 1);
+    }
+
+    [[nodiscard]] inline std::array<SplitViewPanelLayout, 2> makeSplitViewPanelLayouts(
+        const int total_width,
+        const float split_position) {
+        const int divider_x = splitViewDividerPixel(total_width, split_position);
+        return {{
+            {.panel = SplitViewPanelId::Left,
+             .x = 0,
+             .width = divider_x,
+             .start_position = 0.0f,
+             .end_position = split_position},
+            {.panel = SplitViewPanelId::Right,
+             .x = divider_x,
+             .width = std::max(total_width - divider_x, 0),
+             .start_position = split_position,
+             .end_position = 1.0f},
+        }};
+    };
+
+    enum class SelectionPreviewMode {
+        Centers,
+        Rectangle,
+        Polygon,
+        Lasso,
+        Rings
     };
 
     struct PPISPOverrides {
@@ -58,6 +146,12 @@ namespace lfs::vis {
     };
 
     struct RenderSettings {
+        enum class CameraMetricsMode {
+            Off = 0,
+            PSNR = 1,
+            PSNRSSIM = 2,
+        };
+
         // Core rendering settings
         float focal_length_mm = lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
         float scaling_modifier = 1.0f;
@@ -65,6 +159,7 @@ namespace lfs::vis {
         bool mip_filter = false;
         int sh_degree = 3;
         float render_scale = 1.0f; // Viewer resolution scale (0.25-1.0), does not affect training
+        CameraMetricsMode camera_metrics_mode = CameraMetricsMode::Off;
 
         // Crop box (data stored in scene graph CropBoxData, these are UI toggles only)
         bool show_crop_box = false;
@@ -74,6 +169,7 @@ namespace lfs::vis {
         bool use_ellipsoid = false;
         bool desaturate_unselected = false;     // Desaturate unselected PLYs when one is selected
         bool desaturate_cropping = true;        // Desaturate outside crop box/ellipsoid instead of hiding
+        bool hide_outside_depth_box = false;    // Hide gaussians outside the selection depth box
         bool crop_filter_for_selection = false; // Use crop box/ellipsoid as selection filter
 
         // Appearance correction (PPISP)
@@ -85,6 +181,10 @@ namespace lfs::vis {
 
         // Background
         glm::vec3 background_color = glm::vec3(0.0f, 0.0f, 0.0f);
+        EnvironmentBackgroundMode environment_mode = EnvironmentBackgroundMode::SolidColor;
+        std::string environment_map_path = std::string(kDefaultEnvironmentMapPath);
+        float environment_exposure = 0.0f;
+        float environment_rotation_degrees = 0.0f;
 
         // Coordinate axes
         bool show_coord_axes = false;
@@ -106,7 +206,7 @@ namespace lfs::vis {
         bool show_center_markers = false;
 
         // Camera frustums
-        bool show_camera_frustums = true; // Master toggle for camera frustum rendering
+        bool show_camera_frustums = false; // Master toggle for camera frustum rendering
         float camera_frustum_scale = 0.25f;
         glm::vec3 train_camera_color = glm::vec3(1.0f, 1.0f, 1.0f);
         glm::vec3 eval_camera_color = glm::vec3(1.0f, 0.0f, 0.0f);
@@ -150,8 +250,21 @@ namespace lfs::vis {
         lfs::geometry::EuclideanTransform depth_filter_transform;
     };
 
+    [[nodiscard]] inline bool environmentBackgroundEnabled(const RenderSettings& settings) {
+        return settings.environment_mode == EnvironmentBackgroundMode::Equirectangular &&
+               !settings.environment_map_path.empty();
+    }
+
+    [[nodiscard]] inline bool environmentBackgroundUsesTransparentViewerCompositing(
+        const RenderSettings& settings) {
+        return environmentBackgroundEnabled(settings) &&
+               !splitViewEnabled(settings.split_view_mode);
+    }
+
     struct SplitViewInfo {
         bool enabled = false;
+        std::string mode_label;
+        std::string detail_label;
         std::string left_name;
         std::string right_name;
     };
@@ -160,13 +273,24 @@ namespace lfs::vis {
         float x, y, width, height;
     };
 
+    struct GTRenderCamera {
+        glm::mat3 rotation{1.0f};
+        glm::vec3 translation{0.0f};
+        std::optional<lfs::rendering::CameraIntrinsics> intrinsics;
+        bool equirectangular = false;
+    };
+
     struct GTComparisonContext {
         unsigned int gt_texture_id = 0;
+        int camera_id = -1;
         glm::ivec2 dimensions{0, 0};
         glm::ivec2 gpu_aligned_dims{0, 0};
         glm::vec2 render_texcoord_scale{1.0f, 1.0f};
         glm::vec2 gt_texcoord_scale{1.0f, 1.0f};
-        bool gt_needs_flip = false;
+        lfs::rendering::TextureOrigin gt_texture_origin =
+            lfs::rendering::TextureOrigin::BottomLeft;
+        glm::mat4 scene_transform{1.0f};
+        std::optional<GTRenderCamera> render_camera;
 
         [[nodiscard]] bool valid() const { return gt_texture_id != 0 && dimensions.x > 0 && dimensions.y > 0; }
     };

@@ -8,6 +8,10 @@
 
 #define DEF inline constexpr
 
+enum class DensificationType : int { None = 0,
+                                     MCMC = 1,
+                                     MRNF = 2 };
+
 namespace fast_lfs::rasterization::config {
     DEF bool debug = false;
     // rendering constants
@@ -27,8 +31,14 @@ namespace fast_lfs::rasterization::config {
     DEF int block_size_create_instances = 256;
     DEF int block_size_extract_instance_ranges = 256;
     DEF int block_size_extract_bucket_counts = 256;
+#if defined(_WIN32) && \
+    (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || (defined(LFS_USE_HIP) && LFS_USE_HIP) || (defined(USE_HIP) && USE_HIP))
+    DEF int tile_width = 16;
+    DEF int tile_height = 8;
+#else
     DEF int tile_width = 16;
     DEF int tile_height = 16;
+#endif
     DEF int block_size_blend = tile_width * tile_height;
     DEF int n_sequential_threshold = 4;
     // checkpoint interval for gradient computation (how often to save intermediate blending state)

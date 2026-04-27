@@ -80,6 +80,63 @@ def numpy():
 # =============================================================================
 
 
+class TestTensorOpsWithoutNumpy:
+    """Tensor runtime behaviors needed by NumPy-free UI code."""
+
+    def test_tensor_sort_returns_values_and_int64_indices(self, lf):
+        """Tensor.sort should expose the core sort primitive to Python."""
+        values = lf.Tensor.zeros([5], dtype="float32", device="cpu")
+        values[0] = 3.0
+        values[1] = 1.0
+        values[2] = 4.0
+        values[3] = 1.5
+        values[4] = 2.0
+
+        sorted_values, sorted_indices = values.sort(0, False)
+
+        assert sorted_values.dtype == "float32"
+        assert sorted_indices.dtype == "int64"
+        assert sorted_values.shape == (5,)
+        assert sorted_indices.shape == (5,)
+        assert [sorted_values[i].item() for i in range(5)] == [1.0, 1.5, 2.0, 3.0, 4.0]
+        assert [sorted_indices[i].int_() for i in range(5)] == [1, 3, 4, 0, 2]
+
+    def test_uint8_selection_mask_can_be_written_from_bool_mask(self, lf):
+        """Bool-mask assignment should work for uint8 selection tensors."""
+        mask = lf.Tensor.zeros([5], dtype="bool", device="cpu")
+        mask[1] = 1
+        mask[3] = 1
+
+        selection = lf.Tensor.zeros([5], dtype="uint8", device="cpu")
+        selection[mask] = 2
+
+        assert selection.dtype == "uint8"
+        assert [selection[i].int_() for i in range(5)] == [0, 2, 0, 2, 0]
+
+    def test_tensor_tolist_and_count_nonzero(self, lf):
+        """List conversion and nonzero counts should work without NumPy."""
+        values = lf.Tensor.zeros([4], dtype="int32", device="cpu")
+        values[0] = 2
+        values[2] = 5
+
+        assert values.tolist() == [2, 0, 5, 0]
+        assert values.count_nonzero() == 2
+
+    def test_tensor_index_add_counts_occurrences(self, lf):
+        """index_add_ should support NumPy-free histogram counting."""
+        counts = lf.Tensor.zeros([4], dtype="int32", device="cpu")
+        indices = lf.Tensor.zeros([4], dtype="int32", device="cpu")
+        indices[0] = 0
+        indices[1] = 2
+        indices[2] = 2
+        indices[3] = 3
+        ones = lf.Tensor.ones([4], dtype="int32", device="cpu")
+
+        counts.index_add_(0, indices, ones)
+
+        assert counts.tolist() == [1, 0, 2, 1]
+
+
 class TestOperatorStateManagement:
     """Test that operators handle state correctly."""
 
@@ -1096,3 +1153,41 @@ class TestGPUOperations:
         cuda_t = lf.Tensor.zeros([100, 3], dtype="float32", device="cuda")
         g.gpu_data = cuda_t
         assert str(g.gpu_data.device) == "cuda"
+
+
+class TestPanelEnums:
+    """Regression tests for the typed panel enum surface."""
+
+    def test_floating_panels_accept_typed_space_enums(self, lf):
+        if not hasattr(lf, "ui") or not hasattr(lf.ui, "Panel"):
+            pytest.skip("panel API not available")
+
+        assert not hasattr(lf.ui.PanelSpace, "DOCKABLE")
+
+        panel_id = "tests.typed_floating_panel"
+
+        class TypedFloatingPanel(lf.ui.Panel):
+            id = panel_id
+            label = "Typed Floating"
+            space = lf.ui.PanelSpace.FLOATING
+            options = {lf.ui.PanelOption.DEFAULT_CLOSED}
+
+            def draw(self, ui):
+                del ui
+
+        try:
+            lf.register_class(TypedFloatingPanel)
+        except ValueError as exc:
+            if "retained UI manager" in str(exc):
+                pytest.skip("floating window registration requires an active retained UI manager")
+            raise
+        try:
+            floating_names = set(lf.ui.get_panel_names(lf.ui.PanelSpace.FLOATING))
+            panel_info = lf.ui.get_panel(panel_id)
+            assert panel_info is not None
+            assert panel_info.id == panel_id
+            assert panel_info.space == lf.ui.PanelSpace.FLOATING
+            assert lf.ui.set_panel_space(panel_id, lf.ui.PanelSpace.FLOATING) is True
+            assert panel_id in floating_names
+        finally:
+            lf.unregister_class(TypedFloatingPanel)

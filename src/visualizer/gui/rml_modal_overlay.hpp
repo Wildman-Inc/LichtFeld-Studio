@@ -6,8 +6,10 @@
 
 #include "core/modal_request.hpp"
 #include "gui/rmlui/rml_fbo.hpp"
+#include "gui/rmlui/rml_input_utils.hpp"
 
 #include <RmlUi/Core/EventListener.h>
+#include <cstddef>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -19,9 +21,13 @@ namespace Rml {
     class ElementDocument;
 } // namespace Rml
 
+namespace lfs::vis {
+    struct Theme;
+}
 namespace lfs::vis::gui {
 
     class RmlUIManager;
+    struct PanelInputState;
 
     class LFS_VIS_API RmlModalOverlay {
     public:
@@ -32,20 +38,24 @@ namespace lfs::vis::gui {
         RmlModalOverlay& operator=(const RmlModalOverlay&) = delete;
 
         void enqueue(lfs::core::ModalRequest request);
-        void processInput();
-        void render(int screen_w, int screen_h, float vp_x, float vp_y, float vp_w, float vp_h);
+        void processInput(const PanelInputState& input);
+        void render(int screen_w, int screen_h,
+                    float screen_x, float screen_y,
+                    float vp_x, float vp_y, float vp_w, float vp_h);
         void destroyGLResources();
+        void reloadResources();
 
         [[nodiscard]] bool isOpen() const;
 
     private:
         void initContext();
         void syncTheme();
-        std::string generateThemeRCSS() const;
         void cacheElements();
 
         void showNext();
         void dismiss(const std::string& button_label);
+        bool dismissFirstEnabledButton();
+        void bindTextInputRevert();
         void cancel();
         lfs::core::ModalResult collectFormValues() const;
 
@@ -56,6 +66,7 @@ namespace lfs::vis::gui {
 
         RmlUIManager* rml_manager_;
         OverlayEventListener listener_;
+        rml_input::TextInputEscapeRevertController text_input_revert_;
 
         Rml::Context* rml_context_ = nullptr;
         Rml::ElementDocument* document_ = nullptr;
@@ -64,6 +75,7 @@ namespace lfs::vis::gui {
         Rml::Element* el_backdrop_ = nullptr;
         Rml::Element* el_dialog_ = nullptr;
         Rml::Element* el_title_ = nullptr;
+        Rml::Element* el_form_ = nullptr;
         Rml::Element* el_content_ = nullptr;
         Rml::Element* el_input_row_ = nullptr;
         Rml::Element* el_input_ = nullptr;
@@ -76,7 +88,8 @@ namespace lfs::vis::gui {
         std::optional<lfs::core::ModalRequest> active_;
 
         std::string base_rcss_;
-        float last_synced_text_[4] = {};
+        std::size_t last_theme_signature_ = 0;
+        bool has_theme_signature_ = false;
         int width_ = 0;
         int height_ = 0;
     };

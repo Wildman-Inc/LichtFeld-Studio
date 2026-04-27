@@ -1,53 +1,163 @@
-/* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
- *
- * SPDX-License-Identifier: GPL-3.0-or-later */
-
 #pragma once
 
-#include <RmlUi/Core/Input.h>
-#include <imgui.h>
+#include <RmlUi/Core.h>
+#include <RmlUi/Core/EventListener.h>
 
-namespace lfs::vis::gui {
+#include <functional>
+#include <unordered_map>
+#include <utility>
 
-    inline Rml::Input::KeyIdentifier imguiKeyToRml(ImGuiKey key) {
-        // clang-format off
-        switch (key) {
-        case ImGuiKey_Space:      return Rml::Input::KI_SPACE;
-        case ImGuiKey_Backspace:  return Rml::Input::KI_BACK;
-        case ImGuiKey_Tab:        return Rml::Input::KI_TAB;
-        case ImGuiKey_Enter:      return Rml::Input::KI_RETURN;
-        case ImGuiKey_Escape:     return Rml::Input::KI_ESCAPE;
-        case ImGuiKey_Delete:     return Rml::Input::KI_DELETE;
-        case ImGuiKey_Home:       return Rml::Input::KI_HOME;
-        case ImGuiKey_End:        return Rml::Input::KI_END;
-        case ImGuiKey_LeftArrow:  return Rml::Input::KI_LEFT;
-        case ImGuiKey_RightArrow: return Rml::Input::KI_RIGHT;
-        case ImGuiKey_UpArrow:    return Rml::Input::KI_UP;
-        case ImGuiKey_DownArrow:  return Rml::Input::KI_DOWN;
-        default: break;
+namespace lfs::vis::gui::rml_input {
+
+    inline bool isTextEditableElement(Rml::Element* element) {
+        if (!element)
+            return false;
+
+        const auto tag = element->GetTagName();
+        if (tag == "textarea")
+            return true;
+        if (tag != "input")
+            return false;
+
+        const auto input_type = element->GetAttribute<Rml::String>("type", "text");
+        return input_type.empty() || input_type == "text" || input_type == "password" ||
+               input_type == "search" || input_type == "email" || input_type == "url";
+    }
+
+    template <typename Fn>
+    void forEachTextEditableElement(Rml::Element* root, Fn&& fn) {
+        auto visit = [&fn](auto&& self, Rml::Element* element) -> void {
+            if (!element)
+                return;
+
+            if (isTextEditableElement(element))
+                fn(*element);
+
+            const int child_count = element->GetNumChildren();
+            for (int i = 0; i < child_count; ++i)
+                self(self, element->GetChild(i));
+        };
+        visit(visit, root);
+    }
+
+    inline bool hasFocusedKeyboardTarget(Rml::Element* element) {
+        return element && element->GetTagName() != "body";
+    }
+
+    inline bool isCustomTextInputElement(Rml::Element* element) {
+        return element && element->GetAttribute<Rml::String>("data-text-input", "") == "true";
+    }
+
+    inline bool wantsTextInput(Rml::Element* element) {
+        return isTextEditableElement(element) || isCustomTextInputElement(element);
+    }
+
+    inline bool isSingleLineTextInput(Rml::Element* element) {
+        return element && element->GetTagName() == "input" && isTextEditableElement(element);
+    }
+
+    inline bool isSelectRelatedElement(Rml::Element* element) {
+        for (auto* current = element; current; current = current->GetParentNode()) {
+            const auto tag = current->GetTagName();
+            if (tag == "select" || tag == "selectbox")
+                return true;
         }
-        // clang-format on
-
-        if (key >= ImGuiKey_A && key <= ImGuiKey_Z)
-            return static_cast<Rml::Input::KeyIdentifier>(
-                Rml::Input::KI_A + (key - ImGuiKey_A));
-        if (key >= ImGuiKey_0 && key <= ImGuiKey_9)
-            return static_cast<Rml::Input::KeyIdentifier>(
-                Rml::Input::KI_0 + (key - ImGuiKey_0));
-
-        return Rml::Input::KI_UNKNOWN;
+        return false;
     }
 
-    inline int buildRmlModifiers() {
-        ImGuiIO& io = ImGui::GetIO();
-        int mods = 0;
-        if (io.KeyCtrl)
-            mods |= Rml::Input::KM_CTRL;
-        if (io.KeyShift)
-            mods |= Rml::Input::KM_SHIFT;
-        if (io.KeyAlt)
-            mods |= Rml::Input::KM_ALT;
-        return mods;
+    inline bool cancelFocusedElement(Rml::Context& context) {
+        auto* const focused = context.GetFocusElement();
+        if (!focused)
+            return false;
+
+        if (isTextEditableElement(focused)) {
+            Rml::Dictionary params;
+            focused->DispatchEvent("escapecancel", params);
+            focused->Blur();
+            return true;
+        }
+
+        if (!isSelectRelatedElement(focused))
+            return false;
+
+        focused->Blur();
+        if (auto* const still_focused = context.GetFocusElement();
+            still_focused && isSelectRelatedElement(still_focused)) {
+            still_focused->Blur();
+        }
+        return true;
     }
 
-} // namespace lfs::vis::gui
+    class TextInputEscapeRevertController final : public Rml::EventListener {
+    public:
+        using RestoreCallback = std::function<void(Rml::Element&)>;
+
+        ~TextInputEscapeRevertController() override {
+            if (Rml::GetSystemInterface())
+                clear();
+            else
+                bindings_.clear();
+        }
+
+        void bind(Rml::Element* element, RestoreCallback restore_callback = {}) {
+            if (!element || !isTextEditableElement(element) || bindings_.contains(element))
+                return;
+
+            Binding binding;
+            binding.restore_callback = std::move(restore_callback);
+            bindings_.emplace(element, std::move(binding));
+            element->AddEventListener("focus", this);
+            element->AddEventListener("blur", this);
+            element->AddEventListener("escapecancel", this);
+        }
+
+        void clear() {
+            for (auto& [element, _binding] : bindings_) {
+                if (!element)
+                    continue;
+                element->RemoveEventListener("focus", this, false);
+                element->RemoveEventListener("blur", this, false);
+                element->RemoveEventListener("escapecancel", this, false);
+            }
+            bindings_.clear();
+        }
+
+        void ProcessEvent(Rml::Event& event) override {
+            auto* const element = event.GetCurrentElement();
+            if (!element)
+                return;
+
+            const auto it = bindings_.find(element);
+            if (it == bindings_.end())
+                return;
+
+            const auto type = event.GetType();
+            if (type == "focus") {
+                it->second.snapshot = element->GetAttribute<Rml::String>("value", "");
+                return;
+            }
+
+            if (type == "blur") {
+                it->second.snapshot.clear();
+                return;
+            }
+
+            if (type != "escapecancel")
+                return;
+
+            element->SetAttribute("value", it->second.snapshot);
+            if (it->second.restore_callback)
+                it->second.restore_callback(*element);
+            event.StopPropagation();
+        }
+
+    private:
+        struct Binding {
+            Rml::String snapshot;
+            RestoreCallback restore_callback;
+        };
+
+        std::unordered_map<Rml::Element*, Binding> bindings_;
+    };
+
+} // namespace lfs::vis::gui::rml_input

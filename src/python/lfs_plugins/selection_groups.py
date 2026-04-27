@@ -1,32 +1,56 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Selection Groups Panel - RmlUI implementation."""
+"""Selection Groups Panel - data-model-driven RmlUI implementation."""
 
 import lichtfeld as lf
 
-from .types import RmlPanel
+from .types import Panel
 
-def _tr(key):
-    result = lf.ui.tr(key)
-    return result if result else key
+SELECTION_GROUPS_MODEL = "selection_groups"
+__lfs_panel_classes__ = ["SelectionGroupsPanel"]
+__lfs_panel_ids__ = ["lfs.selection_groups"]
 
 
-class SelectionGroupsPanel(RmlPanel):
-    idname = "lfs.selection_groups"
+def __lfs_after_reload__(runtime):
+    runtime.ui.set_panel_parent("lfs.selection_groups", "lfs.rendering")
+
+
+class SelectionGroupsPanel(Panel):
+    id = "lfs.selection_groups"
     label = "Selection Groups"
-    space = "MAIN_PANEL_TAB"
+    space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 110
-    rml_template = "rmlui/selection_groups.rml"
-    rml_height_mode = "content"
+    template = "rmlui/selection_groups.rml"
+    height_mode = lf.ui.PanelHeightMode.CONTENT
+    update_interval_ms = 50
 
     def __init__(self):
-        self._collapsed = False
+        self.doc = None
+        self._handle = None
+        self._collapsed = True
         self._prev_group_hash = None
         self._color_edit_group_id = None
         self._context_menu_group_id = None
         self._picker_click_handled = False
+        self._has_groups = False
 
-    def on_load(self, doc):
+    @classmethod
+    def poll(cls, context):
+        del context
+        return lf.ui.get_active_tool() == "builtin.select" and lf.get_scene() is not None
+
+    def on_bind_model(self, ctx):
+        model = ctx.create_data_model(SELECTION_GROUPS_MODEL)
+        if model is None:
+            return
+
+        model.bind_func("panel_label", lambda: "@tr:main_panel.selection_groups")
+        model.bind_func("show_empty_message", lambda: not self._has_groups)
+        model.bind_record_list("groups")
+        self._handle = model.get_handle()
+
+    def on_mount(self, doc):
+        super().on_mount(doc)
         self.doc = doc
 
         header = doc.get_element_by_id("hdr-groups")
@@ -54,7 +78,11 @@ class SelectionGroupsPanel(RmlPanel):
         if body:
             body.add_event_listener("click", self._on_body_click)
 
-        self._update_labels()
+        section = doc.get_element_by_id("groups-section")
+        arrow = doc.get_element_by_id("arrow-groups")
+        if section:
+            from . import rml_widgets as w
+            w.sync_section_state(section, not self._collapsed, header, arrow)
 
     def on_update(self, doc):
         visible = lf.ui.get_active_tool() == "builtin.select" and lf.get_scene() is not None
@@ -69,31 +97,29 @@ class SelectionGroupsPanel(RmlPanel):
             self._handle_context_action(action, self._context_menu_group_id)
             self._context_menu_group_id = None
 
-        self._rebuild_groups(doc)
+        self._rebuild_groups()
 
     def on_scene_changed(self, doc):
+        del doc
         self._prev_group_hash = None
 
-    def _update_labels(self):
-        if not self.doc:
-            return
-        title = self.doc.get_element_by_id("title-groups")
-        if title:
-            title.set_inner_rml(_tr("main_panel.selection_groups"))
-        btn = self.doc.get_element_by_id("btn-add-group")
-        if btn:
-            btn.set_inner_rml(_tr("main_panel.add_group"))
+    def on_unmount(self, doc):
+        doc.remove_data_model(SELECTION_GROUPS_MODEL)
+        self._handle = None
+        self.doc = None
 
     def _on_toggle_section(self, event):
+        del event
         self._collapsed = not self._collapsed
+        header = self.doc.get_element_by_id("hdr-groups")
         section = self.doc.get_element_by_id("groups-section")
-        if section:
-            section.set_class("collapsed", self._collapsed)
         arrow = self.doc.get_element_by_id("arrow-groups")
-        if arrow:
-            arrow.set_inner_rml("\u25B6" if self._collapsed else "\u25BC")
+        if section:
+            from . import rml_widgets as w
+            w.animate_section_toggle(section, not self._collapsed, arrow, header_element=header)
 
     def _on_add_group(self, event):
+        del event
         scene = lf.get_scene()
         if scene:
             scene.add_selection_group("", (0.0, 0.0, 0.0))
@@ -103,14 +129,22 @@ class SelectionGroupsPanel(RmlPanel):
         groups = scene.selection_groups()
         active_id = scene.active_selection_group
         parts = []
-        for g in groups:
-            r, gc, b = g.color
-            parts.append(f"{g.id}:{g.name}:{g.count}:{g.locked}:{r:.2f}:{gc:.2f}:{b:.2f}")
+        for group in groups:
+            r, g, b = group.color
+            parts.append(f"{group.id}:{group.name}:{group.count}:{group.locked}:{r:.2f}:{g:.2f}:{b:.2f}")
         return f"{active_id}|{'|'.join(parts)}"
 
-    def _rebuild_groups(self, doc):
+    def _set_has_groups(self, has_groups):
+        has_groups = bool(has_groups)
+        if has_groups == self._has_groups:
+            return
+        self._has_groups = has_groups
+        if self._handle:
+            self._handle.dirty("show_empty_message")
+
+    def _rebuild_groups(self):
         scene = lf.get_scene()
-        if not scene:
+        if not scene or not self._handle:
             return
 
         scene.update_selection_group_counts()
@@ -121,58 +155,28 @@ class SelectionGroupsPanel(RmlPanel):
 
         groups = scene.selection_groups()
         active_id = scene.active_selection_group
+        self._set_has_groups(groups)
 
-        no_msg = doc.get_element_by_id("no-groups-msg")
-        if no_msg:
-            if groups:
-                no_msg.set_class("hidden", True)
-            else:
-                no_msg.set_class("hidden", False)
-                no_msg.set_inner_rml(_tr("main_panel.no_selection_groups"))
-
-        container = doc.get_element_by_id("groups-list")
-        if not container:
-            return
-
-        if not groups:
-            container.set_inner_rml("")
-            return
-
-        parts = []
+        records = []
         for group in groups:
-            gid = group.id
-            is_active = gid == active_id
-            is_locked = group.locked
             r, g, b = [int(c * 255) for c in group.color]
-            icon_name = "locked" if is_locked else "unlocked"
-            active_cls = " active" if is_active else ""
-            label = f"{group.name} ({group.count})"
+            records.append({
+                "gid": str(group.id),
+                "active": group.id == active_id,
+                "lock_sprite": f"icon-{'locked' if group.locked else 'unlocked'}",
+                "color_css": f"rgb({r},{g},{b})",
+                "label": f"{group.name} ({group.count})",
+            })
 
-            parts.append(
-                f'<div class="group-row{active_cls}" data-gid="{gid}">'
-                f'  <div class="icon-btn lock-btn" data-action="lock" data-gid="{gid}">'
-                f'    <img sprite="icon-{icon_name}" />'
-                f'  </div>'
-                f'  <div class="color-swatch" data-action="color" data-gid="{gid}"'
-                f'       style="background-color: rgb({r},{g},{b})"></div>'
-                f'  <span class="group-name" data-action="select" data-gid="{gid}">{label}</span>'
-                f'</div>'
-            )
-
-        container.set_inner_rml("\n".join(parts))
+        self._handle.update_record_list("groups", records)
 
     def _find_action_element(self, element):
-        for _ in range(5):
-            if element is None:
-                return None, None
+        while element is not None:
             action = element.get_attribute("data-action")
             if action:
                 gid = element.get_attribute("data-gid", "-1")
                 return action, int(gid)
-            p = element.parent()
-            if p is None:
-                return None, None
-            element = p
+            element = element.parent()
         return None, None
 
     def _on_group_click(self, event):
@@ -220,10 +224,11 @@ class SelectionGroupsPanel(RmlPanel):
         self._picker_el.set_attribute("green", str(float(g)))
         self._picker_el.set_attribute("blue", str(float(b)))
 
-        mx = event.get_parameter("mouse_x", "0")
-        my = event.get_parameter("mouse_y", "0")
-        self._popup_el.set_property("left", f"{mx}px")
-        self._popup_el.set_property("top", f"{int(float(my)) + 2}px")
+        mx = int(float(event.get_parameter("mouse_x", "0")))
+        my = int(float(event.get_parameter("mouse_y", "0")))
+        left = max(0, mx - 210)
+        self._popup_el.set_property("left", f"{left}px")
+        self._popup_el.set_property("top", f"{my + 2}px")
         self._popup_el.set_class("visible", True)
 
     def _hide_picker(self):
@@ -259,6 +264,7 @@ class SelectionGroupsPanel(RmlPanel):
         self._show_context_menu(gid, event)
 
     def _show_context_menu(self, gid, event):
+        del event
         scene = lf.get_scene()
         if not scene:
             return
@@ -268,11 +274,12 @@ class SelectionGroupsPanel(RmlPanel):
             return
 
         self._context_menu_group_id = gid
-        lock_label = _tr("selection_group.unlock") if group.locked else _tr("selection_group.lock")
+        tr = lf.ui.tr
+        lock_label = tr("selection_group.unlock") if group.locked else tr("selection_group.lock")
         items = [
             {"label": lock_label, "action": "lock"},
-            {"label": _tr("main_panel.clear"), "action": "clear"},
-            {"label": _tr("common.delete"), "action": "delete", "separator_before": True},
+            {"label": tr("main_panel.clear"), "action": "clear"},
+            {"label": tr("common.delete"), "action": "delete", "separator_before": True},
         ]
         sx, sy = lf.ui.get_mouse_screen_pos()
         lf.ui.show_context_menu(items, sx, sy)
@@ -294,15 +301,15 @@ class SelectionGroupsPanel(RmlPanel):
         self._prev_group_hash = None
 
     def _on_body_click(self, event):
+        del event
         if self._picker_click_handled:
             self._picker_click_handled = False
             return
-
         self._hide_picker()
 
 
 def register():
-    lf.ui.register_rml_panel(SelectionGroupsPanel)
+    lf.register_class(SelectionGroupsPanel)
     lf.ui.set_panel_parent("lfs.selection_groups", "lfs.rendering")
 
 

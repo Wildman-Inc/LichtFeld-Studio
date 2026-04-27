@@ -8,8 +8,10 @@
 #include "core/parameter_manager.hpp"
 #include "core/scene.hpp"
 #include "core/services.hpp"
+#include "core/tensor.hpp"
 #include "python/python_runtime.hpp"
 #include "training/training_setup.hpp"
+#include "training/vksplat_compute_backend.hpp"
 #include <cstring>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -29,10 +31,14 @@ namespace lfs::vis {
             cleanupTrainingResources(resources);
         });
 
-        state_machine_.setStateChangeCallback([this](TrainingState old_state, TrainingState new_state) {
+        state_machine_.setStateChangeCallback([this](TrainingState, TrainingState new_state) {
             // Emit events on state changes
             if (new_state == TrainingState::Idle) {
-                loss_buffer_.clear();
+                {
+                    std::lock_guard<std::mutex> lock(loss_buffer_mutex_);
+                    loss_buffer_.clear();
+                }
+                clearEvaluationMetrics();
                 last_error_.clear();
             }
         });
@@ -59,6 +65,7 @@ namespace lfs::vis {
         }
 
         if (trainer_) {
+            std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
             trainer_->shutdown();
             trainer_.reset();
         }
@@ -95,6 +102,7 @@ namespace lfs::vis {
             pending_opt_params_ = params.optimization;
             pending_dataset_params_ = params.dataset;
 
+            std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
             trainer_ = std::move(trainer);
             updateResourceTracking();
 
@@ -116,6 +124,7 @@ namespace lfs::vis {
             pending_opt_params_ = params.optimization;
             pending_dataset_params_ = params.dataset;
 
+            std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
             trainer_ = std::move(trainer);
             updateResourceTracking();
             internal::TrainerReady{}.emit();
@@ -153,12 +162,15 @@ namespace lfs::vis {
         }
 
         // Destroy trainer - destructor handles cleanup
-        trainer_.reset();
+        {
+            std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
+            trainer_.reset();
+        }
 
         // Transition to Idle
         updateResourceTracking();
 
-        if (!state_machine_.transitionTo(TrainingState::Idle)) {
+        if (getState() != TrainingState::Idle && !state_machine_.transitionTo(TrainingState::Idle)) {
             LOG_WARN("Failed to transition to Idle");
         }
 
@@ -180,9 +192,10 @@ namespace lfs::vis {
             return false;
         }
 
+        clearEvaluationMetrics();
         applyPendingParams();
 
-        if (auto error = trainer_->getParams().optimization.validate(); !error.empty()) {
+        if (auto error = trainer_->getParams().validate(); !error.empty()) {
             LOG_ERROR("Cannot start training: {}", error);
             last_error_ = error;
             state::TrainingCompleted{
@@ -203,8 +216,9 @@ namespace lfs::vis {
             LOG_DEBUG("Resuming from iteration {}", trainer_->get_current_iteration());
         } else {
             const auto& params = trainer_->getParams();
+            const bool use_vksplat_compute = lfs::training::vksplat_compute::is_requested();
 
-            if (scene_) {
+            if (scene_ && !use_vksplat_compute) {
                 if (auto result = lfs::training::initializeTrainingModel(params, *scene_); !result) {
                     LOG_ERROR("Failed to initialize model: {}", result.error());
                     last_error_ = result.error();
@@ -251,6 +265,10 @@ namespace lfs::vis {
                 }
                 return false;
             }
+
+            // Match headless mode: release init-time cached pool allocations before the
+            // first training batch spins up image decoders and render workspaces.
+            lfs::core::Tensor::trim_memory_pool();
         }
 
         {
@@ -268,6 +286,12 @@ namespace lfs::vis {
         accumulated_training_time_ = std::chrono::steady_clock::duration{0};
 
         state::TrainingStarted{.total_iterations = getTotalIterations()}.emit();
+        state::TrainingProgress{
+            .iteration = getCurrentIteration(),
+            .loss = getCurrentLoss(),
+            .num_gaussians = getNumSplats(),
+            .is_refining = false}
+            .emit();
 
         training_thread_ = std::make_unique<std::jthread>(
             [this](std::stop_token stop_token) {
@@ -411,22 +435,22 @@ namespace lfs::vis {
     int TrainerManager::getTotalIterations() const {
         if (!trainer_)
             return 0;
-        return static_cast<int>(trainer_->getParams().optimization.iterations);
+        return trainer_->get_total_iterations();
     }
 
     int TrainerManager::getNumSplats() const {
         if (!trainer_)
             return 0;
-        // Strategy may not be created yet if using Scene-based constructor
-        // In that case, try to get size from scene
+
+        // Prefer scene metadata so UI polling does not dereference the live
+        // training model while topology-changing refinement is in progress.
         if (scene_) {
-            const auto* model = scene_->getTrainingModel();
-            if (model) {
-                return static_cast<int>(model->size());
-            }
+            return static_cast<int>(scene_->getTrainingModelGaussianCount());
         }
-        // Fall back to strategy if trainer is initialized
-        if (trainer_->isInitialized()) {
+
+        // Legacy fallback for non-scene-backed trainers.
+        if (trainer_->isInitialized() && trainer_->has_strategy()) {
+            const std::shared_lock lock(trainer_->getRenderMutex());
             return static_cast<int>(trainer_->get_strategy().get_model().size());
         }
         return 0;
@@ -440,6 +464,10 @@ namespace lfs::vis {
 
     const char* TrainerManager::getStrategyType() const {
         if (!trainer_ || !trainer_->isInitialized())
+            return "unknown";
+        if (trainer_->uses_vksplat_compute_backend())
+            return "vksplat";
+        if (!trainer_->has_strategy())
             return "unknown";
         return trainer_->get_strategy().strategy_type();
     }
@@ -486,6 +514,46 @@ namespace lfs::vis {
     std::deque<float> TrainerManager::getLossBuffer() const {
         std::lock_guard<std::mutex> lock(loss_buffer_mutex_);
         return loss_buffer_;
+    }
+
+    void TrainerManager::updatePSNR(float psnr) {
+        std::lock_guard<std::mutex> lock(psnr_buffer_mutex_);
+        psnr_buffer_.push_back(psnr);
+        while (psnr_buffer_.size() > static_cast<size_t>(MAX_PSNR_POINTS)) {
+            psnr_buffer_.pop_front();
+        }
+    }
+
+    std::deque<float> TrainerManager::getPSNRBuffer() const {
+        std::lock_guard<std::mutex> lock(psnr_buffer_mutex_);
+        return psnr_buffer_;
+    }
+
+    void TrainerManager::updateEvaluationMetrics(int iteration, float psnr, float ssim) {
+        updatePSNR(psnr);
+        setLastPSNR(psnr);
+        std::lock_guard<std::mutex> lock(eval_metrics_mutex_);
+        last_eval_metrics_ = EvaluationMetricsSnapshot{
+            .iteration = iteration,
+            .psnr = psnr,
+            .ssim = ssim};
+    }
+
+    std::optional<TrainerManager::EvaluationMetricsSnapshot> TrainerManager::getLastEvaluationMetrics() const {
+        std::lock_guard<std::mutex> lock(eval_metrics_mutex_);
+        return last_eval_metrics_;
+    }
+
+    void TrainerManager::clearEvaluationMetrics() {
+        {
+            std::lock_guard<std::mutex> lock(psnr_buffer_mutex_);
+            psnr_buffer_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(eval_metrics_mutex_);
+            last_eval_metrics_.reset();
+        }
+        last_psnr_.store(0.0f);
     }
 
     void TrainerManager::trainingThreadFunc(std::stop_token stop_token) {
@@ -594,6 +662,11 @@ namespace lfs::vis {
         state::TrainingProgress::when([this](const auto& event) {
             updateLoss(event.loss);
         });
+
+        // Listen for evaluation completed events - update PSNR buffer
+        state::EvaluationCompleted::when([this](const auto& event) {
+            updateEvaluationMetrics(event.iteration, event.psnr, event.ssim);
+        });
     }
 
     std::shared_ptr<const lfs::core::Camera> TrainerManager::getCamById(int camId) const {
@@ -620,9 +693,39 @@ namespace lfs::vis {
         return {};
     }
 
+    std::expected<lfs::training::Trainer::CameraMetricsSnapshot, std::string>
+    TrainerManager::computeCameraMetricsForCameraId(
+        const int camera_id,
+        const bool include_ssim,
+        const lfs::training::Trainer::CameraMetricsAppearanceConfig& appearance) const {
+        std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
+
+        if (!trainer_) {
+            return std::unexpected("trainer unavailable");
+        }
+        if (!scene_) {
+            return std::unexpected("scene unavailable");
+        }
+
+        const auto cam = scene_->getCameraByUid(camera_id);
+        if (!cam) {
+            return std::unexpected(std::format("camera {} not found", camera_id));
+        }
+
+        return trainer_->computeCameraMetrics(*cam, include_ssim, appearance);
+    }
+
     void TrainerManager::applyPendingParams() {
         if (!trainer_)
             return;
+
+        if (trainer_->isInitialized() && trainer_->getParams().resume_checkpoint.has_value()) {
+            if (auto* const param_mgr = services().paramsOrNull()) {
+                param_mgr->importTrainingParams(trainer_->getParams());
+            }
+            LOG_DEBUG("Ignoring parameter updates for checkpoint-backed trainer");
+            return;
+        }
 
         auto params = trainer_->getParams();
         params.dataset = pending_dataset_params_;

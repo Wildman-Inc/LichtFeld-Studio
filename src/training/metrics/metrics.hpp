@@ -51,8 +51,12 @@ namespace lfs::training {
         float elapsed_time = 0.0f;
         int num_gaussians = 0;
         int iteration = 0;
+        bool valid = false;
 
         [[nodiscard]] std::string to_string() const {
+            if (!valid) {
+                return "No valid evaluation images";
+            }
             std::stringstream ss;
             ss << std::fixed << std::setprecision(4);
             ss << "PSNR: " << psnr
@@ -109,8 +113,7 @@ namespace lfs::training {
         EvalMetrics evaluate(const int iteration,
                              const lfs::core::SplatData& splatData,
                              std::shared_ptr<CameraDataset> val_dataset,
-                             lfs::core::Tensor& background,
-                             bool images_have_alpha = false);
+                             lfs::core::Tensor& background);
 
         // Save final report
         void save_report() const {

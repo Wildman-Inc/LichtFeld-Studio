@@ -20,6 +20,7 @@ add_subdirectory(logger)
 # Tensor C++ sources (merged from src/core/tensor/)
 set(TENSOR_SOURCES
         tensor/cuda_stream_context.cpp
+        tensor/gpu_slab_allocator.cpp
         tensor/lazy_config.cpp
         tensor/lazy_ir.cpp
         tensor/lazy_executor.cpp
@@ -55,6 +56,7 @@ set(CORE_SOURCES
         parameters.cpp
         property_registry.cpp
         scene.cpp
+        splat_simplify.cpp
         splat_data.cpp
         splat_data_mirror.cpp
         splat_data_transform.cpp
@@ -63,7 +65,7 @@ set(CORE_SOURCES
         mesh_data.cpp
 )
 
-add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
+lfs_add_gpu_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
 
 target_compile_definitions(lfs_core PRIVATE LFS_CORE_EXPORTS)
 
@@ -71,7 +73,7 @@ target_include_directories(lfs_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_BINARY_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/external
@@ -87,8 +89,8 @@ target_link_libraries(lfs_core
         nlohmann_json::nlohmann_json
         glm::glm
         Threads::Threads
-        CUDA::cudart
-        CUDA::curand
+        ${GPU_RUNTIME_LIBRARY}
+        ${GPU_RAND_LIBRARY}
         spdlog::spdlog
     PRIVATE
         lfs_core_cuda
@@ -141,28 +143,45 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         )
         target_compile_definitions(lfs_core PRIVATE HAS_AVX2_SUPPORT)
     endif()
+
+    # The splat simplifier is sensitive to tiny FP contraction differences.
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/splat_simplify.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-tree-vectorize;-fno-unsafe-math-optimizations;-frounding-math;-ffloat-store;-fexcess-precision=standard$<$<BOOL:${COMPILER_SUPPORTS_AVX2}>:;-mno-fma;-mno-avx2>")
 endif()
 
 # Visibility: hide by default, export only LFS_CORE_API symbols
 set_target_properties(lfs_core PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
-    CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-    CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON
     EXPORT_COMPILE_COMMANDS ON
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR}
-    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL ${CMAKE_BINARY_DIR}
     DEBUG_POSTFIX d
 )
+get_property(_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(WIN32 AND _IS_MULTI_CONFIG)
+    set_target_properties(lfs_core PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY              ${CMAKE_BINARY_DIR}/$<CONFIG>
+        RUNTIME_OUTPUT_DIRECTORY              ${CMAKE_BINARY_DIR}/$<CONFIG>
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG        ${CMAKE_BINARY_DIR}/Debug
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE      ${CMAKE_BINARY_DIR}/Release
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR}/RelWithDebInfo
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL   ${CMAKE_BINARY_DIR}/MinSizeRel
+    )
+endif()
+
+if(USE_CUDA)
+    set_target_properties(lfs_core PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 # Configure build type
 function(configure_build_type target)

@@ -10,7 +10,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define HOST_DEVICE __host__ __device__
 #include <thrust/tuple.h>
 #else
@@ -464,10 +464,10 @@ namespace lfs::core {
                 if (b == static_cast<T>(2.0)) {
                     return a * a;
                 }
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return powf(a, b);
 #else
-                return static_cast<T>(std::pow(a, b));
+                return static_cast<T>(std::pow(static_cast<double>(a), static_cast<double>(b)));
 #endif
             }
         };
@@ -475,10 +475,10 @@ namespace lfs::core {
         struct mod_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmodf(a, b);
 #else
-                return std::fmod(a, b);
+                return static_cast<T>(std::fmod(static_cast<double>(a), static_cast<double>(b)));
 #endif
             }
         };
@@ -486,10 +486,10 @@ namespace lfs::core {
         struct fmod_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return fmodf(a, b);
 #else
-                return std::fmod(a, b);
+                return static_cast<T>(std::fmod(static_cast<double>(a), static_cast<double>(b)));
 #endif
             }
         };
@@ -497,7 +497,7 @@ namespace lfs::core {
         struct remainder_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
                 return remainderf(a, b);
 #else
                 return std::remainder(a, b);
@@ -912,7 +912,7 @@ namespace lfs::core {
         struct tuple_get_op {
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 return thrust::get<N>(t);
 #else
                 return std::get<N>(t);
@@ -923,7 +923,7 @@ namespace lfs::core {
         struct tuple_first_op {
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 return thrust::get<0>(t);
 #else
                 return std::get<0>(t);
@@ -934,7 +934,7 @@ namespace lfs::core {
         struct tuple_second_op {
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 return thrust::get<1>(t);
 #else
                 return std::get<1>(t);
@@ -949,7 +949,7 @@ namespace lfs::core {
 
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 return op(thrust::get<0>(t), thrust::get<1>(t));
 #else
                 return op(std::get<0>(t), std::get<1>(t));
@@ -1010,7 +1010,7 @@ namespace lfs::core {
             // For use with zip iterators - tuple input
             template <typename Tuple>
             HOST_DEVICE constexpr T operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 return thrust::get<1>(t) ? val : thrust::get<0>(t);
 #else
                 return std::get<1>(t) ? val : std::get<0>(t);
@@ -1026,7 +1026,7 @@ namespace lfs::core {
         struct extract_value_op {
             template <typename ValueMaskPair>
             HOST_DEVICE constexpr auto operator()(const ValueMaskPair& p) const {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 return thrust::get<0>(p);
 #else
                 return std::get<0>(p);
@@ -1037,7 +1037,7 @@ namespace lfs::core {
         struct extract_mask_op {
             template <typename ValueMaskPair>
             HOST_DEVICE constexpr bool operator()(const ValueMaskPair& p) const {
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
                 return thrust::get<1>(p) != 0;
 #else
                 return std::get<1>(p) != 0;
@@ -1194,6 +1194,84 @@ namespace lfs::core {
         HOST_DEVICE constexpr auto compose(F f, G g, H h, K k) {
             return composed_unary_op_4<F, G, H, K>{f, g, h, k};
         }
+
+        // ============= TYPE TRAITS FOR INT32 VALIDITY (UNARY OPS) =============
+        //
+        // Many unary ops are mathematically float-only (exp/log/trig/etc.). If we let them be
+        // instantiated for `int`, MSVC ends up compiling pointless `op<int>` paths through the
+        // expression-template evaluator, causing warning floods (e.g. double->int) and, in large
+        // translation units, internal compiler errors.
+        //
+        // This trait lets the evaluator avoid instantiating `op(int)` at all for float-only ops.
+        template <typename Op>
+        struct supports_int32 : std::true_type {};
+
+        // Float-only unary ops (treat Int32 inputs via promotion in the evaluator).
+        template <>
+        struct supports_int32<exp_op> : std::false_type {};
+        template <>
+        struct supports_int32<exp2_op> : std::false_type {};
+        template <>
+        struct supports_int32<log_op> : std::false_type {};
+        template <>
+        struct supports_int32<log2_op> : std::false_type {};
+        template <>
+        struct supports_int32<log10_op> : std::false_type {};
+        template <>
+        struct supports_int32<log1p_op> : std::false_type {};
+        template <>
+        struct supports_int32<sqrt_op> : std::false_type {};
+        template <>
+        struct supports_int32<rsqrt_op> : std::false_type {};
+        template <>
+        struct supports_int32<cbrt_op> : std::false_type {};
+        template <>
+        struct supports_int32<sin_op> : std::false_type {};
+        template <>
+        struct supports_int32<cos_op> : std::false_type {};
+        template <>
+        struct supports_int32<tan_op> : std::false_type {};
+        template <>
+        struct supports_int32<asin_op> : std::false_type {};
+        template <>
+        struct supports_int32<acos_op> : std::false_type {};
+        template <>
+        struct supports_int32<atan_op> : std::false_type {};
+        template <>
+        struct supports_int32<sinh_op> : std::false_type {};
+        template <>
+        struct supports_int32<cosh_op> : std::false_type {};
+        template <>
+        struct supports_int32<tanh_op> : std::false_type {};
+        template <>
+        struct supports_int32<sigmoid_op> : std::false_type {};
+        template <>
+        struct supports_int32<gelu_op> : std::false_type {};
+        template <>
+        struct supports_int32<swish_op> : std::false_type {};
+
+        // These are defined for integral types today but are not meaningful/safe for Int32
+        // (they can introduce integer division-by-zero via epsilon truncation).
+        template <>
+        struct supports_int32<reciprocal_op> : std::false_type {};
+        template <>
+        struct supports_int32<inverse_op> : std::false_type {};
+
+        // Propagate through composed ops (valid on Int32 only if all components are).
+        template <typename Op>
+        inline constexpr bool supports_int32_v = supports_int32<Op>::value;
+
+        template <typename F, typename G>
+        struct supports_int32<composed_unary_op<F, G>>
+            : std::bool_constant<supports_int32_v<F> && supports_int32_v<G>> {};
+
+        template <typename F, typename G, typename H>
+        struct supports_int32<composed_unary_op_3<F, G, H>>
+            : std::bool_constant<supports_int32_v<F> && supports_int32_v<G> && supports_int32_v<H>> {};
+
+        template <typename F, typename G, typename H, typename K>
+        struct supports_int32<composed_unary_op_4<F, G, H, K>>
+            : std::bool_constant<supports_int32_v<F> && supports_int32_v<G> && supports_int32_v<H> && supports_int32_v<K>> {};
 
         // ============= TYPE TRAITS FOR BOOL-RETURNING OPERATIONS =============
 

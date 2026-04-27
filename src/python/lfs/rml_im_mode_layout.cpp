@@ -7,6 +7,7 @@
 #include "core/logger.hpp"
 #include "py_ui.hpp"
 #include "python/python_runtime.hpp"
+#include "visualizer/gui/rmlui/rml_tooltip.hpp"
 #include "visualizer/operator/operator_registry.hpp"
 
 #include <RmlUi/Core/Element.h>
@@ -18,12 +19,64 @@
 #include <format>
 #include <limits>
 
+namespace {
+    std::string strip_imgui_id(const std::string& label) {
+        auto pos = label.find("##");
+        if (pos == std::string::npos)
+            return label;
+        return label.substr(0, pos);
+    }
+
+    std::string hidden_imgui_id(const std::string& label) {
+        const auto pos = label.find("##");
+        if (pos == std::string::npos || pos + 2 >= label.size())
+            return {};
+        return label.substr(pos + 2);
+    }
+
+    bool is_checkbox_or_radio(const Rml::Element* element) {
+        if (!element || element->GetTagName() != "input")
+            return false;
+        const auto input_type = element->GetAttribute<Rml::String>("type", "");
+        return input_type == "checkbox" || input_type == "radio";
+    }
+
+    bool get_checked_state(const Rml::Element* element) {
+        if (!element || !is_checkbox_or_radio(element))
+            return false;
+        // RmlUi tracks live form state via pseudo-classes; the "checked" attribute
+        // can be stale after user interaction.
+        return element->IsPseudoClassSet("checked");
+    }
+
+    float compute_slider_step(float min, float max) {
+        const float range = std::fabs(max - min);
+        if (!std::isfinite(range) || range <= 0.0f)
+            return 0.01f;
+        // Use a small explicit step; "any" is effectively quantized on some RmlUi builds.
+        return std::max(range / 1000.0f, 0.0001f);
+    }
+
+    Rml::String step_to_string(float step) {
+        return Rml::String(std::format("{:.6g}", step));
+    }
+} // namespace
+
 namespace lfs::python {
 
     void SlotEventListener::ProcessEvent(Rml::Event& event) {
         assert(state_);
         const auto type = event.GetId();
         if (type == Rml::EventId::Click) {
+            auto* el = event.GetCurrentElement();
+            if (el && el->GetTagName() == "input") {
+                const auto input_type = el->GetAttribute<Rml::String>("type", "");
+                if (input_type == "checkbox") {
+                    state_->changed = true;
+                    state_->bool_value = !state_->bool_value;
+                    return;
+                }
+            }
             state_->clicked = true;
         } else if (type == Rml::EventId::Change) {
             state_->changed = true;
@@ -34,7 +87,7 @@ namespace lfs::python {
             if (tag == "input") {
                 const auto input_type = el->GetAttribute<Rml::String>("type", "");
                 if (input_type == "checkbox") {
-                    state_->bool_value = el->HasAttribute("checked");
+                    state_->bool_value = get_checked_state(el);
                 } else if (input_type == "range") {
                     state_->float_value = el->GetAttribute<float>("value", 0.0f);
                 } else if (input_type == "text") {
@@ -66,6 +119,7 @@ namespace lfs::python {
 
         if (containers_.empty() || containers_[0].parent != root_) {
             containers_.clear();
+            child_slots_.clear();
             containers_.push_back({root_, {}, 0});
         } else {
             containers_.resize(1);
@@ -77,12 +131,15 @@ namespace lfs::python {
         disabled_ = false;
         disabled_depth_ = 0;
         id_stack_.clear();
+        child_key_stack_.clear();
         force_next_open_ = false;
         table_.reset();
+        item_width_stack_.clear();
         last_element_ = nullptr;
         last_clicked_ = false;
         tooltip_el_ = doc->GetElementById("im-tooltip");
         tooltip_shown_ = false;
+        tooltip_candidate_seen_ = false;
         popup_backdrop_ = doc->GetElementById("im-popup-backdrop");
         popup_dialog_ = doc->GetElementById("im-popup-dialog");
         active_popup_id_.clear();
@@ -93,11 +150,30 @@ namespace lfs::python {
 
         if (!tooltip_shown_ && tooltip_el_)
             tooltip_el_->SetClass("visible", false);
+        if (!tooltip_candidate_seen_) {
+            tooltip_hover_el_ = nullptr;
+            tooltip_text_.clear();
+            tooltip_hover_started_at_ = {};
+        }
 
         for (auto& level : containers_)
             prune_excess_slots(level);
 
+        std::erase_if(child_slots_, [](const auto& pair) {
+            return !pair.second.container || !pair.second.container->GetParentNode();
+        });
+
         containers_.resize(1);
+        current_line_ = nullptr;
+        doc_ = nullptr;
+        root_ = nullptr;
+    }
+
+    void RmlImModeLayout::release_elements() {
+        removed_elements_.clear();
+        child_slots_.clear();
+        child_key_stack_.clear();
+        containers_.clear();
         current_line_ = nullptr;
         doc_ = nullptr;
         root_ = nullptr;
@@ -120,6 +196,24 @@ namespace lfs::python {
         }
         result += key;
         return result;
+    }
+
+    std::string RmlImModeLayout::stable_label_token(const std::string& label) {
+        return hidden_imgui_id(label);
+    }
+
+    std::string RmlImModeLayout::build_slot_id(const char* prefix,
+                                               const std::string* label) const {
+        std::string key(prefix);
+        if (label) {
+            const auto token = stable_label_token(*label);
+            if (!token.empty()) {
+                key += ":" + token;
+                return build_id(key);
+            }
+        }
+        key += "#" + std::to_string(containers_.empty() ? 0 : containers_.back().cursor);
+        return build_id(key);
     }
 
     std::string RmlImModeLayout::color_to_css(nb::object color) const {
@@ -159,7 +253,7 @@ namespace lfs::python {
         finish_current_line();
 
         assert(!containers_.empty());
-        auto& slot = ensure_slot(SlotType::Line, build_id("line"));
+        auto& slot = ensure_slot(SlotType::Line, build_slot_id("line"));
 
         if (!slot.element) {
             auto line = doc_->CreateElement("div");
@@ -239,17 +333,18 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Label, build_id(text));
+        auto& slot = ensure_slot(SlotType::Label, build_slot_id("label", &text));
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("p");
             el->SetClass("im-label", true);
-            el->SetInnerRML(Rml::String(text));
+            el->SetInnerRML(Rml::String(display));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(text));
+            slot.element->SetInnerRML(Rml::String(display));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -259,19 +354,19 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Label, build_id("c:" + text));
+        auto& slot = ensure_slot(SlotType::Label, build_slot_id("label_center", &text));
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("p");
             el->SetClass("im-label", true);
-            el->SetProperty("text-align", "center");
-            el->SetProperty("width", "100%");
-            el->SetInnerRML(Rml::String(text));
+            el->SetClass("im-label--centered", true);
+            el->SetInnerRML(Rml::String(display));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(text));
+            slot.element->SetInnerRML(Rml::String(display));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -281,17 +376,18 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Heading, build_id(text));
+        auto& slot = ensure_slot(SlotType::Heading, build_slot_id("heading", &text));
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("div");
             el->SetClass("panel-title", true);
-            el->SetInnerRML(Rml::String(text));
+            el->SetInnerRML(Rml::String(display));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(text));
+            slot.element->SetInnerRML(Rml::String(display));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -301,22 +397,23 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::TextColored, build_id(text));
+        auto& slot = ensure_slot(SlotType::TextColored, build_slot_id("text_colored", &text));
         auto css_color = color_to_css(color);
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("p");
             el->SetClass("im-label", true);
             if (!css_color.empty())
                 el->SetProperty("color", Rml::String(css_color));
-            el->SetInnerRML(Rml::String(text));
+            el->SetInnerRML(Rml::String(display));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
             if (!css_color.empty())
                 slot.element->SetProperty("color", Rml::String(css_color));
-            slot.element->SetInnerRML(Rml::String(text));
+            slot.element->SetInnerRML(Rml::String(display));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -326,24 +423,24 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::TextColored, build_id("cc:" + text));
+        auto& slot = ensure_slot(SlotType::TextColored, build_slot_id("text_colored_center", &text));
         auto css_color = color_to_css(color);
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("p");
             el->SetClass("im-label", true);
-            el->SetProperty("text-align", "center");
-            el->SetProperty("width", "100%");
+            el->SetClass("im-label--centered", true);
             if (!css_color.empty())
                 el->SetProperty("color", Rml::String(css_color));
-            el->SetInnerRML(Rml::String(text));
+            el->SetInnerRML(Rml::String(display));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
             if (!css_color.empty())
                 slot.element->SetProperty("color", Rml::String(css_color));
-            slot.element->SetInnerRML(Rml::String(text));
+            slot.element->SetInnerRML(Rml::String(display));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -357,17 +454,18 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::TextWrapped, build_id(text));
+        auto& slot = ensure_slot(SlotType::TextWrapped, build_slot_id("text_wrapped", &text));
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("p");
             el->SetClass("im-text-wrapped", true);
-            el->SetInnerRML(Rml::String(text));
+            el->SetInnerRML(Rml::String(display));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(text));
+            slot.element->SetInnerRML(Rml::String(display));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -377,17 +475,18 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::TextDisabled, build_id(text));
+        auto& slot = ensure_slot(SlotType::TextDisabled, build_slot_id("text_disabled", &text));
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("p");
             el->SetClass("text-disabled", true);
-            el->SetInnerRML(Rml::String(text));
+            el->SetInnerRML(Rml::String(display));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(text));
+            slot.element->SetInnerRML(Rml::String(display));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -397,17 +496,18 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::BulletText, build_id(text));
+        auto& slot = ensure_slot(SlotType::BulletText, build_slot_id("bullet_text", &text));
+        const auto display = strip_imgui_id(text);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("p");
             el->SetClass("im-bullet", true);
-            el->SetInnerRML(Rml::String(std::format("\xe2\x80\xa2 {}", text)));
+            el->SetInnerRML(Rml::String(std::format("\xe2\x80\xa2 {}", display)));
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(std::format("\xe2\x80\xa2 {}", text)));
+            slot.element->SetInnerRML(Rml::String(std::format("\xe2\x80\xa2 {}", display)));
         }
         last_element_ = slot.element;
         last_clicked_ = false;
@@ -419,27 +519,26 @@ namespace lfs::python {
         if (!doc_)
             return false;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Button, build_id(label));
+        auto& slot = ensure_slot(SlotType::Button, build_slot_id("button", &label));
+        const auto display = strip_imgui_id(label);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("button");
             el->SetClass("btn", true);
-            el->SetInnerRML(Rml::String(label));
+            el->SetInnerRML(Rml::String(display));
             auto [w, h] = size;
-            if (w > 0)
+            if (w < 0)
+                el->SetClass("btn--full", true);
+            else if (w > 0)
                 el->SetProperty("width", Rml::String(std::to_string(static_cast<int>(w)) + "dp"));
-            if (h > 0)
-                el->SetProperty("height", Rml::String(std::to_string(static_cast<int>(h)) + "dp"));
 
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            el->AddEventListener(Rml::EventId::Click, listener.get());
-            listeners_.push_back(std::move(listener));
+            el->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(label));
+            slot.element->SetInnerRML(Rml::String(display));
         }
 
         bool clicked = slot.events.clicked;
@@ -466,24 +565,21 @@ namespace lfs::python {
         if (!doc_)
             return false;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::SmallButton, build_id(label));
+        auto& slot = ensure_slot(SlotType::SmallButton, build_slot_id("small_button", &label));
+        const auto display = strip_imgui_id(label);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("button");
             el->SetClass("btn", true);
-            el->SetProperty("padding", "1dp 4dp");
-            el->SetProperty("font-size", "12dp");
-            el->SetInnerRML(Rml::String(label));
+            el->SetInnerRML(Rml::String(display));
 
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            el->AddEventListener(Rml::EventId::Click, listener.get());
-            listeners_.push_back(std::move(listener));
+            el->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(label));
+            slot.element->SetInnerRML(Rml::String(display));
         }
 
         bool clicked = slot.events.clicked;
@@ -498,28 +594,27 @@ namespace lfs::python {
         if (!doc_)
             return false;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::ButtonStyled, build_id(label));
+        auto& slot = ensure_slot(SlotType::ButtonStyled, build_slot_id("button_styled", &label));
+        const auto display = strip_imgui_id(label);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("button");
             el->SetClass("btn", true);
             el->SetClass("btn--" + style, true);
-            el->SetInnerRML(Rml::String(label));
+            el->SetInnerRML(Rml::String(display));
             auto [w, h] = size;
-            if (w > 0)
+            if (w < 0)
+                el->SetClass("btn--full", true);
+            else if (w > 0)
                 el->SetProperty("width", Rml::String(std::to_string(static_cast<int>(w)) + "dp"));
-            if (h > 0)
-                el->SetProperty("height", Rml::String(std::to_string(static_cast<int>(h)) + "dp"));
 
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            el->AddEventListener(Rml::EventId::Click, listener.get());
-            listeners_.push_back(std::move(listener));
+            el->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            slot.element->SetInnerRML(Rml::String(label));
+            slot.element->SetInnerRML(Rml::String(display));
         }
 
         bool clicked = slot.events.clicked;
@@ -533,38 +628,39 @@ namespace lfs::python {
         if (!doc_)
             return {false, value};
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Checkbox, build_id(label));
+        auto& slot = ensure_slot(SlotType::Checkbox, build_slot_id("checkbox", &label));
 
         if (!slot.element) {
             auto wrapper = doc_->CreateElement("div");
             wrapper->SetClass("setting-row", true);
+
+            auto text_span = doc_->CreateElement("span");
+            text_span->SetClass("prop-label", true);
+            text_span->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
             auto input = doc_->CreateElement("input");
             input->SetAttribute("type", "checkbox");
             if (value)
                 input->SetAttribute("checked", "");
 
-            auto lbl = doc_->CreateElement("span");
-            lbl->SetClass("setting-label", true);
-            lbl->SetInnerRML(Rml::String(label));
-
             slot.events.bool_value = value;
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            input->AddEventListener(Rml::EventId::Change, listener.get());
-            listeners_.push_back(std::move(listener));
+            input->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
+            wrapper->AppendChild(std::move(text_span));
             wrapper->AppendChild(std::move(input));
-            wrapper->AppendChild(std::move(lbl));
             slot.element = line->AppendChild(std::move(wrapper));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
-            auto* input = slot.element->GetChild(0);
-            if (input) {
-                if (value && !input->HasAttribute("checked"))
-                    input->SetAttribute("checked", "");
-                else if (!value && input->HasAttribute("checked"))
-                    input->RemoveAttribute("checked");
+            auto* input = slot.element->GetChild(1);
+            if (!slot.events.changed) {
+                slot.events.bool_value = value;
+                if (input) {
+                    if (value && !input->HasAttribute("checked"))
+                        input->SetAttribute("checked", "");
+                    else if (!value && input->HasAttribute("checked"))
+                        input->RemoveAttribute("checked");
+                }
             }
         }
 
@@ -572,7 +668,9 @@ namespace lfs::python {
         last_clicked_ = false;
         if (slot.events.changed) {
             slot.events.changed = false;
-            return {true, slot.events.bool_value};
+            bool new_value = slot.events.bool_value;
+            slot.events.bool_value = new_value;
+            return {true, new_value};
         }
         return {false, value};
     }
@@ -581,7 +679,7 @@ namespace lfs::python {
         if (!doc_)
             return {false, current};
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::RadioButton, build_id(label));
+        auto& slot = ensure_slot(SlotType::RadioButton, build_slot_id("radio_button", &label));
         const bool selected = (current == value);
 
         if (!slot.element) {
@@ -596,11 +694,9 @@ namespace lfs::python {
 
             auto lbl = doc_->CreateElement("span");
             lbl->SetClass("im-radio-label", true);
-            lbl->SetInnerRML(Rml::String(label));
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            wrapper->AddEventListener(Rml::EventId::Click, listener.get());
-            listeners_.push_back(std::move(listener));
+            wrapper->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
             wrapper->AppendChild(std::move(dot));
             wrapper->AppendChild(std::move(lbl));
@@ -631,7 +727,10 @@ namespace lfs::python {
         if (!doc_)
             return {false, value};
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::SliderFloat, build_id(label));
+        auto& slot = ensure_slot(SlotType::SliderFloat, build_slot_id("slider_float", &label));
+        const auto min_text = Rml::String(std::to_string(min));
+        const auto max_text = Rml::String(std::to_string(max));
+        const auto step_text = step_to_string(compute_slider_step(min, max));
 
         if (!slot.element) {
             auto wrapper = doc_->CreateElement("div");
@@ -639,20 +738,18 @@ namespace lfs::python {
 
             auto lbl = doc_->CreateElement("span");
             lbl->SetClass("prop-label", true);
-            lbl->SetInnerRML(Rml::String(label));
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
             auto input = doc_->CreateElement("input");
             input->SetAttribute("type", "range");
-            input->SetAttribute("min", Rml::String(std::to_string(min)));
-            input->SetAttribute("max", Rml::String(std::to_string(max)));
-            input->SetAttribute("step", "any");
+            input->SetAttribute("min", min_text);
+            input->SetAttribute("max", max_text);
+            input->SetAttribute("step", step_text);
             input->SetAttribute("value", Rml::String(std::to_string(value)));
             input->SetClass("setting-slider", true);
 
             slot.events.float_value = value;
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            input->AddEventListener(Rml::EventId::Change, listener.get());
-            listeners_.push_back(std::move(listener));
+            input->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
 
             auto val_text = doc_->CreateElement("span");
             val_text->SetClass("slider-value", true);
@@ -662,10 +759,16 @@ namespace lfs::python {
             wrapper->AppendChild(std::move(input));
             wrapper->AppendChild(std::move(val_text));
             slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
             auto* input = slot.element->GetChild(1);
+            if (input) {
+                input->SetAttribute("min", min_text);
+                input->SetAttribute("max", max_text);
+                input->SetAttribute("step", step_text);
+            }
             if (input && !slot.events.changed)
                 input->SetAttribute("value", Rml::String(std::to_string(value)));
             auto* val_text = slot.element->GetChild(2);
@@ -689,7 +792,7 @@ namespace lfs::python {
         if (!doc_)
             return {false, value};
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::SliderInt, build_id(label));
+        auto& slot = ensure_slot(SlotType::SliderInt, build_slot_id("slider_int", &label));
 
         if (!slot.element) {
             auto wrapper = doc_->CreateElement("div");
@@ -697,7 +800,7 @@ namespace lfs::python {
 
             auto lbl = doc_->CreateElement("span");
             lbl->SetClass("prop-label", true);
-            lbl->SetInnerRML(Rml::String(label));
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
             auto input = doc_->CreateElement("input");
             input->SetAttribute("type", "range");
@@ -708,9 +811,7 @@ namespace lfs::python {
             input->SetClass("setting-slider", true);
 
             slot.events.float_value = static_cast<float>(value);
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            input->AddEventListener(Rml::EventId::Change, listener.get());
-            listeners_.push_back(std::move(listener));
+            input->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
 
             auto val_text = doc_->CreateElement("span");
             val_text->SetClass("slider-value", true);
@@ -720,6 +821,7 @@ namespace lfs::python {
             wrapper->AppendChild(std::move(input));
             wrapper->AppendChild(std::move(val_text));
             slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
@@ -765,13 +867,135 @@ namespace lfs::python {
     // ── Drags ───────────────────────────────────────────────
 
     std::tuple<bool, float> RmlImModeLayout::drag_float(const std::string& label, float value,
-                                                        float /*speed*/, float min, float max) {
-        return slider_float(label, value, min, max);
+                                                        float speed, float min, float max) {
+        if (!doc_)
+            return {false, value};
+        auto* line = ensure_line_container();
+        auto& slot = ensure_slot(SlotType::DragFloat, build_slot_id("drag_float", &label));
+        const auto min_text = Rml::String(std::to_string(min));
+        const auto max_text = Rml::String(std::to_string(max));
+        const float step = (speed > 0.0f) ? std::fabs(speed) : compute_slider_step(min, max);
+        const auto step_text = step_to_string(step);
+
+        if (!slot.element) {
+            auto wrapper = doc_->CreateElement("div");
+            wrapper->SetClass("setting-row", true);
+
+            auto lbl = doc_->CreateElement("span");
+            lbl->SetClass("prop-label", true);
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
+
+            auto input = doc_->CreateElement("input");
+            input->SetAttribute("type", "range");
+            input->SetAttribute("min", min_text);
+            input->SetAttribute("max", max_text);
+            input->SetAttribute("step", step_text);
+            input->SetAttribute("value", Rml::String(std::to_string(value)));
+            input->SetClass("setting-slider", true);
+
+            slot.events.float_value = value;
+            input->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
+
+            auto val_text = doc_->CreateElement("span");
+            val_text->SetClass("slider-value", true);
+            val_text->SetInnerRML(Rml::String(std::format("{:.2f}", value)));
+
+            wrapper->AppendChild(std::move(lbl));
+            wrapper->AppendChild(std::move(input));
+            wrapper->AppendChild(std::move(val_text));
+            slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
+        } else {
+            if (slot.element->GetParentNode() != line)
+                line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
+            auto* input = slot.element->GetChild(1);
+            if (input) {
+                input->SetAttribute("min", min_text);
+                input->SetAttribute("max", max_text);
+                input->SetAttribute("step", step_text);
+            }
+            if (input && !slot.events.changed)
+                input->SetAttribute("value", Rml::String(std::to_string(value)));
+            auto* val_text = slot.element->GetChild(2);
+            if (val_text) {
+                float display_val = slot.events.changed ? slot.events.float_value : value;
+                val_text->SetInnerRML(Rml::String(std::format("{:.2f}", display_val)));
+            }
+        }
+
+        last_element_ = slot.element;
+        last_clicked_ = false;
+        if (slot.events.changed) {
+            slot.events.changed = false;
+            return {true, slot.events.float_value};
+        }
+        return {false, value};
     }
 
     std::tuple<bool, int> RmlImModeLayout::drag_int(const std::string& label, int value,
-                                                    float /*speed*/, int min, int max) {
-        return slider_int(label, value, min, max);
+                                                    float speed, int min, int max) {
+        if (!doc_)
+            return {false, value};
+        auto* line = ensure_line_container();
+        auto& slot = ensure_slot(SlotType::DragInt, build_slot_id("drag_int", &label));
+        const auto min_text = Rml::String(std::to_string(min));
+        const auto max_text = Rml::String(std::to_string(max));
+        const int step = std::max(1, static_cast<int>(std::lround(std::fabs(speed))));
+        const auto step_text = Rml::String(std::to_string(step));
+
+        if (!slot.element) {
+            auto wrapper = doc_->CreateElement("div");
+            wrapper->SetClass("setting-row", true);
+
+            auto lbl = doc_->CreateElement("span");
+            lbl->SetClass("prop-label", true);
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
+
+            auto input = doc_->CreateElement("input");
+            input->SetAttribute("type", "range");
+            input->SetAttribute("min", min_text);
+            input->SetAttribute("max", max_text);
+            input->SetAttribute("step", step_text);
+            input->SetAttribute("value", Rml::String(std::to_string(value)));
+            input->SetClass("setting-slider", true);
+
+            slot.events.float_value = static_cast<float>(value);
+            input->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
+
+            auto val_text = doc_->CreateElement("span");
+            val_text->SetClass("slider-value", true);
+            val_text->SetInnerRML(Rml::String(std::to_string(value)));
+
+            wrapper->AppendChild(std::move(lbl));
+            wrapper->AppendChild(std::move(input));
+            wrapper->AppendChild(std::move(val_text));
+            slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
+        } else {
+            if (slot.element->GetParentNode() != line)
+                line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
+            auto* input = slot.element->GetChild(1);
+            if (input) {
+                input->SetAttribute("min", min_text);
+                input->SetAttribute("max", max_text);
+                input->SetAttribute("step", step_text);
+            }
+            if (input && !slot.events.changed)
+                input->SetAttribute("value", Rml::String(std::to_string(value)));
+            auto* val_text = slot.element->GetChild(2);
+            if (val_text) {
+                int display_val = slot.events.changed ? static_cast<int>(slot.events.float_value) : value;
+                val_text->SetInnerRML(Rml::String(std::to_string(display_val)));
+            }
+        }
+
+        last_element_ = slot.element;
+        last_clicked_ = false;
+        if (slot.events.changed) {
+            slot.events.changed = false;
+            return {true, static_cast<int>(std::round(slot.events.float_value))};
+        }
+        return {false, value};
     }
 
     // ── Input ───────────────────────────────────────────────
@@ -781,7 +1005,7 @@ namespace lfs::python {
         if (!doc_)
             return {false, value};
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::InputText, build_id(label));
+        auto& slot = ensure_slot(SlotType::InputText, build_slot_id("input_text", &label));
 
         if (!slot.element) {
             auto wrapper = doc_->CreateElement("div");
@@ -789,21 +1013,20 @@ namespace lfs::python {
 
             auto lbl = doc_->CreateElement("span");
             lbl->SetClass("prop-label", true);
-            lbl->SetInnerRML(Rml::String(label));
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
             auto input = doc_->CreateElement("input");
             input->SetAttribute("type", "text");
             input->SetAttribute("value", Rml::String(value));
-            input->SetProperty("flex", "1");
+            input->SetClass("im-control--fill", true);
 
             slot.events.string_value = value;
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            input->AddEventListener(Rml::EventId::Change, listener.get());
-            listeners_.push_back(std::move(listener));
+            input->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
 
             wrapper->AppendChild(std::move(lbl));
             wrapper->AppendChild(std::move(input));
             slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
@@ -832,12 +1055,103 @@ namespace lfs::python {
     std::tuple<bool, float> RmlImModeLayout::input_float(const std::string& label, float value,
                                                          float /*step*/, float /*step_fast*/,
                                                          const std::string& /*format*/) {
-        return slider_float(label, value, value - 100.0f, value + 100.0f);
+        if (!doc_)
+            return {false, value};
+        auto* line = ensure_line_container();
+        auto& slot = ensure_slot(SlotType::InputFloat, build_slot_id("input_float", &label));
+
+        if (!slot.element) {
+            auto wrapper = doc_->CreateElement("div");
+            wrapper->SetClass("setting-row", true);
+
+            auto display = strip_imgui_id(label);
+            if (!display.empty()) {
+                auto lbl = doc_->CreateElement("span");
+                lbl->SetClass("prop-label", true);
+                lbl->SetInnerRML(Rml::String(display));
+                wrapper->AppendChild(std::move(lbl));
+            }
+
+            auto input = doc_->CreateElement("input");
+            input->SetAttribute("type", "text");
+            input->SetAttribute("value", Rml::String(std::format("{:.3f}", value)));
+            input->SetClass("number-input", true);
+            input->SetClass("im-control--fill", true);
+
+            slot.events.float_value = value;
+            slot.events.string_value = std::format("{:.3f}", value);
+            input->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
+
+            wrapper->AppendChild(std::move(input));
+            slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
+        } else {
+            if (slot.element->GetParentNode() != line)
+                line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
+        }
+
+        last_element_ = slot.element;
+        last_clicked_ = false;
+        if (slot.events.changed) {
+            slot.events.changed = false;
+            try {
+                float parsed = std::stof(slot.events.string_value);
+                return {true, parsed};
+            } catch (const std::exception&) {
+                return {false, value};
+            }
+        }
+        return {false, value};
     }
 
     std::tuple<bool, int> RmlImModeLayout::input_int(const std::string& label, int value,
                                                      int /*step*/, int /*step_fast*/) {
-        return slider_int(label, value, value - 100, value + 100);
+        if (!doc_)
+            return {false, value};
+        auto* line = ensure_line_container();
+        auto& slot = ensure_slot(SlotType::InputInt, build_slot_id("input_int", &label));
+
+        if (!slot.element) {
+            auto wrapper = doc_->CreateElement("div");
+            wrapper->SetClass("setting-row", true);
+
+            auto display = strip_imgui_id(label);
+            if (!display.empty()) {
+                auto lbl = doc_->CreateElement("span");
+                lbl->SetClass("prop-label", true);
+                lbl->SetInnerRML(Rml::String(display));
+                wrapper->AppendChild(std::move(lbl));
+            }
+
+            auto input = doc_->CreateElement("input");
+            input->SetAttribute("type", "text");
+            input->SetAttribute("value", Rml::String(std::to_string(value)));
+            input->SetClass("number-input", true);
+            input->SetClass("im-control--fill", true);
+
+            slot.events.string_value = std::to_string(value);
+            input->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
+
+            wrapper->AppendChild(std::move(input));
+            slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
+        } else {
+            if (slot.element->GetParentNode() != line)
+                line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
+        }
+
+        last_element_ = slot.element;
+        last_clicked_ = false;
+        if (slot.events.changed) {
+            slot.events.changed = false;
+            try {
+                int parsed = std::stoi(slot.events.string_value);
+                return {true, parsed};
+            } catch (const std::exception&) {
+                return {false, value};
+            }
+        }
+        return {false, value};
     }
 
     std::tuple<bool, int> RmlImModeLayout::input_int_formatted(const std::string& label, int value,
@@ -847,7 +1161,7 @@ namespace lfs::python {
 
     std::tuple<bool, float> RmlImModeLayout::stepper_float(const std::string& label, float value,
                                                            const std::vector<float>& /*steps*/) {
-        return slider_float(label, value, value - 100.0f, value + 100.0f);
+        return input_float(label, value);
     }
 
     std::tuple<bool, std::string> RmlImModeLayout::path_input(const std::string& label,
@@ -866,7 +1180,7 @@ namespace lfs::python {
 
         auto [r, g, b] = color;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Label, build_id("ce3:" + label));
+        auto& slot = ensure_slot(SlotType::Label, build_slot_id("color_edit3", &label));
 
         auto css = std::format("rgba({},{},{},255)",
                                static_cast<int>(r * 255), static_cast<int>(g * 255), static_cast<int>(b * 255));
@@ -876,7 +1190,7 @@ namespace lfs::python {
 
             auto lbl = doc_->CreateElement("span");
             lbl->SetClass("prop-label", true);
-            lbl->SetInnerRML(Rml::String(label));
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
             auto swatch = doc_->CreateElement("div");
             swatch->SetClass("im-color-swatch", true);
@@ -922,7 +1236,7 @@ namespace lfs::python {
             return false;
         auto css = color_to_css(color);
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Button, build_id("cb:" + label));
+        auto& slot = ensure_slot(SlotType::Button, build_slot_id("color_button", &label));
 
         if (!slot.element) {
             auto el = doc_->CreateElement("button");
@@ -936,9 +1250,7 @@ namespace lfs::python {
             if (h > 0)
                 el->SetProperty("height", Rml::String(std::to_string(static_cast<int>(h)) + "dp"));
 
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            el->AddEventListener(Rml::EventId::Click, listener.get());
-            listeners_.push_back(std::move(listener));
+            el->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
             slot.element = line->AppendChild(std::move(el));
         } else {
@@ -962,7 +1274,7 @@ namespace lfs::python {
         if (!doc_)
             return {false, current_idx};
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Combo, build_id(label));
+        auto& slot = ensure_slot(SlotType::Combo, build_slot_id("combo", &label));
 
         if (!slot.element) {
             auto wrapper = doc_->CreateElement("div");
@@ -970,10 +1282,10 @@ namespace lfs::python {
 
             auto lbl = doc_->CreateElement("span");
             lbl->SetClass("prop-label", true);
-            lbl->SetInnerRML(Rml::String(label));
+            lbl->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
             auto select = doc_->CreateElement("select");
-            select->SetProperty("flex", "1");
+            select->SetClass("im-control--fill", true);
             for (int i = 0; i < static_cast<int>(items.size()); ++i) {
                 auto option = doc_->CreateElement("option");
                 option->SetAttribute("value", Rml::String(std::to_string(i)));
@@ -984,13 +1296,12 @@ namespace lfs::python {
             }
 
             slot.events.int_value = current_idx;
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            select->AddEventListener(Rml::EventId::Change, listener.get());
-            listeners_.push_back(std::move(listener));
+            select->AddEventListener(Rml::EventId::Change, new SlotEventListener(&slot.events));
 
             wrapper->AppendChild(std::move(lbl));
             wrapper->AppendChild(std::move(select));
             slot.element = line->AppendChild(std::move(wrapper));
+            apply_item_width(slot.element);
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
@@ -1018,25 +1329,24 @@ namespace lfs::python {
         if (!doc_)
             return false;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::Selectable, build_id(label));
+        auto& slot = ensure_slot(SlotType::Selectable, build_slot_id("selectable", &label));
+        const auto display = strip_imgui_id(label);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("div");
             el->SetClass("context-menu-item", true);
             if (selected)
                 el->SetClass("active", true);
-            el->SetInnerRML(Rml::String(label));
+            el->SetInnerRML(Rml::String(display));
 
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            el->AddEventListener(Rml::EventId::Click, listener.get());
-            listeners_.push_back(std::move(listener));
+            el->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
             slot.element = line->AppendChild(std::move(el));
         } else {
             if (slot.element->GetParentNode() != line)
                 line->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
             slot.element->SetClass("active", selected);
-            slot.element->SetInnerRML(Rml::String(label));
+            slot.element->SetInnerRML(Rml::String(display));
         }
 
         bool clicked = slot.events.clicked;
@@ -1054,7 +1364,7 @@ namespace lfs::python {
         finish_current_line();
         assert(!containers_.empty());
         auto& level = containers_.back();
-        auto& slot = ensure_slot(SlotType::Separator, build_id("sep"));
+        auto& slot = ensure_slot(SlotType::Separator, build_slot_id("separator"));
 
         if (!slot.element) {
             auto el = doc_->CreateElement("div");
@@ -1071,11 +1381,11 @@ namespace lfs::python {
         finish_current_line();
         assert(!containers_.empty());
         auto& level = containers_.back();
-        auto& slot = ensure_slot(SlotType::Spacing, build_id("spc"));
+        auto& slot = ensure_slot(SlotType::Spacing, build_slot_id("spacing"));
 
         if (!slot.element) {
             auto el = doc_->CreateElement("div");
-            el->SetProperty("height", "8dp");
+            el->SetClass("im-spacing", true);
             slot.element = level.parent->AppendChild(std::move(el));
         } else if (slot.element->GetParentNode() != level.parent) {
             level.parent->AppendChild(slot.element->GetParentNode()->RemoveChild(slot.element));
@@ -1110,7 +1420,7 @@ namespace lfs::python {
         if (!doc_)
             return false;
         finish_current_line();
-        auto& slot = ensure_slot(SlotType::CollapsHeader, build_id(label));
+        auto& slot = ensure_slot(SlotType::CollapsHeader, build_slot_id("collapsing_header", &label));
 
         if (!slot.element) {
             slot.events.open = force_next_open_ || default_open;
@@ -1124,11 +1434,9 @@ namespace lfs::python {
             arrow->SetInnerRML(slot.events.open ? "\xe2\x96\xbc" : "\xe2\x96\xb6");
 
             auto text = doc_->CreateElement("span");
-            text->SetInnerRML(Rml::String(label));
+            text->SetInnerRML(Rml::String(strip_imgui_id(label)));
 
-            auto listener = std::make_unique<SlotEventListener>(&slot.events);
-            header->AddEventListener(Rml::EventId::Click, listener.get());
-            listeners_.push_back(std::move(listener));
+            header->AddEventListener(Rml::EventId::Click, new SlotEventListener(&slot.events));
 
             header->AppendChild(std::move(arrow));
             header->AppendChild(std::move(text));
@@ -1238,7 +1546,7 @@ namespace lfs::python {
             if (w > 0.0f)
                 cell->SetProperty("width", Rml::String(std::to_string(static_cast<int>(w)) + "dp"));
             else
-                cell->SetProperty("flex", "1");
+                cell->SetClass("im-table-cell--fill", true);
         }
 
         table_->current_cell = table_->current_row->AppendChild(std::move(cell));
@@ -1290,12 +1598,11 @@ namespace lfs::python {
         if (!doc_)
             return;
         auto* line = ensure_line_container();
-        auto& slot = ensure_slot(SlotType::ProgressBar, build_id("progress"));
+        auto& slot = ensure_slot(SlotType::ProgressBar, build_slot_id("progress"));
 
         if (!slot.element) {
             auto wrapper = doc_->CreateElement("div");
-            wrapper->SetProperty("position", "relative");
-            wrapper->SetProperty("width", "100%");
+            wrapper->SetClass("im-progress", true);
 
             auto prog = doc_->CreateElement("progress");
             prog->SetAttribute("value", Rml::String(std::to_string(fraction)));
@@ -1345,13 +1652,44 @@ namespace lfs::python {
     void RmlImModeLayout::pop_style_var(int /*count*/) {}
     void RmlImModeLayout::push_style_color(const std::string& /*col*/, nb::object /*color*/) {}
     void RmlImModeLayout::pop_style_color(int /*count*/) {}
-    void RmlImModeLayout::push_item_width(float /*width*/) {}
-    void RmlImModeLayout::pop_item_width() {}
+    void RmlImModeLayout::push_item_width(float width) {
+        item_width_stack_.push_back(width);
+    }
+
+    void RmlImModeLayout::pop_item_width() {
+        if (!item_width_stack_.empty())
+            item_width_stack_.pop_back();
+    }
+
+    void RmlImModeLayout::apply_item_width(Rml::Element* el) {
+        if (item_width_stack_.empty() || !el)
+            return;
+        float w = item_width_stack_.back();
+        if (w > 0) {
+            el->SetProperty("width", Rml::String(std::format("{:.0f}dp", w)));
+        } else if (w < 0) {
+            el->SetProperty("flex", "1");
+            if (w != -1.0f)
+                el->SetProperty("margin-right", Rml::String(std::format("{:.0f}dp", -w)));
+        }
+    }
 
     // ── Tooltip ─────────────────────────────────────────────
 
     void RmlImModeLayout::set_tooltip(const std::string& text) {
         if (!tooltip_el_ || !last_element_ || !last_element_->IsPseudoClassSet("hover"))
+            return;
+
+        tooltip_candidate_seen_ = true;
+        const auto now = std::chrono::steady_clock::now();
+        if (tooltip_hover_el_ != last_element_ || tooltip_text_ != text) {
+            tooltip_hover_el_ = last_element_;
+            tooltip_text_ = text;
+            tooltip_hover_started_at_ = now;
+        }
+
+        if (tooltip_hover_started_at_ == std::chrono::steady_clock::time_point{} ||
+            now - tooltip_hover_started_at_ < lfs::vis::gui::kRmlTooltipShowDelay)
             return;
 
         auto body_offset = doc_->GetAbsoluteOffset(Rml::BoxArea::Content);
@@ -1471,7 +1809,8 @@ namespace lfs::python {
         finish_current_line();
         assert(!containers_.empty());
 
-        auto& slot = ensure_slot(SlotType::Line, build_id("child:" + id));
+        auto key = build_id("child:" + id);
+        auto& slot = ensure_slot(SlotType::Line, key);
 
         if (!slot.element) {
             auto el = doc_->CreateElement("div");
@@ -1486,10 +1825,14 @@ namespace lfs::python {
             slot.element = containers_.back().parent->AppendChild(std::move(el));
         }
 
-        while (slot.element->HasChildNodes())
-            removed_elements_.push_back(slot.element->RemoveChild(slot.element->GetFirstChild()));
-
-        containers_.push_back({slot.element, {}, 0});
+        auto it = child_slots_.find(key);
+        if (it != child_slots_.end()) {
+            containers_.push_back({slot.element, std::move(it->second.slots), 0});
+            child_slots_.erase(it);
+        } else {
+            containers_.push_back({slot.element, {}, 0});
+        }
+        child_key_stack_.push_back(std::move(key));
         return true;
     }
 
@@ -1498,6 +1841,12 @@ namespace lfs::python {
             return;
         finish_current_line();
         prune_excess_slots(containers_.back());
+
+        if (!child_key_stack_.empty()) {
+            auto* container = containers_.back().parent;
+            child_slots_[child_key_stack_.back()] = {container, std::move(containers_.back().slots)};
+            child_key_stack_.pop_back();
+        }
         containers_.pop_back();
     }
 
@@ -1544,7 +1893,7 @@ namespace lfs::python {
 
         auto title_el = doc_->CreateElement("div");
         title_el->SetClass("im-popup-title", true);
-        title_el->SetInnerRML(Rml::String(title));
+        title_el->SetInnerRML(Rml::String(strip_imgui_id(title)));
         popup_dialog_->AppendChild(std::move(title_el));
 
         active_popup_id_ = title;
@@ -2024,7 +2373,8 @@ namespace lfs::python {
 
         const char* cls = direction_ == RmlLayoutDirection::Row ? "im-row" : "im-column";
         auto& slot = parent_->ensure_slot(
-            SlotType::Line, parent_->build_id(direction_ == RmlLayoutDirection::Row ? "row" : "col"));
+            SlotType::Line,
+            parent_->build_slot_id(direction_ == RmlLayoutDirection::Row ? "row" : "col"));
 
         if (!slot.element) {
             auto el = parent_->doc_->CreateElement("div");

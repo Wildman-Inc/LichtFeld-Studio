@@ -11,6 +11,7 @@
 #include "formats/transforms.hpp"
 #include "io/error.hpp"
 #include "io/filesystem_utils.hpp"
+#include "io/loaders/loader_utils.hpp"
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -25,44 +26,6 @@ namespace lfs::io {
     using lfs::core::PointCloud;
     using lfs::core::Tensor;
 
-    namespace {
-        constexpr std::array MASK_FOLDERS = {"masks", "mask", "segmentation"};
-        constexpr std::array MASK_EXTENSIONS = {".png", ".jpg", ".jpeg", ".mask.png"};
-    } // namespace
-
-    static std::filesystem::path find_mask_path(const std::filesystem::path& base_path,
-                                                const std::string& image_name) {
-        const std::filesystem::path img_path = lfs::core::utf8_to_path(image_name);
-        const std::filesystem::path stem_path = img_path.parent_path() / img_path.stem();
-
-        for (const auto& folder : MASK_FOLDERS) {
-            const std::filesystem::path mask_dir = base_path / folder;
-            if (!safe_exists(mask_dir))
-                continue;
-
-            if (const auto exact = mask_dir / img_path; safe_exists(exact))
-                return exact;
-
-            if (auto found = find_path_ci(mask_dir, img_path); !found.empty())
-                return found;
-
-            for (const auto& ext : MASK_EXTENSIONS) {
-                std::filesystem::path target_path = stem_path;
-                target_path += ext;
-                if (auto found = find_path_ci(mask_dir, target_path); !found.empty())
-                    return found;
-            }
-
-            for (const auto& ext : MASK_EXTENSIONS) {
-                std::filesystem::path target_path = img_path;
-                target_path += ext;
-                if (auto found = find_path_ci(mask_dir, target_path); !found.empty())
-                    return found;
-            }
-        }
-        return {};
-    }
-
     Result<LoadResult> BlenderLoader::load(
         const std::filesystem::path& path,
         const LoadOptions& options) {
@@ -74,6 +37,10 @@ namespace lfs::io {
         if (!std::filesystem::exists(path)) {
             return make_error(ErrorCode::PATH_NOT_FOUND,
                               "Blender/NeRF dataset path does not exist", path);
+        }
+
+        if (is_load_cancel_requested(options)) {
+            return make_error(ErrorCode::CANCELLED, "Blender/NeRF dataset load cancelled", path);
         }
 
         // Report initial progress
@@ -155,7 +122,8 @@ namespace lfs::io {
             LOG_INFO("Loading Blender/NeRF dataset from: {}", lfs::core::path_to_utf8(transforms_file));
 
             // Read transforms and create cameras
-            auto [camera_infos, scene_center, train_val_split] = read_transforms_cameras_and_images(transforms_file);
+            auto [camera_infos, scene_center, train_val_split] =
+                read_transforms_cameras_and_images(transforms_file, options);
 
             if (options.progress) {
                 options.progress(40.0f, std::format("Creating {} cameras...", camera_infos.size()));
@@ -169,13 +137,26 @@ namespace lfs::io {
 
             // Get base path for mask lookup
             std::filesystem::path base_path = transforms_file.parent_path();
+            MaskDirCache mask_cache(base_path, options.cancel_requested);
 
             for (size_t i = 0; i < camera_infos.size(); ++i) {
+                if ((i % 64) == 0) {
+                    throw_if_load_cancel_requested(options, "Blender/NeRF camera creation cancelled");
+                }
                 const auto& info = camera_infos[i];
 
                 try {
-                    // Find mask path if available
-                    std::filesystem::path mask_path = find_mask_path(base_path, info._image_name);
+                    std::filesystem::path mask_path;
+                    if (auto mask_lookup = mask_cache.lookup(info._image_name); mask_lookup.found()) {
+                        mask_path = std::move(mask_lookup.path);
+                    } else if (mask_lookup.ambiguous()) {
+                        return make_error(
+                            ErrorCode::INVALID_DATASET,
+                            std::format("Mask for image '{}' is ambiguous across the dataset mask folders. "
+                                        "Keep masks in the same relative subdirectories as the images or rename them uniquely.",
+                                        info._image_name),
+                            base_path);
+                    }
 
                     // Validate mask dimensions match image dimensions
                     if (!mask_path.empty()) {
@@ -214,18 +195,13 @@ namespace lfs::io {
                 }
             }
 
-            bool images_have_alpha = false;
-            if (!cameras.empty()) {
-                try {
-                    auto [w, h, c] = lfs::core::get_image_info(cameras[0]->image_path());
-                    images_have_alpha = (c == 4);
-                } catch (const std::exception&) {
-                }
-            }
+            const bool images_have_alpha = detect_camera_alpha(cameras, options.cancel_requested);
 
             if (options.progress) {
                 options.progress(60.0f, "Loading point cloud...");
             }
+
+            throw_if_load_cancel_requested(options, "Blender/NeRF point cloud load cancelled");
 
             // Check ply_file_path in transforms.json (nerfstudio format), fallback to pointcloud.ply
             std::filesystem::path pointcloud_path;
@@ -246,7 +222,9 @@ namespace lfs::io {
             std::shared_ptr<PointCloud> point_cloud;
             std::vector<std::string> warnings;
             if (std::filesystem::exists(pointcloud_path)) {
-                point_cloud = std::make_shared<PointCloud>(load_simple_ply_point_cloud(pointcloud_path));
+                auto loaded_point_cloud = load_simple_ply_point_cloud(pointcloud_path, options);
+                point_cloud = std::make_shared<PointCloud>(
+                    convert_transforms_point_cloud_to_colmap_world(std::move(loaded_point_cloud)));
                 LOG_INFO("Loaded {} points from {}", point_cloud->size(),
                          lfs::core::path_to_utf8(pointcloud_path.filename()));
             } else {
@@ -285,6 +263,8 @@ namespace lfs::io {
 
             return result;
 
+        } catch (const LoadCancelledError& e) {
+            return make_error(ErrorCode::CANCELLED, e.what(), path);
         } catch (const std::exception& e) {
             return make_error(ErrorCode::CORRUPTED_DATA,
                               std::format("Failed to load Blender/NeRF dataset: {}", e.what()), path);

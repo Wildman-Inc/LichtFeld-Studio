@@ -72,7 +72,7 @@
 
     "indent_spacing": 21.0,
     "scrollbar_size": 12.0,
-    "grab_min_size": 10.0,
+    "grab_min_size": 16.0,
 
     "toolbar_button_size": 24.0,
     "toolbar_padding": 6.0,
@@ -82,7 +82,7 @@
   "fonts": {
     "regular_path": "Inter-Regular.ttf",
     "bold_path": "Inter-SemiBold.ttf",
-    "base_size": 10.0,
+    "base_size": 12.0,
     "small_size": 12.0,
     "large_size": 16.0,
     "heading_size": 18.0,
