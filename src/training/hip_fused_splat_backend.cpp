@@ -129,12 +129,17 @@ namespace lfs::training::hip_fused_splat_backend {
     Options read_options() {
         Options options;
         options.resident_gpu_cache = !env_flag_disabled("LFS_HIP_FUSED_RESIDENT_CACHE");
+        options.projection_backward_optimizer = !env_flag_disabled("LFS_HIP_FUSED_PROJECTION_OPTIMIZER");
         options.fused_optimizer = !env_flag_disabled("LFS_HIP_FUSED_OPTIMIZER");
         options.loss_raster_boundary_fusion = !env_flag_disabled("LFS_HIP_FUSED_LOSS_RASTER");
         options.rocprim_sort_scan = !env_flag_disabled("LFS_HIP_FUSED_ROCPRIM_SORT_SCAN");
         options.resident_gpu_cache_bytes = read_cache_bytes_from_env();
         options.prefetch_count = read_prefetch_from_env();
         return options;
+    }
+
+    bool projection_backward_optimizer_enabled() {
+        return is_requested() && read_options().projection_backward_optimizer;
     }
 
     bool fused_optimizer_enabled() {
@@ -188,9 +193,10 @@ namespace lfs::training::hip_fused_splat_backend {
             config.jpeg_batch_size);
 
         LOG_INFO(
-            "HIP fused splat backend enabled (resident_cache={}, limit={:.1f} GB, fused_optimizer={}, loss_raster_boundary={}, sort_scan={})",
+            "HIP fused splat backend enabled (resident_cache={}, limit={:.1f} GB, projection_optimizer={}, fused_optimizer={}, loss_raster_boundary={}, sort_scan={})",
             config.resident_gpu_cache,
             config.resident_gpu_cache_max_bytes / BYTES_PER_GIB,
+            options.projection_backward_optimizer,
             options.fused_optimizer,
             options.loss_raster_boundary_fusion,
             options.rocprim_sort_scan ? sort_scan_policy_name() : std::string_view{"fastgs-default"});

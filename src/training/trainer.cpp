@@ -2633,6 +2633,8 @@ namespace lfs::training {
                                              iter >= ppisp_activation_step &&
                                              ppisp_cam_idx >= 0 &&
                                              ppisp_cam_idx < ppisp_controller_pool_->num_cameras();
+            const bool in_sparsification = get_active_sparsify_steps() > 0 &&
+                                           iter > get_sparsity_boundary_iteration();
             const bool use_pixel_error_densification =
                 (params_.optimization.strategy == "mcmc") ||
                 (params_.optimization.strategy == "igs+") ||
@@ -2644,6 +2646,21 @@ namespace lfs::training {
                 densification_type = DensificationType::MCMC;
             else if (core::param::is_mrnf_strategy(params_.optimization.strategy))
                 densification_type = DensificationType::MRNF;
+
+            const bool freeze_gaussians_for_distill =
+                ppisp_controller_pool_ &&
+                params_.optimization.ppisp_use_controller &&
+                params_.optimization.ppisp_freeze_gaussians_on_distill &&
+                iter >= ppisp_activation_step;
+            const bool hip_projection_optimizer_fusion =
+                hip_fused_splat_backend::projection_backward_optimizer_enabled() &&
+                core::param::strategy_names_match(params_.optimization.strategy, core::param::kStrategyMCMC) &&
+                num_tiles == 1 &&
+                !in_controller_phase &&
+                !in_sparsification &&
+                !freeze_gaussians_for_distill &&
+                !params_.optimization.enable_sparsity &&
+                iter < get_total_iterations();
 
             // Loop over tiles (row-major order)
             for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
@@ -3130,10 +3147,16 @@ namespace lfs::training {
                                                   use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{});
                     } else {
                         tile_context_guard.release();
+                        const FastRasterizeBackwardOptions backward_options{
+                            .fused_projection_optimizer = hip_projection_optimizer_fusion,
+                            .iteration = iter,
+                            .scale_reg_weight = params_.optimization.scale_reg,
+                            .opacity_reg_weight = params_.optimization.opacity_reg};
                         fast_rasterize_backward(*fast_ctx, raster_grad, strategy_->get_model(),
                                                 strategy_->get_optimizer(), tile_grad_alpha,
                                                 use_pixel_error_densification ? tile_error_map : lfs::core::Tensor{},
-                                                densification_type);
+                                                densification_type,
+                                                backward_options);
                     }
                     nvtxRangePop();
                 }
@@ -3163,8 +3186,11 @@ namespace lfs::training {
                 nvtxRangePop();
             } else {
                 // Normal phase: regularization losses + optimizer steps for all components
+                const bool fused_projection_step_completed =
+                    strategy_->get_optimizer().fused_projection_step_completed(iter);
+                // The HIP fused projection optimizer folds these regularization gradients into its Adam step.
 
-                if (params_.optimization.scale_reg > 0.0f) {
+                if (params_.optimization.scale_reg > 0.0f && !fused_projection_step_completed) {
                     nvtxRangePush("compute_scale_reg_loss");
                     auto scale_loss_result = compute_scale_reg_loss(strategy_->get_model(), strategy_->get_optimizer(), params_.optimization);
                     if (!scale_loss_result) {
@@ -3174,7 +3200,7 @@ namespace lfs::training {
                     nvtxRangePop();
                 }
 
-                if (params_.optimization.opacity_reg > 0.0f) {
+                if (params_.optimization.opacity_reg > 0.0f && !fused_projection_step_completed) {
                     nvtxRangePush("compute_opacity_reg_loss");
                     auto opacity_loss_result = compute_opacity_reg_loss(strategy_->get_model(), strategy_->get_optimizer(), params_.optimization);
                     if (!opacity_loss_result) {
@@ -3271,9 +3297,6 @@ namespace lfs::training {
                     .is_refining = strategy_->is_refining(iter)}
                     .emit();
             }
-
-            const bool in_sparsification = get_active_sparsify_steps() > 0 &&
-                                           iter > get_sparsity_boundary_iteration();
 
             if (!in_sparsification) {
                 strategy_->pre_step(iter, r_output);

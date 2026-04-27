@@ -13,6 +13,7 @@ namespace lfs::training::hip_fused_splat_backend {
 
     struct Options {
         bool resident_gpu_cache = true;
+        bool projection_backward_optimizer = true;
         bool fused_optimizer = true;
         bool loss_raster_boundary_fusion = true;
         bool rocprim_sort_scan = true;
@@ -23,6 +24,7 @@ namespace lfs::training::hip_fused_splat_backend {
     [[nodiscard]] bool is_requested();
     [[nodiscard]] bool resident_pipeline_requested();
     [[nodiscard]] Options read_options();
+    [[nodiscard]] bool projection_backward_optimizer_enabled();
     [[nodiscard]] bool fused_optimizer_enabled();
     [[nodiscard]] bool loss_raster_boundary_fusion_enabled();
     [[nodiscard]] std::string_view sort_scan_policy_name();

@@ -77,6 +77,7 @@ endif()
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
     optimizer/hip_fused_adam.cu
+    optimizer/hip_fused_projection_optimizer.cu
     optimizer/scheduler.cpp
     losses/regularization.cpp
     losses/photometric_loss.cpp

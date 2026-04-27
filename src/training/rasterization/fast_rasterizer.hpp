@@ -55,6 +55,13 @@ namespace lfs::training {
         lfs::core::Tensor bg_image;
     };
 
+    struct FastRasterizeBackwardOptions {
+        bool fused_projection_optimizer = false;
+        int iteration = 0;
+        float scale_reg_weight = 0.0f;
+        float opacity_reg_weight = 0.0f;
+    };
+
     // Explicit forward pass - returns render output and context for backward
     // Optional tile parameters for memory-efficient training (tile_width/height=0 means full image)
     // bg_image is optional - if provided, uses per-pixel background blending instead of solid color
@@ -77,7 +84,8 @@ namespace lfs::training {
         AdamOptimizer& optimizer,
         const lfs::core::Tensor& grad_alpha_extra = {},
         const lfs::core::Tensor& pixel_error_map = {},
-        DensificationType densification_type = DensificationType::None);
+        DensificationType densification_type = DensificationType::None,
+        const FastRasterizeBackwardOptions& options = {});
 
     // Convenience wrapper for inference (no backward needed)
     inline RenderOutput fast_rasterize(
