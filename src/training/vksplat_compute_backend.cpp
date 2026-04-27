@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <format>
 #include <limits>
@@ -23,6 +24,14 @@
 namespace lfs::training::vksplat_compute {
 
     namespace {
+        struct SampleMetrics {
+            float loss = 0.0f;
+            float l1 = 0.0f;
+            float psnr = 0.0f;
+            float ssim = 0.0f;
+            bool valid = false;
+        };
+
         [[nodiscard]] std::filesystem::path shader_root() {
 #if defined(LFS_VKSPLAT_SHADER_PATH)
             return std::filesystem::path{LFS_VKSPLAT_SHADER_PATH};
@@ -37,6 +46,25 @@ namespace lfs::training::vksplat_compute {
                 normalized.push_back('/');
             }
             return normalized;
+        }
+
+        [[nodiscard]] int metric_interval_from_env() {
+            const char* raw = std::getenv("LFS_VKSPLAT_METRIC_INTERVAL");
+            if (!raw || raw[0] == '\0') {
+                return 100;
+            }
+            try {
+                return std::max(0, std::stoi(raw));
+            } catch (...) {
+                return 100;
+            }
+        }
+
+        [[nodiscard]] double clamp_unit_finite(const double value) {
+            if (!std::isfinite(value)) {
+                return 0.0;
+            }
+            return std::clamp(value, 0.0, 1.0);
         }
 
         [[nodiscard]] std::map<std::string, std::string> make_shader_map() {
@@ -216,6 +244,8 @@ namespace lfs::training::vksplat_compute {
             const size_t reserve = config.strategy == TrainerConfig::Strategy::MCMC
                                        ? static_cast<size_t>(std::max(config.cap_max, 0))
                                        : 0u;
+            uniforms.num_splats = static_cast<uint32_t>(std::min<size_t>(
+                buffers.num_splats, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
             trainer.executeProjectionForward(uniforms, buffers, reserve);
             trainer.executeCalculateIndexBufferOffset(buffers);
             if (buffers.num_indices != 0) {
@@ -266,14 +296,84 @@ namespace lfs::training::vksplat_compute {
             LOG_INFO("vksplat initial splats capped to {} from COLMAP input", target_count);
         }
 
-        void run_train_step(VulkanGSTrainer& trainer, VulkanGSRendererUniforms& uniforms,
-                            VulkanGSPipelineBuffers& buffers, const TrainerConfig& config,
-                            const size_t train_idx, const int step) {
+        SampleMetrics sample_metrics(VulkanGSTrainer& trainer, VulkanGSPipelineBuffers& buffers,
+                                     const TrainerConfig& config, const size_t train_idx) {
+            trainer.copyFromDevice(buffers.pixel_state);
+
+            const auto& rendered = buffers.pixel_state;
+            const auto& reference = trainer.get_train_image(train_idx).buffer;
+            const size_t pixels = std::min(rendered.size(), reference.size()) / 4;
+            if (pixels == 0) {
+                return {};
+            }
+
+            double l1_sum = 0.0;
+            double mse_sum = 0.0;
+            std::array<double, 3> render_sum{};
+            std::array<double, 3> ref_sum{};
+            std::array<double, 3> render_sq_sum{};
+            std::array<double, 3> ref_sq_sum{};
+            std::array<double, 3> cross_sum{};
+
+            for (size_t i = 0; i < pixels; ++i) {
+                for (size_t c = 0; c < 3; ++c) {
+                    const double render_value = clamp_unit_finite(static_cast<double>(rendered[4 * i + c]));
+                    const double ref_value = clamp_unit_finite(static_cast<double>(reference[4 * i + c]) / 255.0);
+                    const double delta = render_value - ref_value;
+                    l1_sum += std::abs(delta);
+                    mse_sum += delta * delta;
+                    render_sum[c] += render_value;
+                    ref_sum[c] += ref_value;
+                    render_sq_sum[c] += render_value * render_value;
+                    ref_sq_sum[c] += ref_value * ref_value;
+                    cross_sum[c] += render_value * ref_value;
+                }
+            }
+
+            const double sample_count = static_cast<double>(pixels);
+            const double channel_count = sample_count * 3.0;
+            const double l1 = l1_sum / channel_count;
+            const double mse = mse_sum / channel_count;
+            const double psnr = mse <= 0.0 ? 99.0 : 10.0 * std::log10(1.0 / mse);
+
+            constexpr double c1 = 0.01 * 0.01;
+            constexpr double c2 = 0.03 * 0.03;
+            double ssim_sum = 0.0;
+            for (size_t c = 0; c < 3; ++c) {
+                const double render_mean = render_sum[c] / sample_count;
+                const double ref_mean = ref_sum[c] / sample_count;
+                const double render_var = std::max(0.0, render_sq_sum[c] / sample_count - render_mean * render_mean);
+                const double ref_var = std::max(0.0, ref_sq_sum[c] / sample_count - ref_mean * ref_mean);
+                const double covariance = cross_sum[c] / sample_count - render_mean * ref_mean;
+                const double numerator = (2.0 * render_mean * ref_mean + c1) * (2.0 * covariance + c2);
+                const double denominator = (render_mean * render_mean + ref_mean * ref_mean + c1) *
+                                           (render_var + ref_var + c2);
+                ssim_sum += denominator > 0.0 ? numerator / denominator : 0.0;
+            }
+            const double ssim = std::clamp(ssim_sum / 3.0, -1.0, 1.0);
+            const double lambda = std::clamp(static_cast<double>(config.ssim_lambda), 0.0, 1.0);
+            const double loss = (1.0 - lambda) * l1 + lambda * (1.0 - ssim);
+
+            return SampleMetrics{
+                .loss = static_cast<float>(loss),
+                .l1 = static_cast<float>(l1),
+                .psnr = static_cast<float>(psnr),
+                .ssim = static_cast<float>(ssim),
+                .valid = std::isfinite(loss) && std::isfinite(l1) && std::isfinite(psnr) && std::isfinite(ssim)};
+        }
+
+        SampleMetrics run_train_step(VulkanGSTrainer& trainer, VulkanGSRendererUniforms& uniforms,
+                                     VulkanGSPipelineBuffers& buffers, const TrainerConfig& config,
+                                     const size_t train_idx, const int step, const bool measure_metrics) {
             trainer.get_train_camera(train_idx, uniforms);
             uniforms.step = static_cast<uint32_t>(step);
 
             auto device_guard = DeviceGuard(&trainer);
             run_forward(trainer, uniforms, buffers, config);
+            SampleMetrics metrics;
+            if (measure_metrics) {
+                metrics = sample_metrics(trainer, buffers, config, train_idx);
+            }
             if (buffers.num_indices != 0) {
                 trainer.executeComputeSSIMGradient(config, uniforms, buffers, train_idx);
             }
@@ -284,6 +384,7 @@ namespace lfs::training::vksplat_compute {
             } else {
                 trainer.executeDefaultPostBackward(config, uniforms, buffers, step);
             }
+            return metrics;
         }
 
     } // namespace
@@ -323,6 +424,8 @@ namespace lfs::training::vksplat_compute {
                 const int total_steps = std::max(1, params.optimization.resolved_total_iterations());
                 const int sh_interval = static_cast<int>(std::max<size_t>(1, params.optimization.sh_degree_interval));
                 const uint32_t max_sh = static_cast<uint32_t>(std::clamp(params.optimization.sh_degree, 0, 3));
+                const int metric_interval = metric_interval_from_env();
+                SampleMetrics last_metrics;
 
                 LOG_INFO("Starting vksplat Vulkan compute training: {} steps, {} train images, output {}",
                          total_steps, trainer.num_train(), config.output_ply);
@@ -341,14 +444,34 @@ namespace lfs::training::vksplat_compute {
                     }
 
                     uniforms.active_sh = std::min<uint32_t>(static_cast<uint32_t>(step / sh_interval), max_sh);
-                    run_train_step(trainer, uniforms, buffers, config, order[step % order.size()], step);
+                    const size_t train_idx = order[step % order.size()];
+                    const bool measure_metrics =
+                        metric_interval > 0 &&
+                        (iteration == 1 || iteration == total_steps || iteration % metric_interval == 0);
+                    const SampleMetrics metrics =
+                        run_train_step(trainer, uniforms, buffers, config, train_idx, step, measure_metrics);
+                    if (metrics.valid) {
+                        last_metrics = metrics;
+                        LOG_INFO("vksplat sample metrics iter {}: loss={:.6f}, l1={:.6f}, psnr={:.2f} dB, global_ssim={:.4f}",
+                                 iteration, metrics.loss, metrics.l1, metrics.psnr, metrics.ssim);
+                    } else if (measure_metrics) {
+                        LOG_WARN("vksplat sample metrics skipped at iter {}: rendered_values={}, reference_values={}, tile_indices={}",
+                                 iteration,
+                                 buffers.pixel_state.deviceSize(),
+                                 trainer.get_train_image(train_idx).buffer.size(),
+                                 buffers.num_indices);
+                    }
 
                     if (control.after_step) {
                         control.after_step(Progress{
                             .iteration = iteration,
                             .total_iterations = total_steps,
                             .num_gaussians = static_cast<int>(buffers.num_splats),
-                            .loss = 0.0f});
+                            .loss = last_metrics.loss,
+                            .l1 = last_metrics.l1,
+                            .psnr = last_metrics.psnr,
+                            .ssim = last_metrics.ssim,
+                            .has_metrics = last_metrics.valid});
                     }
                 }
 

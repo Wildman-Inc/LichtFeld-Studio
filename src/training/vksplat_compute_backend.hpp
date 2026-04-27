@@ -20,6 +20,10 @@ namespace lfs::training::vksplat_compute {
         int total_iterations = 0;
         int num_gaussians = 0;
         float loss = 0.0f;
+        float l1 = 0.0f;
+        float psnr = 0.0f;
+        float ssim = 0.0f;
+        bool has_metrics = false;
     };
 
     struct StepControl {
