@@ -417,19 +417,14 @@ namespace lfs::core::tensor_ops {
 
         // OPTIMIZED PATH: Contiguous segments - use CUB's segmented reduce
         if (inner_size == 1) {
-            // begin_offsets: [0, N, 2N, 3N, ...]
+            // offsets: [0, N, 2N, 3N, ...]. hipCUB requires begin/end iterators
+            // to have the same concrete type, so end offsets use offsets + 1.
             auto begin_offsets = thrust::make_transform_iterator(
                 thrust::counting_iterator<int>(0),
                 [reduce_size] __host__ __device__(int i) -> int {
                     return i * static_cast<int>(reduce_size);
                 });
-
-            // end_offsets: [N, 2N, 3N, 4N, ...]
-            auto end_offsets = thrust::make_transform_iterator(
-                thrust::counting_iterator<int>(1),
-                [reduce_size] __host__ __device__(int i) -> int {
-                    return i * static_cast<int>(reduce_size);
-                });
+            auto end_offsets = begin_offsets + 1;
 
             void* d_temp_storage = nullptr;
             size_t temp_storage_bytes = 0;

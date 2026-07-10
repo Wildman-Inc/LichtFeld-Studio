@@ -71,7 +71,7 @@ set(CORE_SOURCES
         mesh_data.cpp
 )
 
-add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
+lfs_add_gpu_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
 
 target_compile_definitions(lfs_core PRIVATE LFS_CORE_EXPORTS)
 
@@ -79,7 +79,7 @@ target_include_directories(lfs_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_BINARY_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tensor  # For internal/ headers
@@ -98,8 +98,8 @@ target_link_libraries(lfs_core
         nlohmann_json::nlohmann_json
         glm::glm
         Threads::Threads
-        CUDA::cudart
-        CUDA::curand
+        ${GPU_RUNTIME_LIBRARY}
+        ${GPU_RAND_LIBRARY}
         spdlog::spdlog
     PRIVATE
         lfs_core_cuda
@@ -164,10 +164,6 @@ endif()
 set_target_properties(lfs_core PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
-    CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-    CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON
     EXPORT_COMPILE_COMMANDS ON
     CXX_VISIBILITY_PRESET hidden
@@ -176,6 +172,14 @@ set_target_properties(lfs_core PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     DEBUG_POSTFIX d
 )
+if(USE_CUDA)
+    set_target_properties(lfs_core PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 get_property(_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(WIN32 AND _IS_MULTI_CONFIG)
     set_target_properties(lfs_core PROPERTIES

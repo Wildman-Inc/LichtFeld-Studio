@@ -11,6 +11,10 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
+#ifndef LFS_CUDA_SYNC_MASK
+#define LFS_CUDA_SYNC_MASK 0xffffffffu
+#endif
+
 namespace lfs::core {
     namespace warp_ops {
 
@@ -33,7 +37,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_sum(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val += __shfl_xor_sync(0xffffffff, val, offset);
+                val += __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset);
             }
             return val;
         }
@@ -45,7 +49,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_max(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset);
                 val = (val > other) ? val : other;
             }
             return val;
@@ -58,7 +62,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_min(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(0xffffffff, val, offset);
+                T other = __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset);
                 val = (val < other) ? val : other;
             }
             return val;
@@ -71,7 +75,7 @@ namespace lfs::core {
         __device__ inline T warp_reduce_prod(T val) {
 #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                val *= __shfl_xor_sync(0xffffffff, val, offset);
+                val *= __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset);
             }
             return val;
         }

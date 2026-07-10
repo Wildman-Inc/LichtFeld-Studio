@@ -1799,6 +1799,7 @@ namespace lfs::vis {
         lod_page_cache_.reset();
         gpu_lod_tree_ = {};
         initialized_ = false;
+        cuda_timeline_interop_enabled_ = false;
         context_ = nullptr;
     }
 
@@ -3189,6 +3190,11 @@ namespace lfs::vis {
         if (auto ok = ensureInitialized(context); !ok) {
             return std::unexpected(ok.error());
         }
+#if defined(USE_HIP) && USE_HIP
+        // Windows ROCm cannot export the VMM backing used by the shared arena.
+        // The renderer keeps its regular Vulkan-owned scratch buffers instead.
+        return {};
+#endif
 
         const std::size_t width = static_cast<std::size_t>(viewport_size.x);
         const std::size_t height = static_cast<std::size_t>(viewport_size.y);
@@ -3911,15 +3917,23 @@ namespace lfs::vis {
 
         {
             LOG_TIMER("uploadOverlayBindings.signal_timeline");
-            auto& timeline = overlay_upload_timelines_[ring_slot];
-            const std::uint64_t signal_value = ++timeline.value;
-            if (!timeline.cuda_semaphore.cudaSignal(signal_value, stream)) {
-                return std::unexpected(std::format("VkSplat overlay binding upload signal failed: {}",
-                                                   timeline.cuda_semaphore.lastError()));
+            if (cuda_timeline_interop_enabled_) {
+                auto& timeline = overlay_upload_timelines_[ring_slot];
+                const std::uint64_t signal_value = ++timeline.value;
+                if (!timeline.cuda_semaphore.cudaSignal(signal_value, stream)) {
+                    return std::unexpected(std::format("VkSplat overlay binding upload signal failed: {}",
+                                                       timeline.cuda_semaphore.lastError()));
+                }
+                renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
+                                          signal_value,
+                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            } else if (const cudaError_t status = cudaStreamSynchronize(stream);
+                       status != cudaSuccess) {
+                return std::unexpected(std::format(
+                    "VkSplat overlay binding upload sync failed: {} ({})",
+                    cudaGetErrorName(status),
+                    cudaGetErrorString(status)));
             }
-            renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
-                                      signal_value,
-                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         }
 
         const auto view = [&](const std::size_t region) {
@@ -3941,13 +3955,101 @@ namespace lfs::vis {
         if (context_ != nullptr && context_ != &context) {
             reset();
         }
-        context_ = &context;
         if (initialized_) {
             return {};
         }
+
+        VulkanContext::ExternalSemaphore pending_render_complete_external{};
+        lfs::rendering::CudaTimelineSemaphore pending_render_complete_cuda{};
+        std::array<UploadTimeline, kInputRingSize> pending_upload_timelines{};
+        std::array<UploadTimeline, kInputRingSize> pending_overlay_upload_timelines{};
+        UploadTimeline pending_lod_engine_timeline{};
+        UploadTimeline pending_selection_query_timeline{};
+        bool pending_cuda_timeline_interop_enabled = false;
+        bool render_stream_created = false;
+        bool renderer_initialization_started = false;
+        bool initialization_committed = false;
+
+        const auto rollback_timeline = [&](UploadTimeline& timeline) noexcept {
+            timeline.cuda_semaphore.reset();
+            context.destroyExternalSemaphore(timeline.vk_semaphore);
+            timeline.value = 0;
+        };
+        auto initialization_rollback = ScopeExit([&]() noexcept {
+            if (initialization_committed) {
+                return;
+            }
+            for (auto& timeline : pending_upload_timelines) {
+                rollback_timeline(timeline);
+            }
+            for (auto& timeline : pending_overlay_upload_timelines) {
+                rollback_timeline(timeline);
+            }
+            rollback_timeline(pending_lod_engine_timeline);
+            rollback_timeline(pending_selection_query_timeline);
+            pending_render_complete_cuda.reset();
+            context.destroyExternalSemaphore(pending_render_complete_external);
+            if (renderer_initialization_started) {
+                try {
+                    renderer_.cleanup();
+                } catch (...) {
+                    // Initialization has not submitted work; cleanup is best-effort
+                    // only if the underlying Vulkan teardown itself reports failure.
+                }
+            }
+            if (render_stream_created) {
+                (void)cudaStreamDestroy(render_stream_);
+                render_stream_ = nullptr;
+            }
+        });
+
         try {
             if (!render_stream_) {
-                cudaStreamCreateWithFlags(&render_stream_, cudaStreamNonBlocking);
+                const cudaError_t status =
+                    cudaStreamCreateWithFlags(&render_stream_, cudaStreamNonBlocking);
+                if (status != cudaSuccess) {
+                    return std::unexpected(std::format(
+                        "VkSplat render stream creation failed: {} ({})",
+                        cudaGetErrorName(status),
+                        cudaGetErrorString(status)));
+                }
+                render_stream_created = true;
+            }
+            int cuda_device = 0;
+            if (const cudaError_t status = cudaGetDevice(&cuda_device); status != cudaSuccess) {
+                return std::unexpected(std::format(
+                    "VkSplat cudaGetDevice failed: {} ({})",
+                    cudaGetErrorName(status),
+                    cudaGetErrorString(status)));
+            }
+            int timeline_interop_supported = 0;
+            const cudaError_t timeline_status = cudaDeviceGetAttribute(
+                &timeline_interop_supported,
+                cudaDevAttrTimelineSemaphoreInteropSupported,
+                cuda_device);
+            if (timeline_status != cudaSuccess) {
+#if defined(USE_HIP) && USE_HIP
+                (void)cudaGetLastError();
+                timeline_interop_supported = 0;
+                LOG_WARN("ROCm/HIP timeline semaphore capability query failed: {} ({}); "
+                         "using synchronous CUDA/Vulkan handoff",
+                         cudaGetErrorName(timeline_status),
+                         cudaGetErrorString(timeline_status));
+#else
+                return std::unexpected(std::format(
+                    "VkSplat timeline semaphore capability query failed: {} ({})",
+                    cudaGetErrorName(timeline_status),
+                    cudaGetErrorString(timeline_status)));
+#endif
+            }
+            pending_cuda_timeline_interop_enabled = timeline_interop_supported != 0;
+            if (!pending_cuda_timeline_interop_enabled) {
+                LOG_WARN("CUDA/Vulkan external timeline semaphores are unavailable; "
+                         "VkSplat uploads will use synchronous stream handoff");
+            } else if (auto device_error = lfs::rendering::verifyCudaMatchesVulkanDevice();
+                       device_error) {
+                return std::unexpected(std::format(
+                    "VkSplat CUDA/Vulkan device verification failed: {}", *device_error));
             }
             // Submit the splat dispatch chain on the dedicated async-compute queue
             // when the device exposes one (NVIDIA family 2, AMD family 1, etc.). The
@@ -3956,6 +4058,7 @@ namespace lfs::vis {
             // graphics-queue work (RmlUi, viewport overlays) can overlap the splat
             // compute pass with no additional synchronization.
             const bool use_async_compute = context.hasDedicatedComputeQueue();
+            renderer_initialization_started = true;
             renderer_.initializeExternal(makeVkSplatSpirvPaths(),
                                          context.instance(),
                                          context.physicalDevice(),
@@ -3984,137 +4087,112 @@ namespace lfs::vis {
 
             // Exportable so CUDA (the trainer's release-fence wait) can consume
             // the same monotonic counter Vulkan signals at batch completion.
-            if (!context.createExternalTimelineSemaphore(0, render_complete_external_)) {
+            if (!context.createExternalTimelineSemaphore(0, pending_render_complete_external)) {
                 return std::unexpected(std::format(
                     "VkSplat render completion timeline creation failed: {}",
                     context.lastError()));
             }
-            render_complete_timeline_ = render_complete_external_.semaphore;
-            const auto completion_handle =
-                context.releaseExternalSemaphoreNativeHandle(render_complete_external_);
-            if (!VulkanContext::externalNativeHandleValid(completion_handle)) {
-                context.destroyExternalSemaphore(render_complete_external_);
-                render_complete_timeline_ = VK_NULL_HANDLE;
-                return std::unexpected("VkSplat render completion timeline export failed");
-            }
-            lfs::rendering::CudaVulkanExternalSemaphoreImport completion_import{};
-            completion_import.semaphore_handle = completion_handle;
-            completion_import.initial_value = render_complete_external_.initial_value;
-            if (!render_complete_cuda_.init(completion_import)) {
-                std::string err = render_complete_cuda_.lastError();
-                context.destroyExternalSemaphore(render_complete_external_);
-                render_complete_timeline_ = VK_NULL_HANDLE;
-                return std::unexpected(std::format(
-                    "VkSplat render completion timeline CUDA import failed: {}", err));
+            if (pending_cuda_timeline_interop_enabled) {
+                const auto completion_handle =
+                    context.releaseExternalSemaphoreNativeHandle(pending_render_complete_external);
+                if (!VulkanContext::externalNativeHandleValid(completion_handle)) {
+                    return std::unexpected("VkSplat render completion timeline export failed");
+                }
+                lfs::rendering::CudaVulkanExternalSemaphoreImport completion_import{};
+                completion_import.semaphore_handle = completion_handle;
+                completion_import.initial_value = pending_render_complete_external.initial_value;
+                if (!pending_render_complete_cuda.init(completion_import)) {
+                    const std::string error = pending_render_complete_cuda.lastError();
+                    return std::unexpected(std::format(
+                        "VkSplat render completion timeline CUDA import failed: {}", error));
+                }
             }
             context.setDebugObjectName(VK_OBJECT_TYPE_SEMAPHORE,
-                                       render_complete_timeline_,
+                                       pending_render_complete_external.semaphore,
                                        "VkSplat render completion timeline");
-            render_complete_value_ = 0;
+
+            const auto initialize_cuda_timeline =
+                [&](UploadTimeline& timeline,
+                    const std::string_view label) -> std::expected<void, std::string> {
+                if (!context.createExternalTimelineSemaphore(0, timeline.vk_semaphore)) {
+                    return std::unexpected(std::format(
+                        "VkSplat {} timeline semaphore creation failed: {}",
+                        label,
+                        context.lastError()));
+                }
+                const auto handle =
+                    context.releaseExternalSemaphoreNativeHandle(timeline.vk_semaphore);
+                if (!VulkanContext::externalNativeHandleValid(handle)) {
+                    return std::unexpected(std::format(
+                        "VkSplat {} timeline semaphore export failed", label));
+                }
+                lfs::rendering::CudaVulkanExternalSemaphoreImport import{};
+                import.semaphore_handle = handle;
+                import.initial_value = timeline.vk_semaphore.initial_value;
+                if (!timeline.cuda_semaphore.init(import)) {
+                    const std::string error = timeline.cuda_semaphore.lastError();
+                    return std::unexpected(std::format(
+                        "VkSplat {} timeline semaphore CUDA import failed: {}",
+                        label,
+                        error));
+                }
+                timeline.value = 0;
+                return {};
+            };
+
+            if (pending_cuda_timeline_interop_enabled) {
+                for (auto& timeline : pending_upload_timelines) {
+                    if (auto ok = initialize_cuda_timeline(timeline, "upload"); !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                }
+                for (auto& timeline : pending_overlay_upload_timelines) {
+                    if (auto ok = initialize_cuda_timeline(timeline, "overlay upload"); !ok) {
+                        return std::unexpected(ok.error());
+                    }
+                }
+                if (auto ok = initialize_cuda_timeline(
+                        pending_lod_engine_timeline, "LOD upload engine");
+                    !ok) {
+                    return std::unexpected(ok.error());
+                }
+                if (auto ok = initialize_cuda_timeline(
+                        pending_selection_query_timeline, "selection query");
+                    !ok) {
+                    return std::unexpected(ok.error());
+                }
+            } else {
+                if (!context.createExternalTimelineSemaphore(
+                        0, pending_selection_query_timeline.vk_semaphore)) {
+                    return std::unexpected(std::format(
+                        "VkSplat selection query timeline semaphore creation failed: {}",
+                        context.lastError()));
+                }
+                pending_selection_query_timeline.value = 0;
+            }
         } catch (const std::exception& e) {
             return std::unexpected(std::format("VkSplat initialization failed: {}", e.what()));
         }
 
-        // Per-ring-slot upload timeline: a Vulkan-exportable timeline semaphore
-        // imported into CUDA so we can signal CUDA-side after the upload's
-        // cudaMemcpyAsync and have Vulkan compute wait on it, replacing the
-        // per-frame cudaStreamSynchronize that previously blocked the CPU.
-        for (auto& timeline : upload_timelines_) {
-            if (!context.createExternalTimelineSemaphore(0, timeline.vk_semaphore)) {
-                return std::unexpected(std::format(
-                    "VkSplat upload timeline semaphore creation failed: {}",
-                    context.lastError()));
-            }
-            const auto handle = context.releaseExternalSemaphoreNativeHandle(timeline.vk_semaphore);
-            if (!VulkanContext::externalNativeHandleValid(handle)) {
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                return std::unexpected("VkSplat upload timeline semaphore export failed");
-            }
-            lfs::rendering::CudaVulkanExternalSemaphoreImport import{};
-            import.semaphore_handle = handle;
-            import.initial_value = timeline.vk_semaphore.initial_value;
-            if (!timeline.cuda_semaphore.init(import)) {
-                std::string err = timeline.cuda_semaphore.lastError();
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                return std::unexpected(std::format(
-                    "VkSplat upload timeline semaphore CUDA import failed: {}", err));
-            }
-            timeline.value = 0;
+        const auto commit_timeline = [](UploadTimeline& target, UploadTimeline& pending) noexcept {
+            target.vk_semaphore = std::exchange(pending.vk_semaphore, {});
+            target.cuda_semaphore = std::move(pending.cuda_semaphore);
+            target.value = std::exchange(pending.value, 0);
+        };
+        render_complete_external_ = std::exchange(pending_render_complete_external, {});
+        render_complete_cuda_ = std::move(pending_render_complete_cuda);
+        render_complete_timeline_ = render_complete_external_.semaphore;
+        render_complete_value_ = 0;
+        for (std::size_t i = 0; i < kInputRingSize; ++i) {
+            commit_timeline(upload_timelines_[i], pending_upload_timelines[i]);
+            commit_timeline(overlay_upload_timelines_[i], pending_overlay_upload_timelines[i]);
         }
-        for (auto& timeline : overlay_upload_timelines_) {
-            if (!context.createExternalTimelineSemaphore(0, timeline.vk_semaphore)) {
-                return std::unexpected(std::format(
-                    "VkSplat overlay upload timeline semaphore creation failed: {}",
-                    context.lastError()));
-            }
-            const auto handle = context.releaseExternalSemaphoreNativeHandle(timeline.vk_semaphore);
-            if (!VulkanContext::externalNativeHandleValid(handle)) {
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                return std::unexpected("VkSplat overlay upload timeline semaphore export failed");
-            }
-            lfs::rendering::CudaVulkanExternalSemaphoreImport import{};
-            import.semaphore_handle = handle;
-            import.initial_value = timeline.vk_semaphore.initial_value;
-            if (!timeline.cuda_semaphore.init(import)) {
-                std::string err = timeline.cuda_semaphore.lastError();
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                return std::unexpected(std::format(
-                    "VkSplat overlay upload timeline semaphore CUDA import failed: {}", err));
-            }
-            timeline.value = 0;
-        }
-        {
-            auto& timeline = lod_engine_timeline_;
-            if (!context.createExternalTimelineSemaphore(0, timeline.vk_semaphore)) {
-                return std::unexpected(std::format(
-                    "VkSplat LOD upload engine timeline semaphore creation failed: {}",
-                    context.lastError()));
-            }
-            const auto handle = context.releaseExternalSemaphoreNativeHandle(timeline.vk_semaphore);
-            if (!VulkanContext::externalNativeHandleValid(handle)) {
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                timeline.vk_semaphore = {};
-                return std::unexpected("VkSplat LOD upload engine timeline semaphore export failed");
-            }
-            lfs::rendering::CudaVulkanExternalSemaphoreImport import{};
-            import.semaphore_handle = handle;
-            import.initial_value = timeline.vk_semaphore.initial_value;
-            if (!timeline.cuda_semaphore.init(import)) {
-                std::string err = timeline.cuda_semaphore.lastError();
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                timeline.vk_semaphore = {};
-                return std::unexpected(std::format(
-                    "VkSplat LOD upload engine timeline semaphore CUDA import failed: {}", err));
-            }
-            timeline.value = 0;
-        }
-        {
-            auto& timeline = selection_query_timeline_;
-            if (!context.createExternalTimelineSemaphore(0, timeline.vk_semaphore)) {
-                return std::unexpected(std::format(
-                    "VkSplat selection query timeline semaphore creation failed: {}",
-                    context.lastError()));
-            }
-            const auto handle = context.releaseExternalSemaphoreNativeHandle(timeline.vk_semaphore);
-            if (!VulkanContext::externalNativeHandleValid(handle)) {
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                timeline.vk_semaphore = {};
-                return std::unexpected("VkSplat selection query timeline semaphore export failed");
-            }
-            lfs::rendering::CudaVulkanExternalSemaphoreImport import{};
-            import.semaphore_handle = handle;
-            import.initial_value = timeline.vk_semaphore.initial_value;
-            if (!timeline.cuda_semaphore.init(import)) {
-                std::string err = timeline.cuda_semaphore.lastError();
-                context.destroyExternalSemaphore(timeline.vk_semaphore);
-                timeline.vk_semaphore = {};
-                return std::unexpected(std::format(
-                    "VkSplat selection query timeline semaphore CUDA import failed: {}", err));
-            }
-            timeline.value = 0;
-        }
-
+        commit_timeline(lod_engine_timeline_, pending_lod_engine_timeline);
+        commit_timeline(selection_query_timeline_, pending_selection_query_timeline);
+        cuda_timeline_interop_enabled_ = pending_cuda_timeline_interop_enabled;
+        context_ = &context;
         initialized_ = true;
+        initialization_committed = true;
         return {};
     }
 
@@ -4254,7 +4332,14 @@ namespace lfs::vis {
         const bool deleted_mask_only_change =
             input_snapshot_changed &&
             matchesExceptDeletedMask(uploaded_input_snapshot, current_input_snapshot);
-        const bool input_upload_requested = force_upload || input_snapshot_changed;
+        // Training updates tensor contents in place, so pointer/shape snapshots
+        // cannot prove that a ring slot still contains the current iteration.
+        // Timeline-free HIP uses copied input storage and must refresh it on every
+        // live frame, including the second panel of split view.
+        const bool force_live_copy_refresh =
+            synchronize_upload && !cuda_timeline_interop_enabled_;
+        const bool input_upload_requested =
+            force_upload || input_snapshot_changed || force_live_copy_refresh;
 
         std::shared_ptr<VulkanExternalTensorStorage> means_storage, sh0_storage, shN_storage,
             rotations_storage, scaling_storage, opacity_storage;
@@ -4273,8 +4358,13 @@ namespace lfs::vis {
         const bool has_deleted_mask = splat_data.has_deleted_mask();
         const bool base_inputs_external =
             means_storage && sh0_storage && rotations_storage && scaling_storage;
+        // Live training mutates the exportable model storage. Without a timeline
+        // completion signal, Vulkan cannot tell the trainer when direct reads end,
+        // so render from the stable per-frame upload copy instead.
+        const bool external_binding_synchronized =
+            !synchronize_upload || cuda_timeline_interop_enabled_;
         const bool can_bind_external =
-            base_inputs_external &&
+            external_binding_synchronized && base_inputs_external &&
             (upload_layout->omits_shN || shN_storage) &&
             (opacity_storage || has_deleted_mask);
         const auto& layout = can_bind_external && shN_storage ? external_layout : upload_layout;
@@ -4296,6 +4386,9 @@ namespace lfs::vis {
         }
         if (!upload_layout->omits_shN) {
             note_missing_storage(shN_storage, "shN");
+        }
+        if (!external_binding_synchronized) {
+            input_copy_reasons.emplace_back("synchronized_upload_without_timeline");
         }
         if (!can_bind_external && has_deleted_mask) {
             input_copy_reasons.emplace_back("soft_deleted_mask");
@@ -4482,15 +4575,23 @@ namespace lfs::vis {
             // beginModelRead/publishViewerBorrow handshake.
             {
                 LOG_TIMER("prepareInputs.cuda_signal");
-                auto& timeline = upload_timelines_[ring_slot];
-                const std::uint64_t signal_value = ++timeline.value;
-                if (!timeline.cuda_semaphore.cudaSignal(signal_value, stream)) {
-                    return std::unexpected(std::format("VkSplat CUDA input-ready signal failed: {}",
-                                                       timeline.cuda_semaphore.lastError()));
+                if (cuda_timeline_interop_enabled_) {
+                    auto& timeline = upload_timelines_[ring_slot];
+                    const std::uint64_t signal_value = ++timeline.value;
+                    if (!timeline.cuda_semaphore.cudaSignal(signal_value, stream)) {
+                        return std::unexpected(std::format("VkSplat CUDA input-ready signal failed: {}",
+                                                           timeline.cuda_semaphore.lastError()));
+                    }
+                    renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
+                                              signal_value,
+                                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                } else if (const cudaError_t status = cudaStreamSynchronize(stream);
+                           status != cudaSuccess) {
+                    return std::unexpected(std::format(
+                        "VkSplat CUDA input sync failed: {} ({})",
+                        cudaGetErrorName(status),
+                        cudaGetErrorString(status)));
                 }
-                renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
-                                          signal_value,
-                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             }
 
             {
@@ -4505,6 +4606,105 @@ namespace lfs::vis {
             };
         }
 
+#if defined(USE_HIP) && USE_HIP
+        if (cuda_opacity_copies_[ring_slot].buffer.buffer != VK_NULL_HANDLE) {
+            LOG_PERF("vksplat.memory.release_opacity_copy ring={} bytes={} reason=full_input_copy",
+                     ring_slot,
+                     static_cast<std::size_t>(cuda_opacity_copies_[ring_slot].buffer.allocation_size));
+            releaseOpacityCopySlot(context, ring_slot);
+        }
+
+        std::array<std::size_t, kInputRegionCount> region_bytes{};
+        region_bytes[InputXyzWs] = layout->xyz_bytes;
+        region_bytes[InputSh0] = layout->sh0_bytes;
+        region_bytes[InputShN] = layout->shN_bytes;
+        region_bytes[InputRotations] = layout->rotations_bytes;
+        region_bytes[InputScalingRaw] = layout->scaling_bytes;
+        region_bytes[InputOpacityRaw] = layout->opacity_bytes;
+        std::array<std::size_t, kInputRegionCount> region_offset{};
+        const std::size_t total_bytes =
+            layoutRegions(region_bytes, region_offset, kRegionAlignment);
+
+        const bool slot_had_buffer = slot.buffer.buffer != VK_NULL_HANDLE;
+        if (!slot_had_buffer) {
+            LOG_INFO("VkSplat ROCm input-copy fallback ring={} bytes={} reason={}",
+                     ring_slot,
+                     total_bytes,
+                     input_copy_reason);
+        }
+        const auto previous_region_offset = slot.region_offset;
+        const auto previous_region_bytes = slot.region_bytes;
+        if (auto ok = ensureCudaInteropBuffer(context,
+                                              slot.buffer,
+                                              slot.interop,
+                                              total_bytes,
+                                              "vulkan.vksplat.input_copy",
+                                              std::format("ring{}.input_copy", ring_slot),
+                                              "input copy");
+            !ok) {
+            return std::unexpected(ok.error());
+        }
+
+        const bool layout_changed =
+            previous_region_offset != region_offset || previous_region_bytes != region_bytes;
+        slot.region_offset = region_offset;
+        slot.region_bytes = region_bytes;
+        const bool upload_needed = input_upload_requested || !slot_had_buffer || layout_changed;
+        if (!upload_needed) {
+            plugRingInputs(ring_slot, n, false);
+            current_input_sh_degree_ = effective_upload_sh_degree;
+            return InputBindingResult{
+                .uses_temporary_upload_slot = true,
+                .model_snapshot_changed = false,
+            };
+        }
+
+        auto* const base = static_cast<std::uint8_t*>(slot.interop.devicePointer());
+        if (base == nullptr) {
+            return std::unexpected("VkSplat CUDA/Vulkan input copy buffer is not mapped");
+        }
+        const cudaStream_t stream = render_stream_;
+        if (auto ok = vksplat::copyRawDeviceInputsToBuffer(
+                splat_data,
+                base + region_offset[InputXyzWs],
+                base + region_offset[InputSh0],
+                base + region_offset[InputShN],
+                base + region_offset[InputRotations],
+                base + region_offset[InputScalingRaw],
+                base + region_offset[InputOpacityRaw],
+                stream,
+                effective_upload_sh_degree);
+            !ok) {
+            return std::unexpected(ok.error());
+        }
+
+        if (cuda_timeline_interop_enabled_) {
+            auto& timeline = upload_timelines_[ring_slot];
+            const std::uint64_t signal_value = ++timeline.value;
+            if (!timeline.cuda_semaphore.cudaSignal(signal_value, stream)) {
+                return std::unexpected(std::format(
+                    "VkSplat CUDA input-copy signal failed: {}",
+                    timeline.cuda_semaphore.lastError()));
+            }
+            renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
+                                      signal_value,
+                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        } else if (const cudaError_t status = cudaStreamSynchronize(stream);
+                   status != cudaSuccess) {
+            return std::unexpected(std::format(
+                "VkSplat CUDA input-copy sync failed: {} ({})",
+                cudaGetErrorName(status),
+                cudaGetErrorString(status)));
+        }
+
+        ring_uploaded_[ring_slot] = current_input_snapshot;
+        current_input_sh_degree_ = effective_upload_sh_degree;
+        plugRingInputs(ring_slot, n, input_snapshot_changed || layout_changed);
+        return InputBindingResult{
+            .uses_temporary_upload_slot = true,
+            .model_snapshot_changed = input_snapshot_changed,
+        };
+#else
         if (slot.buffer.buffer != VK_NULL_HANDLE) {
             LOG_PERF("vksplat.memory.release_input_copy ring={} bytes={} reason=missing_external_storage",
                      ring_slot,
@@ -4521,6 +4721,7 @@ namespace lfs::vis {
         return std::unexpected(std::format(
             "VkSplat refusing full input-copy fallback; model tensors must use Vulkan-external storage ({})",
             input_copy_reason));
+#endif
     }
 
     void VksplatViewportRenderer::logVramBreakdownIfChanged(const std::string_view reason) {
@@ -6043,14 +6244,22 @@ namespace lfs::vis {
         {
             LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.upload_ready_signal");
             auto& timeline = selection_query_timeline_;
-            const std::uint64_t upload_ready_value = ++timeline.value;
-            if (!timeline.cuda_semaphore.cudaSignal(upload_ready_value, selection_query_stream)) {
-                return std::unexpected(std::format("VkSplat selection query upload-ready signal failed: {}",
-                                                   timeline.cuda_semaphore.lastError()));
+            if (cuda_timeline_interop_enabled_) {
+                const std::uint64_t upload_ready_value = ++timeline.value;
+                if (!timeline.cuda_semaphore.cudaSignal(upload_ready_value, selection_query_stream)) {
+                    return std::unexpected(std::format("VkSplat selection query upload-ready signal failed: {}",
+                                                       timeline.cuda_semaphore.lastError()));
+                }
+                renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
+                                          upload_ready_value,
+                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            } else if (const cudaError_t status = cudaStreamSynchronize(selection_query_stream);
+                       status != cudaSuccess) {
+                return std::unexpected(std::format(
+                    "VkSplat selection query upload sync failed: {} ({})",
+                    cudaGetErrorName(status),
+                    cudaGetErrorString(status)));
             }
-            renderer_.addTimelineWait(timeline.vk_semaphore.semaphore,
-                                      upload_ready_value,
-                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             selection_query_complete_value = ++timeline.value;
         }
 
@@ -6103,10 +6312,25 @@ namespace lfs::vis {
 
         {
             LOG_TIMER("VksplatViewportRenderer::buildSelectionMask.dispatch.cuda_wait");
-            if (!selection_query_timeline_.cuda_semaphore.cudaWait(selection_query_complete_value,
-                                                                   selection_query_stream)) {
-                return std::unexpected(std::format("VkSplat selection query completion wait failed: {}",
-                                                   selection_query_timeline_.cuda_semaphore.lastError()));
+            if (cuda_timeline_interop_enabled_) {
+                if (!selection_query_timeline_.cuda_semaphore.cudaWait(selection_query_complete_value,
+                                                                       selection_query_stream)) {
+                    return std::unexpected(std::format("VkSplat selection query completion wait failed: {}",
+                                                       selection_query_timeline_.cuda_semaphore.lastError()));
+                }
+            } else {
+                VkSemaphoreWaitInfo wait_info{};
+                wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+                wait_info.semaphoreCount = 1;
+                wait_info.pSemaphores = &selection_query_timeline_.vk_semaphore.semaphore;
+                wait_info.pValues = &selection_query_complete_value;
+                if (const VkResult result = vkWaitSemaphores(
+                        context.device(), &wait_info, UINT64_MAX);
+                    result != VK_SUCCESS) {
+                    return std::unexpected(std::format(
+                        "VkSplat selection query Vulkan wait failed: {}",
+                        vkError("vkWaitSemaphores", result)));
+                }
             }
         }
         {
@@ -6658,7 +6882,11 @@ namespace lfs::vis {
             lod_request_active &&
             splat_data.lod_tree &&
             splat_data.lod_tree->rad_source.valid();
+#if defined(USE_HIP) && USE_HIP
+        static constexpr bool kDisableSharedScratch = true;
+#else
         static const bool kDisableSharedScratch = (std::getenv("LFS_NO_SHARED_SCRATCH") != nullptr);
+#endif
         std::optional<RasterizerArenaRenderGuard> shared_arena_guard;
         std::vector<LodPageCache::PendingUpload> lod_page_uploads;
         std::vector<std::uint32_t> protected_lod_chunks;
@@ -6671,7 +6899,7 @@ namespace lfs::vis {
         if (lod_request_active) {
             (void)ensureLodPageCacheSnapshot(splat_data);
             lod_page_inputs_active =
-                rad_backed_lod_pages &&
+                cuda_timeline_interop_enabled_ && rad_backed_lod_pages &&
                 lod_page_cache_.configured();
             partial_lod_page_inputs =
                 lod_page_inputs_active &&

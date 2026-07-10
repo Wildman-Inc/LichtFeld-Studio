@@ -1107,6 +1107,7 @@ namespace lfs::vis {
     void SceneManager::drainGpuForTensorRelease() {
         if (auto* const gui_mgr = services().guiOrNull()) {
             gui_mgr->setVulkanSceneImage(nullptr, glm::ivec2(0, 0), false, 0);
+            gui_mgr->drainVulkanSceneInterop();
         }
         if (auto* const window_mgr = services().windowOrNull()) {
             if (auto* const vulkan_ctx = window_mgr->getVulkanContext()) {

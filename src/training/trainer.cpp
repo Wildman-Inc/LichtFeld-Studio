@@ -4158,6 +4158,12 @@ namespace lfs::training {
 
             if (in_controller_phase) {
                 // Controller phase: only update controller weights
+                std::unique_lock<std::shared_mutex> appearance_write_lock(
+                    model_access_mutex_, std::defer_lock);
+                if (modelAccessLockEnabled()) {
+                    appearance_write_lock.lock();
+                }
+                waitForModelReaders();
                 nvtxRangePush("controller_optimizer_step");
                 LFS_VRAM_SCOPE("train.optimizer.ppisp_controller_step");
                 LOG_VRAM_DIFF("train.optimizer.ppisp_controller_step");
@@ -4165,6 +4171,7 @@ namespace lfs::training {
                 ppisp_controller_pool_->zero_grad();
                 ppisp_controller_pool_->scheduler_step(ppisp_cam_idx);
                 nvtxRangePop();
+                recordParamsReady();
             } else {
                 // Normal phase: regularization losses + optimizer steps for all components
 
@@ -4201,6 +4208,12 @@ namespace lfs::training {
                 }
 
                 if (bilateral_grid_ && params_.optimization.use_bilateral_grid) {
+                    std::unique_lock<std::shared_mutex> appearance_write_lock(
+                        model_access_mutex_, std::defer_lock);
+                    if (modelAccessLockEnabled()) {
+                        appearance_write_lock.lock();
+                    }
+                    waitForModelReaders();
                     nvtxRangePush("bilateral_grid_tv_and_step");
                     LFS_VRAM_SCOPE("train.bilateral_grid.tv_and_step");
                     LOG_VRAM_DIFF("train.bilateral_grid.tv_and_step");
@@ -4213,9 +4226,16 @@ namespace lfs::training {
                     bilateral_grid_->scheduler_step();
 
                     nvtxRangePop();
+                    recordParamsReady();
                 }
 
                 if (ppisp_ && params_.optimization.use_ppisp && !ppisp_frozen) {
+                    std::unique_lock<std::shared_mutex> appearance_write_lock(
+                        model_access_mutex_, std::defer_lock);
+                    if (modelAccessLockEnabled()) {
+                        appearance_write_lock.lock();
+                    }
+                    waitForModelReaders();
                     nvtxRangePush("ppisp_reg_and_step");
                     LFS_VRAM_SCOPE("train.ppisp.reg_and_step");
                     LOG_VRAM_DIFF("train.ppisp.reg_and_step");
@@ -4227,6 +4247,7 @@ namespace lfs::training {
                     ppisp_->scheduler_step();
 
                     nvtxRangePop();
+                    recordParamsReady();
                 }
             }
 

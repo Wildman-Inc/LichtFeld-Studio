@@ -12,12 +12,12 @@ target_include_directories(lfs_diagnostics
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${GPU_INCLUDE_DIRS}
 )
 
 target_link_libraries(lfs_diagnostics
     PUBLIC
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
 )
 
 target_compile_features(lfs_diagnostics PUBLIC cxx_std_23)

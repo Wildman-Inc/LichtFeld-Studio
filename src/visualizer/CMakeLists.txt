@@ -17,7 +17,7 @@ option(LFS_DEV_IMPORT_SOURCE_RESOURCES
         "Load RmlUI resources and locales from source in non-portable builds"
         ON)
 
-add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
+lfs_add_gpu_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         # Core
         visualizer.cpp
         visualizer_impl.cpp
@@ -50,6 +50,8 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         rendering/viewport_frame_lifecycle_service.cpp
         rendering/viewport_appearance_correction.cpp
         rendering/viewport_request_builder.cpp
+        rendering/lod_page_dequant_cuda.cu
+        rendering/vksplat_input_packer_cuda.cu
         rendering/passes/vulkan_scene_image_uploader.cpp
         rendering/passes/vulkan_viewport_pass.cpp
         rendering/passes/vulkan_mesh_pass.cpp
@@ -236,7 +238,7 @@ target_link_libraries(lfs_visualizer
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         nfd::nfd
         vterm
 )
@@ -251,9 +253,7 @@ endif()
 target_sources(lfs_visualizer
         PRIVATE
         gui/rmlui/rmlui_vk_backend.cpp
-        rendering/lod_page_dequant_cuda.cu
         rendering/vksplat_input_packer.cpp
-        rendering/vksplat_input_packer_cuda.cu
         rendering/vksplat_viewport_renderer.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
@@ -361,11 +361,15 @@ endif()
 target_compile_features(lfs_visualizer PUBLIC cxx_std_23)
 
 set_target_properties(lfs_visualizer PROPERTIES
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
+if(USE_CUDA)
+    set_target_properties(lfs_visualizer PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+    )
+endif()
 if(WIN32)
     set_target_properties(lfs_visualizer PROPERTIES
         POSITION_INDEPENDENT_CODE ON

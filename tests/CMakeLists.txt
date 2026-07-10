@@ -339,14 +339,17 @@ endforeach()
 # Create test executable
 add_executable(lichtfeld_tests ${TEST_SOURCES})
 
-# Set CUDA architectures
 set_target_properties(lichtfeld_tests PROPERTIES
-    CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
+if(USE_CUDA)
+    set_target_properties(lichtfeld_tests PROPERTIES
+        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+endif()
 
 # Include directories
 target_include_directories(lichtfeld_tests PRIVATE
@@ -359,7 +362,7 @@ target_include_directories(lichtfeld_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/visualizer # For visualizer-relative headers (e.g. gui/ui_widgets.hpp)
     ${CMAKE_SOURCE_DIR}/external/spz   # SPZ library headers
     ${NB_DIR}/include
-    ${CUDAToolkit_INCLUDE_DIRS}
+    ${GPU_INCLUDE_DIRS}
 )
 
 # Define TEST_DATA_DIR and PROJECT_ROOT_PATH for tests
@@ -403,10 +406,8 @@ target_link_libraries(lichtfeld_tests PRIVATE
     OpenMeshCore
     assimp::assimp
 
-    # CUDA libraries
-    CUDA::cudart
-    CUDA::curand
-    CUDA::cupti
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
 
     # System libraries
     spdlog::spdlog
@@ -427,12 +428,16 @@ target_compile_options(lichtfeld_tests PRIVATE
 add_executable(lichtfeld_benchmarks ${BENCHMARK_SOURCES})
 
 set_target_properties(lichtfeld_benchmarks PROPERTIES
-    CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
+if(USE_CUDA)
+    set_target_properties(lichtfeld_benchmarks PROPERTIES
+        CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+endif()
 
 target_include_directories(lichtfeld_benchmarks PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -443,7 +448,7 @@ target_include_directories(lichtfeld_benchmarks PRIVATE
     ${CMAKE_SOURCE_DIR}/src/visualizer
     ${CMAKE_SOURCE_DIR}/external/spz
     ${NB_DIR}/include
-    ${CUDAToolkit_INCLUDE_DIRS}
+    ${GPU_INCLUDE_DIRS}
 )
 
 target_compile_definitions(lichtfeld_benchmarks PRIVATE
@@ -474,9 +479,8 @@ target_link_libraries(lichtfeld_benchmarks PRIVATE
     GTest::gtest
     ${TORCH_LIBRARIES}
     OpenImageIO::OpenImageIO
-    CUDA::cudart
-    CUDA::curand
-    CUDA::cupti
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
     spdlog::spdlog
 )
 

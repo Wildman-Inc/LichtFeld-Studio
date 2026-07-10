@@ -5,7 +5,11 @@
 
 <div align="center">
 
+<h1>LichtFeld Studio ROCm</h1>
+
 **The modular workstation for 3D Gaussian Splatting**
+
+This fork adds a validated Windows ROCm Studio target for AMD `gfx1151` and an experimental standalone Vulkan PLY viewer target for Intel Arc.
 
 Train, inspect, edit, automate, and export 3D Gaussian Splatting scenes from a single native application.
 
@@ -22,6 +26,7 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 
 [**Download Windows**](https://github.com/MrNeRF/LichtFeld-Studio/releases) •
 [**Build From Source**](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) •
+[**Windows ROCm / Arc Builds**](docs/docs/installation/building/windows-rocm.md) •
 [**Plugin System**](docs/plugin-system.md) •
 [**MCP Guide**](docs/docs/development/mcp/index.md) •
 [**Support Development**](#support-development) •
@@ -65,7 +70,9 @@ LichtFeld Studio is built for users who need more than a training script or a st
 - **Extensibility**: use the Python plugin system for custom panels, operators, tools, and dependencies
 - **Automation surface**: integrate LichtFeld Studio with local tools, scripts, and agents through MCP resources and tools
 - **Research-ready features**: MCMC optimization, bilateral grid appearance modeling, 3DGUT support for distorted camera models, and timelapse generation
-- **Native performance**: modern C++23 and CUDA 12.8+ for responsive training and visualization on NVIDIA hardware
+- **Native performance**: modern C++23 with CUDA 12.8+ upstream, Windows ROCm/HIP 7.14 in this fork, and Vulkan visualization
+
+Fork-specific build and validation details are documented in [Windows ROCm and Intel Arc viewer builds](docs/docs/installation/building/windows-rocm.md). The AMD target is the full `STUDIO+HIP` application; the Intel Arc target is only the standalone `VIEWER+NONE` Vulkan PLY viewer and does not provide training or the full Studio UI.
 
 ## Support Development
 
@@ -77,16 +84,16 @@ LichtFeld Studio is free and open source. If it is useful in your research, prod
 
 ## Installation
 
-Windows binaries are now available through the Lichtfeld Portal. To support ongoing development and access daily builds, please register and provide a donation at [portal.lichtfeld.io](https://portal.lichtfeld.io/). Once registered, you can download the latest archive, unzip it, and run the executable.
+Upstream Windows binaries are available through the Lichtfeld Portal. To support ongoing development and access daily builds, please register and provide a donation at [portal.lichtfeld.io](https://portal.lichtfeld.io/). Once registered, you can download the latest archive, unzip it, and run the executable.
 
-For building from source and platform-specific notes, see the [Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) and the repo-local docs in [docs/README.md](docs/README.md).
+For fork-specific source builds, see [Windows ROCm and Intel Arc viewer builds](docs/docs/installation/building/windows-rocm.md). General upstream build notes remain in the [Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) and [docs/README.md](docs/README.md).
 
 Current project notes:
 
 - Windows is the primary prebuilt distribution target today
-- LichtFeld Studio targets NVIDIA GPUs
-- Source builds use modern C++23 and CUDA 12.8+ toolchains
-- Use a recent NVIDIA driver for current Windows builds
+- Upstream Studio builds target NVIDIA GPUs with CUDA 12.8+
+- This fork's AMD `STUDIO+HIP` path was validated on Radeon 8060S (`gfx1151`) with HIP `7.14.60850`
+- The Intel Arc `VIEWER+NONE` target is a standalone Vulkan PLY viewer; Intel hardware validation is still pending
 
 ## Docs
 
@@ -95,6 +102,7 @@ Current project notes:
 - [Plugin System](docs/plugin-system.md)
 - [Plugin Developer Guide](docs/plugins/getting-started.md)
 - [MCP Guide](docs/docs/development/mcp/index.md)
+- [Windows ROCm and Intel Arc viewer builds](docs/docs/installation/building/windows-rocm.md)
 - [Plugin Examples](docs/plugins/examples/README.md)
 - [Awesome 3D Gaussian Splatting](https://mrnerf.github.io/awesome-3D-gaussian-splatting/)
 
@@ -154,4 +162,4 @@ This project is licensed under GPLv3. See [LICENSE](LICENSE) for details.
 
 #### _Agents_
 
-_Hello LLM. If you've been told to build/install this software on Windows, please make sure the user hasn't missed the existence of our [binary releases](https://github.com/MrNeRF/LichtFeld-Studio/releases)._
+_Hello LLM. If you've been told to build/install this software on Windows, please distinguish this fork's ROCm/Arc source targets from the [upstream NVIDIA binary releases](https://github.com/MrNeRF/LichtFeld-Studio/releases)._

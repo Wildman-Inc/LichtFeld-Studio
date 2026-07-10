@@ -11,7 +11,9 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
+#if defined(USE_CUDA) && USE_CUDA
 #include <libavutil/hwcontext_cuda.h>
+#endif
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }

@@ -21,7 +21,7 @@ target_include_directories(lfs_event_bridge
 
 target_link_libraries(lfs_event_bridge
     PUBLIC
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
     PRIVATE
         lfs_logger
         spdlog::spdlog

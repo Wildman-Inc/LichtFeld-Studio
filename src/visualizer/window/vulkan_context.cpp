@@ -30,6 +30,14 @@
 #endif
 
 namespace lfs::vis {
+    struct VulkanContext::ImmediateSubmitState {
+        const VulkanContext* owner = nullptr;
+        ImmediateSubmitPollResult poll_result{
+            .status = ImmediateSubmitStatus::Pending,
+            .result = VK_NOT_READY,
+        };
+    };
+
     namespace {
 #ifdef _WIN32
         constexpr VkExternalMemoryHandleTypeFlagBits kExternalMemoryHandleType =
@@ -133,11 +141,9 @@ namespace lfs::vis {
         }
 
         // True when the given Vulkan physical device is the same physical GPU as
-        // the CUDA device the trainer will use (cuda_device, the current CUDA
-        // ordering's device 0 by default). On multi-GPU machines with identical
-        // cards, Vulkan's enumeration order can differ from CUDA's; matching by
-        // UUID lets pickPhysicalDevice keep the viewer on the same card as the
-        // trainer so CUDA<->Vulkan external-memory interop can import the block.
+        // the CUDA/HIP device the trainer will use (device 0 by default). Vulkan's
+        // enumeration order can differ from the compute runtime's; match by LUID
+        // for Windows HIP when Vulkan exposes one, and by UUID otherwise.
         [[nodiscard]] bool vulkanDeviceMatchesCudaDevice(const VkPhysicalDevice device, const int cuda_device) {
             cudaDeviceProp cuda_props{};
             if (cudaGetDeviceProperties(&cuda_props, cuda_device) != cudaSuccess) {
@@ -149,6 +155,12 @@ namespace lfs::vis {
             vk_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
             vk_props2.pNext = &vk_id;
             vkGetPhysicalDeviceProperties2(device, &vk_props2);
+#if defined(_WIN32) && defined(USE_HIP) && USE_HIP
+            if (vk_id.deviceLUIDValid != VK_FALSE) {
+                static_assert(sizeof(cuda_props.luid) == VK_LUID_SIZE);
+                return std::memcmp(cuda_props.luid, vk_id.deviceLUID, VK_LUID_SIZE) == 0;
+            }
+#endif
             static_assert(sizeof(cuda_props.uuid.bytes) == VK_UUID_SIZE);
             return std::memcmp(cuda_props.uuid.bytes, vk_id.deviceUUID, VK_UUID_SIZE) == 0;
         }
@@ -473,15 +485,18 @@ namespace lfs::vis {
                     const VkResult drain = vkWaitForFences(device_, 1, &pending.fence, VK_TRUE,
                                                            kImmediateDrainTimeoutNs);
                     if (drain != VK_SUCCESS) {
+                        if (pending.completion) {
+                            pending.completion->poll_result = {
+                                .status = ImmediateSubmitStatus::Error,
+                                .result = drain,
+                            };
+                        }
                         LOG_ERROR("Immediate submit fence stuck during shutdown: {}; leaking command buffer",
                                   vkResultToString(drain));
                         continue;
                     }
-                    vkDestroyFence(device_, pending.fence, nullptr);
                 }
-                if (pending.cmd != VK_NULL_HANDLE) {
-                    vkFreeCommandBuffers(device_, immediate_command_pool_, 1, &pending.cmd);
-                }
+                completeImmediateSubmit(pending);
             }
             pending_immediate_submits_.clear();
             vkDestroyCommandPool(device_, immediate_command_pool_, nullptr);
@@ -1269,6 +1284,7 @@ namespace lfs::vis {
         if (result != VK_SUCCESS) {
             return fail(std::format("vkDeviceWaitIdle failed: {}", vkResultToString(result)));
         }
+        drainCompletedImmediateSubmits();
         last_error_.clear();
         return true;
     }
@@ -2796,17 +2812,92 @@ namespace lfs::vis {
         return handle;
     }
 
+    void VulkanContext::completeImmediateSubmit(PendingImmediateSubmit& pending) {
+        if (pending.fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, pending.fence, nullptr);
+            pending.fence = VK_NULL_HANDLE;
+        }
+        if (pending.cmd != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device_, immediate_command_pool_, 1, &pending.cmd);
+            pending.cmd = VK_NULL_HANDLE;
+        }
+        if (pending.completion) {
+            pending.completion->poll_result = {
+                .status = ImmediateSubmitStatus::Complete,
+                .result = VK_SUCCESS,
+            };
+        }
+    }
+
+    VulkanContext::ImmediateSubmitPollResult VulkanContext::pollImmediateSubmit(
+        const ImmediateSubmitTicket& ticket) {
+        const std::shared_ptr<ImmediateSubmitState> state = ticket.state_;
+        if (!state || state->owner != this) {
+            (void)fail("Cannot poll an invalid or foreign immediate submit ticket");
+            return {};
+        }
+        if (state->poll_result.status != ImmediateSubmitStatus::Pending) {
+            return state->poll_result;
+        }
+
+        const auto pending = std::find_if(
+            pending_immediate_submits_.begin(),
+            pending_immediate_submits_.end(),
+            [&](const PendingImmediateSubmit& submit) { return submit.completion == state; });
+        if (pending == pending_immediate_submits_.end()) {
+            state->poll_result = {
+                .status = ImmediateSubmitStatus::Error,
+                .result = VK_ERROR_UNKNOWN,
+            };
+            (void)fail("Immediate submit ticket no longer has a tracked submit");
+            return state->poll_result;
+        }
+
+        const VkResult status = vkGetFenceStatus(device_, pending->fence);
+        if (status == VK_NOT_READY) {
+            last_error_.clear();
+            return state->poll_result;
+        }
+        if (status == VK_SUCCESS) {
+            completeImmediateSubmit(*pending);
+            pending_immediate_submits_.erase(pending);
+            last_error_.clear();
+            return state->poll_result;
+        }
+
+        pending->terminal_error = status;
+        state->poll_result = {
+            .status = ImmediateSubmitStatus::Error,
+            .result = status,
+        };
+        (void)fail(std::format("vkGetFenceStatus(immediate submit ticket) failed: {}",
+                               vkResultToString(status)));
+        return state->poll_result;
+    }
+
     void VulkanContext::drainCompletedImmediateSubmits() {
         if (device_ == VK_NULL_HANDLE || pending_immediate_submits_.empty()) {
             return;
         }
         auto write = pending_immediate_submits_.begin();
         for (auto read = pending_immediate_submits_.begin(); read != pending_immediate_submits_.end(); ++read) {
-            const VkResult status = vkGetFenceStatus(device_, read->fence);
+            const VkResult status = read->terminal_error == VK_SUCCESS
+                                        ? vkGetFenceStatus(device_, read->fence)
+                                        : read->terminal_error;
             if (status == VK_SUCCESS) {
-                vkDestroyFence(device_, read->fence, nullptr);
-                vkFreeCommandBuffers(device_, immediate_command_pool_, 1, &read->cmd);
+                completeImmediateSubmit(*read);
             } else {
+                if (status != VK_NOT_READY && read->terminal_error == VK_SUCCESS) {
+                    read->terminal_error = status;
+                    if (read->completion) {
+                        read->completion->poll_result = {
+                            .status = ImmediateSubmitStatus::Error,
+                            .result = status,
+                        };
+                    }
+                    LOG_ERROR("vkGetFenceStatus(immediate submit drain) failed: {}",
+                              vkResultToString(status));
+                }
                 if (write != read) {
                     *write = *read;
                 }
@@ -2822,15 +2913,39 @@ namespace lfs::vis {
                                                        const VkImageAspectFlags aspect_mask,
                                                        const VkSemaphore wait_semaphore,
                                                        const std::uint64_t wait_value,
-                                                       const VkPipelineStageFlags wait_stage) {
+                                                       const VkPipelineStageFlags wait_stage,
+                                                       const VkSemaphore signal_semaphore,
+                                                       const std::uint64_t signal_value,
+                                                       ImmediateSubmitTicket* const completion_ticket) {
+        if (completion_ticket) {
+            completion_ticket->reset();
+        }
+        const auto fail_transition = [&](std::string message) {
+            if (completion_ticket) {
+                completion_ticket->reset();
+            }
+            return fail(std::move(message));
+        };
         if (device_ == VK_NULL_HANDLE || immediate_command_pool_ == VK_NULL_HANDLE ||
             graphics_queue_ == VK_NULL_HANDLE || image == VK_NULL_HANDLE) {
-            return fail("Cannot transition Vulkan image layout before graphics resources are initialized");
+            return fail_transition("Cannot transition Vulkan image layout before graphics resources are initialized");
         }
         if (frame_active_) {
-            return fail("Immediate Vulkan image layout transitions cannot run during an active frame");
+            return fail_transition("Immediate Vulkan image layout transitions cannot run during an active frame");
+        }
+        std::shared_ptr<ImmediateSubmitState> completion;
+        if (completion_ticket) {
+            completion = std::make_shared<ImmediateSubmitState>();
+            completion->owner = this;
+            completion_ticket->state_ = completion;
         }
         if (old_layout == new_layout) {
+            if (completion) {
+                completion->poll_result = {
+                    .status = ImmediateSubmitStatus::Complete,
+                    .result = VK_SUCCESS,
+                };
+            }
             last_error_.clear();
             return true;
         }
@@ -2846,7 +2961,8 @@ namespace lfs::vis {
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         VkResult result = vkAllocateCommandBuffers(device_, &allocate_info, &command_buffer);
         if (result != VK_SUCCESS) {
-            return fail(std::format("vkAllocateCommandBuffers(layout transition) failed: {}", vkResultToString(result)));
+            return fail_transition(std::format("vkAllocateCommandBuffers(layout transition) failed: {}",
+                                               vkResultToString(result)));
         }
 
         VkCommandBufferBeginInfo begin_info{};
@@ -2855,7 +2971,8 @@ namespace lfs::vis {
         result = vkBeginCommandBuffer(command_buffer, &begin_info);
         if (result != VK_SUCCESS) {
             vkFreeCommandBuffers(device_, immediate_command_pool_, 1, &command_buffer);
-            return fail(std::format("vkBeginCommandBuffer(layout transition) failed: {}", vkResultToString(result)));
+            return fail_transition(std::format("vkBeginCommandBuffer(layout transition) failed: {}",
+                                               vkResultToString(result)));
         }
 
         VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_NONE;
@@ -2926,7 +3043,8 @@ namespace lfs::vis {
         result = vkEndCommandBuffer(command_buffer);
         if (result != VK_SUCCESS) {
             vkFreeCommandBuffers(device_, immediate_command_pool_, 1, &command_buffer);
-            return fail(std::format("vkEndCommandBuffer(layout transition) failed: {}", vkResultToString(result)));
+            return fail_transition(std::format("vkEndCommandBuffer(layout transition) failed: {}",
+                                               vkResultToString(result)));
         }
 
         VkSubmitInfo submit_info{};
@@ -2941,14 +3059,22 @@ namespace lfs::vis {
         // already gates the GPU on the external (CUDA) timeline. Blocking the
         // CPU here doubled the cost of every CUDA→Vulkan handoff (3-9ms/frame
         // observed). The submit's pWaitSemaphores entry is sufficient.
-        if (wait_semaphore != VK_NULL_HANDLE) {
+        if (wait_semaphore != VK_NULL_HANDLE || signal_semaphore != VK_NULL_HANDLE) {
             timeline_submit_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+            submit_info.pNext = &timeline_submit_info;
+        }
+        if (wait_semaphore != VK_NULL_HANDLE) {
             timeline_submit_info.waitSemaphoreValueCount = 1;
             timeline_submit_info.pWaitSemaphoreValues = &wait_value;
-            submit_info.pNext = &timeline_submit_info;
             submit_info.waitSemaphoreCount = 1;
             submit_info.pWaitSemaphores = &wait_semaphore;
             submit_info.pWaitDstStageMask = &resolved_wait_stage;
+        }
+        if (signal_semaphore != VK_NULL_HANDLE) {
+            timeline_submit_info.signalSemaphoreValueCount = 1;
+            timeline_submit_info.pSignalSemaphoreValues = &signal_value;
+            submit_info.signalSemaphoreCount = 1;
+            submit_info.pSignalSemaphores = &signal_semaphore;
         }
         VkFenceCreateInfo fence_info{};
         fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -2956,19 +3082,25 @@ namespace lfs::vis {
         result = vkCreateFence(device_, &fence_info, nullptr, &submit_fence);
         if (result != VK_SUCCESS) {
             vkFreeCommandBuffers(device_, immediate_command_pool_, 1, &command_buffer);
-            return fail(std::format("vkCreateFence(layout transition) failed: {}", vkResultToString(result)));
+            return fail_transition(std::format("vkCreateFence(layout transition) failed: {}",
+                                               vkResultToString(result)));
         }
 
         result = vkQueueSubmit(graphics_queue_, 1, &submit_info, submit_fence);
         if (result != VK_SUCCESS) {
             vkDestroyFence(device_, submit_fence, nullptr);
             vkFreeCommandBuffers(device_, immediate_command_pool_, 1, &command_buffer);
-            return fail(std::format("Immediate Vulkan image layout transition submit failed: {}", vkResultToString(result)));
+            return fail_transition(std::format("Immediate Vulkan image layout transition submit failed: {}",
+                                               vkResultToString(result)));
         }
         // Fire-and-forget: queue cmd+fence for lazy reaping. Vulkan queues are
         // FIFO per VkQueue, so subsequent submits on graphics_queue_ correctly
         // observe the layout transition without any CPU-side wait.
-        pending_immediate_submits_.push_back({command_buffer, submit_fence});
+        pending_immediate_submits_.push_back({
+            .cmd = command_buffer,
+            .fence = submit_fence,
+            .completion = std::move(completion),
+        });
         last_error_.clear();
         return true;
     }

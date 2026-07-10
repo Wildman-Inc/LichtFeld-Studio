@@ -162,6 +162,9 @@ namespace lfs::vis {
                                              std::uint64_t generation,
                                              VkSemaphore completion_semaphore = VK_NULL_HANDLE,
                                              std::uint64_t completion_value = 0);
+            // Drains Vulkan sampling and any in-flight CUDA/HIP surface copies
+            // before scene-owned tensors are released.
+            void drainVulkanSceneInterop();
 
             // Split-view's right panel routes through a parallel CUDA/Vulkan interop
             // slot so we don't pay PCIe staging cost for it; the left panel reuses the
@@ -189,6 +192,7 @@ namespace lfs::vis {
                                       VkExtent2D extent,
                                       const VulkanViewportPassParams& params);
             void prepareVulkanSceneInterop(VulkanContext& context);
+            void prepareVulkanSceneInteropAsync(VulkanContext& context);
             void resetVulkanSceneInterop();
             void prepareVulkanSplitRightInterop(VulkanContext& context);
             void resetVulkanSplitRightInterop();
@@ -356,6 +360,7 @@ namespace lfs::vis {
             std::vector<std::unique_ptr<VulkanSceneInteropTarget>> vulkan_scene_interop_;
             std::shared_ptr<const lfs::core::Tensor> vulkan_scene_image_;
             std::uint64_t vulkan_scene_image_generation_ = 0;
+            std::uint64_t vulkan_scene_request_serial_ = 0;
             glm::ivec2 vulkan_scene_image_size_{0, 0};
             bool vulkan_scene_image_flip_y_ = false;
             VkImage vulkan_external_scene_image_ = VK_NULL_HANDLE;
@@ -367,6 +372,9 @@ namespace lfs::vis {
             VkSemaphore vulkan_frame_completion_semaphore_ = VK_NULL_HANDLE;
             std::uint64_t vulkan_frame_completion_value_ = 0;
             bool vulkan_scene_interop_disabled_ = false;
+            bool vulkan_scene_async_interop_active_ = false;
+            bool vulkan_external_scene_image_direct_ = false;
+            std::optional<std::size_t> vulkan_scene_published_slot_;
 
             // Parallel slot for split-view's right panel.
             std::vector<std::unique_ptr<VulkanSceneInteropTarget>> vulkan_split_right_interop_;

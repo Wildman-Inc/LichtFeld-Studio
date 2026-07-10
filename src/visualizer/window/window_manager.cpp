@@ -423,7 +423,13 @@ namespace lfs::vis {
             SDL_Quit();
             return false;
         }
-        lfs::rendering::setExpectedVulkanDeviceUuid(vulkan_context_->deviceUUID());
+#ifdef _WIN32
+        lfs::rendering::setExpectedVulkanDeviceIdentity(vulkan_context_->deviceUUID(),
+                                                        vulkan_context_->deviceLUID(),
+                                                        vulkan_context_->deviceLUIDValid());
+#else
+        lfs::rendering::setExpectedVulkanDeviceIdentity(vulkan_context_->deviceUUID());
+#endif
         if (!vulkan_context_->presentBootstrapFrame(0.11f, 0.11f, 0.14f, 1.0f)) {
             std::cerr << "Failed to present Vulkan bootstrap frame: " << vulkan_context_->lastError() << std::endl;
             vulkan_context_.reset();

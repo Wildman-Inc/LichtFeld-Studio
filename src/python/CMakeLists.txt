@@ -222,14 +222,18 @@ nanobind_add_module(
 )
 
 set_target_properties(lfs_py PROPERTIES
-    CUDA_ARCHITECTURES ""
-    CUDA_SEPARABLE_COMPILATION OFF
     LINKER_LANGUAGE CXX
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     OUTPUT_NAME lichtfeld
 )
+if(USE_CUDA)
+    set_target_properties(lfs_py PROPERTIES
+        CUDA_ARCHITECTURES ""
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+endif()
 
 # Do not add --exclude-libs,ALL here while lfs_visualizer is static on Linux.
 # The embedded app and the lichtfeld extension currently share GUI registries
@@ -266,8 +270,8 @@ target_link_libraries(lfs_py PRIVATE
     OpenMeshCore
     OpenMeshTools
     OpenImageIO::OpenImageIO
-    CUDA::cudart
-    CUDA::curand
+    ${GPU_RUNTIME_LIBRARY}
+    ${GPU_RAND_LIBRARY}
     ${CMAKE_DL_LIBS}
     imgui::imgui
     implot::implot
@@ -308,18 +312,30 @@ if(WIN32)
         COMMENT "Copying project DLLs to Python module directory"
     )
 
-    # Copy CUDA DLLs
-    file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
-    file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
-    set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
-    foreach(DLL ${CUDA_DLLS_FOR_PYD})
-        if(EXISTS "${DLL}")
+    if(USE_CUDA)
+        # Copy CUDA DLLs
+        file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
+        file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
+        set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
+        foreach(DLL ${CUDA_DLLS_FOR_PYD})
+            if(EXISTS "${DLL}")
+                add_custom_command(TARGET lfs_py POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
+                    COMMENT "Copying ${DLL} to Python module directory"
+                )
+            endif()
+        endforeach()
+    elseif(USE_HIP)
+        lfs_collect_windows_hip_runtime_dlls(_lfs_hip_pyd_runtime_dlls)
+        if(_lfs_hip_pyd_runtime_dlls)
             add_custom_command(TARGET lfs_py POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
-                COMMENT "Copying ${DLL} to Python module directory"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${_lfs_hip_pyd_runtime_dlls}
+                    "${CMAKE_CURRENT_BINARY_DIR}"
+                COMMENT "Copying ROCm/HIP runtime DLLs to Python module directory"
             )
         endif()
-    endforeach()
+    endif()
 
     # Copy vcpkg runtime DLLs
     add_custom_command(TARGET lfs_py POST_BUILD

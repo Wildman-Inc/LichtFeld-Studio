@@ -18,6 +18,7 @@
 #include "internal/tensor_impl.hpp"
 #include "internal/tensor_ops.hpp"
 #include "internal/warp_reduce.cuh"
+#include "core/logger.hpp"
 #include <cfloat>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>

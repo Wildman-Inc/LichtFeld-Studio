@@ -23,6 +23,21 @@
 
 namespace lfs::core {
 
+    namespace {
+        cudaError_t synchronize_stream(cudaStream_t stream) {
+            return cudaStreamSynchronize(stream);
+        }
+
+        cudaError_t synchronize_device() {
+            return cudaDeviceSynchronize();
+        }
+
+        std::atomic<PinnedMemoryAllocator::StreamSynchronizeFn> stream_synchronize_fn{
+            synchronize_stream};
+        std::atomic<PinnedMemoryAllocator::DeviceSynchronizeFn> device_synchronize_fn{
+            synchronize_device};
+    } // namespace
+
     // Block implementation
     PinnedMemoryAllocator::Block::~Block() {
         release_events();
@@ -31,9 +46,11 @@ namespace lfs::core {
     PinnedMemoryAllocator::Block::Block(Block&& other) noexcept
         : ptr(other.ptr),
           size(other.size),
+          quarantined(other.quarantined),
           ready_events(std::move(other.ready_events)) {
         other.ptr = nullptr;
         other.size = 0;
+        other.quarantined = false;
         other.ready_events.clear();
     }
 
@@ -42,17 +59,22 @@ namespace lfs::core {
             release_events();
             ptr = other.ptr;
             size = other.size;
+            quarantined = other.quarantined;
             ready_events = std::move(other.ready_events);
             other.ptr = nullptr;
             other.size = 0;
+            other.quarantined = false;
             other.ready_events.clear();
         }
         return *this;
     }
 
     bool PinnedMemoryAllocator::Block::all_uses_complete() const {
-        for (cudaEvent_t event : ready_events) {
-            const cudaError_t status = cudaEventQuery(event);
+        if (quarantined) {
+            return false;
+        }
+        for (const ReadyEvent& ready : ready_events) {
+            const cudaError_t status = cudaEventQuery(ready.event);
             if (status == cudaErrorNotReady) {
                 return false;
             }
@@ -64,9 +86,23 @@ namespace lfs::core {
         return true;
     }
 
+    bool PinnedMemoryAllocator::Block::references_stream(cudaStream_t stream) const {
+        return std::any_of(ready_events.begin(), ready_events.end(), [stream](const ReadyEvent& ready) {
+            return ready.stream == stream;
+        });
+    }
+
+    void PinnedMemoryAllocator::Block::quarantine() noexcept {
+        quarantined = true;
+    }
+
     void PinnedMemoryAllocator::Block::release_events() {
-        for (cudaEvent_t event : ready_events) {
-            CudaEventPool::instance().release(event);
+        if (quarantined) {
+            ready_events.clear();
+            return;
+        }
+        for (const ReadyEvent& ready : ready_events) {
+            CudaEventPool::instance().release(ready.event);
         }
         ready_events.clear();
     }
@@ -74,6 +110,17 @@ namespace lfs::core {
     PinnedMemoryAllocator& PinnedMemoryAllocator::instance() {
         static PinnedMemoryAllocator instance;
         return instance;
+    }
+
+    void PinnedMemoryAllocator::set_release_stream_synchronizers_for_testing(
+        StreamSynchronizeFn stream_synchronize,
+        DeviceSynchronizeFn device_synchronize) {
+        stream_synchronize_fn.store(
+            stream_synchronize ? stream_synchronize : synchronize_stream,
+            std::memory_order_release);
+        device_synchronize_fn.store(
+            device_synchronize ? device_synchronize : synchronize_device,
+            std::memory_order_release);
     }
 
     PinnedMemoryAllocator::~PinnedMemoryAllocator() {
@@ -207,11 +254,18 @@ namespace lfs::core {
         }
 
         const size_t size = it->second.size;
+        const bool unsafe_to_reuse = it->second.unsafe_to_reuse;
         std::vector<cudaStream_t> use_streams = std::move(it->second.extra_streams);
         allocated_blocks_.erase(it);
         stats_.allocated_bytes -= size;
         stats_.num_deallocs++;
         lfs::diagnostics::VramProfiler::instance().setPinnedHostUsed(stats_.allocated_bytes);
+
+        if (unsafe_to_reuse) {
+            LOG_ERROR("Abandoning {} bytes of pinned memory after an unrecoverable stream sync failure",
+                      size);
+            return;
+        }
 
         if (std::find(use_streams.begin(), use_streams.end(), stream) == use_streams.end()) {
             use_streams.push_back(stream);
@@ -232,7 +286,7 @@ namespace lfs::core {
                 CudaEventPool::instance().release(event);
                 continue;
             }
-            block.ready_events.push_back(event);
+            block.ready_events.push_back({event, use_stream});
         }
 
         cache_[size].push_back(std::move(block));
@@ -258,10 +312,69 @@ namespace lfs::core {
         if (!stream) {
             return;
         }
-        cudaStreamSynchronize(stream);
+
+        const cudaError_t stream_status =
+            stream_synchronize_fn.load(std::memory_order_acquire)(stream);
+        cudaError_t device_status = cudaSuccess;
+        if (stream_status != cudaSuccess) {
+            LOG_WARN("cudaStreamSynchronize failed while releasing a pinned-memory stream: {}; "
+                     "falling back to cudaDeviceSynchronize",
+                     cudaGetErrorString(stream_status));
+            device_status = device_synchronize_fn.load(std::memory_order_acquire)();
+        }
+
+        const bool synchronized = stream_status == cudaSuccess || device_status == cudaSuccess;
         std::lock_guard<std::mutex> lock(mutex_);
+
+        if (!synchronized) {
+            size_t quarantined_blocks = 0;
+            size_t quarantined_bytes = 0;
+            size_t quarantined_events = 0;
+
+            for (auto& [ptr, info] : allocated_blocks_) {
+                if (std::find(info.extra_streams.begin(), info.extra_streams.end(), stream) !=
+                    info.extra_streams.end()) {
+                    std::erase(info.extra_streams, stream);
+                    info.unsafe_to_reuse = true;
+                }
+            }
+
+            for (auto& [size, blocks] : cache_) {
+                std::erase_if(blocks, [&](Block& block) {
+                    if (!block.references_stream(stream)) {
+                        return false;
+                    }
+                    ++quarantined_blocks;
+                    quarantined_bytes += block.size;
+                    quarantined_events += block.ready_events.size();
+                    block.quarantine();
+                    return true;
+                });
+            }
+
+            stats_.cached_bytes -= quarantined_bytes;
+            LOG_ERROR("cudaDeviceSynchronize also failed while releasing a pinned-memory stream: {}; "
+                      "quarantined {} blocks ({} bytes, {} events) without querying or reusing them",
+                      cudaGetErrorString(device_status),
+                      quarantined_blocks,
+                      quarantined_bytes,
+                      quarantined_events);
+            return;
+        }
+
         for (auto& [ptr, info] : allocated_blocks_) {
             std::erase(info.extra_streams, stream);
+        }
+        for (auto& [size, blocks] : cache_) {
+            for (Block& block : blocks) {
+                std::erase_if(block.ready_events, [stream](const Block::ReadyEvent& ready) {
+                    if (ready.stream != stream) {
+                        return false;
+                    }
+                    CudaEventPool::instance().release(ready.event);
+                    return true;
+                });
+            }
         }
     }
 
@@ -274,8 +387,8 @@ namespace lfs::core {
         // Free all cached blocks
         for (auto& [size, blocks] : cache_) {
             for (auto& block : blocks) {
-                for (cudaEvent_t event : block.ready_events) {
-                    const cudaError_t status = cudaEventSynchronize(event);
+                for (const Block::ReadyEvent& ready : block.ready_events) {
+                    const cudaError_t status = cudaEventSynchronize(ready.event);
                     if (status != cudaSuccess) {
                         LOG_ERROR("cudaEventSynchronize failed during cache clear: {}",
                                   cudaGetErrorString(status));

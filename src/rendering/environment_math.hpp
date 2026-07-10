@@ -11,7 +11,7 @@
 
 #include <cmath>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define LFS_ENV_HD __host__ __device__ __forceinline__
 #else
 #define LFS_ENV_HD inline
@@ -32,7 +32,7 @@ namespace lfs::rendering::envmath {
     }
 
     LFS_ENV_HD Vec3 normalized(const Vec3& v) {
-        const float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        const float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
         if (len <= 0.0f) {
             return v;
         }
@@ -45,8 +45,8 @@ namespace lfs::rendering::envmath {
     }
 
     LFS_ENV_HD Vec3 rotateAroundY(const Vec3& value, const float radians) {
-        const float c = std::cos(radians);
-        const float s = std::sin(radians);
+        const float c = cosf(radians);
+        const float s = sinf(radians);
         return {
             c * value.x + s * value.z,
             value.y,
@@ -72,7 +72,7 @@ namespace lfs::rendering::envmath {
     LFS_ENV_HD Vec3 shadeEnvironmentRadiance(const Vec3& hdr, const float exposure_factor) {
         Vec3 color = acesTonemap({hdr.x * exposure_factor, hdr.y * exposure_factor, hdr.z * exposure_factor});
         constexpr float kInvGamma = 1.0f / 2.2f;
-        color = {std::pow(color.x, kInvGamma), std::pow(color.y, kInvGamma), std::pow(color.z, kInvGamma)};
+        color = {powf(color.x, kInvGamma), powf(color.y, kInvGamma), powf(color.z, kInvGamma)};
         return {clampf(color.x, 0.0f, 1.0f), clampf(color.y, 0.0f, 1.0f), clampf(color.z, 0.0f, 1.0f)};
     }
 
@@ -94,10 +94,10 @@ namespace lfs::rendering::envmath {
         if (equirectangular_view) {
             const float lon = (tex_u - 0.5f) * (2.0f * kPi);
             const float lat = (tex_v - 0.5f) * kPi;
-            const float cos_lat = std::cos(lat);
-            local_dir = normalized({std::sin(lon) * cos_lat,
-                                    std::sin(lat),
-                                    -std::cos(lon) * cos_lat});
+            const float cos_lat = cosf(lat);
+            local_dir = normalized({sinf(lon) * cos_lat,
+                                    sinf(lat),
+                                    -cosf(lon) * cos_lat});
         } else {
             const float px = tex_u * width;
             const float py = tex_v * height;
@@ -118,8 +118,8 @@ namespace lfs::rendering::envmath {
     };
 
     LFS_ENV_HD EquirectUv equirectUvForDirection(const Vec3& world_dir) {
-        const float longitude = std::atan2(world_dir.x, -world_dir.z);
-        const float latitude = std::asin(clampf(world_dir.y, -1.0f, 1.0f));
+        const float longitude = atan2f(world_dir.x, -world_dir.z);
+        const float latitude = asinf(clampf(world_dir.y, -1.0f, 1.0f));
         return {longitude / (2.0f * kPi) + 0.5f, 0.5f - latitude / kPi};
     }
 
@@ -134,15 +134,15 @@ namespace lfs::rendering::envmath {
     };
 
     LFS_ENV_HD BilinearTap environmentBilinearTap(float u, float v, const int width, const int height) {
-        u = u - std::floor(u);
+        u = u - floorf(u);
         v = clampf(v, 0.0f, 1.0f);
 
         const float x = u * static_cast<float>(width - 1);
         const float y = v * static_cast<float>(height - 1);
         BilinearTap tap;
-        tap.x0 = static_cast<int>(std::floor(x));
+        tap.x0 = static_cast<int>(floorf(x));
         tap.x0 = tap.x0 < 0 ? 0 : (tap.x0 > width - 1 ? width - 1 : tap.x0);
-        tap.y0 = static_cast<int>(std::floor(y));
+        tap.y0 = static_cast<int>(floorf(y));
         tap.y0 = tap.y0 < 0 ? 0 : (tap.y0 > height - 1 ? height - 1 : tap.y0);
         tap.x1 = (tap.x0 + 1) % width;
         tap.y1 = tap.y0 + 1 > height - 1 ? height - 1 : tap.y0 + 1;

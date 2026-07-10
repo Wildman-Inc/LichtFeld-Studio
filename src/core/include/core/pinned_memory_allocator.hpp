@@ -130,6 +130,15 @@ namespace lfs::core {
         void set_enabled(bool enabled) { enabled_ = enabled; }
         bool is_enabled() const { return enabled_; }
 
+        using StreamSynchronizeFn = cudaError_t (*)(cudaStream_t);
+        using DeviceSynchronizeFn = cudaError_t (*)();
+
+        // Test seam for deterministic release_stream() failure coverage.
+        // Passing nullptr restores the corresponding runtime function.
+        void set_release_stream_synchronizers_for_testing(
+            StreamSynchronizeFn stream_synchronize,
+            DeviceSynchronizeFn device_synchronize);
+
     private:
         PinnedMemoryAllocator() = default;
         ~PinnedMemoryAllocator();
@@ -147,12 +156,19 @@ namespace lfs::core {
         static size_t round_size(size_t bytes);
 
         struct Block {
+            struct ReadyEvent {
+                cudaEvent_t event{nullptr};
+                cudaStream_t stream{nullptr};
+            };
+
             void* ptr{nullptr};
             size_t size{0};
+            bool quarantined{false};
             // Pooled events, one per stream that used this memory; the block is
-            // safe to reuse once every event has completed. Events stay valid
-            // after their recording stream is destroyed.
-            std::vector<cudaEvent_t> ready_events;
+            // safe to reuse once every event has completed. Keep the recording
+            // stream so release_stream() can retire the event before HIP
+            // invalidates it during stream destruction.
+            std::vector<ReadyEvent> ready_events;
 
             Block() = default;
             Block(void* p, size_t s) : ptr(p),
@@ -166,12 +182,15 @@ namespace lfs::core {
             Block& operator=(const Block&) = delete;
 
             bool all_uses_complete() const;
+            bool references_stream(cudaStream_t stream) const;
+            void quarantine() noexcept;
             void release_events();
         };
 
         struct AllocationInfo {
             size_t size{0};
             std::vector<cudaStream_t> extra_streams;
+            bool unsafe_to_reuse{false};
         };
 
         // Cache of free blocks organized by size

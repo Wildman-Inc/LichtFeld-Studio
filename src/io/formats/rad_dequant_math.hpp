@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define LFS_RAD_HD __host__ __device__ inline
 #else
 #define LFS_RAD_HD inline
@@ -27,7 +27,7 @@ namespace lfs::io::radmath {
     inline constexpr float kPi = 3.14159265358979323846f;
 
     LFS_RAD_HD float bitsToFloat(const std::uint32_t bits) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
         return __uint_as_float(bits);
 #else
         float v;
@@ -70,7 +70,7 @@ namespace lfs::io::radmath {
     }
 
     LFS_RAD_HD std::uint32_t floatToBits(const float v) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
         return __float_as_uint(v);
 #else
         std::uint32_t bits;

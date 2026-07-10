@@ -105,7 +105,7 @@ namespace lfs::rendering::detail {
     } // namespace
 
     cudaError_t launchCudaVulkanCopyTensorToSurface(
-        const cudaSurfaceObject_t surface,
+        cudaSurfaceObject_t surface,
         const void* source,
         const std::uint32_t width,
         const std::uint32_t height,
@@ -114,7 +114,7 @@ namespace lfs::rendering::detail {
         const CudaVulkanTensorElementType element_type,
         const bool flip_y,
         const cudaStream_t stream) {
-        if (surface == 0 || source == nullptr || width == 0 || height == 0) {
+        if (surface == cudaSurfaceObject_t{} || source == nullptr || width == 0 || height == 0) {
             return cudaErrorInvalidValue;
         }
 
@@ -137,7 +137,7 @@ namespace lfs::rendering::detail {
     }
 
     cudaError_t launchCudaVulkanCopyTensorToSurfaceR32f(
-        const cudaSurfaceObject_t surface,
+        cudaSurfaceObject_t surface,
         const float* source,
         const std::uint32_t width,
         const std::uint32_t height,
@@ -145,7 +145,7 @@ namespace lfs::rendering::detail {
         const CudaVulkanTensorLayout layout,
         const bool flip_y,
         const cudaStream_t stream) {
-        if (surface == 0 || source == nullptr || width == 0 || height == 0) {
+        if (surface == cudaSurfaceObject_t{} || source == nullptr || width == 0 || height == 0) {
             return cudaErrorInvalidValue;
         }
         const dim3 block{16, 16, 1};

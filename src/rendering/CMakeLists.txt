@@ -19,13 +19,13 @@ set(RENDERING_TENSOR_SOURCES
         screen_overlay_renderer.cpp
 )
 
-add_library(lfs_rendering_tensor STATIC ${RENDERING_TENSOR_SOURCES})
+lfs_add_gpu_library(lfs_rendering_tensor STATIC ${RENDERING_TENSOR_SOURCES})
 
 target_link_libraries(lfs_rendering_tensor
         PUBLIC
         lfs_core
         PRIVATE
-        CUDA::cudart
+        ${GPU_RUNTIME_LIBRARY}
         glm::glm
         Vulkan::Vulkan
         glslang::glslang

@@ -10,10 +10,12 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LFS_TENSOR_DEVICE_COMPILER 1
 #define HOST_DEVICE __host__ __device__
 #include <thrust/tuple.h>
 #else
+#define LFS_TENSOR_DEVICE_COMPILER 0
 #define HOST_DEVICE
 #include <tuple>
 #endif
@@ -480,8 +482,8 @@ namespace lfs::core {
                 if (b == static_cast<T>(2.0)) {
                     return a * a;
                 }
-#ifdef __CUDA_ARCH__
-                return powf(a, b);
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+                return static_cast<T>(powf(static_cast<float>(a), static_cast<float>(b)));
 #else
                 return static_cast<T>(std::pow(a, b));
 #endif
@@ -494,8 +496,8 @@ namespace lfs::core {
                 if constexpr (std::is_integral_v<T>)
                     return a % b;
                 else {
-#ifdef __CUDA_ARCH__
-                    return fmodf(a, b);
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+                    return static_cast<T>(fmodf(static_cast<float>(a), static_cast<float>(b)));
 #else
                     return std::fmod(a, b);
 #endif
@@ -506,8 +508,8 @@ namespace lfs::core {
         struct fmod_op {
             template <typename T>
             HOST_DEVICE constexpr T operator()(const T& a, const T& b) const {
-#ifdef __CUDA_ARCH__
-                return fmodf(a, b);
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+                return static_cast<T>(fmodf(static_cast<float>(a), static_cast<float>(b)));
 #else
                 return std::fmod(a, b);
 #endif
@@ -932,7 +934,7 @@ namespace lfs::core {
         struct tuple_get_op {
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if LFS_TENSOR_DEVICE_COMPILER
                 return thrust::get<N>(t);
 #else
                 return std::get<N>(t);
@@ -943,7 +945,7 @@ namespace lfs::core {
         struct tuple_first_op {
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if LFS_TENSOR_DEVICE_COMPILER
                 return thrust::get<0>(t);
 #else
                 return std::get<0>(t);
@@ -954,7 +956,7 @@ namespace lfs::core {
         struct tuple_second_op {
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if LFS_TENSOR_DEVICE_COMPILER
                 return thrust::get<1>(t);
 #else
                 return std::get<1>(t);
@@ -969,7 +971,7 @@ namespace lfs::core {
 
             template <typename Tuple>
             HOST_DEVICE constexpr auto operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if LFS_TENSOR_DEVICE_COMPILER
                 return op(thrust::get<0>(t), thrust::get<1>(t));
 #else
                 return op(std::get<0>(t), std::get<1>(t));
@@ -1030,7 +1032,7 @@ namespace lfs::core {
             // For use with zip iterators - tuple input
             template <typename Tuple>
             HOST_DEVICE constexpr T operator()(const Tuple& t) const {
-#ifdef __CUDACC__
+#if LFS_TENSOR_DEVICE_COMPILER
                 return thrust::get<1>(t) ? val : thrust::get<0>(t);
 #else
                 return std::get<1>(t) ? val : std::get<0>(t);
@@ -1046,7 +1048,7 @@ namespace lfs::core {
         struct extract_value_op {
             template <typename ValueMaskPair>
             HOST_DEVICE constexpr auto operator()(const ValueMaskPair& p) const {
-#ifdef __CUDACC__
+#if LFS_TENSOR_DEVICE_COMPILER
                 return thrust::get<0>(p);
 #else
                 return std::get<0>(p);
@@ -1057,7 +1059,7 @@ namespace lfs::core {
         struct extract_mask_op {
             template <typename ValueMaskPair>
             HOST_DEVICE constexpr bool operator()(const ValueMaskPair& p) const {
-#ifdef __CUDACC__
+#if LFS_TENSOR_DEVICE_COMPILER
                 return thrust::get<1>(p) != 0;
 #else
                 return std::get<1>(p) != 0;

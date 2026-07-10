@@ -44,6 +44,7 @@ namespace lfs::vis {
                 params.eval_steps = steps;
         }
 
+#if !defined(USE_HIP) || !USE_HIP
         [[nodiscard]] lfs::core::SplatTensorAllocator makeVulkanTrainingTensorAllocator(VisualizerImpl* viewer) {
             if (!viewer || !viewer->getWindowManager()) {
                 return {};
@@ -73,6 +74,13 @@ namespace lfs::vis {
                 tensor->set_name(debug_name);
                 return std::move(*tensor);
             };
+        }
+#endif
+
+        void clearCudaInteropError() {
+#if defined(USE_HIP) && USE_HIP
+            (void)cudaGetLastError();
+#endif
         }
     } // namespace
 
@@ -118,23 +126,44 @@ namespace lfs::vis {
                              sh_degree,
                              splat_storage_->block->size >> 20);
                 } else {
+#if defined(USE_HIP) && USE_HIP
+                    LOG_WARN("Exportable-interop allocator failed ({}); dropping storage "
+                             "and falling back to regular GPU storage",
+                             interop_alloc_result.error());
+#else
                     LOG_WARN("Exportable-interop allocator failed ({}); dropping storage "
                              "and falling back to legacy Vulkan-external allocator",
                              interop_alloc_result.error());
+#endif
                     splat_storage_.reset();
+                    clearCudaInteropError();
                 }
             } else {
+#if defined(USE_HIP) && USE_HIP
+                LOG_WARN("SplatExportableStorage creation failed ({}); falling back to "
+                         "regular GPU storage",
+                         storage_result.error());
+#else
                 LOG_WARN("SplatExportableStorage creation failed ({}); falling back to "
                          "legacy Vulkan-external allocator",
                          storage_result.error());
+#endif
+                clearCudaInteropError();
             }
         }
 
         if (!tensor_allocator) {
+#if defined(USE_HIP) && USE_HIP
+            if (vulkan_interop_available) {
+                LOG_WARN("ROCm/HIP training tensors will use regular GPU storage; "
+                         "legacy per-tensor Vulkan-external CUDA storage is not supported reliably");
+            }
+#else
             tensor_allocator = makeVulkanTrainingTensorAllocator(viewer_);
             if (tensor_allocator) {
                 LOG_INFO("Training model tensors will use Vulkan-external CUDA storage");
             }
+#endif
         }
 
         return tensor_allocator;
@@ -332,9 +361,9 @@ namespace lfs::vis {
             const std::size_t model_size = model ? static_cast<std::size_t>(model->size()) : 0;
             auto tensor_allocator = scene_ ? createTrainingSplatTensorAllocator(params, model_size)
                                            : lfs::core::SplatTensorAllocator{};
+            trainer_->setSplatTensorAllocator(tensor_allocator);
             const bool force_reallocation = splat_storage_.has_value();
             if (scene_ && tensor_allocator) {
-                trainer_->setSplatTensorAllocator(tensor_allocator);
                 if (model) {
                     if (auto result = lfs::training::migrateTrainingModelToAllocator(
                             params, *model, tensor_allocator, force_reallocation);

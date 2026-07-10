@@ -53,14 +53,15 @@ namespace lfs::rendering {
         std::uint64_t initial_value = 0;
     };
 
-    // Records the Vulkan physical-device UUID expected to back any subsequent
-    // CUDA/Vulkan interop. Call once at startup, after Vulkan device selection.
-    // The first interop init() then verifies the current CUDA device matches;
-    // mismatch is a hard failure (returns false from init() with a clear error).
-    void setExpectedVulkanDeviceUuid(const std::array<std::uint8_t, 16>& uuid);
+    // Records the Vulkan physical-device identity expected to back any subsequent
+    // CUDA/Vulkan interop. Windows HIP uses a valid LUID; all other paths use UUID.
+    // Call once at startup, after Vulkan device selection. Mismatch is a hard failure.
+    void setExpectedVulkanDeviceIdentity(const std::array<std::uint8_t, 16>& uuid,
+                                         const std::array<std::uint8_t, 8>& luid = {},
+                                         bool luid_valid = false);
 
-    // Lazily verifies the CUDA current device's UUID against the value passed
-    // to setExpectedVulkanDeviceUuid(). Returns std::nullopt on success, or an
+    // Lazily verifies the current CUDA/HIP device against the identity passed to
+    // setExpectedVulkanDeviceIdentity(). Returns std::nullopt on success, or an
     // error message on mismatch / missing setup. Result is cached.
     [[nodiscard]] std::optional<std::string> verifyCudaMatchesVulkanDevice();
 
@@ -78,6 +79,12 @@ namespace lfs::rendering {
 
     class CudaVulkanInterop {
     public:
+        enum class SurfaceCopyStatus : std::uint8_t {
+            Idle,
+            Pending,
+            Complete,
+        };
+
         CudaVulkanInterop() = default;
         CudaVulkanInterop(CudaVulkanExternalImageImport image,
                           CudaVulkanExternalSemaphoreImport semaphore);
@@ -89,10 +96,12 @@ namespace lfs::rendering {
         CudaVulkanInterop& operator=(CudaVulkanInterop&& other) noexcept;
 
         [[nodiscard]] bool init(CudaVulkanExternalImageImport image,
-                                CudaVulkanExternalSemaphoreImport semaphore);
+                                 CudaVulkanExternalSemaphoreImport semaphore);
+        [[nodiscard]] bool init(CudaVulkanExternalImageImport image);
         void reset();
 
         [[nodiscard]] bool valid() const;
+        [[nodiscard]] bool timelineSemaphoreEnabled() const { return cuda_timeline_ != nullptr; }
         [[nodiscard]] const std::string& lastError() const { return last_error_; }
         [[nodiscard]] CudaVulkanExtent2D extent() const { return extent_; }
         [[nodiscard]] CudaVulkanImageFormat format() const { return format_; }
@@ -103,21 +112,35 @@ namespace lfs::rendering {
         [[nodiscard]] bool copyTensorToSurface(const lfs::core::Tensor& tensor,
                                                cudaStream_t stream = nullptr,
                                                bool flip_y = false) const;
+        [[nodiscard]] bool enqueueTensorToSurface(const lfs::core::Tensor& tensor,
+                                                  cudaStream_t stream = nullptr,
+                                                  bool flip_y = false) const;
+        [[nodiscard]] bool pollSurfaceCopy(SurfaceCopyStatus& status) const;
+        [[nodiscard]] bool wait(std::uint64_t value, cudaStream_t stream = nullptr) const;
         [[nodiscard]] bool signal(std::uint64_t value, cudaStream_t stream = nullptr) const;
 
     private:
+        [[nodiscard]] bool initImpl(
+            CudaVulkanExternalImageImport image,
+            std::optional<CudaVulkanExternalSemaphoreImport> semaphore);
         [[nodiscard]] bool fail(std::string message) const;
         [[nodiscard]] bool failCuda(const char* operation, cudaError_t status) const;
+        void rememberStream(cudaStream_t stream) const;
+        void synchronizeTrackedStreams();
 
         cudaExternalMemory_t cuda_mem_ = nullptr;
         cudaMipmappedArray_t cuda_mip_ = nullptr;
         cudaArray_t cuda_array_ = nullptr;
-        cudaSurfaceObject_t surface_ = 0;
+        cudaSurfaceObject_t surface_{};
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
+        mutable cudaEvent_t surface_copy_event_ = nullptr;
+        mutable SurfaceCopyStatus surface_copy_status_ = SurfaceCopyStatus::Idle;
+        mutable bool surface_copy_event_recorded_ = false;
         mutable std::uint64_t last_signaled_ = 0;
         CudaVulkanExtent2D extent_{};
         CudaVulkanImageFormat format_ = CudaVulkanImageFormat::Rgba8Unorm;
         mutable lfs::core::Tensor upload_source_;
+        mutable std::vector<cudaStream_t> tracked_streams_;
         mutable std::string last_error_;
     };
 

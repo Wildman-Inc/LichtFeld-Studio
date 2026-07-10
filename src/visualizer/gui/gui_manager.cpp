@@ -91,6 +91,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -100,10 +101,79 @@
 #include <utility>
 
 namespace lfs::vis {
+    struct VulkanSceneInteropTarget;
+
+    namespace {
+        [[nodiscard]] std::optional<std::string> cudaTimelineInteropUnavailableReason() {
+            int device = 0;
+            cudaError_t status = cudaGetDevice(&device);
+            if (status != cudaSuccess) {
+                return std::format("cudaGetDevice failed: {} ({})",
+                                   cudaGetErrorName(status),
+                                   cudaGetErrorString(status));
+            }
+
+            int supported = 0;
+            status = cudaDeviceGetAttribute(&supported,
+                                            cudaDevAttrTimelineSemaphoreInteropSupported,
+                                            device);
+            if (status != cudaSuccess) {
+                const std::string reason = std::format(
+                    "cudaDeviceGetAttribute(cudaDevAttrTimelineSemaphoreInteropSupported) failed: {} ({})",
+                    cudaGetErrorName(status),
+                    cudaGetErrorString(status));
+                (void)cudaGetLastError();
+                return reason;
+            }
+            if (supported == 0) {
+                return "compute device does not support external timeline semaphore interop";
+            }
+            return std::nullopt;
+        }
+
+        [[nodiscard]] bool initializeVulkanCudaImageTarget(
+            VulkanContext& context,
+            VulkanSceneInteropTarget& target,
+            const VkExtent2D extent,
+            const VkFormat vk_format,
+            const lfs::rendering::CudaVulkanImageFormat cuda_format,
+            const std::string_view diagnostic_label,
+            std::string& error);
+
+        [[nodiscard]] bool initializeVulkanCudaImageTargetAsync(
+            VulkanContext& context,
+            VulkanSceneInteropTarget& target,
+            VkExtent2D extent,
+            VkFormat vk_format,
+            lfs::rendering::CudaVulkanImageFormat cuda_format,
+            std::string_view diagnostic_label,
+            std::string& error);
+
+        [[nodiscard]] bool prepareVulkanCudaImageWrite(
+            VulkanContext& context,
+            VulkanSceneInteropTarget& target,
+            std::string& error);
+
+        [[nodiscard]] bool finishVulkanCudaImageWrite(
+            VulkanContext& context,
+            VulkanSceneInteropTarget& target,
+            std::string& error);
+    } // namespace
+
+    enum class VulkanSceneAsyncState : std::uint8_t {
+        None,
+        VulkanWritePending,
+        Writable,
+        CopyPending,
+        Ready,
+        Failed,
+    };
+
     struct VulkanSceneInteropTarget {
         VulkanContext::ExternalImage image;
         VulkanContext::ExternalSemaphore semaphore;
         lfs::rendering::CudaVulkanInterop interop;
+        VulkanContext::ImmediateSubmitTicket writable_ticket;
         glm::ivec2 size{0, 0};
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
         std::uint64_t timeline_value = 0;
@@ -113,8 +183,18 @@ namespace lfs::vis {
         // the renderer returns the same logical image (cache HIT) even though
         // it allocated a fresh Tensor pointer.
         std::uint64_t uploaded_source_generation = 0;
+        std::uint64_t pending_source_generation = 0;
+        bool uploaded_flip_y = false;
+        bool pending_flip_y = false;
+        VulkanSceneAsyncState async_state = VulkanSceneAsyncState::None;
 
         void destroy(VulkanContext& context) {
+            // The image can be referenced by both a pending immediate Vulkan
+            // submit and queued CUDA/HIP surface work. Drain Vulkan first so any
+            // timeline signal needed by the compute stream is guaranteed to fire;
+            // interop.reset() then synchronizes every compute stream it used.
+            (void)context.deviceWaitIdle();
+            writable_ticket.reset();
             interop.reset();
             context.destroyExternalSemaphore(semaphore);
             context.destroyExternalImage(image);
@@ -122,9 +202,227 @@ namespace lfs::vis {
             layout = VK_IMAGE_LAYOUT_UNDEFINED;
             timeline_value = 0;
             uploaded_source_generation = 0;
+            pending_source_generation = 0;
+            uploaded_flip_y = false;
+            pending_flip_y = false;
+            async_state = VulkanSceneAsyncState::None;
             ++generation;
         }
     };
+
+    namespace {
+        bool initializeVulkanCudaImageTarget(
+            VulkanContext& context,
+            VulkanSceneInteropTarget& target,
+            const VkExtent2D extent,
+            const VkFormat vk_format,
+            const lfs::rendering::CudaVulkanImageFormat cuda_format,
+            const std::string_view diagnostic_label,
+            std::string& error) {
+            const auto timeline_unavailable = cudaTimelineInteropUnavailableReason();
+            const bool use_timeline = !timeline_unavailable.has_value();
+
+            if (!context.createExternalImage(extent,
+                                             vk_format,
+                                             target.image,
+                                             "vulkan.gui.interop_image",
+                                             diagnostic_label) ||
+                (use_timeline &&
+                 !context.createExternalTimelineSemaphore(0, target.semaphore))) {
+                error = std::format("target creation failed: {}", context.lastError());
+                target.destroy(context);
+                return false;
+            }
+            const std::uint64_t image_ready_value = use_timeline ? ++target.timeline_value : 0;
+            if (!context.transitionImageLayoutImmediate(
+                    target.image.image,
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_NULL_HANDLE,
+                    0,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    use_timeline ? target.semaphore.semaphore : VK_NULL_HANDLE,
+                    image_ready_value)) {
+                error = std::format("image initialization failed: {}", context.lastError());
+                target.destroy(context);
+                return false;
+            }
+            if (!use_timeline && !context.deviceWaitIdle()) {
+                error = std::format("synchronous image initialization failed: {}", context.lastError());
+                target.destroy(context);
+                return false;
+            }
+
+            const auto memory_handle = context.releaseExternalImageNativeHandle(target.image);
+            lfs::rendering::CudaVulkanExternalImageImport image_import{
+                .memory_handle = memory_handle,
+                .allocation_size = static_cast<std::size_t>(target.image.allocation_size),
+                .extent = {.width = extent.width, .height = extent.height},
+                .format = cuda_format,
+                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
+            };
+
+            bool imported = false;
+            if (use_timeline) {
+                const auto semaphore_handle =
+                    context.releaseExternalSemaphoreNativeHandle(target.semaphore);
+                lfs::rendering::CudaVulkanExternalSemaphoreImport semaphore_import{
+                    .semaphore_handle = semaphore_handle,
+                    .initial_value = 0,
+                };
+                imported = target.interop.init(image_import, semaphore_import);
+            } else {
+                imported = target.interop.init(image_import);
+            }
+            if (!imported) {
+                error = std::format("CUDA import failed: {}", target.interop.lastError());
+                target.destroy(context);
+                return false;
+            }
+            if (use_timeline && !target.interop.wait(image_ready_value)) {
+                error = std::format("CUDA wait for image initialization failed: {}",
+                                    target.interop.lastError());
+                target.destroy(context);
+                return false;
+            }
+
+            if (timeline_unavailable) {
+                static std::once_flag warning_once;
+                std::call_once(warning_once, [&] {
+                    LOG_WARN("CUDA/Vulkan external timeline unavailable ({}); using synchronous viewport image handoff",
+                             *timeline_unavailable);
+                });
+            }
+            return true;
+        }
+
+        bool initializeVulkanCudaImageTargetAsync(
+            VulkanContext& context,
+            VulkanSceneInteropTarget& target,
+            const VkExtent2D extent,
+            const VkFormat vk_format,
+            const lfs::rendering::CudaVulkanImageFormat cuda_format,
+            const std::string_view diagnostic_label,
+            std::string& error) {
+            if (!context.createExternalImage(extent,
+                                             vk_format,
+                                             target.image,
+                                             "vulkan.gui.interop_image",
+                                             diagnostic_label)) {
+                error = std::format("target creation failed: {}", context.lastError());
+                target.destroy(context);
+                return false;
+            }
+
+            const auto memory_handle = context.releaseExternalImageNativeHandle(target.image);
+            lfs::rendering::CudaVulkanExternalImageImport image_import{
+                .memory_handle = memory_handle,
+                .allocation_size = static_cast<std::size_t>(target.image.allocation_size),
+                .extent = {.width = extent.width, .height = extent.height},
+                .format = cuda_format,
+                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
+            };
+            if (!target.interop.init(image_import)) {
+                error = std::format("CUDA import failed: {}", target.interop.lastError());
+                target.destroy(context);
+                return false;
+            }
+
+            if (!context.transitionImageLayoutImmediate(
+                    target.image.image,
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_NULL_HANDLE,
+                    0,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_NULL_HANDLE,
+                    0,
+                    &target.writable_ticket)) {
+                error = std::format("asynchronous image initialization failed: {}",
+                                    context.lastError());
+                target.destroy(context);
+                return false;
+            }
+
+            target.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            target.async_state = VulkanSceneAsyncState::VulkanWritePending;
+            static std::once_flag warning_once;
+            std::call_once(warning_once, [] {
+                LOG_WARN("CUDA/Vulkan external timeline unavailable; using an asynchronous Vulkan-fence/CUDA-event viewport ring");
+            });
+            return true;
+        }
+
+        bool prepareVulkanCudaImageWrite(VulkanContext& context,
+                                         VulkanSceneInteropTarget& target,
+                                         std::string& error) {
+            if (target.layout == VK_IMAGE_LAYOUT_GENERAL) {
+                return true;
+            }
+            const bool use_timeline = target.interop.timelineSemaphoreEnabled();
+            const std::uint64_t image_ready_value = use_timeline ? ++target.timeline_value : 0;
+            if (!context.transitionImageLayoutImmediate(
+                    target.image.image,
+                    target.layout,
+                    VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_NULL_HANDLE,
+                    0,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    use_timeline ? target.semaphore.semaphore : VK_NULL_HANDLE,
+                    image_ready_value)) {
+                error = std::format("image transition to GENERAL failed: {}", context.lastError());
+                return false;
+            }
+            if (use_timeline && !target.interop.wait(image_ready_value)) {
+                error = std::format("CUDA wait for writable image failed: {}",
+                                    target.interop.lastError());
+                return false;
+            }
+            if (!use_timeline && !context.deviceWaitIdle()) {
+                error = std::format("synchronous transition to GENERAL failed: {}", context.lastError());
+                return false;
+            }
+            target.layout = VK_IMAGE_LAYOUT_GENERAL;
+            return true;
+        }
+
+        bool finishVulkanCudaImageWrite(VulkanContext& context,
+                                        VulkanSceneInteropTarget& target,
+                                        std::string& error) {
+            VkSemaphore wait_semaphore = VK_NULL_HANDLE;
+            std::uint64_t wait_value = 0;
+            if (target.interop.timelineSemaphoreEnabled()) {
+                wait_value = ++target.timeline_value;
+                if (!target.interop.signal(wait_value)) {
+                    error = std::format("CUDA signal failed: {}", target.interop.lastError());
+                    return false;
+                }
+                wait_semaphore = target.semaphore.semaphore;
+            } else if (const cudaError_t status = cudaStreamSynchronize(nullptr);
+                       status != cudaSuccess) {
+                error = std::format("CUDA viewport copy synchronization failed: {} ({})",
+                                    cudaGetErrorName(status),
+                                    cudaGetErrorString(status));
+                return false;
+            }
+
+            if (!context.transitionImageLayoutImmediate(target.image.image,
+                                                        VK_IMAGE_LAYOUT_GENERAL,
+                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                        VK_IMAGE_ASPECT_COLOR_BIT,
+                                                        wait_semaphore,
+                                                        wait_value,
+                                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) {
+                error = std::format("image transition to read-only failed: {}", context.lastError());
+                return false;
+            }
+            target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            return true;
+        }
+    } // namespace
 } // namespace lfs::vis
 
 namespace lfs::vis::gui {
@@ -3904,9 +4202,18 @@ namespace lfs::vis::gui {
         const bool target_changed =
             vulkan_scene_image_.get() != image.get() ||
             vulkan_scene_image_size_ != size;
+        const bool content_changed = generation != 0
+                                         ? generation != vulkan_scene_image_generation_ ||
+                                               vulkan_scene_image_size_ != size ||
+                                               vulkan_scene_image_flip_y_ != flip_y
+                                         : target_changed || vulkan_scene_image_flip_y_ != flip_y;
+        if (content_changed) {
+            ++vulkan_scene_request_serial_;
+        }
         if (target_changed) {
             vulkan_scene_interop_disabled_ = false;
         }
+        vulkan_external_scene_image_direct_ = false;
         vulkan_external_scene_image_ = VK_NULL_HANDLE;
         vulkan_external_scene_image_view_ = VK_NULL_HANDLE;
         vulkan_external_scene_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -3927,6 +4234,7 @@ namespace lfs::vis::gui {
                                                  const std::uint64_t generation,
                                                  const VkSemaphore completion_semaphore,
                                                  const std::uint64_t completion_value) {
+        vulkan_external_scene_image_direct_ = true;
         vulkan_scene_image_.reset();
         vulkan_scene_image_size_ = size;
         vulkan_scene_image_flip_y_ = flip_y;
@@ -3938,6 +4246,16 @@ namespace lfs::vis::gui {
         vulkan_external_scene_image_generation_ = generation;
         vulkan_frame_completion_semaphore_ = completion_semaphore;
         vulkan_frame_completion_value_ = completion_value;
+    }
+
+    void GuiManager::drainVulkanSceneInterop() {
+        vulkan_external_scene_image_ = VK_NULL_HANDLE;
+        vulkan_external_scene_image_view_ = VK_NULL_HANDLE;
+        vulkan_external_scene_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+        vulkan_external_scene_image_size_ = {0, 0};
+        vulkan_external_scene_image_generation_ = 0;
+        vulkan_external_scene_image_direct_ = false;
+        resetVulkanSceneInterop();
     }
 
     void GuiManager::setVulkanSplitRightImage(std::shared_ptr<const lfs::core::Tensor> image,
@@ -3992,6 +4310,15 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::resetVulkanSceneInterop() {
+        vulkan_scene_published_slot_.reset();
+        vulkan_scene_async_interop_active_ = false;
+        if (!vulkan_external_scene_image_direct_) {
+            vulkan_external_scene_image_ = VK_NULL_HANDLE;
+            vulkan_external_scene_image_view_ = VK_NULL_HANDLE;
+            vulkan_external_scene_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+            vulkan_external_scene_image_size_ = {0, 0};
+            vulkan_external_scene_image_generation_ = 0;
+        }
         if (vulkan_scene_interop_.empty()) {
             return;
         }
@@ -4020,12 +4347,290 @@ namespace lfs::vis::gui {
         return rendering && rendering->isViewportResizeDeferring();
     }
 
+    void GuiManager::prepareVulkanSceneInteropAsync(VulkanContext& context) {
+        const auto clear_publication = [this] {
+            vulkan_external_scene_image_ = VK_NULL_HANDLE;
+            vulkan_external_scene_image_view_ = VK_NULL_HANDLE;
+            vulkan_external_scene_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+            vulkan_external_scene_image_size_ = {0, 0};
+            vulkan_external_scene_image_flip_y_ = false;
+            vulkan_external_scene_image_generation_ = 0;
+        };
+        const auto publish_current = [this, &clear_publication] {
+            clear_publication();
+            if (!vulkan_scene_published_slot_ ||
+                *vulkan_scene_published_slot_ >= vulkan_scene_interop_.size()) {
+                vulkan_scene_published_slot_.reset();
+                return;
+            }
+            const auto& target = vulkan_scene_interop_[*vulkan_scene_published_slot_];
+            if (!target || target->async_state != VulkanSceneAsyncState::Ready ||
+                target->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                vulkan_scene_published_slot_.reset();
+                return;
+            }
+            vulkan_external_scene_image_ = target->image.image;
+            vulkan_external_scene_image_view_ = target->image.view;
+            vulkan_external_scene_image_layout_ = target->layout;
+            vulkan_external_scene_image_size_ = target->size;
+            vulkan_external_scene_image_flip_y_ = target->uploaded_flip_y;
+            vulkan_external_scene_image_generation_ = target->generation;
+        };
+        const auto fail_required_interop = [this, &clear_publication](std::string message) -> void {
+            clear_publication();
+            vulkan_scene_interop_disabled_ = true;
+            resetVulkanSceneInterop();
+            LOG_ERROR("Required asynchronous Vulkan/CUDA viewport interop failed: {}", message);
+#ifndef NDEBUG
+            assert(false && "Required asynchronous Vulkan/CUDA viewport interop failed");
+#endif
+            throw std::runtime_error(std::move(message));
+        };
+
+        if (!vulkan_scene_image_ ||
+            !vulkan_scene_image_->is_valid() ||
+            vulkan_scene_image_->device() != lfs::core::Device::CUDA ||
+            vulkan_scene_image_size_.x <= 0 ||
+            vulkan_scene_image_size_.y <= 0) {
+            clear_publication();
+            if (!vulkan_scene_interop_.empty()) {
+                resetVulkanSceneInterop();
+            }
+            return;
+        }
+
+        const std::size_t desired_ring_size =
+            std::max<std::size_t>(3, context.framesInFlight() + 1);
+        if (!vulkan_scene_async_interop_active_ ||
+            vulkan_scene_interop_.size() != desired_ring_size) {
+            if (!vulkan_scene_interop_.empty()) {
+                resetVulkanSceneInterop();
+            }
+            vulkan_scene_interop_.resize(desired_ring_size);
+            vulkan_scene_async_interop_active_ = true;
+        }
+
+        for (std::size_t slot = 0; slot < vulkan_scene_interop_.size(); ++slot) {
+            auto& target_ptr = vulkan_scene_interop_[slot];
+            if (!target_ptr) {
+                continue;
+            }
+            auto& target = *target_ptr;
+            if (target.async_state == VulkanSceneAsyncState::VulkanWritePending) {
+                const auto poll = context.pollImmediateSubmit(target.writable_ticket);
+                if (poll.status == VulkanContext::ImmediateSubmitStatus::Error) {
+                    target.async_state = VulkanSceneAsyncState::Failed;
+                    fail_required_interop(std::format(
+                        "slot {} writable transition failed: {}", slot, context.lastError()));
+                }
+                if (poll.status == VulkanContext::ImmediateSubmitStatus::Pending) {
+                    continue;
+                }
+                target.writable_ticket.reset();
+                target.layout = VK_IMAGE_LAYOUT_GENERAL;
+                target.async_state = VulkanSceneAsyncState::Writable;
+            }
+
+            if (target.async_state != VulkanSceneAsyncState::CopyPending) {
+                continue;
+            }
+            lfs::rendering::CudaVulkanInterop::SurfaceCopyStatus copy_status{};
+            if (!target.interop.pollSurfaceCopy(copy_status)) {
+                target.async_state = VulkanSceneAsyncState::Failed;
+                fail_required_interop(std::format(
+                    "slot {} CUDA copy poll failed: {}", slot, target.interop.lastError()));
+            }
+            if (copy_status == lfs::rendering::CudaVulkanInterop::SurfaceCopyStatus::Pending) {
+                continue;
+            }
+            if (copy_status != lfs::rendering::CudaVulkanInterop::SurfaceCopyStatus::Complete) {
+                target.async_state = VulkanSceneAsyncState::Failed;
+                fail_required_interop(std::format(
+                    "slot {} CUDA copy completed with an invalid state", slot));
+            }
+            if (!context.transitionImageLayoutImmediate(
+                    target.image.image,
+                    VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT)) {
+                target.async_state = VulkanSceneAsyncState::Failed;
+                fail_required_interop(std::format(
+                    "slot {} transition to read-only failed: {}", slot, context.lastError()));
+            }
+            target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            target.uploaded_source_generation = target.pending_source_generation;
+            target.uploaded_flip_y = target.pending_flip_y;
+            target.pending_source_generation = 0;
+            target.pending_flip_y = false;
+            target.async_state = VulkanSceneAsyncState::Ready;
+            ++target.generation;
+
+            bool publish = !vulkan_scene_published_slot_;
+            if (!publish && *vulkan_scene_published_slot_ < vulkan_scene_interop_.size()) {
+                const auto& current = vulkan_scene_interop_[*vulkan_scene_published_slot_];
+                publish = !current ||
+                          current->async_state != VulkanSceneAsyncState::Ready ||
+                          current->uploaded_source_generation <= target.uploaded_source_generation;
+            }
+            if (publish) {
+                vulkan_scene_published_slot_ = slot;
+            }
+        }
+
+        publish_current();
+
+        bool latest_ready = false;
+        bool latest_in_flight = false;
+        bool copy_pending = false;
+        bool writable_transition_pending = false;
+        for (const auto& target : vulkan_scene_interop_) {
+            if (!target) {
+                continue;
+            }
+            const bool matching_size = target->size == vulkan_scene_image_size_;
+            latest_ready = latest_ready ||
+                           (matching_size &&
+                            target->async_state == VulkanSceneAsyncState::Ready &&
+                            target->uploaded_source_generation == vulkan_scene_request_serial_);
+            latest_in_flight = latest_in_flight ||
+                               (matching_size &&
+                                target->async_state == VulkanSceneAsyncState::CopyPending &&
+                                target->pending_source_generation == vulkan_scene_request_serial_);
+            copy_pending = copy_pending ||
+                           target->async_state == VulkanSceneAsyncState::CopyPending;
+            writable_transition_pending = writable_transition_pending ||
+                                          (matching_size &&
+                                           target->async_state == VulkanSceneAsyncState::VulkanWritePending);
+        }
+        if (latest_ready || latest_in_flight || copy_pending || writable_transition_pending) {
+            return;
+        }
+
+        if (shouldDeferVulkanInteropResize() && vulkan_scene_published_slot_) {
+            const auto& published = vulkan_scene_interop_[*vulkan_scene_published_slot_];
+            if (published && published->size != vulkan_scene_image_size_) {
+                return;
+            }
+        }
+
+        std::optional<std::size_t> writable_slot;
+        std::optional<std::size_t> empty_slot;
+        std::optional<std::size_t> recyclable_slot;
+        std::uint64_t oldest_generation = std::numeric_limits<std::uint64_t>::max();
+        for (std::size_t slot = 0; slot < vulkan_scene_interop_.size(); ++slot) {
+            const auto& target = vulkan_scene_interop_[slot];
+            if (!target) {
+                if (!empty_slot) {
+                    empty_slot = slot;
+                }
+                continue;
+            }
+            if (target->async_state == VulkanSceneAsyncState::Writable &&
+                target->size == vulkan_scene_image_size_) {
+                writable_slot = slot;
+                break;
+            }
+            if (vulkan_scene_published_slot_ && *vulkan_scene_published_slot_ == slot) {
+                continue;
+            }
+            if ((target->async_state == VulkanSceneAsyncState::Ready ||
+                 target->async_state == VulkanSceneAsyncState::Writable) &&
+                target->uploaded_source_generation < oldest_generation) {
+                oldest_generation = target->uploaded_source_generation;
+                recyclable_slot = slot;
+            }
+        }
+
+        if (!writable_slot) {
+            const std::optional<std::size_t> candidate = empty_slot ? empty_slot : recyclable_slot;
+            if (!candidate) {
+                return;
+            }
+            auto& target_ptr = vulkan_scene_interop_[*candidate];
+            if (!target_ptr || target_ptr->size != vulkan_scene_image_size_) {
+                if (target_ptr) {
+                    target_ptr->destroy(context);
+                    target_ptr.reset();
+                }
+                auto target = std::make_unique<VulkanSceneInteropTarget>();
+                const VkExtent2D extent{
+                    static_cast<std::uint32_t>(vulkan_scene_image_size_.x),
+                    static_cast<std::uint32_t>(vulkan_scene_image_size_.y),
+                };
+                std::string error;
+                if (!initializeVulkanCudaImageTargetAsync(
+                        context,
+                        *target,
+                        extent,
+                        VK_FORMAT_R8G8B8A8_UNORM,
+                        lfs::rendering::CudaVulkanImageFormat::Rgba8Unorm,
+                        std::format("scene.async{}", *candidate),
+                        error)) {
+                    fail_required_interop(std::move(error));
+                }
+                target->size = vulkan_scene_image_size_;
+                target_ptr = std::move(target);
+                return;
+            }
+
+            if (target_ptr->async_state == VulkanSceneAsyncState::Ready) {
+                if (!context.transitionImageLayoutImmediate(
+                        target_ptr->image.image,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_GENERAL,
+                        VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_NULL_HANDLE,
+                        0,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_NULL_HANDLE,
+                        0,
+                        &target_ptr->writable_ticket)) {
+                    target_ptr->async_state = VulkanSceneAsyncState::Failed;
+                    fail_required_interop(std::format(
+                        "slot {} transition to writable failed: {}",
+                        *candidate,
+                        context.lastError()));
+                }
+                target_ptr->async_state = VulkanSceneAsyncState::VulkanWritePending;
+                return;
+            }
+            if (target_ptr->async_state == VulkanSceneAsyncState::Writable) {
+                writable_slot = candidate;
+            }
+        }
+
+        if (!writable_slot) {
+            return;
+        }
+        auto& target = *vulkan_scene_interop_[*writable_slot];
+        assert(target.layout == VK_IMAGE_LAYOUT_GENERAL);
+        if (!target.interop.enqueueTensorToSurface(
+                *vulkan_scene_image_, nullptr, vulkan_scene_image_flip_y_)) {
+            target.async_state = VulkanSceneAsyncState::Failed;
+            fail_required_interop(std::format(
+                "slot {} CUDA copy enqueue failed: {}",
+                *writable_slot,
+                target.interop.lastError()));
+        }
+        target.pending_source_generation = vulkan_scene_request_serial_;
+        target.pending_flip_y = vulkan_scene_image_flip_y_;
+        target.async_state = VulkanSceneAsyncState::CopyPending;
+    }
+
     void GuiManager::prepareVulkanSceneInterop(VulkanContext& context) {
         if (vulkan_scene_interop_disabled_) {
             return;
         }
-        if (vulkan_external_scene_image_ != VK_NULL_HANDLE) {
+        if (vulkan_external_scene_image_direct_) {
             return;
+        }
+
+        if (cudaTimelineInteropUnavailableReason().has_value()) {
+            prepareVulkanSceneInteropAsync(context);
+            return;
+        }
+        if (vulkan_scene_async_interop_active_) {
+            resetVulkanSceneInterop();
         }
 
         const auto fail_required_interop = [this](std::string message) -> void {
@@ -4122,43 +4727,16 @@ namespace lfs::vis::gui {
                 static_cast<std::uint32_t>(target_size.x),
                 static_cast<std::uint32_t>(target_size.y),
             };
-            if (!context.createExternalImage(extent,
-                                             VK_FORMAT_R8G8B8A8_UNORM,
-                                             target->image,
-                                             "vulkan.gui.interop_image",
-                                             std::format("scene.frame{}", frame_slot)) ||
-                !context.createExternalTimelineSemaphore(0, target->semaphore)) {
-                const std::string error = std::format("target creation failed: {}", context.lastError());
-                if (target->image.image != VK_NULL_HANDLE || target->semaphore.semaphore != VK_NULL_HANDLE) {
-                    target->destroy(context);
-                }
-                fail_required_interop(error);
-            }
-            if (!context.transitionImageLayoutImmediate(target->image.image,
-                                                        VK_IMAGE_LAYOUT_UNDEFINED,
-                                                        VK_IMAGE_LAYOUT_GENERAL)) {
-                const std::string error = std::format("image initialization failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-
-            const auto memory_handle = context.releaseExternalImageNativeHandle(target->image);
-            const auto semaphore_handle = context.releaseExternalSemaphoreNativeHandle(target->semaphore);
-            lfs::rendering::CudaVulkanExternalImageImport image_import{
-                .memory_handle = memory_handle,
-                .allocation_size = static_cast<std::size_t>(target->image.allocation_size),
-                .extent = {.width = extent.width, .height = extent.height},
-                .format = lfs::rendering::CudaVulkanImageFormat::Rgba8Unorm,
-                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
-            };
-            lfs::rendering::CudaVulkanExternalSemaphoreImport semaphore_import{
-                .semaphore_handle = semaphore_handle,
-                .initial_value = 0,
-            };
-            if (!target->interop.init(image_import, semaphore_import)) {
-                const std::string error = std::format("CUDA import failed: {}", target->interop.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
+            std::string error;
+            if (!initializeVulkanCudaImageTarget(
+                    context,
+                    *target,
+                    extent,
+                    VK_FORMAT_R8G8B8A8_UNORM,
+                    lfs::rendering::CudaVulkanImageFormat::Rgba8Unorm,
+                    std::format("scene.frame{}", frame_slot),
+                    error)) {
+                fail_required_interop(std::move(error));
             }
             target->size = target_size;
             target->layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -4180,14 +4758,12 @@ namespace lfs::vis::gui {
             return;
         }
 
-        if (target.layout != VK_IMAGE_LAYOUT_GENERAL) {
+        {
             LOG_TIMER("interop.transition_to_GENERAL");
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        target.layout,
-                                                        VK_IMAGE_LAYOUT_GENERAL)) {
-                fail_required_interop(std::format("image transition to GENERAL failed: {}", context.lastError()));
+            std::string error;
+            if (!prepareVulkanCudaImageWrite(context, target, error)) {
+                fail_required_interop(std::move(error));
             }
-            target.layout = VK_IMAGE_LAYOUT_GENERAL;
         }
 
         {
@@ -4198,26 +4774,13 @@ namespace lfs::vis::gui {
                 fail_required_interop(std::format("CUDA copy failed: {}", target.interop.lastError()));
             }
         }
-        const std::uint64_t signal_value = ++target.timeline_value;
         {
-            LOG_TIMER("interop.cuda_signal");
-            if (!target.interop.signal(signal_value)) {
-                fail_required_interop(std::format("CUDA signal failed: {}", target.interop.lastError()));
+            LOG_TIMER("interop.finish_cuda_write");
+            std::string error;
+            if (!finishVulkanCudaImageWrite(context, target, error)) {
+                fail_required_interop(std::move(error));
             }
         }
-        {
-            LOG_TIMER("interop.transition_to_READ_ONLY");
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                        VK_IMAGE_ASPECT_COLOR_BIT,
-                                                        target.semaphore.semaphore,
-                                                        signal_value,
-                                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) {
-                fail_required_interop(std::format("Vulkan wait for CUDA signal failed: {}", context.lastError()));
-            }
-        }
-        target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         target.uploaded_source_generation = vulkan_scene_image_generation_;
         ++target.generation;
     }
@@ -4346,43 +4909,16 @@ namespace lfs::vis::gui {
                 static_cast<std::uint32_t>(target_size.x),
                 static_cast<std::uint32_t>(target_size.y),
             };
-            if (!context.createExternalImage(extent,
-                                             VK_FORMAT_R8G8B8A8_UNORM,
-                                             target->image,
-                                             "vulkan.gui.interop_image",
-                                             std::format("split_right.frame{}", frame_slot)) ||
-                !context.createExternalTimelineSemaphore(0, target->semaphore)) {
-                const std::string error = std::format("target creation failed: {}", context.lastError());
-                if (target->image.image != VK_NULL_HANDLE || target->semaphore.semaphore != VK_NULL_HANDLE) {
-                    target->destroy(context);
-                }
-                fail_required_interop(error);
-            }
-            if (!context.transitionImageLayoutImmediate(target->image.image,
-                                                        VK_IMAGE_LAYOUT_UNDEFINED,
-                                                        VK_IMAGE_LAYOUT_GENERAL)) {
-                const std::string error = std::format("image initialization failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-
-            const auto memory_handle = context.releaseExternalImageNativeHandle(target->image);
-            const auto semaphore_handle = context.releaseExternalSemaphoreNativeHandle(target->semaphore);
-            lfs::rendering::CudaVulkanExternalImageImport image_import{
-                .memory_handle = memory_handle,
-                .allocation_size = static_cast<std::size_t>(target->image.allocation_size),
-                .extent = {.width = extent.width, .height = extent.height},
-                .format = lfs::rendering::CudaVulkanImageFormat::Rgba8Unorm,
-                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
-            };
-            lfs::rendering::CudaVulkanExternalSemaphoreImport semaphore_import{
-                .semaphore_handle = semaphore_handle,
-                .initial_value = 0,
-            };
-            if (!target->interop.init(image_import, semaphore_import)) {
-                const std::string error = std::format("CUDA import failed: {}", target->interop.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
+            std::string error;
+            if (!initializeVulkanCudaImageTarget(
+                    context,
+                    *target,
+                    extent,
+                    VK_FORMAT_R8G8B8A8_UNORM,
+                    lfs::rendering::CudaVulkanImageFormat::Rgba8Unorm,
+                    std::format("split_right.frame{}", frame_slot),
+                    error)) {
+                fail_required_interop(std::move(error));
             }
             target->size = target_size;
             target->layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -4402,13 +4938,11 @@ namespace lfs::vis::gui {
             return;
         }
 
-        if (target.layout != VK_IMAGE_LAYOUT_GENERAL) {
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        target.layout,
-                                                        VK_IMAGE_LAYOUT_GENERAL)) {
-                fail_required_interop(std::format("image transition to GENERAL failed: {}", context.lastError()));
+        {
+            std::string error;
+            if (!prepareVulkanCudaImageWrite(context, target, error)) {
+                fail_required_interop(std::move(error));
             }
-            target.layout = VK_IMAGE_LAYOUT_GENERAL;
         }
 
         assert(target.layout == VK_IMAGE_LAYOUT_GENERAL &&
@@ -4416,20 +4950,10 @@ namespace lfs::vis::gui {
         if (!target.interop.copyTensorToSurface(*vulkan_split_right_image_)) {
             fail_required_interop(std::format("CUDA copy failed: {}", target.interop.lastError()));
         }
-        const std::uint64_t signal_value = ++target.timeline_value;
-        if (!target.interop.signal(signal_value)) {
-            fail_required_interop(std::format("CUDA signal failed: {}", target.interop.lastError()));
+        std::string finish_error;
+        if (!finishVulkanCudaImageWrite(context, target, finish_error)) {
+            fail_required_interop(std::move(finish_error));
         }
-        if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                    VK_IMAGE_LAYOUT_GENERAL,
-                                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                    VK_IMAGE_ASPECT_COLOR_BIT,
-                                                    target.semaphore.semaphore,
-                                                    signal_value,
-                                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) {
-            fail_required_interop(std::format("Vulkan wait for CUDA signal failed: {}", context.lastError()));
-        }
-        target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         target.uploaded_source_generation = vulkan_split_right_image_generation_;
         ++target.generation;
         vulkan_split_right_external_image_ = target.image.image;
@@ -4562,43 +5086,16 @@ namespace lfs::vis::gui {
                 static_cast<std::uint32_t>(target_size.x),
                 static_cast<std::uint32_t>(target_size.y),
             };
-            if (!context.createExternalImage(extent,
-                                             VK_FORMAT_R32_SFLOAT,
-                                             target->image,
-                                             "vulkan.gui.interop_image",
-                                             std::format("depth_blit.frame{}", frame_slot)) ||
-                !context.createExternalTimelineSemaphore(0, target->semaphore)) {
-                const std::string error = std::format("target creation failed: {}", context.lastError());
-                if (target->image.image != VK_NULL_HANDLE || target->semaphore.semaphore != VK_NULL_HANDLE) {
-                    target->destroy(context);
-                }
-                fail_required_interop(error);
-            }
-            if (!context.transitionImageLayoutImmediate(target->image.image,
-                                                        VK_IMAGE_LAYOUT_UNDEFINED,
-                                                        VK_IMAGE_LAYOUT_GENERAL)) {
-                const std::string error = std::format("image initialization failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-
-            const auto memory_handle = context.releaseExternalImageNativeHandle(target->image);
-            const auto semaphore_handle = context.releaseExternalSemaphoreNativeHandle(target->semaphore);
-            lfs::rendering::CudaVulkanExternalImageImport image_import{
-                .memory_handle = memory_handle,
-                .allocation_size = static_cast<std::size_t>(target->image.allocation_size),
-                .extent = {.width = extent.width, .height = extent.height},
-                .format = lfs::rendering::CudaVulkanImageFormat::R32Sfloat,
-                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
-            };
-            lfs::rendering::CudaVulkanExternalSemaphoreImport semaphore_import{
-                .semaphore_handle = semaphore_handle,
-                .initial_value = 0,
-            };
-            if (!target->interop.init(image_import, semaphore_import)) {
-                const std::string error = std::format("CUDA import failed: {}", target->interop.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
+            std::string error;
+            if (!initializeVulkanCudaImageTarget(
+                    context,
+                    *target,
+                    extent,
+                    VK_FORMAT_R32_SFLOAT,
+                    lfs::rendering::CudaVulkanImageFormat::R32Sfloat,
+                    std::format("depth_blit.frame{}", frame_slot),
+                    error)) {
+                fail_required_interop(std::move(error));
             }
             target->size = target_size;
             target->layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -4618,13 +5115,11 @@ namespace lfs::vis::gui {
             return;
         }
 
-        if (target.layout != VK_IMAGE_LAYOUT_GENERAL) {
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        target.layout,
-                                                        VK_IMAGE_LAYOUT_GENERAL)) {
-                fail_required_interop(std::format("image transition to GENERAL failed: {}", context.lastError()));
+        {
+            std::string error;
+            if (!prepareVulkanCudaImageWrite(context, target, error)) {
+                fail_required_interop(std::move(error));
             }
-            target.layout = VK_IMAGE_LAYOUT_GENERAL;
         }
 
         assert(target.layout == VK_IMAGE_LAYOUT_GENERAL &&
@@ -4632,20 +5127,10 @@ namespace lfs::vis::gui {
         if (!target.interop.copyTensorToSurface(*vulkan_depth_blit_image_)) {
             fail_required_interop(std::format("CUDA copy failed: {}", target.interop.lastError()));
         }
-        const std::uint64_t signal_value = ++target.timeline_value;
-        if (!target.interop.signal(signal_value)) {
-            fail_required_interop(std::format("CUDA signal failed: {}", target.interop.lastError()));
+        std::string finish_error;
+        if (!finishVulkanCudaImageWrite(context, target, finish_error)) {
+            fail_required_interop(std::move(finish_error));
         }
-        if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                    VK_IMAGE_LAYOUT_GENERAL,
-                                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                    VK_IMAGE_ASPECT_COLOR_BIT,
-                                                    target.semaphore.semaphore,
-                                                    signal_value,
-                                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) {
-            fail_required_interop(std::format("Vulkan wait for CUDA signal failed: {}", context.lastError()));
-        }
-        target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         target.uploaded_source_generation = vulkan_depth_blit_image_generation_;
         ++target.generation;
         vulkan_depth_blit_external_image_ = target.image.image;
@@ -4716,6 +5201,14 @@ namespace lfs::vis::gui {
                     }
                 }
             }
+        }
+        if (vulkan_scene_async_interop_active_ &&
+            params.external_scene_image == VK_NULL_HANDLE) {
+            // The first asynchronous upload has not completed yet. Render the
+            // viewport without a scene image instead of entering the mandatory
+            // CUDA-image path with no external image and logging a false error.
+            params.scene_image.reset();
+            params.scene_image_size = {0, 0};
         }
 
         if (auto* const rendering_manager = viewer_ ? viewer_->getRenderingManager() : nullptr) {
@@ -7417,6 +7910,29 @@ namespace lfs::vis::gui {
 
     bool GuiManager::needsAnimationFrame() const {
         const auto now = std::chrono::steady_clock::now();
+        if (vulkan_scene_async_interop_active_ &&
+            !vulkan_external_scene_image_direct_ &&
+            vulkan_scene_image_ &&
+            vulkan_scene_image_->is_valid()) {
+            bool latest_ready = false;
+            for (const auto& target : vulkan_scene_interop_) {
+                if (!target) {
+                    continue;
+                }
+                if (target->async_state == VulkanSceneAsyncState::VulkanWritePending ||
+                    target->async_state == VulkanSceneAsyncState::CopyPending) {
+                    return true;
+                }
+                if (target->async_state == VulkanSceneAsyncState::Ready &&
+                    target->size == vulkan_scene_image_size_ &&
+                    target->uploaded_source_generation == vulkan_scene_request_serial_) {
+                    latest_ready = true;
+                }
+            }
+            if (!latest_ready) {
+                return true;
+            }
+        }
         const bool ui_toggle_due =
             ui_toggle_pending_ && now >= ui_toggle_next_allowed_at_;
         const bool fullscreen_toggle_due =

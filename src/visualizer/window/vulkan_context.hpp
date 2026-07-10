@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -32,6 +33,8 @@ struct SDL_Window;
 namespace lfs::vis {
 
     class VulkanContext {
+        struct ImmediateSubmitState;
+
     public:
         enum class ResizeIntent {
             Interactive,
@@ -106,6 +109,29 @@ namespace lfs::vis {
             VkSemaphore semaphore = VK_NULL_HANDLE;
             std::uint64_t initial_value = 0;
             ExternalNativeHandle native_handle = kInvalidExternalNativeHandle;
+        };
+
+        enum class ImmediateSubmitStatus {
+            Pending,
+            Complete,
+            Error,
+        };
+
+        struct ImmediateSubmitPollResult {
+            ImmediateSubmitStatus status = ImmediateSubmitStatus::Error;
+            VkResult result = VK_ERROR_UNKNOWN;
+        };
+
+        // Observer only: VulkanContext retains sole ownership of the submit's
+        // command buffer and fence for the full ticket lifetime.
+        class ImmediateSubmitTicket {
+        public:
+            [[nodiscard]] bool valid() const noexcept { return state_ != nullptr; }
+            void reset() noexcept { state_.reset(); }
+
+        private:
+            friend class VulkanContext;
+            std::shared_ptr<ImmediateSubmitState> state_;
         };
 
         [[nodiscard]] VkInstance instance() const { return instance_; }
@@ -207,13 +233,17 @@ namespace lfs::vis {
         [[nodiscard]] ExternalNativeHandle releaseExternalSemaphoreNativeHandle(ExternalSemaphore& semaphore) const;
         [[nodiscard]] static bool externalNativeHandleValid(ExternalNativeHandle handle);
         void closeExternalNativeHandle(ExternalNativeHandle& handle) const;
+        [[nodiscard]] ImmediateSubmitPollResult pollImmediateSubmit(const ImmediateSubmitTicket& ticket);
         [[nodiscard]] bool transitionImageLayoutImmediate(VkImage image,
                                                           VkImageLayout old_layout,
                                                           VkImageLayout new_layout,
                                                           VkImageAspectFlags aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
                                                           VkSemaphore wait_semaphore = VK_NULL_HANDLE,
                                                           std::uint64_t wait_value = 0,
-                                                          VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                                                          VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                          VkSemaphore signal_semaphore = VK_NULL_HANDLE,
+                                                          std::uint64_t signal_value = 0,
+                                                          ImmediateSubmitTicket* completion_ticket = nullptr);
 
     private:
         bool fail(std::string message);
@@ -341,13 +371,16 @@ namespace lfs::vis {
         // Async cleanup queue for transitionImageLayoutImmediate. The function
         // used to vkWaitForFences synchronously after submit (3-9ms/frame on
         // the CUDA→Vulkan handoff path because it also blocked CPU on the
-        // CUDA-signaled semaphore via vkWaitSemaphores). Now we fire-and-
-        // forget: submit, push (cmd, fence) here, drain on next call.
+        // CUDA-signaled semaphore via vkWaitSemaphores). The context retains
+        // ownership of each (cmd, fence) pair while optional tickets observe it.
         struct PendingImmediateSubmit {
             VkCommandBuffer cmd = VK_NULL_HANDLE;
             VkFence fence = VK_NULL_HANDLE;
+            std::shared_ptr<ImmediateSubmitState> completion;
+            VkResult terminal_error = VK_SUCCESS;
         };
         std::vector<PendingImmediateSubmit> pending_immediate_submits_;
+        void completeImmediateSubmit(PendingImmediateSubmit& pending);
         void drainCompletedImmediateSubmits();
         std::vector<FrameTimelineWait> frame_timeline_waits_;
         // image_available_ is sized to swapchain image count (not framesInFlight). We must

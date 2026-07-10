@@ -113,7 +113,11 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline Packed128<ElementType> load128cs(const ElementType* address) {
+#if defined(USE_HIP) && USE_HIP
+        return load128(address);
+#else
         return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
+#endif
     }
 
     /**
@@ -140,7 +144,11 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline void store128cs(ElementType* target, Packed128<ElementType> value) {
+#if defined(USE_HIP) && USE_HIP
+        store128(target, value);
+#else
         __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+#endif
     }
 
     /**
@@ -155,7 +163,11 @@ namespace lfs::core {
      */
     template <typename ElementType>
     __device__ inline void store128cg(ElementType* target, Packed128<ElementType> value) {
+#if defined(USE_HIP) && USE_HIP
+        store128(target, value);
+#else
         __stcg(reinterpret_cast<int4*>(target), value.get_bits());
+#endif
     }
 
     // ============================================================================

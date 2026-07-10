@@ -152,6 +152,9 @@ namespace lfs::vis {
             return render_complete_cuda_.handle();
         }
         [[nodiscard]] std::uint64_t renderCompleteValue() const { return last_signaled_render_value_; }
+        [[nodiscard]] bool usesSynchronousCudaVulkanHandoff() const {
+            return initialized_ && !cuda_timeline_interop_enabled_;
+        }
 
         // Eagerly create the render stream + completion fence so the trainer↔viewer
         // handshake can be installed before the first live frame submits (covers
@@ -465,6 +468,7 @@ namespace lfs::vis {
 
         VulkanContext* context_ = nullptr;
         bool initialized_ = false;
+        bool cuda_timeline_interop_enabled_ = false;
         // Persistent readback transfer resources (see ensureReadbackContext). Mutable
         // because the readback samplers are const but reuse these across calls.
         mutable std::mutex readback_mutex_;

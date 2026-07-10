@@ -51,7 +51,7 @@ typedef unsigned short ushort;
 #define EXIT_WAIVED 2
 #endif
 
-#ifndef __CUDACC__
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
 #include <math.h>
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -219,6 +219,7 @@ inline __host__ __device__ uint4 make_uint4(int4 a) {
 // negate
 ////////////////////////////////////////////////////////////////////////////////
 
+#if !defined(__HIPCC__) && !(defined(USE_HIP) && USE_HIP)
 inline __host__ __device__ float2 operator-(float2& a) {
     return make_float2(-a.x, -a.y);
 }
@@ -851,6 +852,7 @@ inline __host__ __device__ void operator/=(float4& a, float b) {
 inline __host__ __device__ float4 operator/(float b, float4 a) {
     return make_float4(b / a.x, b / a.y, b / a.z, b / a.w);
 }
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 // min

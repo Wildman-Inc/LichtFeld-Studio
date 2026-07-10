@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <numeric>
 #include <print>
+#include <type_traits>
 #include <utility>
 
 // SIMD intrinsics for CPU optimization
@@ -48,6 +49,25 @@ namespace lfs::core {
     std::atomic<size_t> Tensor::next_id_{1};
 
     namespace {
+        template <typename From, typename To>
+        To convert_dtype_cpu_value(const From& value) {
+            if constexpr (std::is_same_v<From, float> && std::is_same_v<To, uint8_t>) {
+                return static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(value), 0.0f, 255.0f)));
+            } else if constexpr (std::is_same_v<From, int> && std::is_same_v<To, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int>(value), 0, 255));
+            } else if constexpr (std::is_same_v<From, int64_t> && std::is_same_v<To, uint8_t>) {
+                return static_cast<uint8_t>(std::clamp(static_cast<int64_t>(value), static_cast<int64_t>(0), static_cast<int64_t>(255)));
+            } else if constexpr (std::is_same_v<From, __half> && std::is_same_v<To, uint8_t>) {
+                return static_cast<uint8_t>(std::round(std::clamp(__half2float(value), 0.0f, 255.0f)));
+            } else if constexpr (std::is_same_v<To, __half>) {
+                return __float2half(static_cast<float>(value));
+            } else if constexpr (std::is_same_v<From, __half>) {
+                return static_cast<To>(__half2float(value));
+            } else {
+                return static_cast<To>(value);
+            }
+        }
+
         struct StorageAccountingCounter {
             std::atomic<uint64_t> live_bytes{0};
             std::atomic<uint64_t> live_allocations{0};
@@ -1180,15 +1200,7 @@ namespace lfs::core {
         const FROM_TYPE* src = ptr<FROM_TYPE>();                                                                                             \
         TO_TYPE* dst = result.ptr<TO_TYPE>();                                                                                                \
         for (size_t i = 0; i < numel(); ++i) {                                                                                               \
-            if constexpr (std::is_same_v<FROM_TYPE, float> && std::is_same_v<TO_TYPE, uint8_t>) {                                            \
-                dst[i] = static_cast<uint8_t>(std::round(std::clamp(static_cast<float>(src[i]), 0.0f, 255.0f)));                             \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int> && std::is_same_v<TO_TYPE, uint8_t>) {                                       \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(src[i]), 0, 255));                                                 \
-            } else if constexpr (std::is_same_v<FROM_TYPE, int64_t> && std::is_same_v<TO_TYPE, uint8_t>) {                                   \
-                dst[i] = static_cast<uint8_t>(std::clamp(static_cast<int64_t>(src[i]), static_cast<int64_t>(0), static_cast<int64_t>(255))); \
-            } else {                                                                                                                         \
-                dst[i] = static_cast<TO_TYPE>(src[i]);                                                                                       \
-            }                                                                                                                                \
+            dst[i] = convert_dtype_cpu_value<FROM_TYPE, TO_TYPE>(src[i]);                                                                    \
         }                                                                                                                                    \
         return result;                                                                                                                       \
     }

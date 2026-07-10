@@ -316,6 +316,49 @@ namespace lfs::vis::vksplat {
                                cudaGetErrorString(status));
         }
 
+        [[nodiscard]] std::expected<void, std::string> copyRawOpacityValidated(
+            const lfs::core::SplatData& splat_data,
+            const Tensor& opacity_raw,
+            void* const opacity_dst,
+            const cudaStream_t stream,
+            const char* const copy_operation) {
+            const auto n = static_cast<std::size_t>(splat_data.size());
+            if (splat_data.has_deleted_mask()) {
+                const Tensor& deleted = splat_data.deleted();
+                if (deleted.dtype() != DataType::Bool ||
+                    deleted.device() != Device::CUDA ||
+                    !deleted.is_contiguous() ||
+                    static_cast<std::size_t>(deleted.numel()) != n) {
+                    return std::unexpected(
+                        "VkSplat deleted mask must be a contiguous CUDA bool tensor of size N");
+                }
+                if (auto ok = waitForInputStream(stream, deleted, "deleted"); !ok) {
+                    return std::unexpected(ok.error());
+                }
+                const cudaError_t status = detail::launchPackOpacityMaskingDeleted(
+                    opacity_raw.ptr<float>(),
+                    deleted.ptr<bool>(),
+                    static_cast<float*>(opacity_dst),
+                    n,
+                    stream);
+                if (status != cudaSuccess) {
+                    return std::unexpected(cudaErrorMessage("launchPackOpacityMaskingDeleted", status));
+                }
+                return {};
+            }
+
+            const cudaError_t status = cudaMemcpyAsync(
+                opacity_dst,
+                opacity_raw.data_ptr(),
+                n * sizeof(float),
+                cudaMemcpyDeviceToDevice,
+                stream);
+            if (status != cudaSuccess) {
+                return std::unexpected(cudaErrorMessage(copy_operation, status));
+            }
+            return {};
+        }
+
     } // namespace
 
     std::expected<DeviceInputLayout, std::string> deviceInputLayout(
@@ -431,6 +474,152 @@ namespace lfs::vis::vksplat {
         };
     }
 
+    std::expected<void, std::string> copyRawDeviceInputsToBuffer(
+        const lfs::core::SplatData& splat_data,
+        void* const xyz_dst,
+        void* const sh0_dst,
+        void* const shN_dst,
+        void* const rotations_dst,
+        void* const scaling_dst,
+        void* const opacity_dst,
+        const cudaStream_t stream,
+        const int upload_sh_degree) {
+        auto layout = rawDeviceInputLayout(splat_data, upload_sh_degree);
+        if (!layout) {
+            return std::unexpected(layout.error());
+        }
+        if (xyz_dst == nullptr || sh0_dst == nullptr || shN_dst == nullptr ||
+            rotations_dst == nullptr || scaling_dst == nullptr || opacity_dst == nullptr) {
+            return std::unexpected("VkSplat raw input copy received a null destination region");
+        }
+
+        const Tensor& means_raw = splat_data.means_raw();
+        const Tensor& rotation_raw = splat_data.rotation_raw();
+        const Tensor& scaling_raw = splat_data.scaling_raw();
+        const Tensor& opacity_raw = splat_data.opacity_raw();
+        const Tensor& sh0_raw = splat_data.sh0_raw();
+        const Tensor& shN_raw = splat_data.shN_raw();
+
+        if (auto ok = requireCudaFloat32Contiguous(means_raw, "means"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = requireCudaFloat32Contiguous(rotation_raw, "rotation"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = requireCudaFloat32Contiguous(scaling_raw, "scaling"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = requireCudaFloat32Contiguous(opacity_raw, "opacity"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = requireCudaFloat32Contiguous(sh0_raw, "sh0"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (!layout->omits_shN) {
+            if (auto ok = requireCudaFloat32Contiguous(shN_raw, "shN"); !ok) {
+                return std::unexpected(ok.error());
+            }
+        }
+
+        if (auto ok = waitForInputStream(stream, means_raw, "means"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = waitForInputStream(stream, rotation_raw, "rotation"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = waitForInputStream(stream, scaling_raw, "scaling"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = waitForInputStream(stream, opacity_raw, "opacity"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = waitForInputStream(stream, sh0_raw, "sh0"); !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (!layout->omits_shN) {
+            if (auto ok = waitForInputStream(stream, shN_raw, "shN"); !ok) {
+                return std::unexpected(ok.error());
+            }
+        }
+
+        const auto copy = [&](void* const dst,
+                              const Tensor& src,
+                              const std::size_t bytes,
+                              const char* const operation) -> std::expected<void, std::string> {
+            const cudaError_t status = cudaMemcpyAsync(
+                dst, src.data_ptr(), bytes, cudaMemcpyDeviceToDevice, stream);
+            if (status != cudaSuccess) {
+                return std::unexpected(cudaErrorMessage(operation, status));
+            }
+            return {};
+        };
+
+        if (auto ok = copy(xyz_dst, means_raw, layout->xyz_bytes,
+                           "cudaMemcpyAsync(VkSplat raw means -> Vulkan input)");
+            !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = copy(sh0_dst, sh0_raw, layout->sh0_bytes,
+                           "cudaMemcpyAsync(VkSplat raw sh0 -> Vulkan input)");
+            !ok) {
+            return std::unexpected(ok.error());
+        }
+
+        if (layout->omits_shN) {
+            const cudaError_t status = cudaMemsetAsync(shN_dst, 0, layout->shN_bytes, stream);
+            if (status != cudaSuccess) {
+                return std::unexpected(cudaErrorMessage(
+                    "cudaMemsetAsync(VkSplat raw shN fallback)", status));
+            }
+        } else {
+            const auto source_layout_rest =
+                static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest());
+            if (source_layout_rest == layout->shN_layout_rest) {
+                if (auto ok = copy(shN_dst, shN_raw, layout->shN_bytes,
+                                   "cudaMemcpyAsync(VkSplat raw shN -> Vulkan input)");
+                    !ok) {
+                    return std::unexpected(ok.error());
+                }
+            } else {
+                lfs::core::shN_swizzled_copy_contiguous(
+                    shN_raw.ptr<float>(),
+                    static_cast<float*>(shN_dst),
+                    layout->num_splats,
+                    0,
+                    source_layout_rest,
+                    layout->shN_layout_rest,
+                    stream);
+                const cudaError_t status = cudaGetLastError();
+                if (status != cudaSuccess) {
+                    return std::unexpected(cudaErrorMessage(
+                        "VkSplat raw shN layout conversion", status));
+                }
+            }
+        }
+
+        if (auto ok = copy(rotations_dst, rotation_raw, layout->rotations_bytes,
+                           "cudaMemcpyAsync(VkSplat raw rotation -> Vulkan input)");
+            !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = copy(scaling_dst, scaling_raw, layout->scaling_bytes,
+                           "cudaMemcpyAsync(VkSplat raw scaling -> Vulkan input)");
+            !ok) {
+            return std::unexpected(ok.error());
+        }
+        if (auto ok = copyRawOpacityValidated(
+                splat_data,
+                opacity_raw,
+                opacity_dst,
+                stream,
+                "cudaMemcpyAsync(VkSplat raw opacity -> Vulkan input)");
+            !ok) {
+            return std::unexpected(ok.error());
+        }
+
+        return {};
+    }
+
     std::expected<void, std::string> copyRawOpacityToBuffer(
         const lfs::core::SplatData& splat_data,
         void* const opacity_dst,
@@ -455,41 +644,12 @@ namespace lfs::vis::vksplat {
             return std::unexpected(ok.error());
         }
 
-        if (splat_data.has_deleted_mask()) {
-            const Tensor& deleted = splat_data.deleted();
-            if (deleted.dtype() != DataType::Bool ||
-                deleted.device() != Device::CUDA ||
-                !deleted.is_contiguous() ||
-                static_cast<std::size_t>(deleted.numel()) != n) {
-                return std::unexpected(
-                    "VkSplat deleted mask must be a contiguous CUDA bool tensor of size N");
-            }
-            if (auto ok = waitForInputStream(stream, deleted, "deleted"); !ok) {
-                return std::unexpected(ok.error());
-            }
-            const cudaError_t status = detail::launchPackOpacityMaskingDeleted(
-                opacity_raw.ptr<float>(),
-                deleted.ptr<bool>(),
-                static_cast<float*>(opacity_dst),
-                n,
-                stream);
-            if (status != cudaSuccess) {
-                return std::unexpected(cudaErrorMessage("launchPackOpacityMaskingDeleted", status));
-            }
-            return {};
-        }
-
-        const cudaError_t status = cudaMemcpyAsync(
+        return copyRawOpacityValidated(
+            splat_data,
+            opacity_raw,
             opacity_dst,
-            opacity_raw.data_ptr(),
-            n * sizeof(float),
-            cudaMemcpyDeviceToDevice,
-            stream);
-        if (status != cudaSuccess) {
-            return std::unexpected(cudaErrorMessage(
-                "cudaMemcpyAsync(VkSplat raw opacity -> Vulkan opacity copy)", status));
-        }
-        return {};
+            stream,
+            "cudaMemcpyAsync(VkSplat raw opacity -> Vulkan opacity copy)");
     }
 
     std::expected<void, std::string> packDeviceInputsToBuffer(

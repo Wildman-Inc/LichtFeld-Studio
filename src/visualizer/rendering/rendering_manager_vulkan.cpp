@@ -848,14 +848,14 @@ namespace lfs::vis {
             frame_stream_guard.emplace(vksplat_viewport_renderer_->renderStream());
         }
         lfs::training::Trainer* live_trainer = nullptr;
+        const bool has_vksplat_release_fence =
+            vksplat_viewport_renderer_ && vksplat_viewport_renderer_->renderCompleteFence();
+        const bool uses_synchronous_vksplat_handoff =
+            vksplat_viewport_renderer_ &&
+            vksplat_viewport_renderer_->usesSynchronousCudaVulkanHandoff();
         if (is_training && trainer_manager && vksplat_viewport_renderer_ &&
             vksplat_viewport_renderer_->renderStream() &&
-            vksplat_viewport_renderer_->renderCompleteFence()) {
-            // Gate on a live release fence too: a failed/partial ensureHandshakeReady
-            // leaves render_stream_ created but render_complete_cuda_ uninitialized,
-            // and installing that null fence would silently drop the trainer's borrow
-            // wait (racing any in-flight Vulkan read). render() also fails without it,
-            // so skipping the handshake this frame is correct.
+            (has_vksplat_release_fence || uses_synchronous_vksplat_handoff)) {
             live_trainer = trainer_manager->getTrainer();
         }
         // Held shared for the whole frame so the trainer's non-refining optimizer
@@ -872,9 +872,13 @@ namespace lfs::vis {
             // submit, before its shared arena frame releases — the trainer's
             // borrow wait must cover the in-flight batch before the trainer
             // can reacquire the arena.
-            lfs::training::Trainer* const trainer = live_trainer;
-            vksplat_viewport_renderer_->setLiveSubmitCallback(
-                [trainer](const std::uint64_t value) { trainer->publishViewerBorrow(value); });
+            if (has_vksplat_release_fence) {
+                lfs::training::Trainer* const trainer = live_trainer;
+                vksplat_viewport_renderer_->setLiveSubmitCallback(
+                    [trainer](const std::uint64_t value) { trainer->publishViewerBorrow(value); });
+            } else {
+                vksplat_viewport_renderer_->setLiveSubmitCallback({});
+            }
         } else if (vksplat_viewport_renderer_) {
             vksplat_viewport_renderer_->setLiveSubmitCallback({});
         }

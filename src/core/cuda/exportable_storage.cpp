@@ -59,6 +59,13 @@ namespace lfs::core {
 
         bool export_handle_supported(int device) {
             int supported = 0;
+#if defined(USE_HIP) && USE_HIP
+            const CUresult r = cuDeviceGetAttribute(
+                &supported,
+                hipDeviceAttributeMemoryPoolSupportedHandleTypes,
+                device);
+            return r == CUDA_SUCCESS && (supported & static_cast<int>(kCudaHandleType)) != 0;
+#else
 #ifdef _WIN32
             constexpr CUdevice_attribute handle_attribute =
                 CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_WIN32_HANDLE_SUPPORTED;
@@ -68,6 +75,13 @@ namespace lfs::core {
 #endif
             const CUresult r = cuDeviceGetAttribute(&supported, handle_attribute, device);
             return r == CUDA_SUCCESS && supported != 0;
+#endif
+        }
+
+        void clear_failed_interop_status() {
+#if defined(USE_HIP) && USE_HIP
+            (void)cudaGetLastError();
+#endif
         }
 
         // Owns a CUDA VMM allocation: a fixed virtual reservation (va,
@@ -136,6 +150,7 @@ namespace lfs::core {
         // is rolled back (the reservation is left intact for the caller).
         std::expected<void, std::string> commit_physical(OwnedAllocation& a, std::size_t aligned_size) {
             if (const auto r = cuMemCreate(&a.mem_handle, aligned_size, &a.prop, 0); r != CUDA_SUCCESS) {
+                clear_failed_interop_status();
                 return std::unexpected("cuMemCreate (exportable) failed: " + cu_error(r));
             }
             a.created = true;

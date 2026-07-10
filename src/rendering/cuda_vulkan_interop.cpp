@@ -27,11 +27,21 @@
 
 namespace lfs::rendering {
     namespace {
-        std::mutex g_device_uuid_mutex;
+        std::mutex g_device_identity_mutex;
         std::optional<std::array<std::uint8_t, 16>> g_expected_vk_uuid;
+        std::array<std::uint8_t, 8> g_expected_vk_luid{};
+        bool g_expected_vk_luid_valid = false;
         bool g_device_match_resolved = false;
         bool g_device_match_ok = false;
         std::string g_device_match_error;
+
+#if defined(USE_HIP) && USE_HIP
+        constexpr const char* kComputeApiName = "HIP";
+        constexpr const char* kVisibleDevicesVariable = "HIP_VISIBLE_DEVICES";
+#else
+        constexpr const char* kComputeApiName = "CUDA";
+        constexpr const char* kVisibleDevicesVariable = "CUDA_VISIBLE_DEVICES";
+#endif
 
         std::string formatUuid(const std::array<std::uint8_t, 16>& uuid) {
             std::string s;
@@ -46,18 +56,35 @@ namespace lfs::rendering {
             }
             return s;
         }
+
+#if defined(_WIN32) && defined(USE_HIP) && USE_HIP
+        std::string formatLuid(const std::array<std::uint8_t, 8>& luid) {
+            constexpr char kHexDigits[] = "0123456789abcdef";
+            std::string s;
+            s.reserve(luid.size() * 2);
+            for (const std::uint8_t byte : luid) {
+                s.push_back(kHexDigits[byte >> 4]);
+                s.push_back(kHexDigits[byte & 0x0f]);
+            }
+            return s;
+        }
+#endif
     } // namespace
 
-    void setExpectedVulkanDeviceUuid(const std::array<std::uint8_t, 16>& uuid) {
-        std::lock_guard lk(g_device_uuid_mutex);
+    void setExpectedVulkanDeviceIdentity(const std::array<std::uint8_t, 16>& uuid,
+                                         const std::array<std::uint8_t, 8>& luid,
+                                         const bool luid_valid) {
+        std::lock_guard lk(g_device_identity_mutex);
         g_expected_vk_uuid = uuid;
+        g_expected_vk_luid = luid;
+        g_expected_vk_luid_valid = luid_valid;
         g_device_match_resolved = false;
         g_device_match_ok = false;
         g_device_match_error.clear();
     }
 
     std::optional<std::string> verifyCudaMatchesVulkanDevice() {
-        std::lock_guard lk(g_device_uuid_mutex);
+        std::lock_guard lk(g_device_identity_mutex);
         if (g_device_match_resolved) {
             if (g_device_match_ok) {
                 return std::nullopt;
@@ -67,8 +94,8 @@ namespace lfs::rendering {
         g_device_match_resolved = true;
         if (!g_expected_vk_uuid) {
             g_device_match_error =
-                "Vulkan device UUID was not registered before CUDA/Vulkan interop init; "
-                "call setExpectedVulkanDeviceUuid() once at startup";
+                "Vulkan device identity was not registered before CUDA/Vulkan interop init; "
+                "call setExpectedVulkanDeviceIdentity() once at startup";
             return g_device_match_error;
         }
         int cuda_device = 0;
@@ -85,15 +112,39 @@ namespace lfs::rendering {
                                                cudaGetErrorName(status), cudaGetErrorString(status));
             return g_device_match_error;
         }
+
+#if defined(_WIN32) && defined(USE_HIP) && USE_HIP
+        if (g_expected_vk_luid_valid) {
+            std::array<std::uint8_t, 8> hip_luid_bytes{};
+            static_assert(sizeof(props.luid) == hip_luid_bytes.size());
+            std::memcpy(hip_luid_bytes.data(), props.luid, hip_luid_bytes.size());
+            if (hip_luid_bytes != g_expected_vk_luid) {
+                g_device_match_error = std::format(
+                    "{} device {} (LUID {}) does not match the selected Vulkan physical device (LUID {}). "
+                    "Set {} to expose the same GPU to both APIs.",
+                    kComputeApiName,
+                    cuda_device,
+                    formatLuid(hip_luid_bytes),
+                    formatLuid(g_expected_vk_luid),
+                    kVisibleDevicesVariable);
+                return g_device_match_error;
+            }
+            g_device_match_ok = true;
+            return std::nullopt;
+        }
+#endif
+
         std::array<std::uint8_t, 16> cuda_uuid_bytes{};
         std::memcpy(cuda_uuid_bytes.data(), props.uuid.bytes, 16);
         if (cuda_uuid_bytes != *g_expected_vk_uuid) {
             g_device_match_error = std::format(
-                "CUDA device {} (UUID {}) does not match the selected Vulkan physical device (UUID {}). "
-                "Set CUDA_VISIBLE_DEVICES to expose the same GPU to both APIs.",
+                "{} device {} (UUID {}) does not match the selected Vulkan physical device (UUID {}). "
+                "Set {} to expose the same GPU to both APIs.",
+                kComputeApiName,
                 cuda_device,
                 formatUuid(cuda_uuid_bytes),
-                formatUuid(*g_expected_vk_uuid));
+                formatUuid(*g_expected_vk_uuid),
+                kVisibleDevicesVariable);
             return g_device_match_error;
         }
         g_device_match_ok = true;
@@ -296,18 +347,33 @@ namespace lfs::rendering {
         cuda_mem_ = std::exchange(other.cuda_mem_, nullptr);
         cuda_mip_ = std::exchange(other.cuda_mip_, nullptr);
         cuda_array_ = std::exchange(other.cuda_array_, nullptr);
-        surface_ = std::exchange(other.surface_, 0);
+        surface_ = std::exchange(other.surface_, cudaSurfaceObject_t{});
         cuda_timeline_ = std::exchange(other.cuda_timeline_, nullptr);
+        surface_copy_event_ = std::exchange(other.surface_copy_event_, nullptr);
+        surface_copy_status_ = std::exchange(other.surface_copy_status_, SurfaceCopyStatus::Idle);
+        surface_copy_event_recorded_ = std::exchange(other.surface_copy_event_recorded_, false);
         last_signaled_ = std::exchange(other.last_signaled_, 0);
         extent_ = std::exchange(other.extent_, {});
         format_ = std::exchange(other.format_, CudaVulkanImageFormat::Rgba8Unorm);
         upload_source_ = std::move(other.upload_source_);
+        tracked_streams_ = std::move(other.tracked_streams_);
+        other.tracked_streams_.clear();
         last_error_ = std::move(other.last_error_);
         return *this;
     }
 
     bool CudaVulkanInterop::init(CudaVulkanExternalImageImport image,
                                  CudaVulkanExternalSemaphoreImport semaphore) {
+        return initImpl(std::move(image), std::move(semaphore));
+    }
+
+    bool CudaVulkanInterop::init(CudaVulkanExternalImageImport image) {
+        return initImpl(std::move(image), std::nullopt);
+    }
+
+    bool CudaVulkanInterop::initImpl(
+        CudaVulkanExternalImageImport image,
+        std::optional<CudaVulkanExternalSemaphoreImport> semaphore) {
         reset();
         last_error_.clear();
 
@@ -317,7 +383,7 @@ namespace lfs::rendering {
         if (!nativeHandleValid(image.memory_handle)) {
             return fail("CUDA/Vulkan external image import requires a valid memory handle");
         }
-        if (!nativeHandleValid(semaphore.semaphore_handle)) {
+        if (semaphore && !nativeHandleValid(semaphore->semaphore_handle)) {
             return fail("CUDA/Vulkan external semaphore import requires a valid semaphore handle");
         }
         if (image.allocation_size == 0 || image.extent.width == 0 || image.extent.height == 0) {
@@ -327,24 +393,28 @@ namespace lfs::rendering {
             return fail(std::format("CUDA/Vulkan external image format {} is unsupported",
                                     formatName(image.format)));
         }
-        int cuda_device = 0;
-        cudaError_t status = cudaGetDevice(&cuda_device);
-        if (status != cudaSuccess) {
-            return failCuda("cudaGetDevice", status);
-        }
-        int timeline_interop_supported = 0;
-        status = cudaDeviceGetAttribute(&timeline_interop_supported,
-                                        cudaDevAttrTimelineSemaphoreInteropSupported,
-                                        cuda_device);
-        if (status != cudaSuccess) {
-            return failCuda("cudaDeviceGetAttribute(cudaDevAttrTimelineSemaphoreInteropSupported)", status);
-        }
-        if (timeline_interop_supported == 0) {
-            return fail("CUDA device does not support external timeline semaphore interop");
-        }
-
         NativeHandleOwner memory_handle(image.memory_handle);
-        NativeHandleOwner semaphore_handle(semaphore.semaphore_handle);
+        NativeHandleOwner semaphore_handle(
+            semaphore ? semaphore->semaphore_handle : kInvalidCudaVulkanExternalHandle);
+
+        cudaError_t status = cudaSuccess;
+        if (semaphore) {
+            int cuda_device = 0;
+            status = cudaGetDevice(&cuda_device);
+            if (status != cudaSuccess) {
+                return failCuda("cudaGetDevice", status);
+            }
+            int timeline_interop_supported = 0;
+            status = cudaDeviceGetAttribute(&timeline_interop_supported,
+                                            cudaDevAttrTimelineSemaphoreInteropSupported,
+                                            cuda_device);
+            if (status != cudaSuccess) {
+                return failCuda("cudaDeviceGetAttribute(cudaDevAttrTimelineSemaphoreInteropSupported)", status);
+            }
+            if (timeline_interop_supported == 0) {
+                return fail("CUDA device does not support external timeline semaphore interop");
+            }
+        }
 
         cudaExternalMemoryHandleDesc memory_desc{};
         memory_desc.type = kCudaExternalMemoryHandleType;
@@ -395,29 +465,31 @@ namespace lfs::rendering {
             return failCuda("cudaCreateSurfaceObject", status);
         }
 
-        // cudaExternalSemaphoreHandleDesc has no initialValue field; the imported timeline starts at
-        // whatever value Vulkan created it with. Our signal contract is monotonic from 1, which only
-        // holds when the Vulkan-side initial value is 0.
-        assert(semaphore.initial_value == 0 &&
-               "CUDA timeline import assumes Vulkan initialValue==0; first signal is value 1");
+        if (semaphore) {
+            // cudaExternalSemaphoreHandleDesc has no initialValue field; the imported timeline starts at
+            // whatever value Vulkan created it with. Our signal contract is monotonic from 1, which only
+            // holds when the Vulkan-side initial value is 0.
+            assert(semaphore->initial_value == 0 &&
+                   "CUDA timeline import assumes Vulkan initialValue==0; first signal is value 1");
 
-        cudaExternalSemaphoreHandleDesc semaphore_desc{};
-        semaphore_desc.type = kCudaExternalSemaphoreHandleType;
+            cudaExternalSemaphoreHandleDesc semaphore_desc{};
+            semaphore_desc.type = kCudaExternalSemaphoreHandleType;
 #ifdef _WIN32
-        semaphore_desc.handle.win32.handle = semaphore_handle.get();
+            semaphore_desc.handle.win32.handle = semaphore_handle.get();
 #else
-        semaphore_desc.handle.fd = semaphore_handle.get();
+            semaphore_desc.handle.fd = semaphore_handle.get();
 #endif
 
-        status = cudaImportExternalSemaphore(&cuda_timeline_, &semaphore_desc);
-        if (status != cudaSuccess) {
-            reset();
-            return failCuda("cudaImportExternalSemaphore", status);
-        }
+            status = cudaImportExternalSemaphore(&cuda_timeline_, &semaphore_desc);
+            if (status != cudaSuccess) {
+                reset();
+                return failCuda("cudaImportExternalSemaphore", status);
+            }
 #ifndef _WIN32
-        semaphore_handle.release();
+            semaphore_handle.release();
 #endif
-        last_signaled_ = semaphore.initial_value;
+            last_signaled_ = semaphore->initial_value;
+        }
 
         extent_ = image.extent;
         format_ = image.format;
@@ -425,10 +497,24 @@ namespace lfs::rendering {
     }
 
     void CudaVulkanInterop::reset() {
+        if (surface_copy_status_ == SurfaceCopyStatus::Pending &&
+            surface_copy_event_recorded_ &&
+            surface_copy_event_ != nullptr) {
+            if (cudaEventSynchronize(surface_copy_event_) != cudaSuccess) {
+                (void)cudaGetLastError();
+            }
+        }
+        synchronizeTrackedStreams();
         upload_source_ = {};
-        if (surface_ != 0) {
+        if (surface_copy_event_ != nullptr) {
+            (void)cudaEventDestroy(surface_copy_event_);
+            surface_copy_event_ = nullptr;
+        }
+        surface_copy_status_ = SurfaceCopyStatus::Idle;
+        surface_copy_event_recorded_ = false;
+        if (surface_ != cudaSurfaceObject_t{}) {
             cudaDestroySurfaceObject(surface_);
-            surface_ = 0;
+            surface_ = cudaSurfaceObject_t{};
         }
         cuda_array_ = nullptr;
         if (cuda_mip_ != nullptr) {
@@ -452,16 +538,20 @@ namespace lfs::rendering {
         return cuda_mem_ != nullptr &&
                cuda_mip_ != nullptr &&
                cuda_array_ != nullptr &&
-               surface_ != 0 &&
-               cuda_timeline_ != nullptr &&
+               surface_ != cudaSurfaceObject_t{} &&
                extent_.width > 0 &&
                extent_.height > 0;
     }
 
     bool CudaVulkanInterop::copyTensorToSurface(const lfs::core::Tensor& tensor,
-                                                const cudaStream_t stream,
-                                                const bool flip_y) const {
+                                                 const cudaStream_t stream,
+                                                 const bool flip_y) const {
         last_error_.clear();
+        if (surface_copy_status_ == SurfaceCopyStatus::Pending) {
+            return fail("CUDA/Vulkan surface copy is already pending");
+        }
+        surface_copy_status_ = SurfaceCopyStatus::Idle;
+        surface_copy_event_recorded_ = false;
         if (!valid()) {
             return fail("CUDA/Vulkan interop target is not initialized");
         }
@@ -469,6 +559,7 @@ namespace lfs::rendering {
         if (!prepareCudaImageTensor(tensor, extent_, stream, prepared, last_error_)) {
             return false;
         }
+        rememberStream(stream);
         upload_source_ = std::move(prepared.tensor);
 
         const void* data = upload_source_.data_ptr();
@@ -506,6 +597,90 @@ namespace lfs::rendering {
         return failCuda("copy tensor to CUDA surface", status);
     }
 
+    bool CudaVulkanInterop::enqueueTensorToSurface(const lfs::core::Tensor& tensor,
+                                                    const cudaStream_t stream,
+                                                    const bool flip_y) const {
+        last_error_.clear();
+        if (surface_copy_status_ == SurfaceCopyStatus::Pending) {
+            return fail("CUDA/Vulkan surface copy is already pending");
+        }
+        if (surface_copy_event_ == nullptr) {
+            cudaEvent_t event = nullptr;
+            const cudaError_t status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+            if (status != cudaSuccess) {
+                return failCuda("cudaEventCreateWithFlags(surface copy)", status);
+            }
+            surface_copy_event_ = event;
+        }
+        if (!copyTensorToSurface(tensor, stream, flip_y)) {
+            return false;
+        }
+
+        const cudaError_t record_status = cudaEventRecord(surface_copy_event_, stream);
+        if (record_status != cudaSuccess) {
+            (void)failCuda("cudaEventRecord(surface copy)", record_status);
+            const std::string record_error = last_error_;
+            surface_copy_status_ = SurfaceCopyStatus::Pending;
+            surface_copy_event_recorded_ = false;
+
+            const cudaError_t sync_status = cudaStreamSynchronize(stream);
+            if (sync_status == cudaSuccess) {
+                upload_source_ = {};
+                surface_copy_status_ = SurfaceCopyStatus::Idle;
+                last_error_ = record_error;
+            } else {
+                last_error_ = std::format(
+                    "{}; cudaStreamSynchronize after event record failure also failed: {} ({})",
+                    record_error,
+                    cudaGetErrorName(sync_status),
+                    cudaGetErrorString(sync_status));
+                (void)cudaGetLastError();
+            }
+            return false;
+        }
+
+        surface_copy_event_recorded_ = true;
+        surface_copy_status_ = SurfaceCopyStatus::Pending;
+        return true;
+    }
+
+    bool CudaVulkanInterop::pollSurfaceCopy(SurfaceCopyStatus& status) const {
+        last_error_.clear();
+        status = surface_copy_status_;
+        if (surface_copy_status_ != SurfaceCopyStatus::Pending) {
+            return true;
+        }
+        if (surface_copy_event_ == nullptr || !surface_copy_event_recorded_) {
+            return fail("CUDA/Vulkan surface copy completion event is unavailable; reset is required");
+        }
+
+        const cudaError_t query_status = cudaEventQuery(surface_copy_event_);
+        if (query_status == cudaErrorNotReady) {
+            return true;
+        }
+        if (query_status != cudaSuccess) {
+            return failCuda("cudaEventQuery(surface copy)", query_status);
+        }
+
+        upload_source_ = {};
+        surface_copy_status_ = SurfaceCopyStatus::Complete;
+        status = SurfaceCopyStatus::Complete;
+        return true;
+    }
+
+    bool CudaVulkanInterop::wait(const std::uint64_t value, const cudaStream_t stream) const {
+        last_error_.clear();
+        if (cuda_timeline_ == nullptr) {
+            return fail("CUDA/Vulkan timeline semaphore is not initialized");
+        }
+
+        cudaExternalSemaphoreWaitParams params{};
+        params.params.fence.value = value;
+        rememberStream(stream);
+        const cudaError_t status = cudaWaitExternalSemaphoresAsync(&cuda_timeline_, &params, 1, stream);
+        return failCuda("cudaWaitExternalSemaphoresAsync", status);
+    }
+
     bool CudaVulkanInterop::signal(const std::uint64_t value, const cudaStream_t stream) const {
         last_error_.clear();
         if (cuda_timeline_ == nullptr) {
@@ -517,8 +692,24 @@ namespace lfs::rendering {
 
         cudaExternalSemaphoreSignalParams params{};
         params.params.fence.value = value;
+        rememberStream(stream);
         const cudaError_t status = cudaSignalExternalSemaphoresAsync(&cuda_timeline_, &params, 1, stream);
         return failCuda("cudaSignalExternalSemaphoresAsync", status);
+    }
+
+    void CudaVulkanInterop::rememberStream(const cudaStream_t stream) const {
+        if (std::find(tracked_streams_.begin(), tracked_streams_.end(), stream) == tracked_streams_.end()) {
+            tracked_streams_.push_back(stream);
+        }
+    }
+
+    void CudaVulkanInterop::synchronizeTrackedStreams() {
+        for (const cudaStream_t stream : tracked_streams_) {
+            if (cudaStreamSynchronize(stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+            }
+        }
+        tracked_streams_.clear();
     }
 
     bool CudaVulkanInterop::fail(std::string message) const {

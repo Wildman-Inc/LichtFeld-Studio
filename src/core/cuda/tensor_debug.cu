@@ -7,6 +7,10 @@
 #include <cuda_runtime.h>
 #include <limits>
 
+#ifndef LFS_CUDA_SYNC_MASK
+#define LFS_CUDA_SYNC_MASK 0xffffffffu
+#endif
+
 namespace lfs::core::debug {
 
     namespace {
@@ -16,7 +20,7 @@ namespace lfs::core::debug {
         // Warp-level reduction for min
         __device__ float warp_reduce_min(float val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
+                val = fminf(val, __shfl_down_sync(LFS_CUDA_SYNC_MASK, val, offset));
             }
             return val;
         }
@@ -24,7 +28,7 @@ namespace lfs::core::debug {
         // Warp-level reduction for max
         __device__ float warp_reduce_max(float val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+                val = fmaxf(val, __shfl_down_sync(LFS_CUDA_SYNC_MASK, val, offset));
             }
             return val;
         }
@@ -32,7 +36,7 @@ namespace lfs::core::debug {
         // Warp-level reduction for sum
         __device__ float warp_reduce_sum(float val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val += __shfl_down_sync(0xffffffff, val, offset);
+                val += __shfl_down_sync(LFS_CUDA_SYNC_MASK, val, offset);
             }
             return val;
         }
@@ -40,7 +44,7 @@ namespace lfs::core::debug {
         // Warp-level reduction for count
         __device__ unsigned int warp_reduce_sum_uint(unsigned int val) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-                val += __shfl_down_sync(0xffffffff, val, offset);
+                val += __shfl_down_sync(LFS_CUDA_SYNC_MASK, val, offset);
             }
             return val;
         }

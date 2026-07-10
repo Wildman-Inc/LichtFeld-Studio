@@ -50,6 +50,19 @@ namespace {
 #endif
     }
 
+    void clearCudaLimitProbeError(cudaError_t status) {
+        if (status == cudaSuccess) {
+            return;
+        }
+#if defined(USE_HIP) && USE_HIP
+        // HIP can report unsupported device limits as the next sticky runtime
+        // error. The VRAM profiler can live without these optional probes.
+        (void)cudaGetLastError();
+#else
+        (void)status;
+#endif
+    }
+
     // Probe what the CUDA driver allocates during context creation, *attributed to this
     // process* (NVML per-PID, not device-wide cudaMemGetInfo). Each phase is the delta
     // against the previous probe so the sum reconstructs the total context cost.
@@ -68,7 +81,7 @@ namespace {
         // per_thread_stack × num_SMs × max_threads_per_SM = ~192 MiB on a 4090. Driver
         // accepts the request post-context but applies it on the *next* launch — well
         // before any real kernel runs.
-        cudaDeviceSetLimit(cudaLimitStackSize, 256);
+        clearCudaLimitProbeError(cudaDeviceSetLimit(cudaLimitStackSize, 256));
         const std::size_t after_context = process_used_now();
         const std::size_t primary_context =
             after_context > before_context ? after_context - before_context : after_context;
@@ -95,9 +108,9 @@ namespace {
         std::size_t printf_fifo = 0;
         std::size_t per_thread_stack = 0;
         std::size_t malloc_heap = 0;
-        cudaDeviceGetLimit(&printf_fifo, cudaLimitPrintfFifoSize);
-        cudaDeviceGetLimit(&per_thread_stack, cudaLimitStackSize);
-        cudaDeviceGetLimit(&malloc_heap, cudaLimitMallocHeapSize);
+        clearCudaLimitProbeError(cudaDeviceGetLimit(&printf_fifo, cudaLimitPrintfFifoSize));
+        clearCudaLimitProbeError(cudaDeviceGetLimit(&per_thread_stack, cudaLimitStackSize));
+        clearCudaLimitProbeError(cudaDeviceGetLimit(&malloc_heap, cudaLimitMallocHeapSize));
 
         // Stack is per-thread; total reservation = stack * max_threads_per_sm * num_sms.
         cudaDeviceProp prop{};

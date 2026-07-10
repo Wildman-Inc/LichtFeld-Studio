@@ -16,8 +16,13 @@
 #include <thrust/scatter.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
+#include <cmath>
 
 #include "kernel_stream.hpp"
+
+#ifndef LFS_CUDA_SYNC_MASK
+#define LFS_CUDA_SYNC_MASK 0xffffffffu
+#endif
 
 namespace lfs::training::mcmc {
 
@@ -37,7 +42,7 @@ namespace lfs::training::mcmc {
             float binom = 1.0f;
             for (int k = 0; k <= n; k++) {
                 const float sign = (k % 2 == 0) ? 1.0f : -1.0f;
-                coeffs[n * RELOCATION_N_MAX + k] = binom * sign * rsqrtf(static_cast<float>(k + 1));
+                coeffs[n * RELOCATION_N_MAX + k] = binom * sign / std::sqrt(static_cast<float>(k + 1));
                 if (k < n)
                     binom *= static_cast<float>(n - k) / static_cast<float>(k + 1);
             }
@@ -650,7 +655,7 @@ namespace lfs::training::mcmc {
 
         // Warp-level reduction to sum counts
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            count += __shfl_down_sync(0xffffffff, count, offset);
+            count += __shfl_down_sync(LFS_CUDA_SYNC_MASK, count, offset);
         }
 
         // First lane writes the result

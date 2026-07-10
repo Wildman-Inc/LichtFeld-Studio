@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/cuda/memory_arena.hpp"
+#include "core/pinned_memory_allocator.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_event_pool.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
@@ -23,6 +24,24 @@ namespace {
 
     constexpr size_t SLAB_BYTES = 64 * 1024;
     constexpr size_t BUCKET_BYTES = 4 * 1024 * 1024;
+
+    std::atomic<int> release_stream_sync_calls{0};
+    std::atomic<int> release_device_sync_calls{0};
+
+    cudaError_t failReleaseStreamSynchronize(cudaStream_t) {
+        release_stream_sync_calls.fetch_add(1, std::memory_order_relaxed);
+        return cudaErrorUnknown;
+    }
+
+    cudaError_t synchronizeDeviceForRelease() {
+        release_device_sync_calls.fetch_add(1, std::memory_order_relaxed);
+        return cudaDeviceSynchronize();
+    }
+
+    cudaError_t failReleaseDeviceSynchronize() {
+        release_device_sync_calls.fetch_add(1, std::memory_order_relaxed);
+        return cudaErrorUnknown;
+    }
 
     void destroyStreamSafely(cudaStream_t stream) {
         CudaMemoryPool::instance().release_stream(stream);
@@ -79,6 +98,13 @@ class TensorMultiStreamTest : public ::testing::Test {
 protected:
     void SetUp() override {
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        release_stream_sync_calls.store(0, std::memory_order_relaxed);
+        release_device_sync_calls.store(0, std::memory_order_relaxed);
+        PinnedMemoryAllocator::instance().set_release_stream_synchronizers_for_testing(nullptr, nullptr);
+    }
+
+    void TearDown() override {
+        PinnedMemoryAllocator::instance().set_release_stream_synchronizers_for_testing(nullptr, nullptr);
     }
 };
 
@@ -266,6 +292,121 @@ TEST_F(TensorMultiStreamTest, PinnedBlockReusedOnlyAfterAllStreamsDone) {
     pinned.deallocate(reused_after, nullptr);
     cudaFree(device_buffer);
     destroyStreamSafely(d2h_stream);
+}
+
+TEST_F(TensorMultiStreamTest, PinnedReleaseStreamRetiresCachedEventsBeforeDestroy) {
+    auto& pinned = PinnedMemoryAllocator::instance();
+    pinned.empty_cache();
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    constexpr size_t kBytes = 12 * 1024;
+
+    void* device_buffer = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_buffer, kBytes), cudaSuccess);
+
+    void* cached_block = pinned.allocate(kBytes);
+    ASSERT_NE(cached_block, nullptr);
+    std::memset(cached_block, 0x5A, kBytes);
+    ASSERT_EQ(cudaMemcpyAsync(device_buffer, cached_block, kBytes, cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+    pinned.deallocate(cached_block, stream);
+
+    // This is the production stream-destruction path. The cached event must be
+    // returned before HIP invalidates it with the recording stream.
+    CudaMemoryPool::instance().release_stream(stream);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    void* reused_block = pinned.allocate(kBytes);
+    ASSERT_NE(reused_block, nullptr);
+    EXPECT_EQ(reused_block, cached_block);
+
+    // An event made available by the retirement path must remain usable after
+    // the recording stream is gone.
+    cudaEvent_t recycled_event = CudaEventPool::instance().acquire();
+    ASSERT_NE(recycled_event, nullptr);
+    ASSERT_EQ(cudaEventRecord(recycled_event, nullptr), cudaSuccess);
+    ASSERT_EQ(cudaEventSynchronize(recycled_event), cudaSuccess);
+    EXPECT_EQ(cudaEventQuery(recycled_event), cudaSuccess);
+    CudaEventPool::instance().release(recycled_event);
+
+    pinned.deallocate(reused_block, nullptr);
+    pinned.empty_cache();
+    ASSERT_EQ(cudaFree(device_buffer), cudaSuccess);
+}
+
+TEST_F(TensorMultiStreamTest, PinnedReleaseStreamFallsBackToDeviceSynchronize) {
+    auto& pinned = PinnedMemoryAllocator::instance();
+    pinned.empty_cache();
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    constexpr size_t kBytes = 16 * 1024;
+    void* device_buffer = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_buffer, kBytes), cudaSuccess);
+
+    void* cached_block = pinned.allocate(kBytes);
+    ASSERT_NE(cached_block, nullptr);
+    std::memset(cached_block, 0x6B, kBytes);
+    ASSERT_EQ(cudaMemcpyAsync(device_buffer, cached_block, kBytes, cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+    pinned.deallocate(cached_block, stream);
+    const size_t pooled_while_cached = CudaEventPool::instance().pooled_count();
+
+    pinned.set_release_stream_synchronizers_for_testing(
+        failReleaseStreamSynchronize, synchronizeDeviceForRelease);
+    pinned.release_stream(stream);
+
+    EXPECT_EQ(release_stream_sync_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(release_device_sync_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(CudaEventPool::instance().pooled_count(), pooled_while_cached + 1);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    void* reused_block = pinned.allocate(kBytes);
+    ASSERT_NE(reused_block, nullptr);
+    EXPECT_EQ(reused_block, cached_block);
+
+    pinned.deallocate(reused_block, nullptr);
+    pinned.empty_cache();
+    ASSERT_EQ(cudaFree(device_buffer), cudaSuccess);
+}
+
+TEST_F(TensorMultiStreamTest, PinnedReleaseStreamQuarantinesWhenAllSynchronizationFails) {
+    auto& pinned = PinnedMemoryAllocator::instance();
+    pinned.empty_cache();
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    constexpr size_t kBytes = 20 * 1024;
+    void* abandoned_block = pinned.allocate(kBytes);
+    ASSERT_NE(abandoned_block, nullptr);
+    pinned.deallocate(abandoned_block, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    const size_t pooled_while_cached = CudaEventPool::instance().pooled_count();
+
+    pinned.set_release_stream_synchronizers_for_testing(
+        failReleaseStreamSynchronize, failReleaseDeviceSynchronize);
+    pinned.release_stream(stream);
+
+    EXPECT_EQ(release_stream_sync_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(release_device_sync_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(CudaEventPool::instance().pooled_count(), pooled_while_cached);
+    EXPECT_EQ(pinned.get_stats().cached_bytes, 0u);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    void* replacement = pinned.allocate(kBytes);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_NE(replacement, abandoned_block);
+
+    pinned.deallocate(replacement, nullptr);
+    pinned.empty_cache();
+
+    // The injected failures are synthetic and the real stream completed above,
+    // so the test can reclaim the production quarantine's intentionally retained block.
+    ASSERT_EQ(cudaFreeHost(abandoned_block), cudaSuccess);
 }
 
 TEST_F(TensorMultiStreamTest, ArenaCrossStreamFrameHandoff) {

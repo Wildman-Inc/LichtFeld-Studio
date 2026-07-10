@@ -11,7 +11,9 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
+#if defined(USE_CUDA) && USE_CUDA
 #include <libavutil/hwcontext_cuda.h>
+#endif
 #include <libavutil/opt.h>
 }
 
