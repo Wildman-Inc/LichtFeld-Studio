@@ -13,25 +13,6 @@ endif()
 
 cmake_minimum_required(VERSION 3.30)
 
-set(LFS_PRODUCT_MODE "STUDIO" CACHE STRING "Product mode")
-set_property(CACHE LFS_PRODUCT_MODE PROPERTY STRINGS STUDIO VIEWER)
-string(TOUPPER "${LFS_PRODUCT_MODE}" LFS_PRODUCT_MODE)
-if(NOT LFS_PRODUCT_MODE MATCHES "^(STUDIO|VIEWER)$")
-    message(FATAL_ERROR "LFS_PRODUCT_MODE must be STUDIO or VIEWER")
-endif()
-
-# The standalone viewer has its own minimal manifest. vcpkg reads this variable
-# while project() loads the toolchain, so it must be selected before project().
-set(_LFS_ARC_VIEWER_MANIFEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/arc_viewer")
-if(LFS_PRODUCT_MODE STREQUAL "VIEWER")
-    set(VCPKG_MANIFEST_DIR "${_LFS_ARC_VIEWER_MANIFEST_DIR}"
-        CACHE PATH "vcpkg manifest directory for the selected product" FORCE)
-elseif(VCPKG_MANIFEST_DIR STREQUAL "${_LFS_ARC_VIEWER_MANIFEST_DIR}")
-    set(VCPKG_MANIFEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
-        CACHE PATH "vcpkg manifest directory for the selected product" FORCE)
-endif()
-unset(_LFS_ARC_VIEWER_MANIFEST_DIR)
-
 # vcpkg manifest install runs during CMake configure/regeneration, outside the
 # native build tool's `cmake --build -j ...` limit. Cap vcpkg separately before
 # the toolchain is loaded by project().
@@ -79,15 +60,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(LFS_GPU_BACKEND "CUDA" CACHE STRING "GPU backend")
-set_property(CACHE LFS_GPU_BACKEND PROPERTY STRINGS CUDA HIP NONE)
+set_property(CACHE LFS_GPU_BACKEND PROPERTY STRINGS CUDA HIP)
 string(TOUPPER "${LFS_GPU_BACKEND}" LFS_GPU_BACKEND)
-if(NOT LFS_GPU_BACKEND MATCHES "^(CUDA|HIP|NONE)$")
-    message(FATAL_ERROR "LFS_GPU_BACKEND must be CUDA, HIP, or NONE")
-endif()
-if(LFS_PRODUCT_MODE STREQUAL "VIEWER" AND NOT LFS_GPU_BACKEND STREQUAL "NONE")
-    message(FATAL_ERROR "LFS_PRODUCT_MODE=VIEWER requires LFS_GPU_BACKEND=NONE")
-elseif(LFS_GPU_BACKEND STREQUAL "NONE" AND NOT LFS_PRODUCT_MODE STREQUAL "VIEWER")
-    message(FATAL_ERROR "LFS_GPU_BACKEND=NONE is only supported with LFS_PRODUCT_MODE=VIEWER")
+if(NOT LFS_GPU_BACKEND MATCHES "^(CUDA|HIP)$")
+    message(FATAL_ERROR "LFS_GPU_BACKEND must be CUDA or HIP")
 endif()
 
 set(USE_CUDA OFF)
@@ -131,32 +107,6 @@ endif()
 
 project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CXX C)
 include(GNUInstallDirs)
-if(LFS_PRODUCT_MODE STREQUAL "VIEWER")
-    include(CTest)
-    add_subdirectory(src/arc_viewer)
-    set(CPACK_PACKAGE_NAME "LichtFeld-Arc-Viewer")
-    set(CPACK_PACKAGE_VENDOR "Wildman-Inc")
-    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
-        "Experimental Vulkan Gaussian splat viewer with Intel Arc support")
-    if(WIN32)
-        set(_LFS_ARC_PACKAGE_PLATFORM "windows-x64")
-    else()
-        string(TOLOWER "${CMAKE_SYSTEM_NAME}" _LFS_ARC_SYSTEM_NAME)
-        set(_LFS_ARC_PACKAGE_PLATFORM
-            "${_LFS_ARC_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
-    endif()
-    set(CPACK_PACKAGE_FILE_NAME
-        "LichtFeld-Arc-Viewer-${PROJECT_VERSION}-${_LFS_ARC_PACKAGE_PLATFORM}")
-    set(CPACK_GENERATOR ZIP)
-    set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
-    set(CPACK_PACKAGE_CHECKSUM SHA256)
-    if(BUILD_PORTABLE)
-        include(CPack)
-    endif()
-    unset(_LFS_ARC_PACKAGE_PLATFORM)
-    unset(_LFS_ARC_SYSTEM_NAME)
-    return()
-endif()
 
 if(USE_CUDA)
     enable_language(CUDA)

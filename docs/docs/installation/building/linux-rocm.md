@@ -46,7 +46,6 @@ cmake -S . -B build-rocm -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
-  -DLFS_PRODUCT_MODE=STUDIO \
   -DLFS_GPU_BACKEND=HIP \
   -DLFS_AMDGPU_ARCH=gfx942 \
   -DLFS_VCPKG_MAX_CONCURRENCY=32
@@ -70,7 +69,6 @@ cmake -S . -B build-rocm-multi -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER="$ROCM_PATH/llvm/bin/clang++" \
-  -DLFS_PRODUCT_MODE=STUDIO \
   -DLFS_GPU_BACKEND=HIP \
   '-DLFS_AMDGPU_ARCH=gfx90a;gfx942;gfx950' \
   -DLFS_VCPKG_MAX_CONCURRENCY=32

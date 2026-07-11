@@ -1,6 +1,6 @@
 # LichtFeld-Studio One-Shot Build Script for Windows
 # This script verifies prerequisites, sets up dependencies, and builds the project
-# Usage: .\build_lichtfeld.ps1 [-ProductMode STUDIO|VIEWER] [-GpuBackend CUDA|HIP|NONE] [-Configuration Debug|Release] [-Package] [-Clean] [-Help]
+# Usage: .\build_lichtfeld.ps1 [-GpuBackend CUDA|HIP] [-Configuration Debug|Release] [-Package] [-Clean] [-Help]
 
 [CmdletBinding()]
 param(
@@ -8,10 +8,7 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
 
-    [ValidateSet('STUDIO', 'VIEWER')]
-    [string]$ProductMode = 'STUDIO',
-
-    [ValidateSet('CUDA', 'HIP', 'NONE')]
+    [ValidateSet('CUDA', 'HIP')]
     [string]$GpuBackend = 'CUDA',
 
     [string]$RocmPath = '',
@@ -28,22 +25,21 @@ param(
 
 if ($Help) {
     Write-Host @"
-LichtFeld Studio / Arc Viewer One-Shot Build Script
+LichtFeld Studio One-Shot Build Script
 
 Usage: .\build_lichtfeld.ps1 [options]
 
 This script automatically:
-  1. Verifies build prerequisites for the selected product and GPU backend
+  1. Verifies build prerequisites for the selected GPU backend
   2. Sets up vcpkg in the parent directory
-  3. Downloads CUDA LibTorch (Debug & Release) for Studio CUDA builds
-  4. Initializes git submodules for Studio builds
-  5. Configures and builds LichtFeld Studio or the standalone Arc Viewer
+  3. Downloads CUDA LibTorch (Debug & Release) for CUDA builds
+  4. Initializes git submodules
+  5. Configures and builds LichtFeld Studio
   6. Optionally creates a portable ZIP package and SHA-256 checksum
 
 Options:
   -Configuration <Debug|Release>  Build configuration (default: Release)
-  -ProductMode <STUDIO|VIEWER>     Product to build (default: STUDIO)
-  -GpuBackend <CUDA|HIP|NONE>      GPU backend (default: CUDA for STUDIO, NONE for VIEWER)
+  -GpuBackend <CUDA|HIP>           GPU backend (default: CUDA)
   -RocmPath <path>                 ROCm/HIP SDK root for HIP builds
   -AmdgpuArch <arch[;arch...]>     AMDGPU target(s), for example gfx1151 or gfx90a;gfx942
   -SkipVerification               Skip environment verification
@@ -58,14 +54,11 @@ Examples:
   .\build_lichtfeld.ps1 -Configuration Debug       Build Debug
   .\build_lichtfeld.ps1 -GpuBackend HIP            Build with ROCm/HIP
   .\build_lichtfeld.ps1 -GpuBackend HIP -AmdgpuArch gfx942
-  .\build_lichtfeld.ps1 -ProductMode VIEWER         Build the Arc Viewer with Ninja
-  .\build_lichtfeld.ps1 -ProductMode VIEWER -GpuBackend NONE -Clean
   .\build_lichtfeld.ps1 -Package                   Build and package Release
   .\build_lichtfeld.ps1 -Clean                     Clean and rebuild
   .\build_lichtfeld.ps1 -SkipLibTorch              Skip LibTorch download (if already present)
 
 Notes:
-  - VIEWER uses GpuBackend NONE; NONE is not valid for STUDIO.
   - Package builds require Configuration Release and enable BUILD_PORTABLE.
   - Windows Long Path Support: If you encounter path-too-long errors, enable long paths:
     Run as Administrator: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
@@ -74,20 +67,7 @@ Notes:
     exit 0
 }
 
-$ProductMode = $ProductMode.ToUpperInvariant()
-if ($ProductMode -eq 'VIEWER' -and -not $PSBoundParameters.ContainsKey('GpuBackend')) {
-    $GpuBackend = 'NONE'
-}
 $GpuBackend = $GpuBackend.ToUpperInvariant()
-
-if ($ProductMode -eq 'VIEWER' -and $GpuBackend -ne 'NONE') {
-    Write-Host "ERROR: ProductMode VIEWER requires GpuBackend NONE." -ForegroundColor Red
-    exit 1
-}
-if ($ProductMode -eq 'STUDIO' -and $GpuBackend -eq 'NONE') {
-    Write-Host "ERROR: GpuBackend NONE is only valid with ProductMode VIEWER." -ForegroundColor Red
-    exit 1
-}
 if ($Package -and $Configuration -ne 'Release') {
     Write-Host "ERROR: -Package requires -Configuration Release." -ForegroundColor Red
     exit 1
@@ -100,7 +80,6 @@ $ErrorActionPreference = 'Stop'
 $ScriptPath = $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptPath
 $VcpkgPath = Join-Path (Split-Path -Parent $ProjectRoot) "vcpkg"
-$IsViewer = ($ProductMode -eq 'VIEWER')
 
 # Track overall status
 $AllChecksPassed = $true
@@ -258,10 +237,7 @@ function Assert-ZipNoticeDirectory {
 }
 
 function Assert-ZipRuntimePolicy {
-    param(
-        [Parameter(Mandatory = $true)][string[]]$EntryNames,
-        [Parameter(Mandatory = $true)][bool]$IsViewerPackage
-    )
+    param([Parameter(Mandatory = $true)][string[]]$EntryNames)
 
     $WindowsSystemDlls = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
@@ -288,18 +264,12 @@ function Assert-ZipRuntimePolicy {
         if ($LeafName -match '^(?i:gtest|gmock|benchmark|catch2).*[.]dll$') {
             throw "Package ZIP must not contain test-only runtime '$EntryName'."
         }
-        if ($IsViewerPackage -and $LeafName.EndsWith('.dll',
-                [System.StringComparison]::OrdinalIgnoreCase) -and $LeafName -notmatch
-            '^(?i:SDL3|vulkan-1|concrt140|vccorlib140|msvcp140(?:_[a-z0-9_]+)?|vcruntime140(?:_[a-z0-9_]+)?)[.]dll$') {
-            throw "Arc Viewer package contains an unapproved runtime '$EntryName'."
-        }
     }
 }
 
 function Test-PackageArchiveContract {
     param(
         [Parameter(Mandatory = $true)][string]$ArchivePath,
-        [Parameter(Mandatory = $true)][bool]$IsViewerPackage,
         [Parameter(Mandatory = $true)][string]$Backend,
         [string]$RuntimeManifestPath = ''
     )
@@ -317,8 +287,8 @@ function Test-PackageArchiveContract {
                 throw "Package ZIP contains a duplicate entry: $EntryName"
             }
         }
-        Assert-ZipRuntimePolicy $EntryNames $IsViewerPackage
-        $RuntimeDirectory = if ($IsViewerPackage) { '' } else { 'bin/' }
+        Assert-ZipRuntimePolicy $EntryNames
+        $RuntimeDirectory = 'bin/'
         foreach ($RuntimePattern in @('^(?i:msvcp140).*?[.]dll$',
                 '^(?i:vcruntime140).*?[.]dll$')) {
             $LocatedRuntimePattern = '^' + [regex]::Escape($RuntimeDirectory) +
@@ -326,37 +296,6 @@ function Test-PackageArchiveContract {
             if (-not ($EntryNames -match $LocatedRuntimePattern)) {
                 throw "Package ZIP is missing a required MSVC runtime matching '$RuntimePattern'."
             }
-        }
-
-        if ($IsViewerPackage) {
-            Assert-ZipEntry $Entries 'LichtFeld-Studio-Arc-Viewer.exe' 'Arc Viewer executable'
-            Assert-ZipEntry $Entries 'point.vert.spv' 'Arc Viewer vertex shader'
-            Assert-ZipEntry $Entries 'point.frag.spv' 'Arc Viewer fragment shader'
-            Assert-ZipEntry $Entries 'SDL3.dll' 'Arc Viewer SDL3 runtime'
-            Assert-ZipEntry $Entries 'vulkan-1.dll' 'Arc Viewer Vulkan loader'
-            Assert-ZipEntry $Entries 'LICENSE.txt' 'Arc Viewer license'
-            Assert-ZipEntry $Entries 'THIRD_PARTY_LICENSES.md' 'Arc Viewer third-party license notice'
-            Assert-ZipEntry $Entries 'README.md' 'Arc Viewer README'
-            foreach ($Notice in @('sdl3.txt', 'glm.txt', 'vulkan-loader.txt', 'vulkan-headers.txt')) {
-                Assert-ZipEntry $Entries "licenses/$Notice" 'Arc Viewer dependency notice'
-            }
-            foreach ($ShaderPath in @('point.vert.spv', 'point.frag.spv')) {
-                $ShaderEntry = $Archive.GetEntry($ShaderPath)
-                if ($ShaderEntry.Length -lt 20 -or $ShaderEntry.Length % 4 -ne 0) {
-                    throw "Arc Viewer package contains malformed SPIR-V bytecode '$ShaderPath'."
-                }
-                $ShaderStream = $ShaderEntry.Open()
-                try {
-                    $Header = [byte[]]::new(4)
-                    if ($ShaderStream.Read($Header, 0, $Header.Length) -ne $Header.Length -or
-                        [BitConverter]::ToUInt32($Header, 0) -ne 0x07230203) {
-                        throw "Arc Viewer package contains invalid SPIR-V bytecode '$ShaderPath'."
-                    }
-                } finally {
-                    $ShaderStream.Dispose()
-                }
-            }
-            return
         }
 
         Assert-ZipEntry $Entries 'bin/LichtFeld-Studio.exe' 'Studio executable'
@@ -638,9 +577,6 @@ function Test-BuildEnvironment {
                 "ROCm/HIP SDK not found" `
                 "Set -RocmPath, LFS_ROCM_PATH, ROCM_PATH, HIP_PATH, or install the _rocm_sdk_core Python package"
         }
-    } else {
-        Write-Host "[4/$TotalChecks] Checking GPU backend SDK..." -ForegroundColor Yellow
-        Write-Status "GPU Backend SDK" $true "Not required for Arc Viewer"
     }
 
     # Check 5: Git
@@ -659,7 +595,7 @@ function Test-BuildEnvironment {
     }
 
     # Check 6: Ninja
-    $NinjaRequired = $IsViewer -or $GpuBackend -eq 'HIP'
+    $NinjaRequired = $GpuBackend -eq 'HIP'
     $NinjaLabel = if ($NinjaRequired) { "Checking Ninja..." } else { "Checking Ninja (optional)..." }
     Write-Host "[6/$TotalChecks] $NinjaLabel" -ForegroundColor Yellow
     if (Test-Command "ninja") {
@@ -671,7 +607,7 @@ function Test-BuildEnvironment {
         }
     } elseif ($NinjaRequired) {
         Write-Status "Ninja" $false "" `
-            "Ninja is required for $ProductMode/$GpuBackend builds" `
+            "Ninja is required for $GpuBackend builds" `
             "Install via: choco install ninja OR download from https://github.com/ninja-build/ninja/releases"
     } else {
         Write-Warning-Status "Ninja" "Not found (build will use Visual Studio generator)" `
@@ -699,10 +635,7 @@ function Test-BuildEnvironment {
     }
 
     # Check 8: Python
-    if ($IsViewer) {
-        Write-Host "[8/$TotalChecks] Checking Python..." -ForegroundColor Yellow
-        Write-Status "Python" $true "Not required for Arc Viewer"
-    } elseif (Test-Command "python") {
+    if (Test-Command "python") {
         Write-Host "[8/$TotalChecks] Checking Python 3.12..." -ForegroundColor Yellow
         try {
             $PythonVersion = python --version 2>&1
@@ -980,33 +913,27 @@ function Copy-RequiredDLLs {
 # ============================================================================
 
 function Build-LichtFeldStudio {
-    $ProductDisplayName = if ($IsViewer) {
-        'LichtFeld Arc Viewer'
-    } elseif ($GpuBackend -eq 'HIP') {
+    $ProductDisplayName = if ($GpuBackend -eq 'HIP') {
         'LichtFeld Studio for ROCm'
     } else {
         'LichtFeld Studio'
     }
     Write-Host "================================================================" -ForegroundColor Cyan
     Write-Host "Building $ProductDisplayName ($Configuration)" -ForegroundColor Cyan
-    if (-not $IsViewer) {
-        Write-Host "  with Python Bindings" -ForegroundColor Cyan
-    }
+    Write-Host "  with Python Bindings" -ForegroundColor Cyan
     Write-Host "================================================================" -ForegroundColor Cyan
     Write-Host ""
 
     Push-Location $ProjectRoot
     try {
-        $BuildDirName = if ($IsViewer) {
-            'build-arc-viewer'
-        } elseif ($GpuBackend -eq 'HIP') {
+        $BuildDirName = if ($GpuBackend -eq 'HIP') {
             'build-hip'
         } else {
             'build'
         }
         $BuildDir = Join-Path $ProjectRoot $BuildDirName
         $VcpkgToolchain = Join-Path $VcpkgPath "scripts\buildsystems\vcpkg.cmake"
-        $Generator = if ($IsViewer -or $GpuBackend -eq 'HIP') { "Ninja" } else { "Visual Studio 17 2022" }
+        $Generator = if ($GpuBackend -eq 'HIP') { "Ninja" } else { "Visual Studio 17 2022" }
         $ResolvedRocm = $null
         if ($GpuBackend -eq 'HIP') {
             $ResolvedRocm = Find-ROCmRoot
@@ -1017,7 +944,7 @@ function Build-LichtFeldStudio {
             }
         }
         if ($Generator -eq 'Ninja' -and -not (Test-Command "ninja")) {
-            Write-Host "ERROR: Ninja is required for $ProductMode/$GpuBackend builds." -ForegroundColor Red
+            Write-Host "ERROR: Ninja is required for $GpuBackend builds." -ForegroundColor Red
             Write-Host "Install Ninja and ensure ninja.exe is available on PATH." -ForegroundColor Yellow
             exit 1
         }
@@ -1092,14 +1019,11 @@ function Build-LichtFeldStudio {
             "-B", $BuildDir,
             "-G", $Generator,
             "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
-            "-DLFS_PRODUCT_MODE=$ProductMode",
             "-DLFS_GPU_BACKEND=$GpuBackend",
             "-DLFS_VCPKG_MAX_CONCURRENCY=32"
         )
         if ($Package) {
             $CMakeArgs += '-DBUILD_PORTABLE=ON'
-        } elseif ($IsViewer) {
-            $CMakeArgs += '-UBUILD_PORTABLE'
         } else {
             # Reset cache values forced by a prior portable Studio build.
             $CMakeArgs += '-DBUILD_PORTABLE=OFF'
@@ -1177,7 +1101,6 @@ function Build-LichtFeldStudio {
         Write-Host "Configuring CMake..." -ForegroundColor Yellow
         Write-Host "  Generator: $Generator" -ForegroundColor Gray
         Write-Host "  Configuration: $Configuration" -ForegroundColor Gray
-        Write-Host "  Product Mode: $ProductMode" -ForegroundColor Gray
         Write-Host "  GPU Backend: $GpuBackend" -ForegroundColor Gray
         if ($Package) {
             Write-Host "  Portable Package: Enabled" -ForegroundColor Gray
@@ -1187,9 +1110,7 @@ function Build-LichtFeldStudio {
             Write-Host "  AMDGPU targets: $AmdgpuArch" -ForegroundColor Gray
         }
         Write-Host "  Toolchain: $VcpkgToolchain" -ForegroundColor Gray
-        if (-not $IsViewer) {
-            Write-Host "  Python Bindings: Enabled" -ForegroundColor Gray
-        }
+        Write-Host "  Python Bindings: Enabled" -ForegroundColor Gray
         Write-Host ""
 
         & cmake @CMakeArgs
@@ -1211,8 +1132,6 @@ function Build-LichtFeldStudio {
         if ($Generator -like "Visual Studio*") {
             $SolutionFile = Join-Path $BuildDir "LichtFeld-Studio.sln"
             msbuild $SolutionFile /p:Configuration=$Configuration /p:Platform=x64 /m:32
-        } elseif ($IsViewer) {
-            cmake --build $BuildDir --config $Configuration --target LichtFeld-Studio-Arc-Viewer --parallel 32
         } else {
             cmake --build $BuildDir --config $Configuration --parallel 32
         }
@@ -1222,22 +1141,16 @@ function Build-LichtFeldStudio {
             exit 1
         }
 
-        if (-not $IsViewer) {
-            # Studio has extra runtime modules not covered by the viewer's post-build staging.
-            Copy-RequiredDLLs -BuildDir $BuildDir -Config $Configuration
-        }
+        Copy-RequiredDLLs -BuildDir $BuildDir -Config $Configuration
 
-        $ExecutablePath = if ($IsViewer) {
-            Join-Path $BuildDir "LichtFeld-Studio-Arc-Viewer.exe"
-        } elseif ($Generator -like "Visual Studio*") {
+        $ExecutablePath = if ($Generator -like "Visual Studio*") {
             Join-Path (Join-Path $BuildDir $Configuration) "LichtFeld-Studio.exe"
         } else {
             Join-Path $BuildDir "LichtFeld-Studio.exe"
         }
 
         if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
-            $ProductOutputName = if ($IsViewer) { 'Arc Viewer' } else { 'Studio' }
-            Write-Host "ERROR: $ProductOutputName build completed without producing the expected executable." -ForegroundColor Red
+            Write-Host "ERROR: Studio build completed without producing the expected executable." -ForegroundColor Red
             Write-Host "Expected: $ExecutablePath" -ForegroundColor Gray
             exit 1
         }
@@ -1278,9 +1191,7 @@ function Build-LichtFeldStudio {
             }
 
             $ProjectVersion = $ProjectVersionMatch.Groups[1].Value
-            $PackageBaseName = if ($IsViewer) {
-                "LichtFeld-Arc-Viewer-$ProjectVersion-windows-x64"
-            } elseif ($GpuBackend -eq 'HIP') {
+            $PackageBaseName = if ($GpuBackend -eq 'HIP') {
                 "LichtFeld-Studio-for-ROCm-$ProjectVersion-windows-x64"
             } else {
                 $PackageBackend = $GpuBackend.ToLowerInvariant()
@@ -1332,7 +1243,7 @@ function Build-LichtFeldStudio {
             $PackageArchivePath = (Resolve-Path -LiteralPath $PackageArchivePath).Path
             $PackageChecksumPath = (Resolve-Path -LiteralPath $PackageChecksumPath).Path
             Test-PackageChecksum $PackageArchivePath $PackageChecksumPath
-            Test-PackageArchiveContract $PackageArchivePath $IsViewer $GpuBackend $RuntimeManifestPath
+            Test-PackageArchiveContract $PackageArchivePath $GpuBackend $RuntimeManifestPath
         }
 
         Write-Host ""
@@ -1344,11 +1255,9 @@ function Build-LichtFeldStudio {
         Write-Host "  $ExecutablePath" -ForegroundColor White
         Write-Host ""
 
-        if (-not $IsViewer) {
-            Write-Host "Python module location:" -ForegroundColor Cyan
-            Write-Host "  $BuildDir\src\python\$Configuration\lichtfeld.pyd" -ForegroundColor White
-            Write-Host ""
-        }
+        Write-Host "Python module location:" -ForegroundColor Cyan
+        Write-Host "  $BuildDir\src\python\$Configuration\lichtfeld.pyd" -ForegroundColor White
+        Write-Host ""
 
         if ($Package) {
             Write-Host "Package archive:" -ForegroundColor Cyan
@@ -1367,7 +1276,7 @@ function Build-LichtFeldStudio {
 # Main Execution
 # ============================================================================
 
-$ScriptDisplayName = if ($IsViewer) { "LichtFeld Studio Arc Viewer Build Script" } else { "LichtFeld-Studio One-Shot Build Script" }
+$ScriptDisplayName = "LichtFeld-Studio One-Shot Build Script"
 
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Cyan
@@ -1376,11 +1285,8 @@ Write-Host "================================================================" -F
 Write-Host ""
 Write-Host "Project: $ProjectRoot" -ForegroundColor Gray
 Write-Host "Configuration: $Configuration" -ForegroundColor Gray
-Write-Host "Product Mode: $ProductMode" -ForegroundColor Gray
 Write-Host "GPU Backend: $GpuBackend" -ForegroundColor Gray
-if (-not $IsViewer) {
-    Write-Host "Python Bindings: Enabled" -ForegroundColor Gray
-}
+Write-Host "Python Bindings: Enabled" -ForegroundColor Gray
 Write-Host ""
 
 # Phase 1: Environment Verification
@@ -1409,12 +1315,7 @@ if (-not $SkipVerification) {
 }
 
 # Phase 2: Git Submodules
-if ($IsViewer) {
-    Write-Host "Skipping Studio git submodules for Arc Viewer" -ForegroundColor Yellow
-    Write-Host ""
-} else {
-    Setup-GitSubmodules
-}
+Setup-GitSubmodules
 
 # Phase 3: vcpkg Setup
 if (-not $SkipVcpkg) {
@@ -1432,10 +1333,7 @@ if (-not $SkipVcpkg) {
 }
 
 # Phase 4: LibTorch Download
-if ($IsViewer) {
-    Write-Host "Skipping LibTorch setup (not required for Arc Viewer)" -ForegroundColor Yellow
-    Write-Host ""
-} elseif ($GpuBackend -eq 'CUDA' -and -not $SkipLibTorch) {
+if ($GpuBackend -eq 'CUDA' -and -not $SkipLibTorch) {
     Setup-LibTorch
 } elseif ($GpuBackend -eq 'HIP') {
     Write-Host "Skipping CUDA LibTorch setup for $GpuBackend backend" -ForegroundColor Yellow

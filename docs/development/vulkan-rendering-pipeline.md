@@ -4,7 +4,7 @@ How a frame goes from CUDA tensors to pixels on screen.
 
 ## Scope
 
-The CUDA terminology and timeline-semaphore flow below describe the upstream LichtFeld Studio backend. LichtFeld Studio for ROCm can use the same external-memory Vulkan interop design through the HIP compatibility layer. When HIP cannot use external timeline semaphores, scene-image publication uses the synchronization path described below if external-memory image interop succeeded. Otherwise, it uses CPU/Vulkan staging. LichtFeld Arc Viewer (Experimental) is a separate SDL3/Vulkan PLY viewer and is outside this pipeline.
+The CUDA terminology and timeline-semaphore flow below describe the upstream LichtFeld Studio backend. LichtFeld Studio for ROCm can use the same external-memory Vulkan interop design through the HIP compatibility layer. When HIP cannot use external timeline semaphores, scene-image publication uses the synchronization path described below if external-memory image interop succeeded. Otherwise, it uses CPU/Vulkan staging.
 
 ## Flow
 

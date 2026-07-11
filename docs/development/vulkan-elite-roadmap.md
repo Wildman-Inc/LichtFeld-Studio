@@ -220,7 +220,7 @@ Lean on Vulkan 1.3+ features that are probed but unused.
 
 ## Phase 6 — Conditional Vulkan-native backward (candidate, 6–10 weeks)
 
-This is a conditional, hardware-specific research path, not a cross-vendor support promise. Proceed only for target GPUs whose Vulkan drivers and required features pass a go/no-go prototype. Any Vulkan-native training work remains separate from the supported CUDA/HIP training backends and from the standalone Arc Viewer.
+This is a conditional, hardware-specific research path, not a cross-vendor support promise. Proceed only for target GPUs whose Vulkan drivers and required features pass a go/no-go prototype. Any Vulkan-native training work remains separate from the supported CUDA/HIP training backends.
 
 ### 6.1 Wire the existing backward Slang shaders
 - `vulkan/CMakeLists.txt:138` — enable `EXPORT_MODE=1` compilation.
