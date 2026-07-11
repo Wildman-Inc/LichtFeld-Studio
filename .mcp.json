@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "lichtfeld": {
-      "command": "python3",
+      "command": "cmake",
       "args": [
-        "scripts/lichtfeld_mcp_bridge.py"
+        "-P",
+        "scripts/lichtfeld_mcp_bridge_launcher.cmake"
       ]
     }
   }

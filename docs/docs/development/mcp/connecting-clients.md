@@ -67,12 +67,13 @@ Notes:
 
 The repository's [`.mcp.json`](https://github.com/MrNeRF/LichtFeld-Studio/blob/master/.mcp.json) launches `scripts/lichtfeld_mcp_bridge.py`, a stdio-to-HTTP proxy that also starts LichtFeld Studio on demand: it pings the endpoint, launches the executable if nothing answers, then forwards JSON-RPC messages to HTTP.
 
-This path targets coding agents that operate inside a checkout of this repository. Current limitations to know about:
+This path targets coding agents that operate inside a checkout of this repository. Current limitation to know about:
 
 - The bridge frames stdio messages with `Content-Length` headers. Clients that use spec-standard newline-delimited framing (including Claude Desktop) will hang; use `mcp-remote` or direct HTTP for those instead.
-- Auto-launch passes `--no-splash`, which portable builds (the released binaries) do not recognize, so the launched app exits immediately. Use a regular development build, or set `LICHTFELD_EXECUTABLE` to one.
 
-See [issue #1399](https://github.com/MrNeRF/LichtFeld-Studio/issues/1399) for the status of these limitations.
+Auto-launch invokes the executable without optional UI flags, so both development and portable builds are supported. The bridge checks HIP and Linux ROCm build directories before generic build directories, including multi-config outputs such as `build/Release`; `LICHTFELD_EXECUTABLE` remains the highest-priority override. The checked-in `.mcp.json` runs a CMake launcher that selects a working Python 3.9+ interpreter on Windows, Linux, and macOS.
+
+See [issue #1399](https://github.com/MrNeRF/LichtFeld-Studio/issues/1399) for the background on bridge compatibility.
 
 Bridge environment variables:
 

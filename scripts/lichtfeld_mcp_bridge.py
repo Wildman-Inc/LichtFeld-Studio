@@ -78,6 +78,9 @@ def executable_candidates() -> list[Path]:
         names = ["LichtFeld-Studio", "run_lichtfeld.sh"]
 
     search_roots = [
+        REPO_ROOT / "build-hip",
+        REPO_ROOT / "build-rocm",
+        REPO_ROOT / "build-rocm-multi",
         REPO_ROOT / "build",
         REPO_ROOT / "cmake-build-release",
         REPO_ROOT / "cmake-build-debug",
@@ -85,10 +88,17 @@ def executable_candidates() -> list[Path]:
     ]
 
     for root in search_roots:
-        for name in names:
-            candidate = root / name
-            if candidate.exists():
-                candidates.append(candidate)
+        locations = [
+            root / "Release",
+            root / "RelWithDebInfo",
+            root / "Debug",
+            root,
+        ]
+        for location in locations:
+            for name in names:
+                candidate = location / name
+                if candidate.exists():
+                    candidates.append(candidate)
 
     unique_candidates: list[Path] = []
     seen: set[Path] = set()
@@ -103,7 +113,7 @@ def executable_candidates() -> list[Path]:
 def pick_launch_command() -> list[str]:
     for candidate in executable_candidates():
         if candidate.is_file():
-            return [str(candidate), "--no-splash"]
+            return [str(candidate)]
     raise RuntimeError(
         "Could not find a LichtFeld Studio executable. "
         "Set LICHTFELD_EXECUTABLE or build the app first."

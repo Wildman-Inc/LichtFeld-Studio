@@ -1478,8 +1478,15 @@ namespace lfs::core {
 
     // Global singleton implementation
     GlobalArenaManager& GlobalArenaManager::instance() {
+#ifdef _WIN32
+        // lfs_core_cuda is linked into multiple DLLs. Avoid running GPU cleanup
+        // from their process-detach handlers while the Windows loader lock is held.
+        static auto* const manager = new GlobalArenaManager();
+        return *manager;
+#else
         static GlobalArenaManager instance;
         return instance;
+#endif
     }
 
     RasterizerMemoryArena& GlobalArenaManager::get_arena() {
