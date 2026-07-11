@@ -116,6 +116,9 @@ jobs:
       VCPKG_MAX_CONCURRENCY: 2
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       CMAKE_MAKE_PROGRAM: /usr/bin/ninja
+      CCACHE_DIR: /github/home/.cache/ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPRESS: 1
 
     steps:
       - name: Prepare checkout dependencies
@@ -206,6 +209,14 @@ jobs:
           key: vcpkg-pkgs-${{ runner.os }}-rocm-full-app-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
           restore-keys: vcpkg-pkgs-${{ runner.os }}-rocm-full-app-
 
+      - name: Restore compiler cache
+        id: cache-compiler
+        uses: actions/cache/restore@v5
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache-${{ runner.os }}-rocm-7.2.4-gfx942-${{ github.sha }}
+          restore-keys: ccache-${{ runner.os }}-rocm-7.2.4-gfx942-
+
       - name: Configure full Linux ROCm application
         shell: bash
         run: |
@@ -222,11 +233,14 @@ jobs:
             -DBUILD_PORTABLE=OFF \
             -DBUILD_TESTING=OFF \
             -DBUILD_PYTHON_STUBS=OFF \
+            -DENABLE_COMPILER_CACHE=ON \
             -DLFS_DEV_IMPORT_SOURCE_PYTHON=OFF \
             -DLFS_DEV_IMPORT_SOURCE_RESOURCES=OFF
           grep -E '^LFS_GPU_BACKEND(:[^=]+)?=HIP$' build-rocm-full/CMakeCache.txt
           grep -E '^CMAKE_HIP_ARCHITECTURES(:[^=]+)?=gfx942$' \
             build-rocm-full/CMakeCache.txt
+          grep -F ccache build-rocm-full/build.ninja >/dev/null
+          ccache --zero-stats
           rm -rf \
             build-rocm-full/vcpkg_installed/vcpkg/blds \
             build-rocm-full/vcpkg_installed/vcpkg/pkgs \
@@ -250,6 +264,7 @@ jobs:
           cmake --build build-rocm-full --parallel 4 --verbose \
             2>&1 | tee build-rocm-full/build.log
           build_status=${PIPESTATUS[0]}
+          ccache --show-stats
           set -e
           if (( build_status != 0 )); then
             failure_tail="$(sed -n -E \
@@ -288,3 +303,10 @@ jobs:
             exit 1
           fi
           build-rocm-full/LichtFeld-Studio --version
+
+      - name: Save compiler cache
+        if: always() && steps.cache-compiler.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: /github/home/.cache/ccache
+          key: ${{ steps.cache-compiler.outputs.cache-primary-key }}
