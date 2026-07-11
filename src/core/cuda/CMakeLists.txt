@@ -44,9 +44,11 @@ target_link_libraries(lfs_core_cuda
         spdlog::spdlog
         glm::glm
 )
-find_package(OpenMP COMPONENTS CXX)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(lfs_core_cuda PUBLIC OpenMP::OpenMP_CXX)
+if(NOT (WIN32 AND USE_HIP AND BUILD_PORTABLE))
+    find_package(OpenMP COMPONENTS CXX)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(lfs_core_cuda PUBLIC OpenMP::OpenMP_CXX)
+    endif()
 endif()
 
 if(USE_CUDA)

@@ -61,6 +61,7 @@ unset(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY)
 unset(_LFS_HOST_PROCESSOR_COUNT)
 
 option(LFS_ENFORCE_LINUX_GUI_BACKENDS "Fail configure when Linux SDL3 would lack X11 and Wayland support" ON)
+option(BUILD_PORTABLE "Build portable distribution" OFF)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxGuiSanity.cmake")
 lfs_linux_preflight_gui_backends()
@@ -129,6 +130,7 @@ if(USE_HIP AND CMAKE_HOST_WIN32)
 endif()
 
 project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CXX C)
+include(GNUInstallDirs)
 if(LFS_PRODUCT_MODE STREQUAL "VIEWER")
     include(CTest)
     add_subdirectory(src/arc_viewer)
@@ -148,7 +150,9 @@ if(LFS_PRODUCT_MODE STREQUAL "VIEWER")
     set(CPACK_GENERATOR ZIP)
     set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
     set(CPACK_PACKAGE_CHECKSUM SHA256)
-    include(CPack)
+    if(BUILD_PORTABLE)
+        include(CPack)
+    endif()
     unset(_LFS_ARC_PACKAGE_PLATFORM)
     unset(_LFS_ARC_SYSTEM_NAME)
     return()
@@ -280,7 +284,6 @@ endif()
 option(BUILD_CUDA_PTX_ONLY "Build PTX-only (JIT at runtime, ~5-15s first startup)" OFF)
 
 # Portable: bundle runtime libraries and disable tests. CUDA additionally uses PTX-only output.
-option(BUILD_PORTABLE "Build portable distribution" OFF)
 if(BUILD_PORTABLE)
     if(USE_CUDA)
         set(BUILD_CUDA_PTX_ONLY ON CACHE BOOL "" FORCE)
@@ -1544,8 +1547,35 @@ endif()
 set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
 set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
 
-include(GNUInstallDirs)
 include(InstallRequiredSystemLibraries)
+
+if(WIN32 AND BUILD_PORTABLE AND NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+    set(_lfs_vswhere_result 1)
+    set(_lfs_vswhere
+        "$ENV{ProgramFiles}/../Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe")
+    if(EXISTS "${_lfs_vswhere}")
+        execute_process(
+            COMMAND "${_lfs_vswhere}" -latest -products * -property installationPath
+            OUTPUT_VARIABLE _lfs_vs_install_root
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _lfs_vswhere_result)
+    endif()
+    if(_lfs_vswhere_result EQUAL 0 AND IS_DIRECTORY "${_lfs_vs_install_root}")
+        file(TO_CMAKE_PATH "${_lfs_vs_install_root}" _lfs_vs_install_root)
+        file(GLOB _lfs_msvc_crt_dirs LIST_DIRECTORIES TRUE
+            "${_lfs_vs_install_root}/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
+        list(SORT _lfs_msvc_crt_dirs COMPARE NATURAL ORDER DESCENDING)
+        if(_lfs_msvc_crt_dirs)
+            list(GET _lfs_msvc_crt_dirs 0 _lfs_msvc_crt_dir)
+            file(GLOB _lfs_msvc_runtime_files "${_lfs_msvc_crt_dir}/*.dll")
+        endif()
+    endif()
+    if(NOT _lfs_msvc_runtime_files)
+        message(FATAL_ERROR
+            "Portable Windows packages require Visual Studio C++ Redistributable DLLs")
+    endif()
+    install(FILES ${_lfs_msvc_runtime_files} DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS lfs_core
@@ -1730,7 +1760,7 @@ if(BUILD_PORTABLE)
             [[api-ms-.*]] [[ext-ms-.*]] [[API-MS-.*]] [[EXT-MS-.*]]
             [[nvcuda[.]dll]] [[libcuda[.]so.*]] [[hvsifiletrust[.]dll]])
     set(_POST_EXCLUDE
-            [[^[A-Za-z]:/[Ww]indows/.*]]
+            [[^[A-Za-z]:[/\\][Ww]indows[/\\].*]]
             [[/lib/x86_64-linux-gnu/.*]] [[/lib64/ld-linux.*]] [[/usr/lib.*]]
             [[.*ld-linux.*]] [[.*libc[.]so[.].*]] [[.*libpthread.*]]
             [[.*libdl[.]so.*]] [[.*libm[.]so[.].*]] [[.*librt[.]so.*]]
@@ -1752,9 +1782,6 @@ if(BUILD_PORTABLE)
         list(APPEND _RUNTIME_SEARCH_DIRS
                 "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin"
                 "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
-        list(APPEND _RUNTIME_SEARCH_DIRS
-            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin"
-            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/lib")
     endif()
     list(REMOVE_DUPLICATES _RUNTIME_SEARCH_DIRS)
 
@@ -1770,32 +1797,112 @@ if(BUILD_PORTABLE)
     else()
         set(_BUNDLE_DEST "${CMAKE_INSTALL_LIBDIR}")
     endif()
-    function(bundle_runtime_deps TARGET_FILE IS_LIBRARY)
-        if(IS_LIBRARY)
-            set(_type "LIBRARIES")
-        else()
-            set(_type "EXECUTABLES")
+    set(_LFS_WINDOWS_SYSTEM_DLL_NAMES
+        advapi32.dll bcrypt.dll cfgmgr32.dll comdlg32.dll crypt32.dll
+        combase.dll cryptbase.dll d3d12.dll dbghelp.dll dnsapi.dll dwmapi.dll
+        dxcore.dll dxgi.dll gdi32.dll imm32.dll iphlpapi.dll kernel32.dll
+        kernelbase.dll mpr.dll mswsock.dll ncrypt.dll netapi32.dll normaliz.dll
+        ntdll.dll ole32.dll oleaut32.dll powrprof.dll
+        propsys.dll rpcrt4.dll sechost.dll secur32.dll setupapi.dll shcore.dll
+        shell32.dll shlwapi.dll user32.dll userenv.dll uxtheme.dll version.dll
+        win32u.dll winhttp.dll wininet.dll winmm.dll wintrust.dll ws2_32.dll
+        wtsapi32.dll xmllite.dll)
+    set(_LFS_WINDOWS_SYSTEM_ROOT "")
+    if(WIN32)
+        if(NOT DEFINED ENV{SystemRoot} OR "$ENV{SystemRoot}" STREQUAL "")
+            message(FATAL_ERROR
+                "Portable Windows packages require the SystemRoot environment variable")
         endif()
-        install(CODE "
-            file(GET_RUNTIME_DEPENDENCIES
-                ${_type} \"${TARGET_FILE}\"
-                RESOLVED_DEPENDENCIES_VAR _deps
-                DIRECTORIES ${_SEARCH_DIRS_STR}
-                PRE_EXCLUDE_REGEXES ${_PRE_EXCLUDE}
-                POST_EXCLUDE_REGEXES ${_POST_EXCLUDE})
-            foreach(_d IN LISTS _deps)
-                file(INSTALL \"\${_d}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${_BUNDLE_DEST}\" FOLLOW_SYMLINK_CHAIN)
-            endforeach()
-        " COMPONENT runtime)
-    endfunction()
-
-    bundle_runtime_deps("$<TARGET_FILE:${PROJECT_NAME}>" FALSE)
-    if(TARGET nvjpeg_ext)
-        bundle_runtime_deps("$<TARGET_FILE:nvjpeg_ext>" TRUE)
+        file(REAL_PATH "$ENV{SystemRoot}" _LFS_WINDOWS_SYSTEM_ROOT)
+        file(TO_CMAKE_PATH "${_LFS_WINDOWS_SYSTEM_ROOT}" _LFS_WINDOWS_SYSTEM_ROOT)
+        string(TOLOWER "${_LFS_WINDOWS_SYSTEM_ROOT}" _LFS_WINDOWS_SYSTEM_ROOT)
+        string(REGEX REPLACE "/+$" "" _LFS_WINDOWS_SYSTEM_ROOT
+            "${_LFS_WINDOWS_SYSTEM_ROOT}")
     endif()
-    foreach(_lfs_ort_runtime_lib IN LISTS _lfs_ort_runtime_libs)
-        bundle_runtime_deps("${_lfs_ort_runtime_lib}" TRUE)
+
+    set(_LFS_RUNTIME_EXECUTABLES "$<TARGET_FILE:${PROJECT_NAME}>")
+    set(_LFS_RUNTIME_LIBRARIES "")
+    set(_LFS_RUNTIME_MODULES "")
+    if(TARGET lfs_py)
+        list(APPEND _LFS_RUNTIME_MODULES "$<TARGET_FILE:lfs_py>")
+    endif()
+    list(APPEND _LFS_RUNTIME_MODULES ${LFS_PYTHON_EXTENSION_MODULES})
+    if(TARGET nvjpeg_ext)
+        list(APPEND _LFS_RUNTIME_LIBRARIES "$<TARGET_FILE:nvjpeg_ext>")
+    endif()
+    if(TARGET nvjpeg2k_ext)
+        list(APPEND _LFS_RUNTIME_LIBRARIES "$<TARGET_FILE:nvjpeg2k_ext>")
+    endif()
+    list(APPEND _LFS_RUNTIME_LIBRARIES ${_lfs_ort_runtime_libs})
+
+    set(_RUNTIME_ROOT_ARGS "")
+    foreach(_runtime_root_type IN ITEMS EXECUTABLES LIBRARIES MODULES)
+        set(_runtime_root_list "_LFS_RUNTIME_${_runtime_root_type}")
+        if(${_runtime_root_list})
+            string(APPEND _RUNTIME_ROOT_ARGS "\n                ${_runtime_root_type}")
+            foreach(_runtime_root IN LISTS ${_runtime_root_list})
+                string(APPEND _RUNTIME_ROOT_ARGS " \"${_runtime_root}\"")
+            endforeach()
+        endif()
     endforeach()
+
+    install(CODE "
+        file(GET_RUNTIME_DEPENDENCIES
+            ${_RUNTIME_ROOT_ARGS}
+            RESOLVED_DEPENDENCIES_VAR _deps
+            UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
+            CONFLICTING_DEPENDENCIES_PREFIX _dependency_conflicts
+            DIRECTORIES ${_SEARCH_DIRS_STR}
+            PRE_EXCLUDE_REGEXES ${_PRE_EXCLUDE}
+            POST_EXCLUDE_REGEXES ${_POST_EXCLUDE})
+        if(_unresolved_deps)
+            list(JOIN _unresolved_deps \", \" _unresolved_text)
+            message(FATAL_ERROR
+                \"Unresolved portable package dependencies: \${_unresolved_text}\")
+        endif()
+        foreach(_conflict_name IN LISTS _dependency_conflicts_FILENAMES)
+            set(_conflict_var \"_dependency_conflicts_\${_conflict_name}\")
+            set(_conflict_paths \"\${\${_conflict_var}}\")
+            set(_conflict_hash \"\")
+            foreach(_conflict_path IN LISTS _conflict_paths)
+                file(SHA256 \"\${_conflict_path}\" _candidate_hash)
+                if(NOT _conflict_hash)
+                    set(_conflict_hash \"\${_candidate_hash}\")
+                elseif(NOT _candidate_hash STREQUAL _conflict_hash)
+                    list(JOIN _conflict_paths \", \" _conflict_text)
+                    message(FATAL_ERROR
+                        \"Conflicting runtime dependency '\${_conflict_name}' has different binaries: \${_conflict_text}\")
+                endif()
+            endforeach()
+            list(GET _conflict_paths 0 _resolved_conflict_path)
+            list(APPEND _deps \"\${_resolved_conflict_path}\")
+        endforeach()
+        list(REMOVE_DUPLICATES _deps)
+        set(_windows_system_dll_names ${_LFS_WINDOWS_SYSTEM_DLL_NAMES})
+        set(_windows_system_root \"${_LFS_WINDOWS_SYSTEM_ROOT}\")
+        foreach(_d IN LISTS _deps)
+            file(REAL_PATH \"\${_d}\" _d_real)
+            file(TO_CMAKE_PATH \"\${_d_real}\" _d_normalized)
+            string(TOLOWER \"\${_d_normalized}\" _d_normalized_lower)
+            get_filename_component(_d_name \"\${_d_normalized}\" NAME)
+            string(TOLOWER \"\${_d_name}\" _d_name_lower)
+            list(FIND _windows_system_dll_names \"\${_d_name_lower}\" _system_dll_index)
+            string(FIND \"\${_d_normalized_lower}/\" \"\${_windows_system_root}/\" _system_root_prefix)
+            if((_windows_system_root AND _system_root_prefix EQUAL 0)
+               OR _d_normalized_lower MATCHES \"^[a-z]:/windows/\"
+               OR _system_dll_index GREATER -1
+               OR _d_name_lower MATCHES \"^(api-ms-|ext-ms-)\")
+                continue()
+            endif()
+            if(_d_name_lower MATCHES \"^(gtest|gmock|benchmark|catch2).*[.]dll$\")
+                message(FATAL_ERROR
+                    \"Test-only runtime dependency reached the portable package: \${_d_normalized}\")
+            endif()
+            file(INSTALL \"\${_d_real}\"
+                DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${_BUNDLE_DEST}\"
+                FOLLOW_SYMLINK_CHAIN)
+        endforeach()
+    " COMPONENT runtime)
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         configure_file(
@@ -1804,36 +1911,6 @@ if(BUILD_PORTABLE)
                 @ONLY)
         install(PROGRAMS "${CMAKE_BINARY_DIR}/run_lichtfeld.sh" DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
-endif()
-
-if(WIN32)
-    install(CODE "
-        foreach(_cfg IN ITEMS \"\" \"Release\" \"Debug\" \"RelWithDebInfo\" \"MinSizeRel\")
-            if(_cfg)
-                set(_ext_dir \"${CMAKE_BINARY_DIR}/\${_cfg}/extensions\")
-            else()
-                set(_ext_dir \"${CMAKE_BINARY_DIR}/extensions\")
-            endif()
-            if(EXISTS \"\${_ext_dir}\")
-                file(GLOB _ext_dlls \"\${_ext_dir}/*.dll\")
-                foreach(_extension IN LISTS _ext_dlls)
-                    file(INSTALL \"\${_extension}\"
-                        DESTINATION \"\${CMAKE_INSTALL_PREFIX}/extensions\")
-                endforeach()
-                break()
-            endif()
-        endforeach()
-    " COMPONENT runtime)
-    install(CODE "
-        if(EXISTS \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin\")
-            file(GLOB _vcpkg_runtime_dlls
-                \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll\")
-            foreach(_vcpkg_runtime_dll IN LISTS _vcpkg_runtime_dlls)
-                file(INSTALL \"\${_vcpkg_runtime_dll}\"
-                    DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
-            endforeach()
-        endif()
-        " COMPONENT runtime)
 endif()
 
 # Build statistics (parses .ninja_log, no Python required)
@@ -1871,6 +1948,7 @@ elseif(SCCACHE_PROGRAM)
 endif()
 
 # Package the selected CUDA or HIP Studio backend.
+if(BUILD_PORTABLE)
     string(TOLOWER "${LFS_GPU_BACKEND}" _lfs_package_backend)
     if(WIN32)
         set(_lfs_package_platform "windows-x64")
@@ -1903,3 +1981,4 @@ endif()
     set(CPACK_PACKAGE_CHECKSUM SHA256)
     set(CPACK_MONOLITHIC_INSTALL ON)
     include(CPack)
+endif()
