@@ -65,6 +65,9 @@ namespace lfs::rendering {
     // error message on mismatch / missing setup. Result is cached.
     [[nodiscard]] std::optional<std::string> verifyCudaMatchesVulkanDevice();
 
+    // Image/surface interop is unavailable on HIP devices such as gfx942 and gfx950.
+    [[nodiscard]] bool cudaVulkanImageInteropSupported();
+
     namespace detail {
         enum class CudaVulkanTensorLayout : std::uint8_t {
             Hwc,

@@ -4621,6 +4621,11 @@ namespace lfs::vis::gui {
         if (vulkan_scene_interop_disabled_) {
             return;
         }
+        if (!lfs::rendering::cudaVulkanImageInteropSupported()) {
+            vulkan_scene_interop_disabled_ = true;
+            resetVulkanSceneInterop();
+            return;
+        }
         if (vulkan_external_scene_image_direct_) {
             return;
         }
@@ -4815,6 +4820,11 @@ namespace lfs::vis::gui {
         if (vulkan_split_right_interop_disabled_) {
             return;
         }
+        if (!lfs::rendering::cudaVulkanImageInteropSupported()) {
+            vulkan_split_right_interop_disabled_ = true;
+            resetVulkanSplitRightInterop();
+            return;
+        }
 
         const auto fail_required_interop = [this](std::string message) -> void {
             vulkan_split_right_interop_disabled_ = true;
@@ -4990,6 +5000,11 @@ namespace lfs::vis::gui {
 
     void GuiManager::prepareVulkanDepthBlitInterop(VulkanContext& context) {
         if (vulkan_depth_blit_interop_disabled_) {
+            return;
+        }
+        if (!lfs::rendering::cudaVulkanImageInteropSupported()) {
+            vulkan_depth_blit_interop_disabled_ = true;
+            resetVulkanDepthBlitInterop();
             return;
         }
 

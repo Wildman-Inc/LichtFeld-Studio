@@ -6,6 +6,24 @@
 
 namespace lfs::rendering::detail {
     namespace {
+        [[nodiscard]] cudaError_t requireImageSupport() {
+#if defined(USE_HIP) && USE_HIP
+            int device = 0;
+            cudaError_t status = cudaGetDevice(&device);
+            if (status != cudaSuccess) {
+                return status;
+            }
+            int image_supported = 0;
+            status = hipDeviceGetAttribute(&image_supported, hipDeviceAttributeImageSupport, device);
+            if (status != cudaSuccess) {
+                return status;
+            }
+            return image_supported != 0 ? cudaSuccess : hipErrorNotSupported;
+#else
+            return cudaSuccess;
+#endif
+        }
+
         __device__ __forceinline__ unsigned char toByte(const float value) {
             const float clamped = fminf(fmaxf(value, 0.0f), 1.0f);
             return static_cast<unsigned char>(clamped * 255.0f + 0.5f);
@@ -78,7 +96,13 @@ namespace lfs::rendering::detail {
             }
 
             const std::uint32_t out_y = flip_y ? (height - 1u - y) : y;
+#if defined(__HIP_NO_IMAGE_SUPPORT) && __HIP_NO_IMAGE_SUPPORT
+            (void)rgba;
+            (void)surface;
+            (void)out_y;
+#else
             surf2Dwrite(rgba, surface, static_cast<int>(x * sizeof(uchar4)), static_cast<int>(out_y));
+#endif
         }
 
         __global__ void copyTensorToSurfaceR32fKernel(
@@ -99,7 +123,13 @@ namespace lfs::rendering::detail {
                                     ? source[(static_cast<std::size_t>(y) * width + x) * channels]
                                     : source[(static_cast<std::size_t>(y) * width + x)];
             const std::uint32_t out_y = flip_y ? (height - 1u - y) : y;
+#if defined(__HIP_NO_IMAGE_SUPPORT) && __HIP_NO_IMAGE_SUPPORT
+            (void)value;
+            (void)surface;
+            (void)out_y;
+#else
             surf2Dwrite(value, surface, static_cast<int>(x * sizeof(float)), static_cast<int>(out_y));
+#endif
         }
 
     } // namespace
@@ -116,6 +146,10 @@ namespace lfs::rendering::detail {
         const cudaStream_t stream) {
         if (surface == cudaSurfaceObject_t{} || source == nullptr || width == 0 || height == 0) {
             return cudaErrorInvalidValue;
+        }
+        const cudaError_t support_status = requireImageSupport();
+        if (support_status != cudaSuccess) {
+            return support_status;
         }
 
         const dim3 block{16, 16, 1};
@@ -147,6 +181,10 @@ namespace lfs::rendering::detail {
         const cudaStream_t stream) {
         if (surface == cudaSurfaceObject_t{} || source == nullptr || width == 0 || height == 0) {
             return cudaErrorInvalidValue;
+        }
+        const cudaError_t support_status = requireImageSupport();
+        if (support_status != cudaSuccess) {
+            return support_status;
         }
         const dim3 block{16, 16, 1};
         const dim3 grid{

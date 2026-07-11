@@ -108,6 +108,29 @@ def test_vksplat_initialization_failure_rolls_back_only_pending_resources():
     assert commit_pos < initialized_pos < committed_pos
 
 
+def test_cdna_image_interop_falls_back_before_importing_external_images():
+    interop_header = _read("src/rendering/cuda_vulkan_interop.hpp")
+    interop_host = _read("src/rendering/cuda_vulkan_interop.cpp")
+    interop_device = _read("src/rendering/cuda_vulkan_interop.cu")
+    gui = _read("src/visualizer/gui/gui_manager.cpp")
+    ui_texture = _read("src/visualizer/gui/vulkan_ui_texture.cpp")
+
+    assert "cudaVulkanImageInteropSupported" in interop_header
+    assert "hipDeviceAttributeImageSupport" in interop_host
+    assert "__HIP_NO_IMAGE_SUPPORT" in interop_device
+    assert "hipErrorNotSupported" in interop_device
+
+    init_start = interop_host.index("bool CudaVulkanInterop::initImpl")
+    init_end = interop_host.index("void CudaVulkanInterop::reset()", init_start)
+    init_body = interop_host[init_start:init_end]
+    owner_pos = init_body.index("NativeHandleOwner memory_handle")
+    capability_pos = init_body.index("cudaVulkanImageInteropSupported()")
+    assert owner_pos < capability_pos
+
+    assert gui.count("if (!lfs::rendering::cudaVulkanImageInteropSupported())") == 3
+    assert "if (!lfs::rendering::cudaVulkanImageInteropSupported())" in ui_texture
+
+
 def test_appearance_optimizer_writes_are_bracketed_by_reader_handshake():
     source = _read("src/training/trainer.cpp")
     section_start = source.index("if (in_controller_phase)")

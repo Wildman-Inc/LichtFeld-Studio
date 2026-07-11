@@ -343,6 +343,27 @@ namespace lfs::rendering {
             const cudaStream_t stream);
     } // namespace detail
 
+    bool cudaVulkanImageInteropSupported() {
+#if defined(USE_HIP) && USE_HIP
+        static const bool supported = [] {
+            int device = 0;
+            if (cudaGetDevice(&device) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return false;
+            }
+            int image_supported = 0;
+            if (hipDeviceGetAttribute(&image_supported, hipDeviceAttributeImageSupport, device) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return false;
+            }
+            return image_supported != 0;
+        }();
+        return supported;
+#else
+        return true;
+#endif
+    }
+
     CudaVulkanInterop::CudaVulkanInterop(CudaVulkanExternalImageImport image,
                                          CudaVulkanExternalSemaphoreImport semaphore) {
         if (!init(std::move(image), std::move(semaphore))) {
@@ -416,6 +437,10 @@ namespace lfs::rendering {
         NativeHandleOwner memory_handle(image.memory_handle);
         NativeHandleOwner semaphore_handle(
             semaphore ? semaphore->semaphore_handle : kInvalidCudaVulkanExternalHandle);
+
+        if (!cudaVulkanImageInteropSupported()) {
+            return fail("HIP device does not support image/surface operations required for Vulkan image interop");
+        }
 
         cudaError_t status = cudaSuccess;
         if (semaphore) {

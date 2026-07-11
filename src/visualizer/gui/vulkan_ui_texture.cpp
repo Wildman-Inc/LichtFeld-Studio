@@ -512,6 +512,10 @@ namespace lfs::vis::gui {
                 !context->externalSemaphoreInteropEnabled()) {
                 return false;
             }
+            if (!lfs::rendering::cudaVulkanImageInteropSupported()) {
+                interop_disabled = true;
+                return false;
+            }
             if (mode == Mode::Cpu) {
                 LOG_ERROR("Vulkan UI texture used CUDA-interop after CPU mode was engaged");
                 return false;
