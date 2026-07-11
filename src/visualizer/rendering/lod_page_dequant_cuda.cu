@@ -2,7 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-// Compiled with --fmad=false: the CPU decoders round every multiply and add
+// Compiled with FMA contraction disabled: the CPU decoders round every multiply and add
 // separately, and contraction here would break bit-parity for the pure
 // arithmetic encodings (r8, s8, meta dequant frames).
 

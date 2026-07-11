@@ -7,7 +7,7 @@
 // must agree bit-exactly for pure-arithmetic paths (f16, r8, s8); paths
 // through libm (exp/log/trig) agree within a few ULP and are covered by
 // tolerance in the parity tests. The kernel translation unit is compiled
-// with --fmad=false so a*b+c sequences round identically to the host.
+// with FMA contraction disabled so a*b+c sequences round identically to the host.
 
 #pragma once
 
@@ -16,6 +16,7 @@
 #include <cstring>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
+#include <cuda_runtime.h>
 #define LFS_RAD_HD __host__ __device__ inline
 #else
 #define LFS_RAD_HD inline

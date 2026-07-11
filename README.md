@@ -98,7 +98,7 @@ Current project notes:
 - Windows is the primary prebuilt distribution target today
 - Upstream Studio builds target NVIDIA GPUs with CUDA 12.8+
 - LichtFeld Studio for ROCm (`STUDIO+HIP`) was validated on Radeon 8060S (`gfx1151`) with HIP `7.14.60850`
-- Linux ROCm source builds accept native and explicit CDNA targets. CI compiles the shared wave-reduction contract for `gfx90a`, `gfx942`, and `gfx950`; complete application runtime and training still require validation on physical Linux CDNA systems
+- Linux ROCm source builds accept native and explicit CDNA targets. CI builds CMake HIP-language wave-reduction, VkSplat input, and bit-exact LOD/RAD targets for `gfx90a`, `gfx942`, and `gfx950` through the same architecture and target helpers used by the application; complete application runtime and training still require validation on physical Linux CDNA systems
 - LichtFeld Arc Viewer (Experimental) (`VIEWER+NONE`) is a standalone Vulkan PLY viewer; only the AMD Vulkan fallback has been validated, and physical Intel Arc hardware validation is still pending
 
 ## Docs

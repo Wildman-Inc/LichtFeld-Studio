@@ -145,6 +145,12 @@ macro(lfs_hip_add_library target_name lib_type)
         endforeach()
         if(_hip_language_sources)
             set_source_files_properties(${_hip_language_sources} PROPERTIES LANGUAGE HIP)
+            foreach(_hip_source IN LISTS _hip_language_sources)
+                if(_hip_source MATCHES "(lod_page_dequant_cuda|rad_encode_quant)\\.cu$")
+                    set_property(SOURCE "${_hip_source}" APPEND PROPERTY
+                        COMPILE_OPTIONS "-ffp-contract=off")
+                endif()
+            endforeach()
         endif()
 
         set_target_properties(${target_name} PROPERTIES

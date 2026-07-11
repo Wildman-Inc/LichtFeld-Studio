@@ -1,8 +1,7 @@
-name: Linux ROCm CDNA Compile
+name: Linux ROCm CDNA CMake Compile
 
 on:
   push:
-    branches: [master]
     paths:
       - '.github/workflows/linux-rocm-cdna.yml'
       - 'CMakeLists.txt'
@@ -11,7 +10,14 @@ on:
       - 'src/core/cuda/**'
       - 'src/core/include/core/cuda/**'
       - 'src/core/tensor/**'
+      - 'src/io/CMakeLists.txt'
+      - 'src/io/cuda/rad_encode_quant.*'
+      - 'src/io/formats/**'
       - 'src/training/**'
+      - 'src/visualizer/CMakeLists.txt'
+      - 'src/visualizer/rendering/lod_page_dequant_cuda.*'
+      - 'src/visualizer/rendering/lod_pool_quant.hpp'
+      - 'src/visualizer/rendering/vksplat_input_packer_cuda.*'
       - 'tests/hip/**'
   pull_request:
     branches: [master]
@@ -23,7 +29,14 @@ on:
       - 'src/core/cuda/**'
       - 'src/core/include/core/cuda/**'
       - 'src/core/tensor/**'
+      - 'src/io/CMakeLists.txt'
+      - 'src/io/cuda/rad_encode_quant.*'
+      - 'src/io/formats/**'
       - 'src/training/**'
+      - 'src/visualizer/CMakeLists.txt'
+      - 'src/visualizer/rendering/lod_page_dequant_cuda.*'
+      - 'src/visualizer/rendering/lod_pool_quant.hpp'
+      - 'src/visualizer/rendering/vksplat_input_packer_cuda.*'
       - 'tests/hip/**'
   workflow_dispatch:
 
@@ -49,33 +62,48 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build
+          cmake --version
+          ninja --version
           /opt/rocm/bin/hipconfig --full
           /opt/rocm/bin/hipcc --version
 
-      - name: Compile core and training wave reductions
+      - name: Configure CMake HIP compile contract
         shell: bash
         run: |
           set -euo pipefail
           output_dir="${RUNNER_TEMP}/lichtfeld-cdna-${{ matrix.amdgpu_arch }}"
-          mkdir -p "${output_dir}"
-          common=(
-            -std=c++20
-            --offload-arch=${{ matrix.amdgpu_arch }}
-            -DLFS_USE_HIP=1
-            -DUSE_HIP=1
-            -DUSE_ROCM=1
-            -D__HIP_PLATFORM_AMD__
-            -Iinclude/cuda_shim
-            -Isrc/core/include
-          )
+          cmake -S tests/hip/cmake -B "${output_dir}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DLFS_SOURCE_DIR="${GITHUB_WORKSPACE}" \
+            -DLFS_AMDGPU_ARCH=${{ matrix.amdgpu_arch }}
 
-          /opt/rocm/bin/hipcc "${common[@]}" \
-            -Isrc/core/tensor \
-            -c tests/hip/cdna_wave_smoke.hip.cpp \
-            -o "${output_dir}/core-wave.o"
+          grep -F 'LFS_AMDGPU_ARCH:STRING=${{ matrix.amdgpu_arch }}' \
+            "${output_dir}/CMakeCache.txt"
+          grep -F 'CMAKE_HIP_ARCHITECTURES:STRING=${{ matrix.amdgpu_arch }}' \
+            "${output_dir}/CMakeCache.txt"
 
-          /opt/rocm/bin/hipcc "${common[@]}" \
-            -DLFS_TEST_TRAINING_WARP_REDUCE=1 \
-            -Isrc/training/include \
-            -c tests/hip/cdna_wave_smoke.hip.cpp \
-            -o "${output_dir}/training-wave.o"
+      - name: Build core, training, VkSplat, and bit-exact HIP sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir="${RUNNER_TEMP}/lichtfeld-cdna-${{ matrix.amdgpu_arch }}"
+          cmake --build "${output_dir}" --parallel 32 --verbose
+          commands="$(ninja -C "${output_dir}" -t commands)"
+          for source in \
+            cdna_wave_smoke.hip.cpp \
+            vksplat_input_packer_cuda.cu \
+            lod_page_dequant_cuda.cu \
+            rad_encode_quant.cu; do
+            printf '%s\n' "${commands}" \
+              | grep -F -- "${source}" \
+              | grep -F -- '--offload-arch=${{ matrix.amdgpu_arch }}'
+          done
+          printf '%s\n' "${commands}" \
+            | grep -F -- 'lod_page_dequant_cuda.cu' \
+            | grep -F -- '-ffp-contract=off'
+          printf '%s\n' "${commands}" \
+            | grep -F -- 'rad_encode_quant.cu' \
+            | grep -F -- '-ffp-contract=off'

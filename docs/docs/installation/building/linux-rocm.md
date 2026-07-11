@@ -88,8 +88,8 @@ Status as of 2026-07-11:
 | --- | --- |
 | Windows Radeon runtime and training | Validated separately; see the [Windows guide](windows-rocm.md) |
 | CDNA source compatibility | CUDA-style 32-lane reductions use explicit shuffle widths so they preserve their logical warp on wave64 hardware |
-| Local compiler smoke | On WSL Ubuntu 24.04 with ROCm 7.2, the core and training warp/block reduction contracts compile for `gfx90a`, `gfx942`, and `gfx950`; representative kernels also compile for `gfx942` with HIP Clang |
-| Linux CI | The `Linux ROCm CDNA Compile` workflow uses AMD's ROCm development container and compiles the wave-reduction smoke for `gfx90a`, `gfx942`, and `gfx950` |
+| Local compiler smoke | On WSL Ubuntu 24.04 with ROCm 7.2, CMake HIP-language targets using the shared application helpers compile the core and training warp/block reduction contracts, VkSplat input packer, and bit-exact LOD/RAD kernels for `gfx90a`, `gfx942`, and `gfx950`; representative kernels also compile for `gfx942` with HIP Clang |
+| Linux CI | The `Linux ROCm CDNA CMake Compile` workflow uses AMD's ROCm development container and builds real CMake HIP-language wave-reduction, VkSplat input, and bit-exact LOD/RAD targets through the repository's architecture and HIP target helpers for `gfx90a`, `gfx942`, and `gfx950` |
 | Full Linux application build | Not yet validated in CI or on a physical Linux host |
 | Linux CDNA runtime and training | Not yet validated on physical hardware |
 

@@ -4,7 +4,7 @@
 
 // GPU side of the RAD chunk encoders for the streaming writer. Output bytes
 // must match rad.cpp's PropertyEncoder bit for bit, which constrains the
-// arithmetic: compiled with --fmad=false and without -use_fast_math so
+// arithmetic: compiled with FMA contraction disabled and without fast math so
 // subtract/divide/multiply/round sequences round exactly like the host
 // (mirrors lod_page_dequant_cuda.cu). Only pure-arithmetic encodings live
 // here; libm-dependent planes (ln_f16 scales, oct88r8 orientation) stay on

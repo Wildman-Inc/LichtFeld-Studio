@@ -259,7 +259,7 @@ target_sources(lfs_visualizer
         rendering/point_cloud_vulkan_renderer.cpp)
 # The CPU chunk decoders round multiplies and adds separately; FMA contraction
 # in the dequant kernel would break CPU/GPU bit-parity (guarded by gtest).
-set_source_files_properties(rendering/lod_page_dequant_cuda.cu PROPERTIES
+set_property(SOURCE rendering/lod_page_dequant_cuda.cu APPEND PROPERTY
         COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 set(glslang_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/share/glslang"
     CACHE PATH "Path to vcpkg-installed glslang config" FORCE)
