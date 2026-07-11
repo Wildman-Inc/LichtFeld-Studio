@@ -5,11 +5,17 @@
 
 #if defined(USE_HIP) && USE_HIP
 
+#include <cooperative_groups.h>
+
+// HIP added the optional cooperative-groups reduction header after ROCm 7.2.
+#if __has_include(<hip/cooperative_groups/hip_reduce.h>)
+
 #include <hip/cooperative_groups/hip_reduce.h>
+
+#else
 
 namespace cooperative_groups {
 
-#if HIP_VERSION < 70000000
     template <typename T>
     struct plus {
         __device__ T operator()(const T& a, const T& b) const { return a + b; }
@@ -30,8 +36,9 @@ namespace cooperative_groups {
         }
         return group.shfl(value, 0);
     }
-#endif
 
 } // namespace cooperative_groups
+
+#endif
 
 #endif
