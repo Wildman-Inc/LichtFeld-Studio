@@ -419,6 +419,7 @@ using cudaGraphNode_t = hipGraphNode_t;
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 #define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
+#define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
 #endif
 
 #ifndef cudaDevAttrTimelineSemaphoreInteropSupported
