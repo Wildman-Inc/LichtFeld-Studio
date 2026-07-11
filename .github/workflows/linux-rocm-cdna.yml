@@ -252,16 +252,18 @@ jobs:
           build_status=${PIPESTATUS[0]}
           set -e
           if (( build_status != 0 )); then
-            error_tail="$(sed -n -E \
+            failure_tail="$(sed -n -E \
               '/^FAILED:/,/^\[[0-9]+\/[0-9]+\]/p' \
-              build-rocm-full/build.log | tail -c 18000)"
-            if [[ -z "${error_tail}" ]]; then
-              error_tail="$(tail -c 18000 build-rocm-full/build.log)"
+              build-rocm-full/build.log | tail -c 3000)"
+            if [[ -z "${failure_tail}" ]]; then
+              failure_tail="$(tail -c 3000 build-rocm-full/build.log)"
             fi
-            error_tail+=$'\n\n=== runner memory ===\n'
+            error_tail=$'=== runner memory ===\n'
             error_tail+="$(free -h)"
             error_tail+=$'\n\n=== runner disk ===\n'
             error_tail+="$(df -h)"
+            error_tail+=$'\n\n=== failed command tail ===\n'
+            error_tail+="${failure_tail}"
             error_tail="${error_tail//'%'/'%25'}"
             error_tail="${error_tail//$'\r'/'%0D'}"
             error_tail="${error_tail//$'\n'/'%0A'}"
