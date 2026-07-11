@@ -117,6 +117,7 @@ def test_cdna_image_interop_falls_back_before_importing_external_images():
 
     assert "cudaVulkanImageInteropSupported" in interop_header
     assert "hipDeviceAttributeImageSupport" in interop_host
+    assert 'dlsym(RTLD_DEFAULT, "hipExternalMemoryGetMappedMipmappedArray")' in interop_host
     assert "__HIP_NO_IMAGE_SUPPORT" in interop_device
     assert "hipErrorNotSupported" in interop_device
 
@@ -126,6 +127,8 @@ def test_cdna_image_interop_falls_back_before_importing_external_images():
     owner_pos = init_body.index("NativeHandleOwner memory_handle")
     capability_pos = init_body.index("cudaVulkanImageInteropSupported()")
     assert owner_pos < capability_pos
+    assert "status = cudaExternalMemoryGetMappedMipmappedArray" not in init_body
+    assert "mapped_mipmapped_array(&cuda_mip_" in init_body
 
     assert gui.count("if (!lfs::rendering::cudaVulkanImageInteropSupported())") == 3
     assert "if (!lfs::rendering::cudaVulkanImageInteropSupported())" in ui_texture

@@ -22,6 +22,9 @@
 #endif
 #include <windows.h>
 #else
+#if defined(USE_HIP) && USE_HIP
+#include <dlfcn.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -184,6 +187,24 @@ namespace lfs::rendering {
             cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd;
 #endif
 
+        using ExternalMemoryGetMappedMipmappedArrayFn = cudaError_t (*)(
+            cudaMipmappedArray_t*,
+            cudaExternalMemory_t,
+            const cudaExternalMemoryMipmappedArrayDesc*);
+
+        [[nodiscard]] ExternalMemoryGetMappedMipmappedArrayFn
+        externalMemoryGetMappedMipmappedArrayFunction() {
+#if defined(__linux__) && defined(USE_HIP) && USE_HIP
+            // Some Linux ROCm releases declare this API without exporting it
+            // from libamdhip64.so, so treat it as an optional runtime feature.
+            static const auto function = reinterpret_cast<ExternalMemoryGetMappedMipmappedArrayFn>(
+                ::dlsym(RTLD_DEFAULT, "hipExternalMemoryGetMappedMipmappedArray"));
+            return function;
+#else
+            return &cudaExternalMemoryGetMappedMipmappedArray;
+#endif
+        }
+
         [[nodiscard]] bool nativeHandleValid(const CudaVulkanExternalHandle handle) {
 #ifdef _WIN32
             return handle != nullptr;
@@ -345,6 +366,9 @@ namespace lfs::rendering {
 
     bool cudaVulkanImageInteropSupported() {
 #if defined(USE_HIP) && USE_HIP
+        if (externalMemoryGetMappedMipmappedArrayFunction() == nullptr) {
+            return false;
+        }
         static const bool supported = [] {
             int device = 0;
             if (cudaGetDevice(&device) != cudaSuccess) {
@@ -489,7 +513,12 @@ namespace lfs::rendering {
         array_desc.flags = cudaArraySurfaceLoadStore;
         array_desc.numLevels = 1;
 
-        status = cudaExternalMemoryGetMappedMipmappedArray(&cuda_mip_, cuda_mem_, &array_desc);
+        const auto mapped_mipmapped_array = externalMemoryGetMappedMipmappedArrayFunction();
+        if (mapped_mipmapped_array == nullptr) {
+            reset();
+            return fail("HIP runtime does not export external mipmapped-array image interop");
+        }
+        status = mapped_mipmapped_array(&cuda_mip_, cuda_mem_, &array_desc);
         if (status != cudaSuccess) {
             reset();
             return failCuda("cudaExternalMemoryGetMappedMipmappedArray", status);
