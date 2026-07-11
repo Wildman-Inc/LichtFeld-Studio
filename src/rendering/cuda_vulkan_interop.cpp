@@ -57,6 +57,13 @@ namespace lfs::rendering {
             return s;
         }
 
+        template <std::size_t N>
+        bool hasNonZeroIdentityByte(const std::array<std::uint8_t, N>& identity) {
+            return std::any_of(identity.begin(), identity.end(), [](const std::uint8_t byte) {
+                return byte != 0;
+            });
+        }
+
 #if defined(_WIN32) && defined(USE_HIP) && USE_HIP
         std::string formatLuid(const std::array<std::uint8_t, 8>& luid) {
             constexpr char kHexDigits[] = "0123456789abcdef";
@@ -118,6 +125,12 @@ namespace lfs::rendering {
             std::array<std::uint8_t, 8> hip_luid_bytes{};
             static_assert(sizeof(props.luid) == hip_luid_bytes.size());
             std::memcpy(hip_luid_bytes.data(), props.luid, hip_luid_bytes.size());
+            if (!hasNonZeroIdentityByte(g_expected_vk_luid) ||
+                !hasNonZeroIdentityByte(hip_luid_bytes)) {
+                g_device_match_error =
+                    "HIP/Vulkan LUID identity is all zero and cannot safely authorize external-memory interop";
+                return g_device_match_error;
+            }
             if (hip_luid_bytes != g_expected_vk_luid) {
                 g_device_match_error = std::format(
                     "{} device {} (LUID {}) does not match the selected Vulkan physical device (LUID {}). "
@@ -136,6 +149,13 @@ namespace lfs::rendering {
 
         std::array<std::uint8_t, 16> cuda_uuid_bytes{};
         std::memcpy(cuda_uuid_bytes.data(), props.uuid.bytes, 16);
+        if (!hasNonZeroIdentityByte(*g_expected_vk_uuid) ||
+            !hasNonZeroIdentityByte(cuda_uuid_bytes)) {
+            g_device_match_error = std::format(
+                "{}/Vulkan UUID identity is all zero and cannot safely authorize external-memory interop",
+                kComputeApiName);
+            return g_device_match_error;
+        }
         if (cuda_uuid_bytes != *g_expected_vk_uuid) {
             g_device_match_error = std::format(
                 "{} device {} (UUID {}) does not match the selected Vulkan physical device (UUID {}). "

@@ -156,8 +156,12 @@ namespace lfs::io {
         size_t ready_count() const;
         size_t in_flight_count() const;
         void clear();
+        void request_shutdown();
         void shutdown();
-        bool is_running() const { return running_.load(); }
+        bool is_running() const {
+            return running_.load(std::memory_order_acquire) &&
+                   !shutdown_requested_.load(std::memory_order_acquire);
+        }
         CacheStats get_stats() const;
         GpuMemoryStats get_gpu_memory_stats() const;
 
@@ -330,6 +334,7 @@ namespace lfs::io {
 
         PipelinedLoaderConfig config_;
         std::atomic<bool> running_{false};
+        std::atomic<bool> shutdown_requested_{false};
         std::vector<std::thread> io_threads_;
         std::thread gpu_decode_thread_;
         std::vector<std::thread> cold_process_threads_;

@@ -1,7 +1,8 @@
-# LichtFeld Studio ROCm Arc Viewer
+# LichtFeld Arc Viewer (Experimental)
 
 This package is the standalone SDL3/Vulkan PLY point viewer. It does not include
 LichtFeld Studio training, editing, Python, plugins, MCP, or export workflows.
+It is not a ROCm training target and does not provide a compute training backend.
 
 ## Run
 
@@ -19,8 +20,8 @@ supported. Scale, rotation, opacity, and higher-order SH coefficients are not
 rendered by this point-viewer target.
 
 Automatic device selection prefers a compatible Intel discrete GPU. Use
-`--gpu INDEX` to override it. Intel Arc hardware validation is still pending;
-the compatible Vulkan fallback has been tested on AMD hardware.
+`--gpu INDEX` to override it. No physical Intel Arc GPU has been validated;
+only the compatible AMD Vulkan fallback has been validated.
 
-See `docs/windows-rocm.md` for build and validation details. The project license
-is `LICENSE.txt`; dependency notices are under the `licenses` directory.
+The portable package includes `LICENSE.txt`, `THIRD_PARTY_LICENSES.md`, and the
+exact SDL3, GLM, Vulkan loader, and Vulkan headers notices under `licenses`.

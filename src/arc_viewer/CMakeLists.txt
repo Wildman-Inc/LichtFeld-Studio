@@ -171,22 +171,29 @@ install(FILES "${PROJECT_SOURCE_DIR}/LICENSE"
     DESTINATION .
     RENAME LICENSE.txt
     COMPONENT ArcViewer)
+install(FILES "${PROJECT_SOURCE_DIR}/THIRD_PARTY_LICENSES.md"
+    DESTINATION .
+    COMPONENT ArcViewer)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
     DESTINATION .
     COMPONENT ArcViewer)
-install(FILES "${PROJECT_SOURCE_DIR}/docs/docs/installation/building/windows-rocm.md"
-    DESTINATION docs
-    COMPONENT ArcViewer)
-if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
-    foreach(_LFS_ARC_DEPENDENCY sdl3 glm vulkan-loader vulkan-headers)
+set(_LFS_ARC_NOTICE_DEPENDENCIES sdl3 glm vulkan-loader vulkan-headers)
+foreach(_LFS_ARC_DEPENDENCY IN LISTS _LFS_ARC_NOTICE_DEPENDENCIES)
+    set(_LFS_ARC_NOTICE_FILE
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/${_LFS_ARC_DEPENDENCY}/copyright")
+    if(BUILD_PORTABLE AND NOT EXISTS "${_LFS_ARC_NOTICE_FILE}")
+        message(FATAL_ERROR
+            "Portable Arc Viewer packages require the ${_LFS_ARC_DEPENDENCY} notice: "
+            "${_LFS_ARC_NOTICE_FILE}")
+    endif()
+    if(EXISTS "${_LFS_ARC_NOTICE_FILE}")
         install(FILES
-            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/${_LFS_ARC_DEPENDENCY}/copyright"
+            "${_LFS_ARC_NOTICE_FILE}"
             DESTINATION licenses
             RENAME "${_LFS_ARC_DEPENDENCY}.txt"
-            COMPONENT ArcViewer
-            OPTIONAL)
-    endforeach()
-endif()
+            COMPONENT ArcViewer)
+    endif()
+endforeach()
 
 if(BUILD_TESTING)
     add_executable(lfs_arc_ply_loader_tests

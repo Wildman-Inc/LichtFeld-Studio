@@ -48,9 +48,9 @@ namespace lfs::vis {
         TrainerManager& operator=(TrainerManager&&) = default;
 
         // Setup and teardown
-        void setTrainer(std::unique_ptr<lfs::training::Trainer> trainer);
-        void setTrainerFromCheckpoint(std::unique_ptr<lfs::training::Trainer> trainer, int checkpoint_iteration);
-        void clearTrainer();
+        bool setTrainer(std::unique_ptr<lfs::training::Trainer> trainer);
+        bool setTrainerFromCheckpoint(std::unique_ptr<lfs::training::Trainer> trainer, int checkpoint_iteration);
+        bool clearTrainer();
         bool hasTrainer() const;
 
         // Link to viewer for notifications
@@ -143,8 +143,12 @@ namespace lfs::vis {
             return splat_storage_.has_value() ? &*splat_storage_ : nullptr;
         }
 
-        // Wait for training to complete (blocking)
-        void waitForCompletion();
+        // Finalize a completed training thread without waiting. Returns false while
+        // the thread is still running.
+        bool tryFinalizeCompletion();
+
+        // Wait for training to complete (blocking). Returns false on timeout.
+        bool waitForCompletion();
 
         // Get last error message
         const std::string& getLastError() const { return last_error_; }
@@ -195,9 +199,11 @@ namespace lfs::vis {
         mutable std::mutex trainer_lifetime_mutex_;
 
         // Synchronization
+        mutable std::mutex training_thread_mutex_;
         std::condition_variable completion_cv_;
         std::mutex completion_mutex_;
-        bool training_complete_ = false;
+        std::atomic<bool> has_training_thread_{false};
+        std::atomic<bool> training_thread_exited_{true};
 
         static constexpr int COMPLETION_TIMEOUT_SEC = 30;
         static constexpr int MAX_LOSS_POINTS = 200;

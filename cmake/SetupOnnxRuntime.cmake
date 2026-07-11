@@ -6,7 +6,7 @@ include_guard(GLOBAL)
 
 set(LFS_ONNXRUNTIME_VERSION "1.23.2" CACHE STRING "ONNX Runtime prebuilt SDK version")
 set(LFS_ONNXRUNTIME_ROOT "" CACHE PATH "Path to an unpacked ONNX Runtime SDK; empty downloads the pinned prebuilt SDK on supported platforms")
-option(LFS_ONNXRUNTIME_USE_PREBUILT "Use pinned prebuilt ONNX Runtime GPU SDKs on supported platforms" ON)
+option(LFS_ONNXRUNTIME_USE_PREBUILT "Use pinned prebuilt ONNX Runtime SDKs on supported platforms" ON)
 
 function(_lfs_normalize_onnxruntime_root ROOT OUT_ROOT)
     set(_root "${ROOT}")
@@ -26,13 +26,24 @@ function(_lfs_collect_onnxruntime_runtime_libs ROOT OUT_LIBS)
     if(WIN32)
         file(GLOB _runtime_libs
             "${ROOT}/lib/onnxruntime.dll"
-            "${ROOT}/lib/onnxruntime_providers_cuda.dll"
             "${ROOT}/lib/onnxruntime_providers_shared.dll")
+        if(USE_CUDA)
+            file(GLOB _cuda_runtime_libs
+                "${ROOT}/lib/onnxruntime_providers_cuda.dll")
+            list(APPEND _runtime_libs ${_cuda_runtime_libs})
+        endif()
     else()
         file(GLOB _runtime_libs
             "${ROOT}/lib/libonnxruntime.so*"
-            "${ROOT}/lib/libonnxruntime_providers_cuda.so*"
-            "${ROOT}/lib/libonnxruntime_providers_shared.so*")
+            "${ROOT}/lib/libonnxruntime_providers_shared.so*"
+            "${ROOT}/lib/libonnxruntime*.dylib"
+            "${ROOT}/lib/libonnxruntime_providers_shared*.dylib")
+        if(USE_CUDA)
+            file(GLOB _cuda_runtime_libs
+                "${ROOT}/lib/libonnxruntime_providers_cuda.so*"
+                "${ROOT}/lib/libonnxruntime_providers_cuda*.dylib")
+            list(APPEND _runtime_libs ${_cuda_runtime_libs})
+        endif()
     endif()
     list(FILTER _runtime_libs INCLUDE REGEX "\\.(dll|dylib|so(\\.[0-9]+)*)$")
     list(REMOVE_DUPLICATES _runtime_libs)
@@ -77,12 +88,20 @@ function(_lfs_register_onnxruntime_root ROOT)
 
     _lfs_collect_onnxruntime_runtime_libs("${_root}" _runtime_libs)
     if(NOT _runtime_libs)
-        message(FATAL_ERROR "ONNX Runtime SDK at '${_root}' does not contain CUDA/shared provider runtime libraries")
+        message(FATAL_ERROR "ONNX Runtime SDK at '${_root}' does not contain runtime libraries")
     endif()
+
+    set(_notice_files "")
+    foreach(_notice_name IN ITEMS LICENSE ThirdPartyNotices.txt)
+        if(EXISTS "${_root}/${_notice_name}")
+            list(APPEND _notice_files "${_root}/${_notice_name}")
+        endif()
+    endforeach()
 
     set(LFS_ONNXRUNTIME_INCLUDE_DIR "${_include_dir}" CACHE INTERNAL "ONNX Runtime include directory" FORCE)
     set(LFS_ONNXRUNTIME_TARGET "onnxruntime::onnxruntime" CACHE INTERNAL "ONNX Runtime CMake target" FORCE)
     set(LFS_ONNXRUNTIME_RUNTIME_LIBS "${_runtime_libs}" CACHE INTERNAL "ONNX Runtime runtime libraries to copy/bundle" FORCE)
+    set(LFS_ONNXRUNTIME_NOTICE_FILES "${_notice_files}" CACHE INTERNAL "ONNX Runtime license and third-party notices" FORCE)
 
     message(STATUS "ONNX Runtime: prebuilt SDK ${_root}")
 endfunction()
@@ -108,17 +127,40 @@ function(_lfs_setup_onnxruntime_from_package)
     endif()
 
     set(_runtime_libs "")
+    set(_runtime_target "${_target}")
+    get_target_property(_aliased_runtime_target "${_target}" ALIASED_TARGET)
+    if(_aliased_runtime_target)
+        set(_runtime_target "${_aliased_runtime_target}")
+    endif()
+    get_target_property(_runtime_location "${_runtime_target}" IMPORTED_LOCATION)
+    if(_runtime_location AND EXISTS "${_runtime_location}")
+        list(APPEND _runtime_libs "${_runtime_location}")
+    endif()
+    get_target_property(_runtime_configurations
+        "${_runtime_target}" IMPORTED_CONFIGURATIONS)
+    if(_runtime_configurations)
+        foreach(_runtime_configuration IN LISTS _runtime_configurations)
+            string(TOUPPER "${_runtime_configuration}" _runtime_configuration_upper)
+            get_target_property(_configuration_location "${_runtime_target}"
+                "IMPORTED_LOCATION_${_runtime_configuration_upper}")
+            if(_configuration_location AND EXISTS "${_configuration_location}")
+                list(APPEND _runtime_libs "${_configuration_location}")
+            endif()
+        endforeach()
+    endif()
     if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
-        file(GLOB _runtime_libs
+        file(GLOB _vcpkg_runtime_libs
             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/*onnxruntime*"
             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/*onnxruntime*")
-        list(FILTER _runtime_libs INCLUDE REGEX "\\.(dll|dylib|so(\\.[0-9]+)*)$")
-        list(REMOVE_DUPLICATES _runtime_libs)
+        list(APPEND _runtime_libs ${_vcpkg_runtime_libs})
     endif()
+    list(FILTER _runtime_libs INCLUDE REGEX "\\.(dll|dylib|so(\\.[0-9]+)*)$")
+    list(REMOVE_DUPLICATES _runtime_libs)
 
     set(LFS_ONNXRUNTIME_INCLUDE_DIR "${_include_dir}" CACHE INTERNAL "ONNX Runtime include directory" FORCE)
     set(LFS_ONNXRUNTIME_TARGET "${_target}" CACHE INTERNAL "ONNX Runtime CMake target" FORCE)
     set(LFS_ONNXRUNTIME_RUNTIME_LIBS "${_runtime_libs}" CACHE INTERNAL "ONNX Runtime runtime libraries to copy/bundle" FORCE)
+    set(LFS_ONNXRUNTIME_NOTICE_FILES "" CACHE INTERNAL "ONNX Runtime license and third-party notices" FORCE)
 endfunction()
 
 function(lfs_setup_onnxruntime)
@@ -134,12 +176,28 @@ function(lfs_setup_onnxruntime)
     endif()
 
     if(LFS_ONNXRUNTIME_USE_PREBUILT AND _is_x64)
+        if(USE_CUDA)
+            set(_package_suffix "-gpu")
+            set(_provider "CUDA")
+        else()
+            set(_package_suffix "")
+            set(_provider "CPU")
+        endif()
+
         if(WIN32)
-            set(_asset "onnxruntime-win-x64-gpu-${LFS_ONNXRUNTIME_VERSION}.zip")
-            set(_sha256 "e77afdbbc2b8cb6da4e5a50d89841b48c44f3e47dce4fb87b15a2743786d0bb9")
+            set(_asset "onnxruntime-win-x64${_package_suffix}-${LFS_ONNXRUNTIME_VERSION}.zip")
+            if(USE_CUDA)
+                set(_sha256 "e77afdbbc2b8cb6da4e5a50d89841b48c44f3e47dce4fb87b15a2743786d0bb9")
+            else()
+                set(_sha256 "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd")
+            endif()
         elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            set(_asset "onnxruntime-linux-x64-gpu-${LFS_ONNXRUNTIME_VERSION}.tgz")
-            set(_sha256 "2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53")
+            set(_asset "onnxruntime-linux-x64${_package_suffix}-${LFS_ONNXRUNTIME_VERSION}.tgz")
+            if(USE_CUDA)
+                set(_sha256 "2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53")
+            else()
+                set(_sha256 "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b")
+            endif()
         endif()
 
         if(DEFINED _asset)
@@ -150,6 +208,7 @@ function(lfs_setup_onnxruntime)
                 DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
             FetchContent_MakeAvailable(lfs_onnxruntime_prebuilt)
             _lfs_register_onnxruntime_root("${lfs_onnxruntime_prebuilt_SOURCE_DIR}")
+            set(LFS_ONNXRUNTIME_PROVIDER "${_provider}" CACHE INTERNAL "ONNX Runtime execution provider bundled by the prebuilt SDK" FORCE)
             return()
         endif()
     endif()

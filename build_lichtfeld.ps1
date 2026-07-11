@@ -1,6 +1,6 @@
 # LichtFeld-Studio One-Shot Build Script for Windows
 # This script verifies prerequisites, sets up dependencies, and builds the project
-# Usage: .\build_lichtfeld.ps1 [-ProductMode STUDIO|VIEWER] [-Configuration Debug|Release] [-Clean] [-Help]
+# Usage: .\build_lichtfeld.ps1 [-ProductMode STUDIO|VIEWER] [-GpuBackend CUDA|HIP|NONE] [-Configuration Debug|Release] [-Package] [-Clean] [-Help]
 
 [CmdletBinding()]
 param(
@@ -16,9 +16,12 @@ param(
 
     [string]$RocmPath = '',
 
+    [string]$AmdgpuArch = 'gfx1151',
+
     [switch]$SkipVerification,
     [switch]$SkipVcpkg,
     [switch]$SkipLibTorch,
+    [switch]$Package,
     [switch]$Clean,
     [switch]$Help
 )
@@ -35,15 +38,18 @@ This script automatically:
   3. Downloads CUDA LibTorch (Debug & Release) for Studio CUDA builds
   4. Initializes git submodules for Studio builds
   5. Configures and builds LichtFeld Studio or the standalone Arc Viewer
+  6. Optionally creates a portable ZIP package and SHA-256 checksum
 
 Options:
   -Configuration <Debug|Release>  Build configuration (default: Release)
   -ProductMode <STUDIO|VIEWER>     Product to build (default: STUDIO)
   -GpuBackend <CUDA|HIP|NONE>      GPU backend (default: CUDA for STUDIO, NONE for VIEWER)
   -RocmPath <path>                 ROCm/HIP SDK root for HIP builds
+  -AmdgpuArch <arch[;arch...]>     AMDGPU target(s), for example gfx1151 or gfx90a;gfx942
   -SkipVerification               Skip environment verification
   -SkipVcpkg                      Skip vcpkg setup
   -SkipLibTorch                   Skip CUDA LibTorch download
+  -Package                        Create a portable ZIP package (Release only)
   -Clean                          Clean build directory before building
   -Help                           Show this help message
 
@@ -51,13 +57,16 @@ Examples:
   .\build_lichtfeld.ps1                            Build Release (default)
   .\build_lichtfeld.ps1 -Configuration Debug       Build Debug
   .\build_lichtfeld.ps1 -GpuBackend HIP            Build with ROCm/HIP
+  .\build_lichtfeld.ps1 -GpuBackend HIP -AmdgpuArch gfx942
   .\build_lichtfeld.ps1 -ProductMode VIEWER         Build the Arc Viewer with Ninja
   .\build_lichtfeld.ps1 -ProductMode VIEWER -GpuBackend NONE -Clean
+  .\build_lichtfeld.ps1 -Package                   Build and package Release
   .\build_lichtfeld.ps1 -Clean                     Clean and rebuild
   .\build_lichtfeld.ps1 -SkipLibTorch              Skip LibTorch download (if already present)
 
 Notes:
   - VIEWER uses GpuBackend NONE; NONE is not valid for STUDIO.
+  - Package builds require Configuration Release and enable BUILD_PORTABLE.
   - Windows Long Path Support: If you encounter path-too-long errors, enable long paths:
     Run as Administrator: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
     Then restart your system.
@@ -78,6 +87,13 @@ if ($ProductMode -eq 'VIEWER' -and $GpuBackend -ne 'NONE') {
 if ($ProductMode -eq 'STUDIO' -and $GpuBackend -eq 'NONE') {
     Write-Host "ERROR: GpuBackend NONE is only valid with ProductMode VIEWER." -ForegroundColor Red
     exit 1
+}
+if ($Package -and $Configuration -ne 'Release') {
+    Write-Host "ERROR: -Package requires -Configuration Release." -ForegroundColor Red
+    exit 1
+}
+if ($Package) {
+    $Configuration = 'Release'
 }
 
 $ErrorActionPreference = 'Stop'
@@ -144,6 +160,179 @@ function Find-ROCmRoot {
     return $null
 }
 
+function Get-CMakeCacheValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $Match = [regex]::Match(
+        $Content,
+        "(?m)^$([regex]::Escape($Name))(?::[^=]+)?=(.+?)\r?$")
+    if ($Match.Success) {
+        return $Match.Groups[1].Value.Trim()
+    }
+    return $null
+}
+
+function Test-EquivalentPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Left,
+        [Parameter(Mandatory = $true)][string]$Right
+    )
+
+    try {
+        $NormalizedLeft = [System.IO.Path]::GetFullPath($Left).TrimEnd('\', '/')
+        $NormalizedRight = [System.IO.Path]::GetFullPath($Right).TrimEnd('\', '/')
+        return $NormalizedLeft.Equals(
+            $NormalizedRight,
+            [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function Remove-PackageOutputs {
+    param([Parameter(Mandatory = $true)][string[]]$Paths)
+
+    foreach ($Path in $Paths) {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Force
+        }
+        if (Test-Path -LiteralPath $Path) {
+            throw "Could not remove the previous package output: $Path"
+        }
+    }
+}
+
+function Get-PackageRuntimeManifestEntries {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Required runtime manifest was not generated: $ManifestPath"
+    }
+
+    $Entries = @(Get-Content -LiteralPath $ManifestPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne '' })
+    if ($Entries.Count -eq 0) {
+        throw "Runtime manifest is empty: $ManifestPath"
+    }
+
+    $UniqueEntries = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($Entry in $Entries) {
+        if ([System.IO.Path]::GetFileName($Entry) -ne $Entry -or
+            $Entry.IndexOfAny([char[]]'\\/') -ge 0 -or
+            -not $UniqueEntries.Add($Entry)) {
+            throw "Runtime manifest contains an invalid or duplicate file name '$Entry': $ManifestPath"
+        }
+    }
+    return $Entries
+}
+
+function Assert-ZipEntry {
+    param(
+        [Parameter(Mandatory = $true)]$Entries,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    if (-not $Entries.Contains($Path)) {
+        throw "Package ZIP is missing $Description at '$Path'."
+    }
+}
+
+function Assert-ZipNoticeDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$EntryNames,
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $Prefix = "$Directory/"
+    if (-not ($EntryNames | Where-Object { $_.StartsWith($Prefix, [System.StringComparison]::OrdinalIgnoreCase) } |
+            Select-Object -First 1)) {
+        throw "Package ZIP is missing $Description under '$Directory'."
+    }
+}
+
+function Test-PackageArchiveContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][bool]$IsViewerPackage,
+        [Parameter(Mandatory = $true)][string]$Backend,
+        [string]$RuntimeManifestPath = ''
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $EntryNames = @($Archive.Entries |
+            Where-Object { -not $_.FullName.EndsWith('/') } |
+            ForEach-Object { $_.FullName.Replace('\\', '/') })
+        $Entries = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($EntryName in $EntryNames) {
+            if (-not $Entries.Add($EntryName)) {
+                throw "Package ZIP contains a duplicate entry: $EntryName"
+            }
+        }
+
+        if ($IsViewerPackage) {
+            Assert-ZipEntry $Entries 'LichtFeld-Studio-Arc-Viewer.exe' 'Arc Viewer executable'
+            Assert-ZipEntry $Entries 'LICENSE.txt' 'Arc Viewer license'
+            Assert-ZipEntry $Entries 'THIRD_PARTY_LICENSES.md' 'Arc Viewer third-party license notice'
+            Assert-ZipEntry $Entries 'README.md' 'Arc Viewer README'
+            foreach ($Notice in @('sdl3.txt', 'glm.txt', 'vulkan-loader.txt', 'vulkan-headers.txt')) {
+                Assert-ZipEntry $Entries "licenses/$Notice" 'Arc Viewer dependency notice'
+            }
+            return
+        }
+
+        Assert-ZipEntry $Entries 'bin/LichtFeld-Studio.exe' 'Studio executable'
+        Assert-ZipEntry $Entries 'LICENSE' 'Studio license'
+        Assert-ZipEntry $Entries 'licenses/THIRD_PARTY_LICENSES.md' 'Studio third-party license notice'
+
+        if ($Backend -eq 'HIP') {
+            Assert-ZipNoticeDirectory $EntryNames 'licenses/ROCm/runtime' 'a ROCm redistribution notice'
+        }
+
+        if ($RuntimeManifestPath) {
+            foreach ($RuntimeEntry in Get-PackageRuntimeManifestEntries $RuntimeManifestPath) {
+                Assert-ZipEntry $Entries "bin/$RuntimeEntry" "required $Backend runtime '$RuntimeEntry'"
+            }
+        }
+    } finally {
+        $Archive.Dispose()
+    }
+}
+
+function Test-PackageChecksum {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$ChecksumPath
+    )
+
+    $ChecksumLine = Get-Content -LiteralPath $ChecksumPath |
+        Where-Object { $_.Trim() -ne '' } |
+        Select-Object -First 1
+    $ChecksumMatch = [regex]::Match(
+        $ChecksumLine,
+        '^\s*([0-9A-Fa-f]{64})\s+(?:\*?)(.+?)\s*$')
+    if (-not $ChecksumMatch.Success) {
+        throw "SHA-256 sidecar is not in a supported checksum format: $ChecksumPath"
+    }
+    if ($ChecksumMatch.Groups[2].Value.Trim() -ne [System.IO.Path]::GetFileName($ArchivePath)) {
+        throw "SHA-256 sidecar names a different archive: $ChecksumPath"
+    }
+    $ActualHash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash
+    if (-not $ActualHash.Equals($ChecksumMatch.Groups[1].Value,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "SHA-256 sidecar does not match the generated archive: $ChecksumPath"
+    }
+}
+
 function Write-Status {
     param(
         [string]$Name,
@@ -197,7 +386,9 @@ function Write-Warning-Status {
 # ============================================================================
 
 function Test-VSDevEnvironment {
-    return ($env:VSINSTALLDIR -or $env:VisualStudioVersion)
+    return (($env:VSINSTALLDIR -or $env:VisualStudioVersion) -and
+        $env:VisualStudioVersion -like '17.*' -and
+        (Test-Command 'cl.exe'))
 }
 
 function Find-VSInstallPath {
@@ -209,6 +400,7 @@ function Find-VSInstallPath {
 
     try {
         return & $VSWherePath -latest -products * `
+            -version '[17.0,18.0)' `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath 2>$null
     } catch {
@@ -269,11 +461,11 @@ function Test-BuildEnvironment {
     # Check 1: PowerShell Version
     Write-Host "[1/$TotalChecks] Checking PowerShell..." -ForegroundColor Yellow
     $PSVer = $PSVersionTable.PSVersion
-    if ($PSVer.Major -ge 5) {
+    if ($PSVer.Major -gt 5 -or ($PSVer.Major -eq 5 -and $PSVer.Minor -ge 1)) {
         Write-Status "PowerShell" $true "v$($PSVer.Major).$($PSVer.Minor)"
     } else {
         Write-Status "PowerShell" $false "v$($PSVer.Major).$($PSVer.Minor)" `
-            "PowerShell 5.0 or later required" `
+            "PowerShell 5.1 or later required" `
             "Update PowerShell: https://docs.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows"
     }
 
@@ -701,7 +893,13 @@ function Copy-RequiredDLLs {
 # ============================================================================
 
 function Build-LichtFeldStudio {
-    $ProductDisplayName = if ($IsViewer) { "LichtFeld Studio Arc Viewer" } else { "LichtFeld-Studio" }
+    $ProductDisplayName = if ($IsViewer) {
+        'LichtFeld Arc Viewer'
+    } elseif ($GpuBackend -eq 'HIP') {
+        'LichtFeld Studio for ROCm'
+    } else {
+        'LichtFeld Studio'
+    }
     Write-Host "================================================================" -ForegroundColor Cyan
     Write-Host "Building $ProductDisplayName ($Configuration)" -ForegroundColor Cyan
     if (-not $IsViewer) {
@@ -712,7 +910,13 @@ function Build-LichtFeldStudio {
 
     Push-Location $ProjectRoot
     try {
-        $BuildDirName = if ($IsViewer) { "build-arc-viewer" } elseif ($GpuBackend -eq 'HIP') { "build-hip" } else { "build" }
+        $BuildDirName = if ($IsViewer) {
+            'build-arc-viewer'
+        } elseif ($GpuBackend -eq 'HIP') {
+            'build-hip'
+        } else {
+            'build'
+        }
         $BuildDir = Join-Path $ProjectRoot $BuildDirName
         $VcpkgToolchain = Join-Path $VcpkgPath "scripts\buildsystems\vcpkg.cmake"
         $Generator = if ($IsViewer -or $GpuBackend -eq 'HIP') { "Ninja" } else { "Visual Studio 17 2022" }
@@ -725,7 +929,6 @@ function Build-LichtFeldStudio {
                 exit 1
             }
         }
-
         if ($Generator -eq 'Ninja' -and -not (Test-Command "ninja")) {
             Write-Host "ERROR: Ninja is required for $ProductMode/$GpuBackend builds." -ForegroundColor Red
             Write-Host "Install Ninja and ensure ninja.exe is available on PATH." -ForegroundColor Yellow
@@ -806,14 +1009,68 @@ function Build-LichtFeldStudio {
             "-DLFS_GPU_BACKEND=$GpuBackend",
             "-DLFS_VCPKG_MAX_CONCURRENCY=32"
         )
+        if ($Package) {
+            $CMakeArgs += '-DBUILD_PORTABLE=ON'
+        } elseif ($IsViewer) {
+            $CMakeArgs += '-UBUILD_PORTABLE'
+        } else {
+            # Reset cache values forced by a prior portable Studio build.
+            $CMakeArgs += '-DBUILD_PORTABLE=OFF'
+            if ($GpuBackend -eq 'CUDA') {
+                $CMakeArgs += '-DBUILD_CUDA_PTX_ONLY=OFF'
+            }
+        }
         if ($Generator -like "Visual Studio*") {
             $CMakeArgs += @("-A", "x64")
         } else {
             $CMakeArgs += "-DCMAKE_BUILD_TYPE=$Configuration"
         }
+
         if ($GpuBackend -eq 'HIP') {
+            $HipCxxCompiler = Join-Path $ResolvedRocm 'lib\llvm\bin\clang++.exe'
+            $HipCCompiler = Join-Path $ResolvedRocm 'lib\llvm\bin\clang.exe'
+            if (-not (Test-Path -LiteralPath $HipCxxCompiler -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $HipCCompiler -PathType Leaf)) {
+                Write-Host "ERROR: ROCm/HIP Clang compiler pair was not found." -ForegroundColor Red
+                Write-Host "Expected: $HipCxxCompiler" -ForegroundColor Gray
+                Write-Host "Expected: $HipCCompiler" -ForegroundColor Gray
+                exit 1
+            }
+
             $CMakeArgs += "-DLFS_ROCM_PATH=$ResolvedRocm"
-            $CMakeArgs += "-DLFS_AMDGPU_ARCH=gfx1151"
+            $CMakeArgs += "-DLFS_AMDGPU_ARCH=$AmdgpuArch"
+            $CMakeArgs += "-DCMAKE_CXX_COMPILER=$HipCxxCompiler"
+            $CMakeArgs += "-DCMAKE_C_COMPILER=$HipCCompiler"
+
+            $CMakeCachePath = Join-Path $BuildDir 'CMakeCache.txt'
+            if (Test-Path -LiteralPath $CMakeCachePath -PathType Leaf) {
+                $CMakeCacheContent = Get-Content -LiteralPath $CMakeCachePath -Raw
+                $CachedCxxCompiler = Get-CMakeCacheValue $CMakeCacheContent 'CMAKE_CXX_COMPILER'
+                $CachedCCompiler = Get-CMakeCacheValue $CMakeCacheContent 'CMAKE_C_COMPILER'
+                $RequiresFreshConfigure =
+                    -not $CachedCxxCompiler -or
+                    -not $CachedCCompiler -or
+                    -not (Test-EquivalentPath $CachedCxxCompiler $HipCxxCompiler) -or
+                    -not (Test-EquivalentPath $CachedCCompiler $HipCCompiler)
+
+                foreach ($CompilerToolName in @(
+                    'CMAKE_CXX_COMPILER_AR',
+                    'CMAKE_CXX_COMPILER_RANLIB',
+                    'CMAKE_C_COMPILER_AR',
+                    'CMAKE_C_COMPILER_RANLIB')) {
+                    $CompilerTool = Get-CMakeCacheValue $CMakeCacheContent $CompilerToolName
+                    if ($CompilerTool -and
+                        [System.IO.Path]::IsPathRooted($CompilerTool) -and
+                        -not (Test-Path -LiteralPath $CompilerTool -PathType Leaf)) {
+                        $RequiresFreshConfigure = $true
+                    }
+                }
+
+                if ($RequiresFreshConfigure) {
+                    Write-Host "Refreshing CMake cache after ROCm/HIP toolchain change." -ForegroundColor Yellow
+                    $CMakeArgs = @('--fresh') + $CMakeArgs
+                }
+            }
         }
 
         if ($GpuBackend -eq 'CUDA') {
@@ -835,8 +1092,12 @@ function Build-LichtFeldStudio {
         Write-Host "  Configuration: $Configuration" -ForegroundColor Gray
         Write-Host "  Product Mode: $ProductMode" -ForegroundColor Gray
         Write-Host "  GPU Backend: $GpuBackend" -ForegroundColor Gray
+        if ($Package) {
+            Write-Host "  Portable Package: Enabled" -ForegroundColor Gray
+        }
         if ($GpuBackend -eq 'HIP') {
             Write-Host "  ROCm/HIP SDK: $ResolvedRocm" -ForegroundColor Gray
+            Write-Host "  AMDGPU targets: $AmdgpuArch" -ForegroundColor Gray
         }
         Write-Host "  Toolchain: $VcpkgToolchain" -ForegroundColor Gray
         if (-not $IsViewer) {
@@ -887,13 +1148,104 @@ function Build-LichtFeldStudio {
             Join-Path $BuildDir "LichtFeld-Studio.exe"
         }
 
-        if ($IsViewer -and -not (Test-Path -LiteralPath $ExecutablePath)) {
-            Write-Host "ERROR: Arc Viewer build completed without producing the expected executable." -ForegroundColor Red
+        if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
+            $ProductOutputName = if ($IsViewer) { 'Arc Viewer' } else { 'Studio' }
+            Write-Host "ERROR: $ProductOutputName build completed without producing the expected executable." -ForegroundColor Red
             Write-Host "Expected: $ExecutablePath" -ForegroundColor Gray
             exit 1
         }
-        if (Test-Path -LiteralPath $ExecutablePath) {
-            $ExecutablePath = (Resolve-Path -LiteralPath $ExecutablePath).Path
+        $ExecutablePath = (Resolve-Path -LiteralPath $ExecutablePath).Path
+
+        $PackageArchivePath = $null
+        $PackageChecksumPath = $null
+        if ($Package) {
+            $CPackConfigPath = Join-Path $BuildDir 'CPackConfig.cmake'
+            if (-not (Test-Path -LiteralPath $CPackConfigPath -PathType Leaf)) {
+                Write-Host "ERROR: CPack configuration was not generated." -ForegroundColor Red
+                Write-Host "Expected: $CPackConfigPath" -ForegroundColor Gray
+                exit 1
+            }
+
+            $CPackConfigContent = Get-Content -LiteralPath $CPackConfigPath -Raw
+            $PackageNameMatch = [regex]::Match(
+                $CPackConfigContent,
+                '(?m)^[ \t]*set[ \t]*\([ \t]*CPACK_PACKAGE_FILE_NAME[ \t]+"([^"]+)"[ \t]*\)[ \t]*\r?$')
+            if (-not $PackageNameMatch.Success) {
+                Write-Host "ERROR: CPack configuration does not define CPACK_PACKAGE_FILE_NAME." -ForegroundColor Red
+                exit 1
+            }
+            if ($CPackConfigContent -notmatch '(?m)^[ \t]*set[ \t]*\([ \t]*CPACK_GENERATOR[ \t]+"ZIP"[ \t]*\)[ \t]*\r?$' -or
+                $CPackConfigContent -notmatch '(?m)^[ \t]*set[ \t]*\([ \t]*CPACK_PACKAGE_CHECKSUM[ \t]+"SHA256"[ \t]*\)[ \t]*\r?$') {
+                Write-Host "ERROR: CPack is not configured for the expected ZIP and SHA-256 outputs." -ForegroundColor Red
+                exit 1
+            }
+
+            $CMakeListsPath = Join-Path $ProjectRoot 'CMakeLists.txt'
+            $CMakeListsContent = Get-Content -LiteralPath $CMakeListsPath -Raw
+            $ProjectVersionMatch = [regex]::Match(
+                $CMakeListsContent,
+                '(?m)^[ \t]*project[ \t]*\([ \t]*LichtFeld-Studio[ \t]+VERSION[ \t]+([0-9]+(?:\.[0-9]+)+)[ \t]+LANGUAGES\b')
+            if (-not $ProjectVersionMatch.Success) {
+                Write-Host "ERROR: Could not determine the package version from CMakeLists.txt." -ForegroundColor Red
+                exit 1
+            }
+
+            $ProjectVersion = $ProjectVersionMatch.Groups[1].Value
+            $PackageBaseName = if ($IsViewer) {
+                "LichtFeld-Arc-Viewer-$ProjectVersion-windows-x64"
+            } elseif ($GpuBackend -eq 'HIP') {
+                "LichtFeld-Studio-for-ROCm-$ProjectVersion-windows-x64"
+            } else {
+                $PackageBackend = $GpuBackend.ToLowerInvariant()
+                "LichtFeld-Studio-$ProjectVersion-$PackageBackend-windows-x64"
+            }
+            $ConfiguredPackageBaseName = $PackageNameMatch.Groups[1].Value
+            if ($ConfiguredPackageBaseName -ne $PackageBaseName) {
+                Write-Host "ERROR: CPack package name does not match the expected CMake contract." -ForegroundColor Red
+                Write-Host "Expected: $PackageBaseName" -ForegroundColor Gray
+                Write-Host "Configured: $ConfiguredPackageBaseName" -ForegroundColor Gray
+                exit 1
+            }
+
+            $PackageArchivePath = Join-Path $BuildDir "$PackageBaseName.zip"
+            $PackageChecksumPath = "$PackageArchivePath.sha256"
+            $RuntimeManifestPath = if ($GpuBackend -eq 'HIP') {
+                Join-Path $BuildDir 'rocm-runtime-manifest.txt'
+            } else {
+                ''
+            }
+
+            Remove-PackageOutputs @($PackageArchivePath, $PackageChecksumPath)
+            $PackageGenerationStartedAt = [DateTime]::UtcNow
+
+            Write-Host ""
+            Write-Host "Creating portable package..." -ForegroundColor Yellow
+            & cmake --build $BuildDir `
+                --config $Configuration `
+                --target package `
+                --parallel 32
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "ERROR: Package build failed!" -ForegroundColor Red
+                exit 1
+            }
+
+            foreach ($ExpectedOutput in @($PackageArchivePath, $PackageChecksumPath)) {
+                if (-not (Test-Path -LiteralPath $ExpectedOutput -PathType Leaf)) {
+                    Write-Host "ERROR: Package build completed without producing an expected output." -ForegroundColor Red
+                    Write-Host "Expected: $ExpectedOutput" -ForegroundColor Gray
+                    exit 1
+                }
+                $OutputInfo = Get-Item -LiteralPath $ExpectedOutput
+                if ($OutputInfo.Length -le 0 -or $OutputInfo.LastWriteTimeUtc -lt $PackageGenerationStartedAt) {
+                    Write-Host "ERROR: Package output is empty or was not freshly generated." -ForegroundColor Red
+                    Write-Host "Output: $ExpectedOutput" -ForegroundColor Gray
+                    exit 1
+                }
+            }
+            $PackageArchivePath = (Resolve-Path -LiteralPath $PackageArchivePath).Path
+            $PackageChecksumPath = (Resolve-Path -LiteralPath $PackageChecksumPath).Path
+            Test-PackageChecksum $PackageArchivePath $PackageChecksumPath
+            Test-PackageArchiveContract $PackageArchivePath $IsViewer $GpuBackend $RuntimeManifestPath
         }
 
         Write-Host ""
@@ -908,6 +1260,14 @@ function Build-LichtFeldStudio {
         if (-not $IsViewer) {
             Write-Host "Python module location:" -ForegroundColor Cyan
             Write-Host "  $BuildDir\src\python\$Configuration\lichtfeld.pyd" -ForegroundColor White
+            Write-Host ""
+        }
+
+        if ($Package) {
+            Write-Host "Package archive:" -ForegroundColor Cyan
+            Write-Host "  $PackageArchivePath" -ForegroundColor White
+            Write-Host "SHA-256 checksum:" -ForegroundColor Cyan
+            Write-Host "  $PackageChecksumPath" -ForegroundColor White
             Write-Host ""
         }
 
@@ -991,7 +1351,7 @@ if ($IsViewer) {
 } elseif ($GpuBackend -eq 'CUDA' -and -not $SkipLibTorch) {
     Setup-LibTorch
 } elseif ($GpuBackend -eq 'HIP') {
-    Write-Host "Skipping CUDA LibTorch setup for HIP backend" -ForegroundColor Yellow
+    Write-Host "Skipping CUDA LibTorch setup for $GpuBackend backend" -ForegroundColor Yellow
     Write-Host ""
 } else {
     Write-Host "Skipping LibTorch setup (-SkipLibTorch)" -ForegroundColor Yellow

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -56,6 +57,8 @@ namespace lfs::vis {
         constexpr std::uint32_t kRingPickPhaseNone = 0u;
         constexpr std::uint32_t kRingPickPhaseFindMin = 1u;
         constexpr std::uint32_t kRingPickPhaseWritePick = 2u;
+        constexpr std::string_view kInteropUnsupportedError =
+            "VkSplat is unavailable because HIP/Vulkan device identity could not be verified";
 
         // Readback frames of deferred-wants-with-zero-admissions before the
         // pool counts as frozen: long enough to outlast the publish
@@ -241,7 +244,8 @@ namespace lfs::vis {
             // — neither the chain event nor a device sync can see in-flight
             // Vulkan work, which lets training kernels overwrite scratch a
             // running batch still reads (Xid 109 device-lost class).
-            void noteVulkanRelease(cudaExternalSemaphore_t semaphore, std::uint64_t value) const {
+            void noteVulkanRelease(cudaExternalSemaphore_t semaphore,
+                                   std::uint64_t value) const {
                 if (arena_ && frame_active_ && semaphore != nullptr) {
                     arena_->note_external_release(semaphore, value);
                 }
@@ -1510,6 +1514,21 @@ namespace lfs::vis {
         }
     };
 
+    bool VksplatViewportRenderer::isSupported() {
+#if defined(USE_HIP) && USE_HIP
+        if (const auto identity_error = lfs::rendering::verifyCudaMatchesVulkanDevice()) {
+            static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+            if (!logged.test_and_set(std::memory_order_relaxed)) {
+                LOG_WARN("VkSplat disabled because HIP/Vulkan device identity could not be "
+                         "verified: {}; using the Vulkan point-cloud fallback",
+                         *identity_error);
+            }
+            return false;
+        }
+#endif
+        return true;
+    }
+
     VksplatViewportRenderer::VksplatViewportRenderer() {
         // Created here (not in ensureInitialized) so the trainer↔viewer
         // handshake can target the render stream from the very first frame.
@@ -1834,6 +1853,9 @@ namespace lfs::vis {
 
     std::optional<LodPageCache::Snapshot> VksplatViewportRenderer::ensureLodPageCacheSnapshot(
         const lfs::core::SplatData& splat_data) {
+        if (!isSupported()) {
+            return std::nullopt;
+        }
         const std::size_t logical_chunks =
             splat_data.lod_tree ? splat_data.lod_tree->chunk_count() : 0;
         if (logical_chunks == 0) {
@@ -3952,6 +3974,9 @@ namespace lfs::vis {
     }
 
     std::expected<void, std::string> VksplatViewportRenderer::ensureInitialized(VulkanContext& context) {
+        if (!isSupported()) {
+            return std::unexpected(std::string(kInteropUnsupportedError));
+        }
         if (context_ != nullptr && context_ != &context) {
             reset();
         }
@@ -5810,6 +5835,9 @@ namespace lfs::vis {
         const SelectionMaskRequest& request,
         const bool force_input_upload) {
         LOG_TIMER("VksplatViewportRenderer::buildSelectionMask");
+        if (!isSupported()) {
+            return std::unexpected(std::string(kInteropUnsupportedError));
+        }
         const glm::ivec2 size = request.frame_view.size;
         if (size.x <= 0 || size.y <= 0) {
             return std::unexpected("VkSplat selection query received an invalid viewport size");
@@ -6418,6 +6446,9 @@ namespace lfs::vis {
         const lfs::rendering::ViewportRenderRequest& request,
         const OutputSlot output_slot,
         const bool synchronize_input_read) {
+        if (!isSupported()) {
+            return std::unexpected(std::string(kInteropUnsupportedError));
+        }
         const glm::ivec2 size = request.frame_view.size;
         if (size.x <= 0 || size.y <= 0) {
             return std::unexpected("VkSplat selection overlay received an invalid viewport size");
@@ -6633,6 +6664,9 @@ namespace lfs::vis {
         const bool force_input_upload,
         const OutputSlot output_slot,
         const bool synchronize_input_upload) {
+        if (!isSupported()) {
+            return std::unexpected(std::string(kInteropUnsupportedError));
+        }
         const glm::ivec2 size = request.frame_view.size;
         if (size.x <= 0 || size.y <= 0) {
             return std::unexpected("VkSplat received an invalid viewport size");

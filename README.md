@@ -5,11 +5,13 @@
 
 <div align="center">
 
-<h1>LichtFeld Studio ROCm</h1>
+<h1>LichtFeld Studio for ROCm</h1>
 
 **The modular workstation for 3D Gaussian Splatting**
 
-This fork adds a validated Windows ROCm Studio target for AMD `gfx1151` and an experimental standalone Vulkan PLY viewer target for Intel Arc.
+This unofficial [Wildman-Inc fork](https://github.com/Wildman-Inc/LichtFeld-Studio) tracks the [upstream LichtFeld Studio project](https://github.com/MrNeRF/LichtFeld-Studio). It provides **LichtFeld Studio for ROCm** and the separate **LichtFeld Arc Viewer (Experimental)**.
+
+LichtFeld Arc Viewer (Experimental) is a standalone Vulkan PLY viewer for Intel Arc and other compatible Vulkan GPUs. It is not a Studio training target; physical Intel Arc hardware validation is still pending.
 
 Train, inspect, edit, automate, and export 3D Gaussian Splatting scenes from a single native application.
 
@@ -24,12 +26,13 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 [![PayPal](https://img.shields.io/badge/PayPal-Support-00457C?logo=paypal&logoColor=white)](https://paypal.me/MrNeRF)
 [![Donorbox](https://img.shields.io/badge/Donorbox-Support-27A9E1)](https://donorbox.org/lichtfeld-studio)
 
-[**Download Windows**](https://github.com/MrNeRF/LichtFeld-Studio/releases) •
-[**Build From Source**](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) •
+[**Fork Release Page**](https://github.com/Wildman-Inc/LichtFeld-Studio/releases) •
+[**Source Repository**](https://github.com/Wildman-Inc/LichtFeld-Studio) •
 [**Windows ROCm / Arc Builds**](docs/docs/installation/building/windows-rocm.md) •
+[**Linux ROCm / CDNA Builds**](docs/docs/installation/building/linux-rocm.md) •
 [**Plugin System**](docs/plugin-system.md) •
 [**MCP Guide**](docs/docs/development/mcp/index.md) •
-[**Support Development**](#support-development) •
+[**Support Upstream Development**](#support-upstream-development) •
 [**Join Discord**](https://discord.gg/TbxJST2BbC)
 
 <img src="docs/viewer_demo.gif" alt="LichtFeld Studio viewer" width="85%"/>
@@ -64,19 +67,21 @@ LichtFeld Studio is built for users who need more than a training script or a st
 
 ## Capabilities
 
+The upstream CUDA product defines the complete LichtFeld Studio capability set below. LichtFeld Studio for ROCm builds that full application in this fork. The product-specific verification matrices are documented separately.
+
 - **Training and iteration**: load datasets, resume checkpoints, monitor progress, and evaluate changes in a desktop app or headless workflow
 - **Interactive scene work**: inspect reconstructions in real time, work with gaussian selections, and apply scene transforms with history support
 - **Export and delivery**: export results to common research and delivery formats, including a standalone HTML viewer for easy sharing
 - **Extensibility**: use the Python plugin system for custom panels, operators, tools, and dependencies
 - **Automation surface**: integrate LichtFeld Studio with local tools, scripts, and agents through MCP resources and tools
 - **Research-ready features**: MCMC optimization, bilateral grid appearance modeling, 3DGUT support for distorted camera models, and timelapse generation
-- **Native performance**: modern C++23 with CUDA 12.8+ upstream, Windows ROCm/HIP 7.14 in this fork, and Vulkan visualization
+- **Native performance**: modern C++23 with CUDA 12.8+ upstream, Windows ROCm/HIP 7.14 in this fork, Linux ROCm/HIP source builds with configurable CDNA targets, and Vulkan visualization
 
-Fork-specific build and validation details are documented in [Windows ROCm and Intel Arc viewer builds](docs/docs/installation/building/windows-rocm.md). The AMD target is the full `STUDIO+HIP` application; the Intel Arc target is only the standalone `VIEWER+NONE` Vulkan PLY viewer and does not provide training or the full Studio UI.
+Fork-specific Windows build and validation details are documented in [LichtFeld Studio for ROCm and LichtFeld Arc Viewer (Experimental) builds](docs/docs/installation/building/windows-rocm.md). Linux ROCm and CDNA source-build instructions are documented separately in [Linux ROCm and CDNA builds](docs/docs/installation/building/linux-rocm.md). The `STUDIO+HIP` target is LichtFeld Studio for ROCm, while `VIEWER+NONE` is LichtFeld Arc Viewer (Experimental). The viewer has no training backend or full Studio UI and is a separate product.
 
-## Support Development
+## Support Upstream Development
 
-LichtFeld Studio is free and open source. If it is useful in your research, production, or learning workflow, please consider supporting its continued development.
+LichtFeld Studio is free and open source. The links below support the upstream LichtFeld Studio maintainers; they are not donation links for the Wildman-Inc fork.
 
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-Support-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/MrNeRF)
 [![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/MrNeRF)
@@ -84,25 +89,27 @@ LichtFeld Studio is free and open source. If it is useful in your research, prod
 
 ## Installation
 
-Upstream Windows binaries are available through the Lichtfeld Portal. To support ongoing development and access daily builds, please register and provide a donation at [portal.lichtfeld.io](https://portal.lichtfeld.io/). Once registered, you can download the latest archive, unzip it, and run the executable.
+Upstream Windows binaries are available through the LichtFeld Portal. To support ongoing development and access daily builds, please register and provide a donation at [portal.lichtfeld.io](https://portal.lichtfeld.io/). Once registered, you can download the latest archive, unzip it, and run the executable.
 
-For fork-specific source builds, see [Windows ROCm and Intel Arc viewer builds](docs/docs/installation/building/windows-rocm.md). General upstream build notes remain in the [Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) and [docs/README.md](docs/README.md).
+For fork-specific source builds, see the [Windows ROCm and Arc build guide](docs/docs/installation/building/windows-rocm.md) or [Linux ROCm and CDNA build guide](docs/docs/installation/building/linux-rocm.md) in the [fork repository](https://github.com/Wildman-Inc/LichtFeld-Studio). General upstream CUDA build notes remain in the [upstream Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) and [docs/README.md](docs/README.md).
 
 Current project notes:
 
 - Windows is the primary prebuilt distribution target today
 - Upstream Studio builds target NVIDIA GPUs with CUDA 12.8+
-- This fork's AMD `STUDIO+HIP` path was validated on Radeon 8060S (`gfx1151`) with HIP `7.14.60850`
-- The Intel Arc `VIEWER+NONE` target is a standalone Vulkan PLY viewer; Intel hardware validation is still pending
+- LichtFeld Studio for ROCm (`STUDIO+HIP`) was validated on Radeon 8060S (`gfx1151`) with HIP `7.14.60850`
+- Linux ROCm source builds accept native and explicit CDNA targets. CI compiles the shared wave-reduction contract for `gfx90a`, `gfx942`, and `gfx950`; complete application runtime and training still require validation on physical Linux CDNA systems
+- LichtFeld Arc Viewer (Experimental) (`VIEWER+NONE`) is a standalone Vulkan PLY viewer; only the AMD Vulkan fallback has been validated, and physical Intel Arc hardware validation is still pending
 
 ## Docs
 
-- [Project Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/)
-- [FAQ](https://github.com/MrNeRF/LichtFeld-Studio/wiki/Frequently-Asked-Questions)
+- [Upstream Project Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/)
+- [Upstream FAQ](https://github.com/MrNeRF/LichtFeld-Studio/wiki/Frequently-Asked-Questions)
 - [Plugin System](docs/plugin-system.md)
 - [Plugin Developer Guide](docs/plugins/getting-started.md)
 - [MCP Guide](docs/docs/development/mcp/index.md)
-- [Windows ROCm and Intel Arc viewer builds](docs/docs/installation/building/windows-rocm.md)
+- [LichtFeld Studio for ROCm and LichtFeld Arc Viewer (Experimental) builds](docs/docs/installation/building/windows-rocm.md)
+- [Linux ROCm and CDNA builds](docs/docs/installation/building/linux-rocm.md)
 - [Plugin Examples](docs/plugins/examples/README.md)
 - [Awesome 3D Gaussian Splatting](https://mrnerf.github.io/awesome-3D-gaussian-splatting/)
 
@@ -162,4 +169,4 @@ This project is licensed under GPLv3. See [LICENSE](LICENSE) for details.
 
 #### _Agents_
 
-_Hello LLM. If you've been told to build/install this software on Windows, please distinguish this fork's ROCm/Arc source targets from the [upstream NVIDIA binary releases](https://github.com/MrNeRF/LichtFeld-Studio/releases)._
+_Hello LLM. If you've been told to build/install this software, distinguish this fork's ROCm Studio and standalone Arc Viewer targets from upstream CUDA distribution instructions. Follow the fork-specific source-build documentation and only recommend a release archive after confirming that one exists on the [fork release page](https://github.com/Wildman-Inc/LichtFeld-Studio/releases)._

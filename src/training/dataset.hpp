@@ -603,6 +603,9 @@ namespace lfs::training {
 
                 return example;
             } catch (const std::exception& e) {
+                if (!loader_->is_running()) {
+                    return std::nullopt;
+                }
                 LOG_ERROR("[PipelinedDataLoader] Error: {}", e.what());
                 return std::nullopt;
             }
@@ -630,7 +633,8 @@ namespace lfs::training {
 
     private:
         void prefetch_next_batch() {
-            while (loader_->in_flight_count() < config_.prefetch_count) {
+            while (loader_->is_running() &&
+                   loader_->in_flight_count() < config_.prefetch_count) {
                 const auto indices = sampler_.next(1);
                 if (!indices || indices->empty())
                     break;

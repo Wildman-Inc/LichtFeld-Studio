@@ -97,6 +97,25 @@ elseif(LFS_GPU_BACKEND STREQUAL "HIP")
     set(USE_HIP ON)
 endif()
 
+if(USE_HIP)
+    if(CMAKE_HOST_WIN32)
+        set(_lfs_default_amdgpu_arch "gfx1151")
+    else()
+        set(_lfs_default_amdgpu_arch "native")
+    endif()
+    set(LFS_AMDGPU_ARCH "${_lfs_default_amdgpu_arch}" CACHE STRING
+        "AMDGPU target architectures (semicolon- or comma-separated)")
+    string(REPLACE "," ";" _lfs_amdgpu_archs "${LFS_AMDGPU_ARCH}")
+    list(FILTER _lfs_amdgpu_archs EXCLUDE REGEX "^[ \t]*$")
+    if(NOT _lfs_amdgpu_archs)
+        message(FATAL_ERROR "LFS_AMDGPU_ARCH must contain at least one AMDGPU architecture")
+    endif()
+    if(NOT CMAKE_HOST_WIN32)
+        set(CMAKE_HIP_ARCHITECTURES "${_lfs_amdgpu_archs}" CACHE STRING
+            "HIP target architectures" FORCE)
+    endif()
+endif()
+
 if(USE_HIP AND CMAKE_HOST_WIN32)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsROCm.cmake")
     lfs_windows_rocm_find_root(_lfs_rocm_root)
@@ -127,8 +146,10 @@ project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CXX C)
 if(LFS_PRODUCT_MODE STREQUAL "VIEWER")
     include(CTest)
     add_subdirectory(src/arc_viewer)
-    set(CPACK_PACKAGE_NAME "LichtFeld-Studio-ROCm-Arc-Viewer")
-    set(CPACK_PACKAGE_VENDOR "LichtFeld Studio ROCm contributors")
+    set(CPACK_PACKAGE_NAME "LichtFeld-Arc-Viewer")
+    set(CPACK_PACKAGE_VENDOR "Wildman-Inc")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+        "Experimental Vulkan Gaussian splat viewer with Intel Arc support")
     if(WIN32)
         set(_LFS_ARC_PACKAGE_PLATFORM "windows-x64")
     else()
@@ -137,7 +158,7 @@ if(LFS_PRODUCT_MODE STREQUAL "VIEWER")
             "${_LFS_ARC_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
     endif()
     set(CPACK_PACKAGE_FILE_NAME
-        "LichtFeld-Studio-ROCm-Arc-Viewer-${PROJECT_VERSION}-${_LFS_ARC_PACKAGE_PLATFORM}")
+        "LichtFeld-Arc-Viewer-${PROJECT_VERSION}-${_LFS_ARC_PACKAGE_PLATFORM}")
     set(CPACK_GENERATOR ZIP)
     set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
     set(CPACK_PACKAGE_CHECKSUM SHA256)
@@ -272,13 +293,19 @@ endif()
 # PTX-only: smaller binary (~66MB vs ~750MB), JIT compiles at runtime
 option(BUILD_CUDA_PTX_ONLY "Build PTX-only (JIT at runtime, ~5-15s first startup)" OFF)
 
-# Portable: PTX-only + bundled libs, no tests
+# Portable: bundle runtime libraries and disable tests. CUDA additionally uses PTX-only output.
 option(BUILD_PORTABLE "Build portable distribution" OFF)
 if(BUILD_PORTABLE)
-    set(BUILD_CUDA_PTX_ONLY ON CACHE BOOL "" FORCE)
+    if(USE_CUDA)
+        set(BUILD_CUDA_PTX_ONLY ON CACHE BOOL "" FORCE)
+    endif()
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
     add_compile_definitions(LFS_BUILD_PORTABLE=1)
-    message(STATUS "Portable: PTX-only, tests disabled")
+    if(USE_CUDA)
+        message(STATUS "Portable: PTX-only CUDA output, bundled libraries, tests disabled")
+    else()
+        message(STATUS "Portable: bundled libraries, tests disabled")
+    endif()
 endif()
 
 # Compiler cache is opt-in. Auto-enabling a broken local launcher can silently
@@ -521,10 +548,8 @@ set(GPU_RUNTIME_LIBRARY CUDA::cudart)
 set(GPU_DRIVER_LIBRARY CUDA::cuda_driver)
 set(GPU_RAND_LIBRARY CUDA::curand)
 set(GPU_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
-else()
-    set(_lfs_default_amdgpu_arch "gfx1151")
-    set(LFS_AMDGPU_ARCH "${_lfs_default_amdgpu_arch}" CACHE STRING "AMDGPU target architecture")
-    set(HIP_ARCHITECTURES "${LFS_AMDGPU_ARCH}" CACHE STRING "HIP target architectures" FORCE)
+elseif(USE_HIP)
+    set(HIP_ARCHITECTURES "${_lfs_amdgpu_archs}" CACHE STRING "HIP target architectures" FORCE)
 
     if(WIN32)
         lfs_windows_rocm_get_short_path("${LFS_ROCM_PATH}" _lfs_rocm_path)
@@ -615,7 +640,18 @@ else()
         endif()
     else()
         find_package(hip CONFIG REQUIRED)
-        find_package(hiprand CONFIG QUIET)
+        find_package(hiprand CONFIG REQUIRED)
+        if(TARGET hip::hiprand)
+            set(_lfs_hiprand_target hip::hiprand)
+        elseif(TARGET roc::hiprand)
+            set(_lfs_hiprand_target roc::hiprand)
+        elseif(TARGET hiprand::hiprand)
+            set(_lfs_hiprand_target hiprand::hiprand)
+        elseif(TARGET hiprand)
+            set(_lfs_hiprand_target hiprand)
+        else()
+            message(FATAL_ERROR "hiprand was found, but it did not export a supported CMake target")
+        endif()
         set(HIP_INCLUDE_DIRS "")
         if(TARGET hip::device)
             get_target_property(HIP_INCLUDE_DIRS hip::device INTERFACE_INCLUDE_DIRECTORIES)
@@ -630,7 +666,8 @@ else()
         endif()
         if(NOT TARGET CUDA::curand)
             add_library(CUDA::curand INTERFACE IMPORTED)
-            set_target_properties(CUDA::curand PROPERTIES INTERFACE_LINK_LIBRARIES hip::device)
+            set_target_properties(CUDA::curand PROPERTIES
+                INTERFACE_LINK_LIBRARIES "hip::device;${_lfs_hiprand_target}")
         endif()
         if(NOT TARGET CUDA::cupti)
             add_library(CUDA::cupti INTERFACE IMPORTED)
@@ -804,7 +841,7 @@ add_subdirectory(src/python)
 # LichtFeld-Studio
 # -----------------------------------------------------------------------------
 
-add_executable(${PROJECT_NAME}
+set(LFS_APP_SOURCES
     src/app/main.cpp
     src/app/application.cpp
     src/app/mcp_gui_tools.cpp
@@ -815,6 +852,8 @@ add_executable(${PROJECT_NAME}
     src/app/converter.cpp
     resources/lichtfeld-studio.rc
 )
+
+add_executable(${PROJECT_NAME} ${LFS_APP_SOURCES})
 
 
 if(USE_CUDA)
@@ -929,9 +968,8 @@ if(TARGET nvimgcodec)
     message(STATUS "Post-build: nvImageCodec libraries will be copied to executable directory")
 endif()
 
-# ONNX Runtime dlopens its CUDA execution providers at runtime. Keep the core
-# runtime and CUDA/shared provider libraries beside the exe so local and packaged
-# preprocess runs do not silently fall back to CPU.
+# Keep the selected ONNX Runtime core/provider libraries beside the executable
+# so local and packaged preprocessing use the same inference configuration.
 set(_lfs_ort_runtime_libs ${LFS_ONNXRUNTIME_RUNTIME_LIBS})
 if(NOT _lfs_ort_runtime_libs AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
     file(GLOB _lfs_ort_runtime_libs
@@ -950,7 +988,8 @@ if(_lfs_ort_runtime_libs)
         )
     endforeach()
 else()
-    message(WARNING "ONNX Runtime runtime libraries were not found; preprocess CUDA inference may fall back to CPU or fail at startup")
+    message(WARNING
+        "ONNX Runtime runtime libraries were not found; preprocessing may fail at startup")
 endif()
 
 # Copy Python DLLs for Windows runtime (Python is embedded in the application)
@@ -993,6 +1032,24 @@ endif()
 
 if(WIN32 AND USE_HIP)
     lfs_collect_windows_hip_runtime_dlls(_lfs_hip_runtime_dlls)
+    if(BUILD_PORTABLE)
+        if(NOT _lfs_hip_runtime_dlls)
+            message(FATAL_ERROR
+                "Portable ROCm packages require the collected ROCm/HIP runtime DLL contract")
+        endif()
+        set(_lfs_hip_runtime_manifest_names "")
+        foreach(_lfs_hip_runtime_dll IN LISTS _lfs_hip_runtime_dlls)
+            get_filename_component(_lfs_hip_runtime_name "${_lfs_hip_runtime_dll}" NAME)
+            list(APPEND _lfs_hip_runtime_manifest_names "${_lfs_hip_runtime_name}")
+        endforeach()
+        list(REMOVE_DUPLICATES _lfs_hip_runtime_manifest_names)
+        list(SORT _lfs_hip_runtime_manifest_names COMPARE NATURAL)
+        list(JOIN _lfs_hip_runtime_manifest_names "\n" _lfs_hip_runtime_manifest_content)
+        string(APPEND _lfs_hip_runtime_manifest_content "\n")
+        file(GENERATE
+            OUTPUT "${CMAKE_BINARY_DIR}/rocm-runtime-manifest.txt"
+            CONTENT "${_lfs_hip_runtime_manifest_content}")
+    endif()
     if(_lfs_hip_runtime_dlls)
         add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -1484,7 +1541,9 @@ message(STATUS "  Tests: ${BUILD_TESTS}")
 message(STATUS "  Unicode Test Only: ${BUILD_UNICODE_TEST_ONLY}")
 message(STATUS "  Portable Build: ${BUILD_PORTABLE}")
 if(BUILD_PORTABLE)
-    message(STATUS "  -> PTX-only: ON (SM >= ${BUILD_CUDA_MIN_SM}, JIT at runtime)")
+    if(USE_CUDA)
+        message(STATUS "  -> PTX-only: ON (SM >= ${BUILD_CUDA_MIN_SM}, JIT at runtime)")
+    endif()
     message(STATUS "  -> Use: cmake --install build --prefix ./dist")
 endif()
 message(STATUS "===========================================")
@@ -1535,10 +1594,76 @@ if(_lfs_ort_runtime_libs)
     endif()
     install(FILES ${_lfs_ort_runtime_libs} DESTINATION ${_lfs_ort_install_dest})
 endif()
+if(WIN32 AND USE_HIP AND _lfs_hip_runtime_dlls)
+    install(FILES ${_lfs_hip_runtime_dlls} DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 if(WIN32 AND BUILD_PORTABLE AND _lfs_cudnn_runtime_libs)
     install(FILES ${_lfs_cudnn_runtime_libs} DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
+install(FILES "${CMAKE_SOURCE_DIR}/THIRD_PARTY_LICENSES.md"
+    DESTINATION "licenses")
+install(FILES
+    "${CMAKE_SOURCE_DIR}/src/rendering/resources/assets/JetBrainsMono-LICENSE.txt"
+    DESTINATION "licenses/JetBrains-Mono")
+install(FILES
+    "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/shader/src/radix_sort/LICENSE"
+    DESTINATION "licenses/AMD-vk_radix_sort")
+install(FILES
+    "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/LICENSE-VKSPLAT"
+    DESTINATION "licenses/VkSplat")
+
+if(LFS_ONNXRUNTIME_NOTICE_FILES)
+    install(FILES ${LFS_ONNXRUNTIME_NOTICE_FILES}
+        DESTINATION "licenses/ONNX-Runtime")
+endif()
+
+if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+    file(GLOB _lfs_vcpkg_copyright_files LIST_DIRECTORIES FALSE
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/*/copyright")
+    foreach(_lfs_vcpkg_copyright IN LISTS _lfs_vcpkg_copyright_files)
+        get_filename_component(_lfs_vcpkg_share_dir "${_lfs_vcpkg_copyright}" DIRECTORY)
+        get_filename_component(_lfs_vcpkg_port "${_lfs_vcpkg_share_dir}" NAME)
+        install(FILES "${_lfs_vcpkg_copyright}"
+            DESTINATION "licenses/vcpkg/${_lfs_vcpkg_port}")
+    endforeach()
+endif()
+
+if(USE_HIP AND WIN32)
+    set(_lfs_rocm_notice_roots "${LFS_ROCM_PATH}")
+    set(_lfs_rocm_notice_destinations runtime)
+    if(DEFINED LFS_ROCM_DEVEL_PATH
+       AND NOT LFS_ROCM_DEVEL_PATH STREQUAL ""
+       AND NOT LFS_ROCM_DEVEL_PATH STREQUAL LFS_ROCM_PATH)
+        list(APPEND _lfs_rocm_notice_roots "${LFS_ROCM_DEVEL_PATH}")
+        list(APPEND _lfs_rocm_notice_destinations devel)
+    endif()
+    list(LENGTH _lfs_rocm_notice_roots _lfs_rocm_notice_count)
+    math(EXPR _lfs_rocm_notice_last "${_lfs_rocm_notice_count} - 1")
+    foreach(_lfs_rocm_notice_index RANGE 0 ${_lfs_rocm_notice_last})
+        list(GET _lfs_rocm_notice_roots
+            ${_lfs_rocm_notice_index} _lfs_rocm_notice_root)
+        list(GET _lfs_rocm_notice_destinations
+            ${_lfs_rocm_notice_index} _lfs_rocm_notice_destination)
+        file(GLOB_RECURSE _lfs_rocm_notice_files LIST_DIRECTORIES FALSE
+            "${_lfs_rocm_notice_root}/share/doc/LICENSE*"
+            "${_lfs_rocm_notice_root}/share/doc/COPYING*"
+            "${_lfs_rocm_notice_root}/share/doc/NOTICE*")
+        if(BUILD_PORTABLE AND NOT _lfs_rocm_notice_files)
+            message(FATAL_ERROR
+                "Portable ROCm packages require redistributable notices under "
+                "${_lfs_rocm_notice_root}/share/doc")
+        endif()
+        if(IS_DIRECTORY "${_lfs_rocm_notice_root}/share/doc")
+            install(DIRECTORY "${_lfs_rocm_notice_root}/share/doc/"
+                DESTINATION "licenses/ROCm/${_lfs_rocm_notice_destination}"
+                FILES_MATCHING
+                PATTERN "LICENSE*"
+                PATTERN "COPYING*"
+                PATTERN "NOTICE*")
+        endif()
+    endforeach()
+endif()
 
 set(INSTALL_RESOURCE_DIR "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio")
 if(_LFS_VULKAN_RASTERIZER_SPV_DIR)
@@ -1614,10 +1739,12 @@ endif()
 # Portable build: bundle runtime dependencies via GET_RUNTIME_DEPENDENCIES
 if(BUILD_PORTABLE)
     # Exclusion patterns for system libraries
-    # nvcuda.dll is provided by the NVIDIA GPU driver, not the CUDA Toolkit
-    set(_PRE_EXCLUDE [[api-ms-.*]] [[ext-ms-.*]] [[API-MS-.*]] [[EXT-MS-.*]] [[nvcuda[.]dll]] [[libcuda[.]so.*]])
+    # Driver and optional Windows system DLLs are supplied by the host OS.
+    set(_PRE_EXCLUDE
+            [[api-ms-.*]] [[ext-ms-.*]] [[API-MS-.*]] [[EXT-MS-.*]]
+            [[nvcuda[.]dll]] [[libcuda[.]so.*]] [[hvsifiletrust[.]dll]])
     set(_POST_EXCLUDE
-            [[.*[Ss]ystem32.*]] [[.*[Ww]indows.*]]
+            [[^[A-Za-z]:/[Ww]indows/.*]]
             [[/lib/x86_64-linux-gnu/.*]] [[/lib64/ld-linux.*]] [[/usr/lib.*]]
             [[.*ld-linux.*]] [[.*libc[.]so[.].*]] [[.*libpthread.*]]
             [[.*libdl[.]so.*]] [[.*libm[.]so[.].*]] [[.*librt[.]so.*]]
@@ -1638,10 +1765,12 @@ if(BUILD_PORTABLE)
     if(DEFINED VCPKG_TARGET_TRIPLET)
         list(APPEND _RUNTIME_SEARCH_DIRS
                 "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin"
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib"
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin"
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/lib")
+                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+        list(APPEND _RUNTIME_SEARCH_DIRS
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin"
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/lib")
     endif()
+    list(REMOVE_DUPLICATES _RUNTIME_SEARCH_DIRS)
 
     set(_SEARCH_DIRS_STR "")
     foreach(_runtime_search_dir IN LISTS _RUNTIME_SEARCH_DIRS)
@@ -1688,36 +1817,37 @@ if(BUILD_PORTABLE)
                 "${CMAKE_BINARY_DIR}/run_lichtfeld.sh"
                 @ONLY)
         install(PROGRAMS "${CMAKE_BINARY_DIR}/run_lichtfeld.sh" DESTINATION ${CMAKE_INSTALL_BINDIR})
-    elseif(WIN32)
-        install(CODE "
-            # Copy extensions/ from build to dist/extensions/
-            # Handle both single-config (Ninja) and multi-config (VS) generators
-            foreach(_cfg IN ITEMS \"\" \"Release\" \"Debug\" \"RelWithDebInfo\" \"MinSizeRel\")
-                if(_cfg)
-                    set(_ext_dir \"${CMAKE_BINARY_DIR}/\${_cfg}/extensions\")
-                else()
-                    set(_ext_dir \"${CMAKE_BINARY_DIR}/extensions\")
-                endif()
-                if(EXISTS \"\${_ext_dir}\")
-                    # Install only DLLs from the build extensions directory to avoid non-binary files
-                    file(GLOB _ext_dlls \"\${_ext_dir}/*.dll\")
-                    if(_ext_dlls)
-                        foreach(_e IN LISTS _ext_dlls)
-                            file(INSTALL \"\${_e}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/extensions\")
-                        endforeach()
-                    endif()
-                    break()
-                endif()
-            endforeach()
-            # Copy vcpkg DLLs
-            if(EXISTS \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin\")
-                file(GLOB _vcpkg \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll\")
-                foreach(_v IN LISTS _vcpkg)
-                    file(INSTALL \"\${_v}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
-                endforeach()
-            endif()
-        " COMPONENT runtime)
     endif()
+endif()
+
+if(WIN32)
+    install(CODE "
+        foreach(_cfg IN ITEMS \"\" \"Release\" \"Debug\" \"RelWithDebInfo\" \"MinSizeRel\")
+            if(_cfg)
+                set(_ext_dir \"${CMAKE_BINARY_DIR}/\${_cfg}/extensions\")
+            else()
+                set(_ext_dir \"${CMAKE_BINARY_DIR}/extensions\")
+            endif()
+            if(EXISTS \"\${_ext_dir}\")
+                file(GLOB _ext_dlls \"\${_ext_dir}/*.dll\")
+                foreach(_extension IN LISTS _ext_dlls)
+                    file(INSTALL \"\${_extension}\"
+                        DESTINATION \"\${CMAKE_INSTALL_PREFIX}/extensions\")
+                endforeach()
+                break()
+            endif()
+        endforeach()
+    " COMPONENT runtime)
+    install(CODE "
+        if(EXISTS \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin\")
+            file(GLOB _vcpkg_runtime_dlls
+                \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll\")
+            foreach(_vcpkg_runtime_dll IN LISTS _vcpkg_runtime_dlls)
+                file(INSTALL \"\${_vcpkg_runtime_dll}\"
+                    DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
+            endforeach()
+        endif()
+        " COMPONENT runtime)
 endif()
 
 # Build statistics (parses .ninja_log, no Python required)
@@ -1753,3 +1883,37 @@ elseif(SCCACHE_PROGRAM)
         COMMENT "Cleaning build and resetting sccache stats"
     )
 endif()
+
+# Package the selected CUDA or HIP Studio backend.
+    string(TOLOWER "${LFS_GPU_BACKEND}" _lfs_package_backend)
+    if(WIN32)
+        set(_lfs_package_platform "windows-x64")
+    else()
+        string(TOLOWER "${CMAKE_SYSTEM_NAME}" _lfs_package_system)
+        set(_lfs_package_platform "${_lfs_package_system}-${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    if(USE_HIP)
+        set(CPACK_PACKAGE_NAME "LichtFeld-Studio-for-ROCm")
+        set(_lfs_package_description
+            "LichtFeld Studio fork for AMD ROCm/HIP")
+    else()
+        set(CPACK_PACKAGE_NAME "LichtFeld-Studio")
+        set(_lfs_package_description "LichtFeld Studio")
+    endif()
+    set(CPACK_PACKAGE_VENDOR "Wildman-Inc")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${_lfs_package_description}")
+    set(CPACK_PACKAGE_HOMEPAGE_URL
+        "https://github.com/Wildman-Inc/LichtFeld-Studio")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+    if(USE_HIP)
+        set(CPACK_PACKAGE_FILE_NAME
+            "LichtFeld-Studio-for-ROCm-${PROJECT_VERSION}-${_lfs_package_platform}")
+    else()
+        set(CPACK_PACKAGE_FILE_NAME
+            "LichtFeld-Studio-${PROJECT_VERSION}-${_lfs_package_backend}-${_lfs_package_platform}")
+    endif()
+    set(CPACK_GENERATOR ZIP)
+    set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+    set(CPACK_PACKAGE_CHECKSUM SHA256)
+    set(CPACK_MONOLITHIC_INSTALL ON)
+    include(CPack)

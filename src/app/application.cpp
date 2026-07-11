@@ -165,7 +165,10 @@ namespace lfs::app {
                     }
 
                     trainer->setParams(checkpoint_params ? *checkpoint_params : *params); // Load checkpoint into trainer is called internally
-                    manager->setTrainer(std::move(trainer));
+                    if (!manager->setTrainer(std::move(trainer))) {
+                        LOG_ERROR("Failed to install trainer");
+                        return 1;
+                    }
                 }
 
                 core::Tensor::trim_memory_pool();
@@ -185,9 +188,21 @@ namespace lfs::app {
                             training_done.set_value(evt);
                         });
 
-                    manager->startTraining();
+                    if (!manager->startTraining()) {
+                        LOG_ERROR("Failed to start training");
+                        publisher.stop();
+                        responder.stop();
+                        responder.join();
+                        return 1;
+                    }
                     training_done.get_future().wait();
-                    manager->waitForCompletion();
+                    if (!manager->waitForCompletion()) {
+                        LOG_ERROR("Training thread did not stop within the timeout");
+                        publisher.stop();
+                        responder.stop();
+                        responder.join();
+                        return 1;
+                    }
 
                     publisher.stop();
                     responder.stop();

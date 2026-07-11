@@ -643,6 +643,7 @@ namespace lfs::training::mcmc {
         // This is O(n) per thread, total O(n*n_samples)
         // BUT: We can optimize using warp primitives
 
+        // Keep CUDA's logical 32-lane grouping when HIP executes on a wave64 CDNA GPU.
         const int WARP_SIZE = 32;
         int lane_id = threadIdx.x % WARP_SIZE;
 
@@ -655,7 +656,7 @@ namespace lfs::training::mcmc {
 
         // Warp-level reduction to sum counts
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            count += __shfl_down_sync(LFS_CUDA_SYNC_MASK, count, offset);
+            count += __shfl_down_sync(LFS_CUDA_SYNC_MASK, count, offset, WARP_SIZE);
         }
 
         // First lane writes the result

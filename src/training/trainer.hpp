@@ -134,7 +134,7 @@ namespace lfs::training {
         void request_pause() { pause_requested_ = true; }
         void request_resume() { pause_requested_ = false; }
         void request_save() { save_requested_ = true; }
-        void request_stop() { stop_requested_ = true; }
+        void request_stop();
 
         bool is_paused() const { return is_paused_.load(); }
         bool is_running() const { return is_running_.load(); }
@@ -534,6 +534,7 @@ namespace lfs::training {
         uint64_t viewer_borrow_waited_ = 0;
         mutable std::mutex stream_sync_mutex_;
 
+        void createGpuSynchronizationResources();
         void createSyncPrimitives();
         void destroySyncPrimitives();
         void recordParamsReady();

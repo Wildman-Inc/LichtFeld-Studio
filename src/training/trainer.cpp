@@ -76,6 +76,12 @@ namespace lfs::training {
         constexpr float CAMERA_LOSS_EMA_ALPHA = 0.2f;
         constexpr int CAMERA_LOSS_PUBLISH_INTERVAL = 16;
 
+        void throw_on_gpu_error(const cudaError_t status, const std::string_view operation) {
+            if (status != cudaSuccess) {
+                throw std::runtime_error(std::format("{}: {}", operation, cudaGetErrorString(status)));
+            }
+        }
+
         [[nodiscard]] bool env_flag_enabled(const char* name) {
             const char* raw = std::getenv(name);
             if (!raw) {
@@ -1773,23 +1779,15 @@ namespace lfs::training {
         : base_dataset_(std::move(dataset)),
           strategy_(std::move(strategy)),
           provided_splits_(std::move(provided_splits)) {
-        // Check CUDA availability
         int device_count = 0;
-        cudaError_t error = cudaGetDeviceCount(&device_count);
+        const cudaError_t error = cudaGetDeviceCount(&device_count);
         if (error != cudaSuccess || device_count == 0) {
-            throw std::runtime_error("CUDA is not available – aborting.");
+            const std::string reason = error == cudaSuccess ? "no compatible devices detected"
+                                                            : cudaGetErrorString(error);
+            throw std::runtime_error(std::format("GPU training is unavailable: {}", reason));
         }
 
-        cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking);
-        // Use the default stream flags so synchronous readbacks and cold-path
-        // uploads remain ordered with training work. Overlap partners use
-        // non-blocking streams with explicit event edges.
-        cudaStreamCreate(&training_stream_);
-        cudaStreamCreateWithFlags(&metrics_stream_, cudaStreamNonBlocking);
-        nvtxNameCudaStreamA(training_stream_, "lfs.train");
-        nvtxNameCudaStreamA(callback_stream_, "lfs.train.callback");
-        nvtxNameCudaStreamA(metrics_stream_, "lfs.metrics");
-        createSyncPrimitives();
+        createGpuSynchronizationResources();
 
         LOG_DEBUG("Trainer constructed with {} cameras", base_dataset_->get_cameras().size());
     }
@@ -1797,38 +1795,73 @@ namespace lfs::training {
     Trainer::Trainer(lfs::core::Scene& scene)
         : scene_(&scene) {
         int device_count = 0;
-        cudaError_t error = cudaGetDeviceCount(&device_count);
+        const cudaError_t error = cudaGetDeviceCount(&device_count);
         if (error != cudaSuccess || device_count == 0) {
-            throw std::runtime_error("CUDA is not available – aborting.");
+            const std::string reason = error == cudaSuccess ? "no compatible devices detected"
+                                                            : cudaGetErrorString(error);
+            throw std::runtime_error(std::format("GPU training is unavailable: {}", reason));
         }
-
-        cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking);
-        // Use the default stream flags so synchronous readbacks and cold-path
-        // uploads remain ordered with training work. Overlap partners use
-        // non-blocking streams with explicit event edges.
-        cudaStreamCreate(&training_stream_);
-        cudaStreamCreateWithFlags(&metrics_stream_, cudaStreamNonBlocking);
-        nvtxNameCudaStreamA(training_stream_, "lfs.train");
-        nvtxNameCudaStreamA(callback_stream_, "lfs.train.callback");
-        nvtxNameCudaStreamA(metrics_stream_, "lfs.metrics");
-        createSyncPrimitives();
 
         if (!scene.hasTrainingData()) {
             throw std::runtime_error("Scene has no cameras");
         }
 
+        createGpuSynchronizationResources();
+
         LOG_DEBUG("Trainer constructed from Scene with {} cameras", scene.getAllCameras().size());
     }
 
+    void Trainer::createGpuSynchronizationResources() {
+        try {
+            throw_on_gpu_error(
+                cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking),
+                "Failed to create training callback stream");
+            // The default flags keep synchronous readbacks and cold-path uploads
+            // ordered with training work. Overlap partners use explicit event edges.
+            throw_on_gpu_error(cudaStreamCreate(&training_stream_),
+                               "Failed to create training stream");
+            throw_on_gpu_error(
+                cudaStreamCreateWithFlags(&metrics_stream_, cudaStreamNonBlocking),
+                "Failed to create metrics stream");
+
+            nvtxNameCudaStreamA(training_stream_, "lfs.train");
+            nvtxNameCudaStreamA(callback_stream_, "lfs.train.callback");
+            nvtxNameCudaStreamA(metrics_stream_, "lfs.metrics");
+            createSyncPrimitives();
+        } catch (...) {
+            destroySyncPrimitives();
+            if (metrics_stream_) {
+                cudaStreamDestroy(metrics_stream_);
+                metrics_stream_ = nullptr;
+            }
+            if (training_stream_) {
+                cudaStreamDestroy(training_stream_);
+                training_stream_ = nullptr;
+            }
+            if (callback_stream_) {
+                cudaStreamDestroy(callback_stream_);
+                callback_stream_ = nullptr;
+            }
+            throw;
+        }
+    }
+
     void Trainer::createSyncPrimitives() {
-        cudaEventCreateWithFlags(&params_ready_event_, cudaEventDisableTiming);
+        throw_on_gpu_error(
+            cudaEventCreateWithFlags(&params_ready_event_, cudaEventDisableTiming),
+            "Failed to create parameter-ready event");
         for (auto& event : reader_done_events_) {
-            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+            throw_on_gpu_error(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                               "Failed to create model-reader event");
         }
         for (auto& slot : loss_slots_) {
             slot.pinned = static_cast<float*>(
                 lfs::core::PinnedMemoryAllocator::instance().allocate(sizeof(float)));
-            cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming);
+            if (!slot.pinned) {
+                throw std::runtime_error("Failed to allocate pinned loss readback memory");
+            }
+            throw_on_gpu_error(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming),
+                               "Failed to create loss readback event");
         }
     }
 
@@ -1890,13 +1923,17 @@ namespace lfs::training {
             if (!slot.in_flight) {
                 continue;
             }
-            if (drain) {
-                if (cudaEventSynchronize(slot.done) != cudaSuccess) {
-                    slot.in_flight = false;
-                    continue;
-                }
-            } else if (cudaEventQuery(slot.done) != cudaSuccess) {
+            const cudaError_t status = drain ? cudaEventSynchronize(slot.done)
+                                             : cudaEventQuery(slot.done);
+            if (!drain && status == cudaErrorNotReady) {
                 break;
+            }
+            if (status != cudaSuccess) {
+                slot.in_flight = false;
+                return std::unexpected(std::format(
+                    "Loss readback event failed at iteration {}: {}",
+                    slot.iter,
+                    cudaGetErrorString(status)));
             }
             slot.in_flight = false;
 
@@ -2680,6 +2717,13 @@ namespace lfs::training {
 
     Trainer::~Trainer() {
         shutdown();
+    }
+
+    void Trainer::request_stop() {
+        stop_requested_.store(true, std::memory_order_release);
+        if (auto loader = getActiveImageLoader()) {
+            loader->request_shutdown();
+        }
     }
 
     std::shared_ptr<lfs::io::PipelinedImageLoader> Trainer::getActiveImageLoader() const {
@@ -4684,6 +4728,9 @@ namespace lfs::training {
                 lfs::core::Tensor gt_image;
                 auto example_opt = train_dataloader->next();
                 if (!example_opt) {
+                    if (stop_token.stop_requested() || stop_requested_.load()) {
+                        break;
+                    }
                     LOG_ERROR("DataLoader returned nullopt unexpectedly");
                     break;
                 }

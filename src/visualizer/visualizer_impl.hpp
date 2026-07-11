@@ -163,6 +163,7 @@ namespace lfs::vis {
         void performNewProject();
         void handleSwitchToLatestCheckpoint();
         void performReset();
+        [[nodiscard]] bool tryPrepareForSceneMutation();
         void resetProjectState();
 
         // Tool initialization

@@ -617,6 +617,28 @@ namespace lfs::vis::gui {
         video_export_environment_state_.reset();
     }
 
+    bool AsyncTaskManager::tryPrepareForSceneMutation() {
+        bool ready = true;
+        if (export_state_.active.load()) {
+            if (!export_state_.cancel_requested.load()) {
+                cancelExport();
+            }
+            ready = false;
+        }
+        if (video_export_state_.active.load()) {
+            if (!video_export_state_.cancel_requested.load()) {
+                cancelVideoExport();
+            }
+            ready = false;
+        }
+        if (!ready) {
+            return false;
+        }
+
+        shutdown();
+        return true;
+    }
+
     void AsyncTaskManager::shutdown() {
         if (export_state_.active.load())
             cancelExport();
@@ -633,22 +655,29 @@ namespace lfs::vis::gui {
             resetVideoExportEnvironmentState();
         }
 
-        if (import_state_.thread) {
-            import_state_.thread->request_stop();
-            if (import_state_.thread->joinable())
-                import_state_.thread->join();
-            import_state_.thread.reset();
-        }
+        cancelImport();
         cancelImportCompletionDismiss();
 
         mesh2splat_state_.active.store(false);
         mesh2splat_state_.pending.store(false);
+        {
+            const std::lock_guard lock(mesh2splat_state_.mutex);
+            mesh2splat_state_.pending_mesh.reset();
+            mesh2splat_state_.result.reset();
+        }
 
         if (splat_simplify_state_.active.load())
             cancelSplatSimplify();
         if (splat_simplify_state_.thread && splat_simplify_state_.thread->joinable())
             splat_simplify_state_.thread->join();
         splat_simplify_state_.thread.reset();
+        splat_simplify_state_.active.store(false);
+        splat_simplify_state_.completed.store(false);
+        splat_simplify_state_.apply_pending.store(false);
+        {
+            const std::lock_guard lock(splat_simplify_state_.mutex);
+            splat_simplify_state_.result.reset();
+        }
     }
 
     void AsyncTaskManager::setupEvents() {
@@ -1362,6 +1391,7 @@ namespace lfs::vis::gui {
     }
 
     void AsyncTaskManager::cancelImport() {
+        import_state_.apply_auto_crop.store(false);
         const bool had_activity = import_state_.active.load() ||
                                   import_state_.show_completion.load() ||
                                   import_state_.thread.has_value();
@@ -1781,12 +1811,13 @@ namespace lfs::vis::gui {
                         video_export_state_.error = "Video encoder not available";
                         video_export_state_.stage = "Failed";
                     }
-                    video_export_state_.active.store(false);
                     publishVideoExportOverlayState();
                     lfs::core::events::state::VideoExportFailed{
                         .error = "Video encoder not available"}
                         .emit();
                     cleanup_environment_state();
+                    video_export_state_.active.store(false);
+                    publishVideoExportOverlayState();
                     return;
                 }
 
@@ -1807,9 +1838,10 @@ namespace lfs::vis::gui {
                     lfs::core::events::state::VideoExportFailed{
                         .error = result.error()}
                         .emit();
-                    video_export_state_.active.store(false);
                     publishVideoExportOverlayState();
                     cleanup_environment_state();
+                    video_export_state_.active.store(false);
+                    publishVideoExportOverlayState();
                     return;
                 }
 

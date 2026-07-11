@@ -218,9 +218,9 @@ Lean on Vulkan 1.3+ features that are probed but unused.
 
 ---
 
-## Phase 6 — Vulkan-native backward (the moat, 6–10 weeks)
+## Phase 6 — Conditional Vulkan-native backward (candidate, 6–10 weeks)
 
-This is the strategic bet. With it, **training works on AMD, Intel Arc, headless cloud GPUs without CUDA**, and on macOS via MoltenVK.
+This is a conditional, hardware-specific research path, not a cross-vendor support promise. Proceed only for target GPUs whose Vulkan drivers and required features pass a go/no-go prototype. Any Vulkan-native training work remains separate from the supported CUDA/HIP training backends and from the standalone Arc Viewer.
 
 ### 6.1 Wire the existing backward Slang shaders
 - `vulkan/CMakeLists.txt:138` — enable `EXPORT_MODE=1` compilation.
@@ -237,11 +237,12 @@ This is the strategic bet. With it, **training works on AMD, Intel Arc, headless
 ### 6.4 Densification heuristics in compute
 - MCMC and default densify are already pointwise + sort-by-grad — straightforward.
 
-### 6.5 Toggle: `--training-backend {cuda,vulkan}`
-- New flag. Default `cuda` initially; flip after PSNR equivalence holds for 30k-iter runs across 3 scenes.
-- **Accept**: train `bicycle` 30k on Vulkan backend; PSNR within 0.1 dB of CUDA backend; throughput within 30% on RTX 3070.
+### 6.5 Conditional toggle: `--training-backend {native,vulkan}`
+- New flag. Keep each platform's existing native backend as the default. Expose Vulkan only after the target hardware and driver pass capability checks, and do not change a platform default until PSNR equivalence holds for 30k-iteration runs across three scenes on that hardware.
+- **Accept on the RTX 3070 reference configuration**: train `bicycle` for 30k iterations on the Vulkan backend; PSNR within 0.1 dB of the native CUDA backend; throughput within 30%.
+- This criterion qualifies only the named NVIDIA/Vulkan configuration. AMD, Intel, cloud, and MoltenVK targets require separate numerical, performance, and training validation.
 
-**Phase 6 exit**: Vendor-agnostic 3DGS training. Industry-leading. Composite 9.7 → 10.
+**Phase 6 exit**: Hardware-qualified Vulkan-native 3DGS training on explicitly validated devices. Additional vendors and devices remain separate validation work. Composite 9.7 → 10.
 
 ---
 
@@ -319,7 +320,7 @@ The `LOG_TIMER("vksplat.render")` in `rendering_manager_vulkan.cpp` wraps the ra
 1. Phase 3 — debug-utils labels everywhere + `VK_KHR_present_wait` + `VK_NV_low_latency2`.
 2. Phase 4 — descriptor buffer (`VK_EXT_descriptor_buffer`) + graphics pipeline library + push descriptor + mutable descriptor type.
 3. Phase 5 — Slang convergence (single math source for CUDA `gsplat_fwd` and Vulkan `vulkan`).
-4. Phase 6 — Vulkan-native backward; Vulkan-backend training (the moat).
+4. Phase 6 — conditional Vulkan-native backward and training on qualified hardware.
 5. Full ImGui exorcism (`py_ui.cpp` → `rml_im_mode_panel_adapter`, theme `ImVec4` → `Color`, ui_widgets/panel_registry migration, ImPlot retirement). Estimated 6–10 weeks; out of scope this sprint per explicit decision.
 
 ## Sequencing notes
@@ -327,7 +328,7 @@ The `LOG_TIMER("vksplat.render")` in `rendering_manager_vulkan.cpp` wraps the ra
 - Phases 0 → 1 → 2 are the **must-land** sequence to claim staff-level. ~3 weeks total.
 - Phase 3 can run parallel to 2 (different files).
 - Phase 4 needs Phase 1 done (RmlUi is the main descriptor consumer left).
-- Phase 5 unblocks Phase 6; both can be deferred if priorities shift.
+- Phase 5 enables a Phase 6 prototype. Full Phase 6 work proceeds only after target-specific hardware and driver qualification, and both phases can be deferred if priorities shift.
 - Phase 7 strictly optional.
 
 ## What "elite" means once this lands
@@ -339,6 +340,6 @@ The `LOG_TIMER("vksplat.render")` in `rendering_manager_vulkan.cpp` wraps the ra
 - Indirect-dispatch splat pipeline with no GPU→CPU readbacks
 - Async compute queue overlapping graphics
 - Single source of math (Slang) for both CUDA and Vulkan backends
-- Optional Vulkan-native training: vendor-agnostic 3DGS
+- Optional, hardware-qualified Vulkan-native training on explicitly validated devices
 
 That's the moat.

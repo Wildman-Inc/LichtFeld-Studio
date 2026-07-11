@@ -7,8 +7,10 @@ This project builds upon and is inspired by the following:
 |---------|-------------|---------|
 | [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | Original work by Kerbl et al. | Custom |
 | [gsplat](https://github.com/nerfstudio-project/gsplat) | Optimized CUDA rasterization backend | Apache-2.0 |
-| [VkSplat](https://github.com/vksplat/vksplat) | High-performance 3DGS training in Vulkan compute | Apache-2.0 |
+| [VkSplat](https://github.com/harry7557558/vksplat) | Vulkan compute rasterization used by the Studio viewport | [Apache-2.0](src/rendering/rasterizer/vulkan/LICENSE-VKSPLAT) |
 | [PPISP](https://github.com/nv-tlabs/ppisp) | Physically-Plausible Image Signal Processing for radiance field reconstruction | Apache-2.0 |
+
+**VkSplat provenance:** The active implementation vendored at `src/rendering/rasterizer/vulkan` is a heavily modified fork originally based on upstream commit [`92aa5bc7f0eb95ec969e5c291f7662e7ca5ce8d8`](https://github.com/harry7557558/vksplat/commit/92aa5bc7f0eb95ec969e5c291f7662e7ca5ce8d8). It includes substantial LichtFeld Studio-specific integration changes, additional rendering features, and performance optimizations.
 
 ## Gaussian Splatting Tools & Inspiration
 | Project | Description | License |
@@ -52,11 +54,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 | [GLM](https://github.com/g-truc/glm) | OpenGL Mathematics library | MIT |
 | [glad](https://github.com/Dav1dde/glad) | OpenGL loader | MIT |
 
-## CUDA & GPU Libraries
+## GPU Toolchains & Libraries
 | Project | Description | License |
 |---------|-------------|---------|
 | [NVIDIA nvImageCodec](https://github.com/NVIDIA/nvImageCodec) | GPU-accelerated image encoding/decoding | Apache-2.0 |
-| [Intel TBB](https://github.com/oneapi-src/oneTBB) | Threading Building Blocks | Apache-2.0 |
+| [Intel oneTBB](https://github.com/uxlfoundation/oneTBB) | Threading Building Blocks | Apache-2.0 |
+| [AMD ROCm / HIP](https://github.com/ROCm/ROCm) | HIP compiler, runtime, and GPU libraries used by LichtFeld Studio for ROCm | Component-specific open-source licenses |
+| [hipRAND](https://github.com/ROCm/hipRAND) | HIP random-number compatibility API used by the training backend | MIT |
 
 ## ML Inference & Models
 | Project | Description | License |

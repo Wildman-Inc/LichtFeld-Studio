@@ -125,6 +125,10 @@ namespace lfs::vis {
         VksplatViewportRenderer(const VksplatViewportRenderer&) = delete;
         VksplatViewportRenderer& operator=(const VksplatViewportRenderer&) = delete;
 
+        // HIP requires a verified Vulkan device identity before external-memory
+        // and timeline-semaphore interop can be used safely.
+        [[nodiscard]] static bool isSupported();
+
         [[nodiscard]] std::expected<RenderResult, std::string> render(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,

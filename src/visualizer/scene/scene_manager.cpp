@@ -1119,7 +1119,10 @@ namespace lfs::vis {
     void SceneManager::resetToEmptyState(const bool trainer_already_cleared) {
         if (!trainer_already_cleared) {
             if (auto* trainer = services().trainerOrNull()) {
-                trainer->clearTrainer();
+                if (!trainer->clearTrainer()) {
+                    LOG_ERROR("Cannot clear scene before the training thread is joined");
+                    return;
+                }
             }
         }
 
@@ -1243,8 +1246,12 @@ namespace lfs::vis {
             if (auto* trainer = services().trainerOrNull()) {
                 LOG_INFO("Stopping training due to node deletion: {}", name);
                 trainer->stopTraining();
-                trainer->waitForCompletion();
-                trainer->clearTrainer();
+                if (!trainer->waitForCompletion()) {
+                    return std::unexpected("Cannot delete training model before the training thread is joined");
+                }
+                if (!trainer->clearTrainer()) {
+                    return std::unexpected("Cannot delete training model before the trainer is cleared");
+                }
                 scene_.setTrainingModelNode("");
                 trainer_cleared = true;
             }
@@ -1312,7 +1319,12 @@ namespace lfs::vis {
             .emit();
 
         if (scene_.getNodeCount() == 0) {
-            resetToEmptyState(trainer_cleared);
+            if (!trainer_cleared) {
+                if (auto* trainer = services().trainerOrNull(); trainer && !trainer->clearTrainer()) {
+                    return std::unexpected("Cannot reset empty scene before the training thread is joined");
+                }
+            }
+            resetToEmptyState(true);
         }
 
         if (history_before) {
@@ -2400,8 +2412,8 @@ namespace lfs::vis {
         try {
             core::Scene::Transaction txn(scene_);
 
-            if (services().trainerOrNull()) {
-                services().trainerOrNull()->clearTrainer();
+            if (auto* trainer = services().trainerOrNull(); trainer && !trainer->clearTrainer()) {
+                return std::unexpected("Cannot replace dataset before the training thread is joined");
             }
             if (!clear()) {
                 return std::unexpected("Failed to clear existing scene");
@@ -2424,7 +2436,9 @@ namespace lfs::vis {
                     return std::unexpected("No trainer manager");
                 }
                 services().trainerOrNull()->setScene(&scene_);
-                services().trainerOrNull()->setTrainer(std::move(trainer));
+                if (!services().trainerOrNull()->setTrainer(std::move(trainer))) {
+                    return std::unexpected("Failed to install trainer for loaded dataset");
+                }
             }
 
             const size_t num_gaussians = scene_.getTrainingModelGaussianCount();
@@ -2475,8 +2489,8 @@ namespace lfs::vis {
             // Validation passed - now clear and load
             core::Scene::Transaction txn(scene_);
 
-            if (services().trainerOrNull()) {
-                services().trainerOrNull()->clearTrainer();
+            if (auto* trainer = services().trainerOrNull(); trainer && !trainer->clearTrainer()) {
+                throw std::runtime_error("Cannot replace dataset before the training thread is joined");
             }
             if (!clear()) {
                 return std::unexpected("Failed to clear existing scene");
@@ -2505,7 +2519,9 @@ namespace lfs::vis {
             if (services().trainerOrNull()) {
                 LOG_DEBUG("Setting trainer in manager");
                 services().trainerOrNull()->setScene(&scene_);
-                services().trainerOrNull()->setTrainer(std::move(trainer));
+                if (!services().trainerOrNull()->setTrainer(std::move(trainer))) {
+                    throw std::runtime_error("Failed to install trainer for loaded dataset");
+                }
             } else {
                 LOG_ERROR("No trainer manager available");
                 throw std::runtime_error("No trainer manager available");
@@ -2624,7 +2640,10 @@ namespace lfs::vis {
         try {
             auto trainer = std::make_unique<lfs::training::Trainer>(scene_);
             trainer_mgr->setScene(&scene_);
-            trainer_mgr->setTrainer(std::move(trainer));
+            if (!trainer_mgr->setTrainer(std::move(trainer))) {
+                LOG_ERROR("Cannot prepare training before the previous training thread is joined");
+                return;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
@@ -2692,8 +2711,8 @@ namespace lfs::vis {
             // === Phase 2: Clear scene (validation passed) ===
             core::Scene::Transaction txn(scene_);
 
-            if (services().trainerOrNull()) {
-                services().trainerOrNull()->clearTrainer();
+            if (auto* trainer = services().trainerOrNull(); trainer && !trainer->clearTrainer()) {
+                throw std::runtime_error("Cannot load checkpoint before the training thread is joined");
             }
             if (!clear()) {
                 throw std::runtime_error("Failed to clear existing scene");
@@ -2756,7 +2775,9 @@ namespace lfs::vis {
                 throw std::runtime_error("No trainer manager available");
             }
             services().trainerOrNull()->setScene(&scene_);
-            services().trainerOrNull()->setTrainerFromCheckpoint(std::move(trainer), checkpoint_iteration);
+            if (!services().trainerOrNull()->setTrainerFromCheckpoint(std::move(trainer), checkpoint_iteration)) {
+                throw std::runtime_error("Failed to install trainer from checkpoint");
+            }
 
             // Keep the viewer's editable state aligned with the restored trainer state.
             if (auto* param_mgr = services().paramsOrNull()) {
@@ -2786,15 +2807,20 @@ namespace lfs::vis {
         LOG_DEBUG("Clearing scene");
 
         // Check if clearing is allowed via state machine
-        if (services().trainerOrNull() && content_type_ == ContentType::Dataset) {
-            if (!services().trainerOrNull()->canPerform(TrainingAction::ClearScene)) {
+        auto* const trainer = services().trainerOrNull();
+        if (trainer && content_type_ == ContentType::Dataset) {
+            if (!trainer->canPerform(TrainingAction::ClearScene)) {
                 LOG_WARN("Cannot clear scene: {}",
-                         services().trainerOrNull()->getActionBlockedReason(TrainingAction::ClearScene));
+                         trainer->getActionBlockedReason(TrainingAction::ClearScene));
                 return false;
             }
         }
+        if (trainer && !trainer->clearTrainer()) {
+            LOG_ERROR("Cannot clear scene before the training thread is joined");
+            return false;
+        }
         op::undoHistory().clear();
-        resetToEmptyState(false);
+        resetToEmptyState(true);
         return true;
     }
 
@@ -2824,7 +2850,10 @@ namespace lfs::vis {
             if (trainer_mgr->isTrainingActive()) {
                 trainer_mgr->stopTraining();
             }
-            trainer_mgr->waitForCompletion();
+            if (!trainer_mgr->waitForCompletion()) {
+                LOG_ERROR("Cannot switch to edit mode before the training thread is joined");
+                return;
+            }
             trainer = trainer_mgr->getTrainer();
             if (trainer && trainer->hasPPISP()) {
                 ppisp = trainer->takePPISP();
@@ -2854,7 +2883,10 @@ namespace lfs::vis {
             scene_.getWorldTransform(model_node->id);
 
         if (trainer_mgr) {
-            trainer_mgr->clearTrainer();
+            if (!trainer_mgr->clearTrainer()) {
+                LOG_ERROR("Cannot switch to edit mode before the trainer is cleared");
+                return;
+            }
         }
 
         scene_.clear();

@@ -808,16 +808,32 @@ namespace lfs::vis {
         // are now handled by TrainerManager::setupEventHandlers()
 
         cmd::ResetTraining::when([this](const auto&) {
-            if (!scene_manager_ || !scene_manager_->hasDataset()) {
-                LOG_WARN("Cannot reset: no dataset");
-                return;
+            const bool posted = postWork(WorkItem{
+                .run = [this] {
+                    if (!scene_manager_ || !scene_manager_->hasDataset()) {
+                        LOG_WARN("Cannot reset: no dataset");
+                        return;
+                    }
+                    pending_new_project_ = false;
+                    const bool training_ready = !trainer_manager_ ||
+                                                (!trainer_manager_->isTrainingActive() &&
+                                                 trainer_manager_->tryFinalizeCompletion());
+                    const bool scene_tasks_ready = tryPrepareForSceneMutation();
+                    if (!training_ready || !scene_tasks_ready) {
+                        pending_reset_ = true;
+                        if (trainer_manager_ && trainer_manager_->canStop()) {
+                            trainer_manager_->stopTraining();
+                        }
+                        wakeMainLoop();
+                        return;
+                    }
+                    pending_reset_ = false;
+                    performReset();
+                },
+                .cancel = {}});
+            if (!posted) {
+                LOG_WARN("Reset request ignored while the viewer is shutting down");
             }
-            if (trainer_manager_ && trainer_manager_->isTrainingActive()) {
-                pending_reset_ = true;
-                trainer_manager_->stopTraining();
-                return;
-            }
-            performReset();
         });
 
         cmd::NewProject::when([this](const auto&) {
@@ -1148,17 +1164,26 @@ namespace lfs::vis {
             selection_tool_->update(*tool_context_);
         }
 
-        if (pending_new_project_ && trainer_manager_ &&
-            trainer_manager_->canPerform(TrainingAction::ClearScene)) {
-            pending_new_project_ = false;
-            trainer_manager_->waitForCompletion();
-            performNewProject();
+        if (pending_new_project_) {
+            const bool training_ready = !trainer_manager_ ||
+                                        (trainer_manager_->tryFinalizeCompletion() &&
+                                         trainer_manager_->canPerform(TrainingAction::ClearScene));
+            const bool scene_tasks_ready = tryPrepareForSceneMutation();
+            if (training_ready && scene_tasks_ready) {
+                pending_new_project_ = false;
+                performNewProject();
+            }
         }
 
-        if (pending_reset_ && trainer_manager_ && !trainer_manager_->isTrainingActive()) {
-            pending_reset_ = false;
-            trainer_manager_->waitForCompletion();
-            performReset();
+        if (pending_reset_) {
+            const bool training_ready = !trainer_manager_ ||
+                                        (trainer_manager_->tryFinalizeCompletion() &&
+                                         trainer_manager_->canPerform(TrainingAction::Reset));
+            const bool scene_tasks_ready = tryPrepareForSceneMutation();
+            if (training_ready && scene_tasks_ready) {
+                pending_reset_ = false;
+                performReset();
+            }
         }
 
         if (!gui_frame_rendered_) {
@@ -1598,7 +1623,10 @@ namespace lfs::vis {
         if (trainer_manager_) {
             if (trainer_manager_->isTrainingActive()) {
                 trainer_manager_->stopTraining();
-                trainer_manager_->waitForCompletion();
+            }
+            if (!trainer_manager_->waitForCompletion()) {
+                LOG_ERROR("Shutdown deferred because the training thread did not stop");
+                return;
             }
             trainer_manager_.reset();
         }
@@ -1732,11 +1760,16 @@ namespace lfs::vis {
         pending_auto_train_ = false;
         pending_reset_ = false;
 
-        if (trainer_manager_ && !trainer_manager_->canPerform(TrainingAction::ClearScene)) {
+        const bool training_ready = !trainer_manager_ ||
+                                    (trainer_manager_->tryFinalizeCompletion() &&
+                                     trainer_manager_->canPerform(TrainingAction::ClearScene));
+        const bool scene_tasks_ready = tryPrepareForSceneMutation();
+        if (!training_ready || !scene_tasks_ready) {
             pending_new_project_ = true;
-            if (trainer_manager_->canStop()) {
+            if (trainer_manager_ && trainer_manager_->canStop()) {
                 trainer_manager_->stopTraining();
             }
+            wakeMainLoop();
             return;
         }
 
@@ -1847,7 +1880,7 @@ namespace lfs::vis {
     void VisualizerImpl::performReset() {
         assert(scene_manager_ && scene_manager_->hasDataset());
 
-        const auto& path = scene_manager_->getDatasetPath();
+        const auto path = scene_manager_->getDatasetPath();
         if (path.empty()) {
             LOG_ERROR("Cannot reset: empty path");
             return;
@@ -1898,6 +1931,10 @@ namespace lfs::vis {
         }
 
         restore_camera();
+    }
+
+    bool VisualizerImpl::tryPrepareForSceneMutation() {
+        return !gui_manager_ || gui_manager_->asyncTasks().tryPrepareForSceneMutation();
     }
 
     void VisualizerImpl::handleLoadFileCommand([[maybe_unused]] const lfs::core::events::cmd::LoadFile& cmd) {

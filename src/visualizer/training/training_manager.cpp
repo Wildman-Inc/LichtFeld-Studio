@@ -190,21 +190,17 @@ namespace lfs::vis {
     void TrainerManager::cleanupTrainingResources(const TrainingResources& /*resources*/) {
         LOG_DEBUG("Cleaning up training resources");
 
-        if (training_thread_ && training_thread_->joinable()) {
-            training_thread_->request_stop();
-            auto timeout = std::chrono::milliseconds(500);
-            {
-                std::unique_lock<std::mutex> lock(completion_mutex_);
-                if (completion_cv_.wait_for(lock, timeout, [this] { return training_complete_; })) {
-                    lock.unlock();
-                    training_thread_->join();
-                } else {
-                    lock.unlock();
-                    LOG_WARN("Thread didn't respond to stop request, detaching");
-                    training_thread_->detach();
-                }
+        {
+            std::lock_guard lock(training_thread_mutex_);
+            if (training_thread_ && training_thread_->joinable()) {
+                training_thread_->request_stop();
             }
-            training_thread_.reset();
+        }
+        if (has_training_thread_.load(std::memory_order_acquire)) {
+            if (!waitForCompletion()) {
+                LOG_ERROR("Training resources remain live because the training thread did not stop");
+                return;
+            }
         }
 
         if (trainer_) {
@@ -217,7 +213,7 @@ namespace lfs::vis {
     void TrainerManager::updateResourceTracking() {
         TrainingResources resources;
         resources.has_trainer = trainer_ != nullptr;
-        resources.has_training_thread = training_thread_ != nullptr && training_thread_->joinable();
+        resources.has_training_thread = has_training_thread_.load(std::memory_order_acquire);
         resources.has_scene_data = scene_ != nullptr;
         resources.has_gpu_tensors = trainer_ && trainer_->isInitialized();
         if (scene_) {
@@ -228,17 +224,30 @@ namespace lfs::vis {
 
     TrainerManager::~TrainerManager() {
         // Ensure training is stopped before destruction
-        if (training_thread_ && training_thread_->joinable()) {
+        if (has_training_thread_.load(std::memory_order_acquire)) {
             LOG_INFO("Stopping training thread during destruction...");
             stopTraining();
-            waitForCompletion();
+            if (!waitForCompletion()) {
+                LOG_ERROR("Timed out stopping training during destruction; waiting for a safe join");
+                std::lock_guard lock(training_thread_mutex_);
+                if (training_thread_ && training_thread_->joinable()) {
+                    training_thread_->request_stop();
+                    training_thread_->join();
+                    training_thread_.reset();
+                }
+                has_training_thread_.store(false, std::memory_order_release);
+                training_thread_exited_.store(true, std::memory_order_release);
+            }
         }
     }
 
-    void TrainerManager::setTrainer(std::unique_ptr<lfs::training::Trainer> trainer) {
+    bool TrainerManager::setTrainer(std::unique_ptr<lfs::training::Trainer> trainer) {
         LOG_TIMER_TRACE("TrainerManager::setTrainer");
 
-        clearTrainer();
+        if (!clearTrainer()) {
+            LOG_ERROR("Cannot replace trainer before the previous training thread is joined");
+            return false;
+        }
 
         if (trainer) {
             const auto& params = trainer->getParams();
@@ -255,12 +264,16 @@ namespace lfs::vis {
 
             internal::TrainerReady{}.emit();
         }
+        return true;
     }
 
-    void TrainerManager::setTrainerFromCheckpoint(std::unique_ptr<lfs::training::Trainer> trainer, int checkpoint_iteration) {
+    bool TrainerManager::setTrainerFromCheckpoint(std::unique_ptr<lfs::training::Trainer> trainer, int checkpoint_iteration) {
         LOG_TIMER_TRACE("TrainerManager::setTrainerFromCheckpoint");
 
-        clearTrainer();
+        if (!clearTrainer()) {
+            LOG_ERROR("Cannot replace trainer from checkpoint before the previous training thread is joined");
+            return false;
+        }
 
         if (trainer) {
             const auto& params = trainer->getParams();
@@ -279,13 +292,14 @@ namespace lfs::vis {
             state::TrainingPaused{.iteration = checkpoint_iteration}.emit();
             LOG_DEBUG("Trainer paused from checkpoint (iteration {})", checkpoint_iteration);
         }
+        return true;
     }
 
     bool TrainerManager::hasTrainer() const {
         return trainer_ != nullptr;
     }
 
-    void TrainerManager::clearTrainer() {
+    bool TrainerManager::clearTrainer() {
         LOG_DEBUG("Clearing trainer");
 
         const auto state = getState();
@@ -297,13 +311,12 @@ namespace lfs::vis {
             stopTraining();
         }
 
-        if (training_thread_ && training_thread_->joinable()) {
-            if (training_thread_->get_id() == std::this_thread::get_id()) {
-                LOG_ERROR("Cannot clear trainer from its own training thread");
-                return;
-            }
+        if (has_training_thread_.load(std::memory_order_acquire)) {
             LOG_INFO("Waiting for training thread before clearing trainer");
-            waitForCompletion();
+            if (!waitForCompletion()) {
+                LOG_ERROR("Cannot clear trainer before the training thread is joined");
+                return false;
+            }
         }
 
         {
@@ -320,6 +333,7 @@ namespace lfs::vis {
         python::update_training_state(false, "idle");
         python::update_trainer_loaded(false, 0);
         LOG_INFO("Trainer cleared");
+        return true;
     }
 
     bool TrainerManager::startTraining() {
@@ -327,6 +341,12 @@ namespace lfs::vis {
 
         if (!canStart()) {
             LOG_WARN("Cannot start: {}", getActionBlockedReason(TrainingAction::Start));
+            return false;
+        }
+
+        if (has_training_thread_.load(std::memory_order_acquire) &&
+            !tryFinalizeCompletion()) {
+            LOG_ERROR("Cannot start training before the previous training thread exits");
             return false;
         }
 
@@ -468,13 +488,6 @@ namespace lfs::vis {
             }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(completion_mutex_);
-            training_complete_ = false;
-        }
-
-        updateResourceTracking();
-
         if (!state_machine_.transitionTo(TrainingState::Running)) {
             LOG_WARN("Failed to transition to Running");
         }
@@ -484,10 +497,30 @@ namespace lfs::vis {
 
         state::TrainingStarted{.total_iterations = getTotalIterations()}.emit();
 
-        training_thread_ = std::make_unique<std::jthread>(
-            [this](std::stop_token stop_token) {
-                trainingThreadFunc(stop_token);
-            });
+        {
+            std::lock_guard lock(training_thread_mutex_);
+            if (training_thread_ && training_thread_->joinable()) {
+                LOG_ERROR("Cannot start a second training thread");
+                return false;
+            }
+            training_thread_exited_.store(false, std::memory_order_release);
+            try {
+                training_thread_ = std::make_unique<std::jthread>(
+                    [this](std::stop_token stop_token) {
+                        trainingThreadFunc(stop_token);
+                        {
+                            std::lock_guard completion_lock(completion_mutex_);
+                            training_thread_exited_.store(true, std::memory_order_release);
+                        }
+                        completion_cv_.notify_all();
+                    });
+                has_training_thread_.store(true, std::memory_order_release);
+            } catch (...) {
+                training_thread_exited_.store(true, std::memory_order_release);
+                throw;
+            }
+        }
+        updateResourceTracking();
 
         LOG_INFO("Training started - {} iterations planned", getTotalIterations());
         return true;
@@ -521,15 +554,35 @@ namespace lfs::vis {
             return;
 
         const int iter = getCurrentIteration();
-        const bool need_thread = !training_thread_ || !training_thread_->joinable();
-
-        if (need_thread) {
-            // Checkpoint resume: no thread exists yet
-            training_complete_ = false;
-            accumulated_training_time_ = std::chrono::steady_clock::duration{0};
-            training_thread_ = std::make_unique<std::jthread>(
-                [this](std::stop_token st) { trainingThreadFunc(st); });
-        } else {
+        bool resumed_existing_thread = false;
+        {
+            std::lock_guard lock(training_thread_mutex_);
+            if (training_thread_ && training_thread_->joinable()) {
+                resumed_existing_thread = true;
+            } else {
+                // Checkpoint resume: no thread exists yet
+                accumulated_training_time_ = std::chrono::steady_clock::duration{0};
+            }
+            if (!resumed_existing_thread) {
+                training_thread_exited_.store(false, std::memory_order_release);
+                try {
+                    training_thread_ = std::make_unique<std::jthread>(
+                        [this](std::stop_token st) {
+                            trainingThreadFunc(st);
+                            {
+                                std::lock_guard completion_lock(completion_mutex_);
+                                training_thread_exited_.store(true, std::memory_order_release);
+                            }
+                            completion_cv_.notify_all();
+                        });
+                    has_training_thread_.store(true, std::memory_order_release);
+                } catch (...) {
+                    training_thread_exited_.store(true, std::memory_order_release);
+                    throw;
+                }
+            }
+        }
+        if (resumed_existing_thread) {
             trainer_->request_resume();
         }
 
@@ -714,9 +767,13 @@ namespace lfs::vis {
             trainer_->request_stop();
         }
 
-        const bool has_thread = training_thread_ && training_thread_->joinable();
-        if (has_thread) {
-            training_thread_->request_stop();
+        bool has_thread = false;
+        {
+            std::lock_guard lock(training_thread_mutex_);
+            has_thread = training_thread_ && training_thread_->joinable();
+            if (has_thread) {
+                training_thread_->request_stop();
+            }
         }
 
         state::TrainingStopped{.iteration = getCurrentIteration(), .user_requested = true}.emit();
@@ -736,21 +793,54 @@ namespace lfs::vis {
         }
     }
 
-    void TrainerManager::waitForCompletion() {
+    bool TrainerManager::tryFinalizeCompletion() {
+        std::lock_guard thread_lock(training_thread_mutex_);
         if (!training_thread_ || !training_thread_->joinable()) {
-            return;
+            has_training_thread_.store(false, std::memory_order_release);
+            return true;
         }
-
-        std::unique_lock<std::mutex> lock(completion_mutex_);
-        if (!completion_cv_.wait_for(lock, std::chrono::seconds(COMPLETION_TIMEOUT_SEC),
-                                     [this] { return training_complete_; })) {
-            LOG_ERROR("Training thread join timed out ({}s)", COMPLETION_TIMEOUT_SEC);
-            training_thread_->request_stop();
-            return;
+        if (training_thread_->get_id() == std::this_thread::get_id()) {
+            LOG_ERROR("Cannot join training thread from itself");
+            return false;
+        }
+        if (!training_thread_exited_.load(std::memory_order_acquire)) {
+            return false;
         }
 
         training_thread_->join();
         training_thread_.reset();
+        has_training_thread_.store(false, std::memory_order_release);
+        updateResourceTracking();
+        return true;
+    }
+
+    bool TrainerManager::waitForCompletion() {
+        std::unique_lock thread_lock(training_thread_mutex_);
+        if (!training_thread_ || !training_thread_->joinable()) {
+            has_training_thread_.store(false, std::memory_order_release);
+            return true;
+        }
+        if (training_thread_->get_id() == std::this_thread::get_id()) {
+            LOG_ERROR("Cannot join training thread from itself");
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(completion_mutex_);
+        if (!completion_cv_.wait_for(lock, std::chrono::seconds(COMPLETION_TIMEOUT_SEC),
+                                     [this] {
+                                         return training_thread_exited_.load(std::memory_order_acquire);
+                                     })) {
+            LOG_ERROR("Training thread join timed out ({}s)", COMPLETION_TIMEOUT_SEC);
+            training_thread_->request_stop();
+            return false;
+        }
+
+        lock.unlock();
+        training_thread_->join();
+        training_thread_.reset();
+        has_training_thread_.store(false, std::memory_order_release);
+        updateResourceTracking();
+        return true;
     }
 
     int TrainerManager::getCurrentIteration() const {
@@ -983,13 +1073,6 @@ namespace lfs::vis {
 
         LOG_INFO("Training finished: iter={}, loss={:.6f}, time={:.1f}s",
                  final_iter, final_loss, elapsed);
-
-        // Signal completion before emitting events to avoid GIL deadlock
-        {
-            std::lock_guard lock(completion_mutex_);
-            training_complete_ = true;
-        }
-        completion_cv_.notify_all();
 
         state::TrainingCompleted{
             .iteration = final_iter,

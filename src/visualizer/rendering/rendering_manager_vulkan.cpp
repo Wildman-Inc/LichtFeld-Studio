@@ -529,6 +529,9 @@ namespace lfs::vis {
         const std::vector<glm::vec2>& polygon_vertices,
         std::uint32_t* const picked_ring_id_out) {
         LOG_TIMER("RenderingManager::buildVksplatSelectionMask");
+        if (!VksplatViewportRenderer::isSupported()) {
+            return std::unexpected("VkSplat selection is unavailable for the active GPU backend");
+        }
         const auto settings = getSettings();
         if (!lfs::rendering::isVkSplatBackend(settings.raster_backend)) {
             return std::unexpected("VkSplat selection query is available only when a VkSplat backend is active");
@@ -779,6 +782,7 @@ namespace lfs::vis {
                                             [](const auto& mesh) { return mesh.mesh != nullptr; });
         const bool has_environment = environmentBackgroundEnabled(settings_);
         const bool has_render_content = has_visible_gaussian_model || has_point_cloud || has_meshes || has_environment;
+        const bool vksplat_supported = VksplatViewportRenderer::isSupported();
         const size_t model_ptr = reinterpret_cast<size_t>(model);
 
         if (const auto model_change = frame_lifecycle_service_.handleModelChange(model_ptr, viewport_artifact_service_);
@@ -830,7 +834,7 @@ namespace lfs::vis {
         // installing the handshake so the first live frame after a start, scene
         // switch, or reset() is covered too — otherwise that frame submits with
         // no borrow fence and the trainer can write while Vulkan still reads.
-        if (is_training && context.vulkan_context &&
+        if (vksplat_supported && is_training && context.vulkan_context &&
             lfs::rendering::isVkSplatBackend(settings_.raster_backend)) {
             if (!vksplat_viewport_renderer_) {
                 vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
@@ -1215,7 +1219,7 @@ namespace lfs::vis {
                 return std::unexpected("No renderable model for split-view panel");
             }
 
-            if (settings_.point_cloud_mode) {
+            if (settings_.point_cloud_mode || !vksplat_supported) {
                 const auto state = buildSplitViewPointCloudPanelRenderState(frame_ctx, panel_size, &source_viewport);
                 std::vector<glm::mat4> transforms_storage;
                 auto scene = state.scene;
@@ -1313,6 +1317,7 @@ namespace lfs::vis {
             request.gut = lfs::rendering::isGutBackend(request.raster_backend);
 
             const bool vksplat_panel_supported =
+                vksplat_supported &&
                 vksplat_output_slot.has_value() &&
                 context.vulkan_context != nullptr &&
                 lfs::rendering::isVkSplatBackend(request.raster_backend);
@@ -1444,7 +1449,7 @@ namespace lfs::vis {
                             std::string compare_error;
 
                             const bool use_point_cloud_compare =
-                                settings_.point_cloud_mode || !has_visible_gaussian_model;
+                                settings_.point_cloud_mode || !has_visible_gaussian_model || !vksplat_supported;
                             if (use_point_cloud_compare && has_visible_gaussian_model) {
                                 auto point_request = buildPointCloudRenderRequest(
                                     frame_ctx, gt_size, frame_ctx.scene_state.model_transforms);
@@ -1680,14 +1685,19 @@ namespace lfs::vis {
             return cached_frame_result();
         }
 
-        const bool render_point_cloud = settings_.point_cloud_mode || !has_visible_gaussian_model;
+        const bool render_gaussian_as_point_cloud =
+            has_visible_gaussian_model && !vksplat_supported;
+        const bool render_point_cloud =
+            settings_.point_cloud_mode || render_gaussian_as_point_cloud || !has_visible_gaussian_model;
 
         if (rendered_image || pending_split_view.enabled) {
             // Split-view paths populate pending_split_view directly; skip the
             // full-viewport fallback that would set rendered_image to a wrong-
             // sized tensor and squash the left panel through the scene interop.
         } else if (render_point_cloud &&
-                   ((settings_.point_cloud_mode && has_visible_gaussian_model) || has_point_cloud)) {
+                   (((settings_.point_cloud_mode || render_gaussian_as_point_cloud) &&
+                     has_visible_gaussian_model) ||
+                    has_point_cloud)) {
             // Brush edits mutate sh0 in place — same tensor pointer but new
             // contents. Invalidate the derived-colors cache so the next frame
             // re-derives + re-uploads.
@@ -1699,7 +1709,8 @@ namespace lfs::vis {
             }
             std::vector<glm::mat4> point_cloud_transforms_storage;
             const std::vector<glm::mat4>* transforms_for_request = nullptr;
-            if (settings_.point_cloud_mode && has_visible_gaussian_model) {
+            if ((settings_.point_cloud_mode || render_gaussian_as_point_cloud) &&
+                has_visible_gaussian_model) {
                 transforms_for_request = &frame_ctx.scene_state.model_transforms;
             } else {
                 point_cloud_transforms_storage = {frame_ctx.scene_state.point_cloud_transform};
@@ -1903,7 +1914,8 @@ namespace lfs::vis {
                 lfs::rendering::normalizeViewerRasterBackend(request.raster_backend, request.gut);
             request.gut = lfs::rendering::isGutBackend(request.raster_backend);
             std::vector<std::uint32_t> lod_touched_chunks;
-            if (lfs::rendering::isVkSplatBackend(request.raster_backend) &&
+            if (vksplat_supported &&
+                lfs::rendering::isVkSplatBackend(request.raster_backend) &&
                 context.vulkan_context &&
                 !vksplat_viewport_renderer_) {
                 vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
@@ -1915,6 +1927,7 @@ namespace lfs::vis {
                 // per-node levels alongside indices.
                 const bool prefer_gpu_lod =
                     settings_.lod_enabled &&
+                    vksplat_supported &&
                     lfs::rendering::isVkSplatBackend(request.raster_backend);
                 const auto create_lod_controller = [this]() {
                     auto controller = std::make_unique<SparkLodController>();
@@ -2112,7 +2125,7 @@ namespace lfs::vis {
                 lod_controller_page_map_generation_ = 0;
             }
 
-            if (lfs::rendering::isVkSplatBackend(request.raster_backend)) {
+            if (vksplat_supported && lfs::rendering::isVkSplatBackend(request.raster_backend)) {
                 if (!context.vulkan_context) {
                     render_error = "VkSplat backend requires an active Vulkan context";
                 } else {
@@ -2697,6 +2710,9 @@ namespace lfs::vis {
         VulkanContext& context,
         const lfs::core::SplatData& model,
         glm::ivec2 viewport_size) {
+        if (!VksplatViewportRenderer::isSupported()) {
+            return std::unexpected("VkSplat training shared scratch is unavailable for the active GPU backend");
+        }
         if (!lfs::rendering::isVkSplatBackend(settings_.raster_backend) || model.size() <= 0) {
             return {};
         }
@@ -2719,7 +2735,9 @@ namespace lfs::vis {
     }
 
     lfs::io::SplatTensorAllocator RenderingManager::makeSplatTensorAllocator() const {
-        if (!last_vulkan_context_ || !last_vulkan_context_->externalMemoryInteropEnabled()) {
+        if (!VksplatViewportRenderer::isSupported() ||
+            !last_vulkan_context_ ||
+            !last_vulkan_context_->externalMemoryInteropEnabled()) {
             return {};
         }
         return [context = last_vulkan_context_](lfs::core::TensorShape shape,

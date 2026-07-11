@@ -334,16 +334,23 @@ namespace lfs::io {
         shutdown();
     }
 
-    void PipelinedImageLoader::shutdown() {
-        if (!running_.exchange(false))
+    void PipelinedImageLoader::request_shutdown() {
+        if (shutdown_requested_.exchange(true, std::memory_order_acq_rel))
             return;
-
-        LOG_INFO("[PipelinedImageLoader] Shutting down...");
 
         prefetch_queue_.signal_shutdown();
         hot_queue_.signal_shutdown();
         cold_queue_.signal_shutdown();
         output_queue_.signal_shutdown();
+    }
+
+    void PipelinedImageLoader::shutdown() {
+        const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
+        request_shutdown();
+        if (!was_running)
+            return;
+
+        LOG_INFO("[PipelinedImageLoader] Shutting down...");
 
         for (auto& t : io_threads_) {
             if (t.joinable())
@@ -375,8 +382,9 @@ namespace lfs::io {
 
     void PipelinedImageLoader::prefetch(const std::vector<ImageRequest>& requests) {
         for (const auto& req : requests) {
-            prefetch_queue_.push(req);
-            in_flight_.fetch_add(1, std::memory_order_acq_rel);
+            if (prefetch_queue_.push(req)) {
+                in_flight_.fetch_add(1, std::memory_order_acq_rel);
+            }
         }
     }
 
@@ -385,8 +393,9 @@ namespace lfs::io {
         request.sequence_id = sequence_id;
         request.path = path;
         request.params = params;
-        prefetch_queue_.push(std::move(request));
-        in_flight_.fetch_add(1, std::memory_order_acq_rel);
+        if (prefetch_queue_.push(std::move(request))) {
+            in_flight_.fetch_add(1, std::memory_order_acq_rel);
+        }
     }
 
     ReadyImage PipelinedImageLoader::get() {
@@ -994,7 +1003,8 @@ namespace lfs::io {
     }
 
     void PipelinedImageLoader::prefetch_thread_func() {
-        while (running_) {
+        while (running_.load(std::memory_order_acquire) &&
+               !shutdown_requested_.load(std::memory_order_acquire)) {
             ImageRequest request;
             try {
                 request = prefetch_queue_.pop();
@@ -1244,7 +1254,8 @@ namespace lfs::io {
         std::vector<PrefetchedImage> batch;
         batch.reserve(config_.jpeg_batch_size);
 
-        while (running_) {
+        while (running_.load(std::memory_order_acquire) &&
+               !shutdown_requested_.load(std::memory_order_acquire)) {
             batch.clear();
             const auto deadline = std::chrono::steady_clock::now() + config_.batch_collect_timeout;
 
@@ -1387,7 +1398,8 @@ namespace lfs::io {
     }
 
     void PipelinedImageLoader::cold_process_thread_func() {
-        while (running_) {
+        while (running_.load(std::memory_order_acquire) &&
+               !shutdown_requested_.load(std::memory_order_acquire)) {
             PrefetchedImage item;
             try {
                 item = cold_queue_.pop();

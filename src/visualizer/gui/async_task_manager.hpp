@@ -41,6 +41,7 @@ namespace lfs::vis {
             explicit AsyncTaskManager(VisualizerImpl* viewer);
             ~AsyncTaskManager();
 
+            [[nodiscard]] bool tryPrepareForSceneMutation();
             void shutdown();
 
             void setupEvents();
