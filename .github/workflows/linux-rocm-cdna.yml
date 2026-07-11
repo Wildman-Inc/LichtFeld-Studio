@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Verify ROCm compiler
         shell: bash
@@ -127,7 +127,7 @@ jobs:
             ca-certificates git
 
       - name: Checkout source and submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           submodules: recursive
@@ -175,7 +175,7 @@ jobs:
 
       - name: Cache vcpkg tool
         id: cache-vcpkg-tool
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.VCPKG_ROOT }}
           key: vcpkg-tool-${{ runner.os }}-rocm-full-app-2026-07-11
@@ -199,7 +199,8 @@ jobs:
           EOF
 
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        id: cache-vcpkg-packages
+        uses: actions/cache/restore@v5
         with:
           path: /github/home/.cache/vcpkg/archives
           key: vcpkg-pkgs-${{ runner.os }}-rocm-full-app-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
@@ -234,6 +235,13 @@ jobs:
             "${VCPKG_ROOT}/packages"
           df -h
 
+      - name: Save configured vcpkg package cache
+        if: steps.cache-vcpkg-packages.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: /github/home/.cache/vcpkg/archives
+          key: ${{ steps.cache-vcpkg-packages.outputs.cache-primary-key }}
+
       - name: Build and load full Linux ROCm application
         shell: bash
         run: |
@@ -244,9 +252,13 @@ jobs:
           build_status=${PIPESTATUS[0]}
           set -e
           if (( build_status != 0 )); then
-            error_tail="$(tail -n 160 build-rocm-full/build.log)"
-            if (( ${#error_tail} > 12000 )); then
-              error_tail="${error_tail: -12000}"
+            error_tail="$({
+              grep -n -B 3 -A 16 -E \
+                'FAILED:|(^|[[:space:]])error:|fatal error:|undefined reference|collect2: error|ld(\\.lld)?: error|No space left|ninja: build stopped' \
+                build-rocm-full/build.log || true
+            } | tail -c 12000)"
+            if [[ -z "${error_tail}" ]]; then
+              error_tail="$(tail -c 12000 build-rocm-full/build.log)"
             fi
             error_tail="${error_tail//'%'/'%25'}"
             error_tail="${error_tail//$'\r'/'%0D'}"
