@@ -238,7 +238,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake --build build-rocm-full --parallel 4 --verbose
+          set +e
+          cmake --build build-rocm-full --parallel 4 --verbose \
+            2>&1 | tee build-rocm-full/build.log
+          build_status=${PIPESTATUS[0]}
+          set -e
+          if (( build_status != 0 )); then
+            error_tail="$(tail -n 160 build-rocm-full/build.log)"
+            if (( ${#error_tail} > 12000 )); then
+              error_tail="${error_tail: -12000}"
+            fi
+            error_tail="${error_tail//'%'/'%25'}"
+            error_tail="${error_tail//$'\r'/'%0D'}"
+            error_tail="${error_tail//$'\n'/'%0A'}"
+            printf '::error title=Full Linux ROCm build failed::%s\n' "${error_tail}"
+            exit "${build_status}"
+          fi
           commands="$(ninja -C build-rocm-full -t commands)"
           printf '%s\n' "${commands}" | grep -F -- '--offload-arch=gfx942' >/dev/null
           ldd build-rocm-full/LichtFeld-Studio | tee build-rocm-full/ldd.txt
