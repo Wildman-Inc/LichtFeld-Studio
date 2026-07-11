@@ -674,11 +674,25 @@ function(lfs_collect_windows_hip_runtime_dlls out_var)
             "${_dir}/rocrand*.dll"
             "${_dir}/rocm-openblas*.dll"
             "${_dir}/rocm_kpack*.dll")
-        list(APPEND _dlls ${_dir_dlls})
+        foreach(_dir_dll IN LISTS _dir_dlls)
+            get_filename_component(_dll_name "${_dir_dll}" NAME)
+            string(TOLOWER "${_dll_name}" _dll_name_lower)
+            string(MAKE_C_IDENTIFIER "${_dll_name_lower}" _dll_key)
+            set(_dll_path_var "_lfs_rocm_runtime_path_${_dll_key}")
+            if(DEFINED ${_dll_path_var})
+                file(SHA256 "${${_dll_path_var}}" _existing_hash)
+                file(SHA256 "${_dir_dll}" _candidate_hash)
+                if(NOT _existing_hash STREQUAL _candidate_hash)
+                    message(FATAL_ERROR
+                        "Conflicting ROCm runtime '${_dll_name}' has different binaries: "
+                        "${${_dll_path_var}} and ${_dir_dll}")
+                endif()
+            else()
+                set(${_dll_path_var} "${_dir_dll}")
+                list(APPEND _dlls "${_dir_dll}")
+            endif()
+        endforeach()
     endforeach()
-    if(_dlls)
-        list(REMOVE_DUPLICATES _dlls)
-    endif()
     set(${out_var} "${_dlls}" PARENT_SCOPE)
 endfunction()
 
@@ -977,9 +991,62 @@ if(WIN32 AND USE_HIP)
                 "Portable ROCm packages require the collected ROCm/HIP runtime DLL contract")
         endif()
         set(_lfs_hip_runtime_manifest_names "")
+        set(_lfs_hip_runtime_license_manifest_entries "")
+        set(_lfs_hip_runtime_sha256_manifest_entries "")
+        set(_lfs_hip_license_sha256_manifest_entries "")
         foreach(_lfs_hip_runtime_dll IN LISTS _lfs_hip_runtime_dlls)
             get_filename_component(_lfs_hip_runtime_name "${_lfs_hip_runtime_dll}" NAME)
             list(APPEND _lfs_hip_runtime_manifest_names "${_lfs_hip_runtime_name}")
+            file(SHA256 "${_lfs_hip_runtime_dll}" _lfs_hip_runtime_sha256)
+            list(APPEND _lfs_hip_runtime_sha256_manifest_entries
+                "${_lfs_hip_runtime_name}|${_lfs_hip_runtime_sha256}")
+            string(TOLOWER "${_lfs_hip_runtime_name}" _lfs_hip_runtime_name_lower)
+            if(_lfs_hip_runtime_name_lower STREQUAL "amd_comgr.dll")
+                set(_lfs_hip_runtime_license
+                    "licenses/ROCm/runtime/amd_comgr/LICENSE.txt")
+            elseif(_lfs_hip_runtime_name_lower MATCHES "^(amdhip.*|hiprtc.*)[.]dll$")
+                set(_lfs_hip_runtime_license
+                    "licenses/ROCm/components/HIP-Runtime-LICENSE.md")
+            elseif(_lfs_hip_runtime_name_lower STREQUAL "hiprand.dll")
+                set(_lfs_hip_runtime_license
+                    "licenses/ROCm/components/hipRAND-LICENSE.md")
+            elseif(_lfs_hip_runtime_name_lower STREQUAL "rocrand.dll")
+                set(_lfs_hip_runtime_license
+                    "licenses/ROCm/components/rocRAND-LICENSE.md")
+            elseif(_lfs_hip_runtime_name_lower MATCHES "^rocm-openblas(64)?[.]dll$")
+                set(_lfs_hip_runtime_license
+                    "licenses/ROCm/components/OpenBLAS-LICENSE,licenses/ROCm/components/LAPACK-LICENSE,licenses/ROCm/components/LAPACKE-LICENSE,licenses/ROCm/components/Reference-BLAS-LICENSE")
+            elseif(_lfs_hip_runtime_name_lower STREQUAL "rocm_kpack.dll")
+                set(_lfs_hip_runtime_license
+                    "licenses/ROCm/components/rocm-kpack-LICENSE,licenses/ROCm/components/msgpack-COPYING,licenses/ROCm/components/msgpack-Boost-LICENSE_1_0.txt,licenses/ROCm/components/zstd-LICENSE")
+            else()
+                message(FATAL_ERROR
+                    "Portable ROCm runtime '${_lfs_hip_runtime_name}' has no audited license mapping")
+            endif()
+            list(APPEND _lfs_hip_runtime_license_manifest_entries
+                "${_lfs_hip_runtime_name}|${_lfs_hip_runtime_license}")
+            string(REPLACE "," ";" _lfs_hip_runtime_license_paths
+                "${_lfs_hip_runtime_license}")
+            foreach(_lfs_hip_runtime_license_path IN LISTS _lfs_hip_runtime_license_paths)
+                if(_lfs_hip_runtime_license_path STREQUAL
+                   "licenses/ROCm/runtime/amd_comgr/LICENSE.txt")
+                    set(_lfs_hip_runtime_license_source
+                        "${LFS_ROCM_PATH}/share/doc/amd_comgr/LICENSE.txt")
+                else()
+                    get_filename_component(_lfs_hip_runtime_license_name
+                        "${_lfs_hip_runtime_license_path}" NAME)
+                    set(_lfs_hip_runtime_license_source
+                        "${CMAKE_SOURCE_DIR}/licenses/ROCm/${_lfs_hip_runtime_license_name}")
+                endif()
+                if(NOT EXISTS "${_lfs_hip_runtime_license_source}")
+                    message(FATAL_ERROR
+                        "Audited ROCm license source is missing: ${_lfs_hip_runtime_license_source}")
+                endif()
+                file(SHA256 "${_lfs_hip_runtime_license_source}"
+                    _lfs_hip_runtime_license_sha256)
+                list(APPEND _lfs_hip_license_sha256_manifest_entries
+                    "${_lfs_hip_runtime_license_path}|${_lfs_hip_runtime_license_sha256}")
+            endforeach()
         endforeach()
         list(REMOVE_DUPLICATES _lfs_hip_runtime_manifest_names)
         list(SORT _lfs_hip_runtime_manifest_names COMPARE NATURAL)
@@ -988,6 +1055,56 @@ if(WIN32 AND USE_HIP)
         file(GENERATE
             OUTPUT "${CMAKE_BINARY_DIR}/rocm-runtime-manifest.txt"
             CONTENT "${_lfs_hip_runtime_manifest_content}")
+        list(SORT _lfs_hip_runtime_license_manifest_entries COMPARE NATURAL)
+        list(REMOVE_DUPLICATES _lfs_hip_runtime_license_manifest_entries)
+        list(JOIN _lfs_hip_runtime_license_manifest_entries "\n"
+            _lfs_hip_runtime_license_manifest_content)
+        string(APPEND _lfs_hip_runtime_license_manifest_content "\n")
+        file(GENERATE
+            OUTPUT "${CMAKE_BINARY_DIR}/rocm-runtime-license-manifest.txt"
+            CONTENT "${_lfs_hip_runtime_license_manifest_content}")
+        list(SORT _lfs_hip_runtime_sha256_manifest_entries COMPARE NATURAL)
+        list(REMOVE_DUPLICATES _lfs_hip_runtime_sha256_manifest_entries)
+        list(JOIN _lfs_hip_runtime_sha256_manifest_entries "\n"
+            _lfs_hip_runtime_sha256_manifest_content)
+        string(APPEND _lfs_hip_runtime_sha256_manifest_content "\n")
+        file(READ "${CMAKE_SOURCE_DIR}/licenses/ROCm/audited-runtime-sha256.txt"
+            _lfs_audited_runtime_sha256_manifest_content)
+        string(REPLACE "\r\n" "\n" _lfs_audited_runtime_sha256_manifest_content
+            "${_lfs_audited_runtime_sha256_manifest_content}")
+        string(STRIP "${_lfs_audited_runtime_sha256_manifest_content}"
+            _lfs_audited_runtime_sha256_manifest_content)
+        string(STRIP "${_lfs_hip_runtime_sha256_manifest_content}"
+            _lfs_hip_runtime_sha256_manifest_compare)
+        if(NOT _lfs_hip_runtime_sha256_manifest_compare STREQUAL
+           _lfs_audited_runtime_sha256_manifest_content)
+            message(FATAL_ERROR
+                "ROCm runtime binaries do not match the audited 7.14 SHA-256 manifest")
+        endif()
+        file(GENERATE
+            OUTPUT "${CMAKE_BINARY_DIR}/rocm-runtime-sha256-manifest.txt"
+            CONTENT "${_lfs_hip_runtime_sha256_manifest_content}")
+        list(SORT _lfs_hip_license_sha256_manifest_entries COMPARE NATURAL)
+        list(REMOVE_DUPLICATES _lfs_hip_license_sha256_manifest_entries)
+        list(JOIN _lfs_hip_license_sha256_manifest_entries "\n"
+            _lfs_hip_license_sha256_manifest_content)
+        string(APPEND _lfs_hip_license_sha256_manifest_content "\n")
+        file(READ "${CMAKE_SOURCE_DIR}/licenses/ROCm/audited-license-sha256.txt"
+            _lfs_audited_license_sha256_manifest_content)
+        string(REPLACE "\r\n" "\n" _lfs_audited_license_sha256_manifest_content
+            "${_lfs_audited_license_sha256_manifest_content}")
+        string(STRIP "${_lfs_audited_license_sha256_manifest_content}"
+            _lfs_audited_license_sha256_manifest_content)
+        string(STRIP "${_lfs_hip_license_sha256_manifest_content}"
+            _lfs_hip_license_sha256_manifest_compare)
+        if(NOT _lfs_hip_license_sha256_manifest_compare STREQUAL
+           _lfs_audited_license_sha256_manifest_content)
+            message(FATAL_ERROR
+                "ROCm license inputs do not match the audited SHA-256 manifest")
+        endif()
+        file(GENERATE
+            OUTPUT "${CMAKE_BINARY_DIR}/rocm-license-sha256-manifest.txt"
+            CONTENT "${_lfs_hip_license_sha256_manifest_content}")
     endif()
     if(_lfs_hip_runtime_dlls)
         add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
@@ -1596,6 +1713,104 @@ if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
 endif()
 
 if(USE_HIP AND WIN32)
+    set(_lfs_rocm_component_license_files
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/HIP-Runtime-LICENSE.md"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/hipRAND-LICENSE.md"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/rocRAND-LICENSE.md"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/rocm-kpack-LICENSE"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/OpenBLAS-LICENSE"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/LAPACK-LICENSE"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/LAPACKE-LICENSE"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/Reference-BLAS-LICENSE"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/msgpack-COPYING"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/msgpack-Boost-LICENSE_1_0.txt"
+        "${CMAKE_SOURCE_DIR}/licenses/ROCm/zstd-LICENSE")
+    foreach(_lfs_rocm_component_license IN LISTS _lfs_rocm_component_license_files)
+        if(NOT EXISTS "${_lfs_rocm_component_license}")
+            message(FATAL_ERROR
+                "Required ROCm component license is missing: ${_lfs_rocm_component_license}")
+        endif()
+    endforeach()
+    install(FILES ${_lfs_rocm_component_license_files}
+        DESTINATION "licenses/ROCm/components")
+    install(FILES "${CMAKE_SOURCE_DIR}/licenses/ROCm/README.md"
+        DESTINATION "licenses/ROCm")
+    if(BUILD_PORTABLE)
+        set(_lfs_rocm_sdk_provenance_manifest
+            "${LFS_ROCM_PATH}/share/therock/therock_manifest.json")
+        set(_lfs_rocm_sdk_version_file "${LFS_ROCM_PATH}/.info/version")
+        if(NOT EXISTS "${_lfs_rocm_sdk_provenance_manifest}")
+            message(FATAL_ERROR
+                "Portable ROCm packages require SDK provenance at ${_lfs_rocm_sdk_provenance_manifest}")
+        endif()
+        if(NOT EXISTS "${_lfs_rocm_sdk_version_file}")
+            message(FATAL_ERROR
+                "Portable ROCm packages require an SDK version at ${_lfs_rocm_sdk_version_file}")
+        endif()
+        file(READ "${_lfs_rocm_sdk_version_file}" _lfs_rocm_sdk_version)
+        string(STRIP "${_lfs_rocm_sdk_version}" _lfs_rocm_sdk_version)
+        if(NOT _lfs_rocm_sdk_version STREQUAL "7.14.0")
+            message(FATAL_ERROR
+                "This audited portable package requires ROCm SDK 7.14.0, got '${_lfs_rocm_sdk_version}'")
+        endif()
+        file(READ "${_lfs_rocm_sdk_provenance_manifest}" _lfs_rocm_sdk_provenance_json)
+        string(JSON _lfs_rocm_the_rock_commit GET
+            "${_lfs_rocm_sdk_provenance_json}" the_rock_commit)
+        if(NOT _lfs_rocm_the_rock_commit STREQUAL
+           "6d7f1714045261f62747f297f2f9e5f9c6d6b465")
+            message(FATAL_ERROR
+                "ROCm SDK TheRock commit is not the audited 7.14 build: ${_lfs_rocm_the_rock_commit}")
+        endif()
+        set(_lfs_rocm_expected_submodules
+            "llvm-project|5c9bfa94a37c59923dee3c55942566db7904b659"
+            "rocm-libraries|46653de70f6d71031bed76e15525edd331318a99"
+            "rocm-systems|b8c378ef2c7220a68122d13b81dab5addd61e016")
+        string(JSON _lfs_rocm_submodule_count LENGTH
+            "${_lfs_rocm_sdk_provenance_json}" submodules)
+        math(EXPR _lfs_rocm_submodule_last "${_lfs_rocm_submodule_count} - 1")
+        foreach(_lfs_rocm_expected_submodule IN LISTS _lfs_rocm_expected_submodules)
+            string(REPLACE "|" ";" _lfs_rocm_expected_submodule_parts
+                "${_lfs_rocm_expected_submodule}")
+            list(GET _lfs_rocm_expected_submodule_parts 0 _lfs_rocm_expected_name)
+            list(GET _lfs_rocm_expected_submodule_parts 1 _lfs_rocm_expected_sha)
+            set(_lfs_rocm_submodule_matches FALSE)
+            foreach(_lfs_rocm_submodule_index RANGE 0 ${_lfs_rocm_submodule_last})
+                string(JSON _lfs_rocm_submodule_name GET
+                    "${_lfs_rocm_sdk_provenance_json}"
+                    submodules ${_lfs_rocm_submodule_index} submodule_name)
+                if(_lfs_rocm_submodule_name STREQUAL _lfs_rocm_expected_name)
+                    string(JSON _lfs_rocm_submodule_sha GET
+                        "${_lfs_rocm_sdk_provenance_json}"
+                        submodules ${_lfs_rocm_submodule_index} pin_sha)
+                    if(NOT _lfs_rocm_submodule_sha STREQUAL _lfs_rocm_expected_sha)
+                        message(FATAL_ERROR
+                            "ROCm SDK ${_lfs_rocm_expected_name} commit is not audited: ${_lfs_rocm_submodule_sha}")
+                    endif()
+                    set(_lfs_rocm_submodule_matches TRUE)
+                    break()
+                endif()
+            endforeach()
+            if(NOT _lfs_rocm_submodule_matches)
+                message(FATAL_ERROR
+                    "ROCm SDK provenance is missing ${_lfs_rocm_expected_name}")
+            endif()
+        endforeach()
+        install(FILES "${CMAKE_BINARY_DIR}/rocm-runtime-license-manifest.txt"
+            DESTINATION "licenses/ROCm"
+            RENAME "runtime-license-manifest.txt")
+        install(FILES "${CMAKE_BINARY_DIR}/rocm-runtime-sha256-manifest.txt"
+            DESTINATION "licenses/ROCm"
+            RENAME "runtime-sha256-manifest.txt")
+        install(FILES "${CMAKE_BINARY_DIR}/rocm-license-sha256-manifest.txt"
+            DESTINATION "licenses/ROCm"
+            RENAME "license-sha256-manifest.txt")
+        install(FILES "${_lfs_rocm_sdk_provenance_manifest}"
+            DESTINATION "licenses/ROCm/provenance")
+        install(FILES "${_lfs_rocm_sdk_version_file}"
+            DESTINATION "licenses/ROCm/provenance"
+            RENAME "rocm-sdk-version.txt")
+    endif()
+
     set(_lfs_rocm_notice_roots "${LFS_ROCM_PATH}")
     set(_lfs_rocm_notice_destinations runtime)
     if(DEFINED LFS_ROCM_DEVEL_PATH

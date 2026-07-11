@@ -210,6 +210,125 @@ function Get-PackageRuntimeManifestEntries {
     return $Entries
 }
 
+function Get-PackageRuntimeLicenseManifestEntries {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Required runtime license manifest was not generated: $ManifestPath"
+    }
+
+    $Lines = @(Get-Content -LiteralPath $ManifestPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne '' })
+    if ($Lines.Count -eq 0) {
+        throw "Runtime license manifest is empty: $ManifestPath"
+    }
+
+    $RuntimeNames = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $Entries = foreach ($Line in $Lines) {
+        $SeparatorIndex = $Line.IndexOf('|')
+        if ($SeparatorIndex -le 0 -or
+            $SeparatorIndex -eq ($Line.Length - 1) -or
+            $Line.IndexOf('|', $SeparatorIndex + 1) -ge 0) {
+            throw "Runtime license manifest contains an invalid entry '$Line': $ManifestPath"
+        }
+
+        $RuntimeName = $Line.Substring(0, $SeparatorIndex).Trim()
+        $LicensePathList = $Line.Substring($SeparatorIndex + 1).Trim()
+        if ([System.IO.Path]::GetFileName($RuntimeName) -ne $RuntimeName -or
+            $RuntimeName.IndexOfAny([char[]]'\\/') -ge 0 -or
+            -not $RuntimeNames.Add($RuntimeName)) {
+            throw "Runtime license manifest contains an invalid or duplicate runtime '$RuntimeName': $ManifestPath"
+        }
+        $LicensePaths = @($LicensePathList.Split(',') |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -ne '' })
+        $UniqueLicensePaths = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        if ($LicensePaths.Count -eq 0) {
+            throw "Runtime license manifest contains no licenses for '$RuntimeName': $ManifestPath"
+        }
+        foreach ($LicensePath in $LicensePaths) {
+            if (-not $UniqueLicensePaths.Add($LicensePath) -or
+                $LicensePath.Contains('\') -or
+                -not $LicensePath.StartsWith('licenses/ROCm/',
+                    [System.StringComparison]::OrdinalIgnoreCase) -or
+                $LicensePath.EndsWith('/') -or
+                $LicensePath -match '(^|/)[.][.]?(/|$)') {
+                throw "Runtime license manifest contains an invalid or duplicate license path '$LicensePath': $ManifestPath"
+            }
+        }
+
+        [pscustomobject]@{
+            RuntimeName = $RuntimeName
+            LicensePaths = $LicensePaths
+            Line = "$RuntimeName|$($LicensePaths -join ',')"
+        }
+    }
+    return @($Entries)
+}
+
+function Get-PackageSha256ManifestEntries {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Required SHA-256 manifest was not generated: $ManifestPath"
+    }
+    $Lines = @(Get-Content -LiteralPath $ManifestPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne '' })
+    if ($Lines.Count -eq 0) {
+        throw "SHA-256 manifest is empty: $ManifestPath"
+    }
+
+    $Keys = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $Entries = foreach ($Line in $Lines) {
+        $SeparatorIndex = $Line.IndexOf('|')
+        if ($SeparatorIndex -le 0 -or
+            $SeparatorIndex -eq ($Line.Length - 1) -or
+            $Line.IndexOf('|', $SeparatorIndex + 1) -ge 0) {
+            throw "SHA-256 manifest contains an invalid entry '$Line': $ManifestPath"
+        }
+        $Key = $Line.Substring(0, $SeparatorIndex).Trim()
+        $Hash = $Line.Substring($SeparatorIndex + 1).Trim()
+        if (-not $Keys.Add($Key) -or $Hash -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "SHA-256 manifest contains an invalid or duplicate entry '$Line': $ManifestPath"
+        }
+        [pscustomobject]@{
+            Key = $Key
+            Hash = $Hash.ToUpperInvariant()
+            Line = "$Key|$($Hash.ToLowerInvariant())"
+        }
+    }
+    return @($Entries)
+}
+
+function Get-ZipEntrySha256 {
+    param(
+        [Parameter(Mandatory = $true)]$Archive,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $Entry = $Archive.Entries |
+        Where-Object { $_.FullName.Replace('\', '/').Equals(
+                $Path, [System.StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 1
+    if (-not $Entry -or $Entry.Length -le 0) {
+        throw "Package ZIP contains a missing or empty integrity target '$Path'."
+    }
+    $Stream = $Entry.Open()
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $HashBytes = $Hasher.ComputeHash($Stream)
+        return ([System.BitConverter]::ToString($HashBytes)).Replace('-', '')
+    } finally {
+        $Hasher.Dispose()
+        $Stream.Dispose()
+    }
+}
+
 function Assert-ZipEntry {
     param(
         [Parameter(Mandatory = $true)]$Entries,
@@ -271,7 +390,10 @@ function Test-PackageArchiveContract {
     param(
         [Parameter(Mandatory = $true)][string]$ArchivePath,
         [Parameter(Mandatory = $true)][string]$Backend,
-        [string]$RuntimeManifestPath = ''
+        [string]$RuntimeManifestPath = '',
+        [string]$RuntimeLicenseManifestPath = '',
+        [string]$RuntimeSha256ManifestPath = '',
+        [string]$LicenseSha256ManifestPath = ''
     )
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -279,7 +401,7 @@ function Test-PackageArchiveContract {
     try {
         $EntryNames = @($Archive.Entries |
             Where-Object { -not $_.FullName.EndsWith('/') } |
-            ForEach-Object { $_.FullName.Replace('\\', '/') })
+                ForEach-Object { $_.FullName.Replace('\', '/') })
         $Entries = [System.Collections.Generic.HashSet[string]]::new(
             [System.StringComparer]::OrdinalIgnoreCase)
         foreach ($EntryName in $EntryNames) {
@@ -309,6 +431,13 @@ function Test-PackageArchiveContract {
         if ($Backend -eq 'HIP' -and -not $RuntimeManifestPath) {
             throw 'HIP packages require a ROCm runtime manifest.'
         }
+        if ($Backend -eq 'HIP' -and -not $RuntimeLicenseManifestPath) {
+            throw 'HIP packages require a ROCm runtime license manifest.'
+        }
+        if ($Backend -eq 'HIP' -and
+            (-not $RuntimeSha256ManifestPath -or -not $LicenseSha256ManifestPath)) {
+            throw 'HIP packages require ROCm runtime and license SHA-256 manifests.'
+        }
         if ($RuntimeManifestPath) {
             $RuntimeManifestEntries = @(Get-PackageRuntimeManifestEntries $RuntimeManifestPath)
             foreach ($RuntimeEntry in $RuntimeManifestEntries) {
@@ -326,6 +455,204 @@ function Test-PackageArchiveContract {
                 $RuntimeDifference = @(Compare-Object $ExpectedRocmRuntimes $PackagedRocmRuntimes)
                 if ($RuntimeDifference) {
                     throw "ROCm runtime manifest does not match the package: $($RuntimeDifference -join ', ')"
+                }
+
+                $LicenseManifestEntries = @(
+                    Get-PackageRuntimeLicenseManifestEntries $RuntimeLicenseManifestPath)
+                $MappedRocmRuntimes = @($LicenseManifestEntries |
+                    ForEach-Object { $_.RuntimeName.ToLowerInvariant() } |
+                    Sort-Object -Unique)
+                $LicenseCoverageDifference = @(
+                    Compare-Object $ExpectedRocmRuntimes $MappedRocmRuntimes)
+                if ($LicenseCoverageDifference) {
+                    throw "ROCm runtime license mappings do not cover the runtime manifest exactly: $($LicenseCoverageDifference -join ', ')"
+                }
+
+                $PackagedLicenseManifestPath = 'licenses/ROCm/runtime-license-manifest.txt'
+                Assert-ZipEntry $Entries $PackagedLicenseManifestPath `
+                    'ROCm runtime license manifest'
+                foreach ($LicenseEntry in $LicenseManifestEntries) {
+                    foreach ($LicensePath in $LicenseEntry.LicensePaths) {
+                        Assert-ZipEntry $Entries $LicensePath `
+                            "license for ROCm runtime '$($LicenseEntry.RuntimeName)'"
+                    }
+                }
+
+                $ProvenanceManifestPath =
+                    'licenses/ROCm/provenance/therock_manifest.json'
+                Assert-ZipEntry $Entries $ProvenanceManifestPath `
+                    'ROCm SDK provenance manifest'
+
+                $PackagedLicenseManifestEntry = $Archive.Entries |
+                    Where-Object { $_.FullName.Replace('\', '/').Equals(
+                            $PackagedLicenseManifestPath,
+                            [System.StringComparison]::OrdinalIgnoreCase) } |
+                    Select-Object -First 1
+                $Reader = [System.IO.StreamReader]::new(
+                    $PackagedLicenseManifestEntry.Open())
+                try {
+                    $PackagedLicenseManifestLines = @($Reader.ReadToEnd() -split '\r?\n' |
+                        ForEach-Object { $_.Trim() } |
+                        Where-Object { $_ -ne '' })
+                } finally {
+                    $Reader.Dispose()
+                }
+                $ExpectedLicenseManifestLines = @(
+                    $LicenseManifestEntries | ForEach-Object { $_.Line })
+                if (($ExpectedLicenseManifestLines -join "`n") -cne
+                    ($PackagedLicenseManifestLines -join "`n")) {
+                    throw 'Packaged ROCm runtime license manifest differs from the generated contract.'
+                }
+
+                $RuntimeSha256Entries = @(
+                    Get-PackageSha256ManifestEntries $RuntimeSha256ManifestPath)
+                $AuditedRuntimeSha256Lines = @(Get-Content -LiteralPath (
+                        Join-Path $PSScriptRoot 'licenses\ROCm\audited-runtime-sha256.txt') |
+                    ForEach-Object { $_.Trim() } |
+                    Where-Object { $_ -ne '' })
+                $GeneratedRuntimeSha256Lines = @(
+                    $RuntimeSha256Entries | ForEach-Object { $_.Line })
+                if (($GeneratedRuntimeSha256Lines -join "`n") -cne
+                    ($AuditedRuntimeSha256Lines -join "`n")) {
+                    throw 'Generated ROCm runtime hashes differ from the audited 7.14 manifest.'
+                }
+                $RuntimeSha256Keys = @($RuntimeSha256Entries |
+                    ForEach-Object { $_.Key.ToLowerInvariant() } |
+                    Sort-Object -Unique)
+                $RuntimeSha256Difference = @(
+                    Compare-Object $ExpectedRocmRuntimes $RuntimeSha256Keys)
+                if ($RuntimeSha256Difference) {
+                    throw "ROCm runtime SHA-256 mappings do not cover the runtime manifest exactly: $($RuntimeSha256Difference -join ', ')"
+                }
+
+                $ExpectedLicensePaths = @($LicenseManifestEntries |
+                    ForEach-Object { $_.LicensePaths } |
+                    ForEach-Object { $_.ToLowerInvariant() } |
+                    Sort-Object -Unique)
+                $LicenseSha256Entries = @(
+                    Get-PackageSha256ManifestEntries $LicenseSha256ManifestPath)
+                $AuditedLicenseSha256Lines = @(Get-Content -LiteralPath (
+                        Join-Path $PSScriptRoot 'licenses\ROCm\audited-license-sha256.txt') |
+                    ForEach-Object { $_.Trim() } |
+                    Where-Object { $_ -ne '' })
+                $GeneratedLicenseSha256Lines = @(
+                    $LicenseSha256Entries | ForEach-Object { $_.Line })
+                if (($GeneratedLicenseSha256Lines -join "`n") -cne
+                    ($AuditedLicenseSha256Lines -join "`n")) {
+                    throw 'Generated ROCm license hashes differ from the audited manifest.'
+                }
+                $LicenseSha256Keys = @($LicenseSha256Entries |
+                    ForEach-Object { $_.Key.ToLowerInvariant() } |
+                    Sort-Object -Unique)
+                $LicenseSha256Difference = @(
+                    Compare-Object $ExpectedLicensePaths $LicenseSha256Keys)
+                if ($LicenseSha256Difference) {
+                    throw "ROCm license SHA-256 mappings do not cover the license contract exactly: $($LicenseSha256Difference -join ', ')"
+                }
+
+                $IntegrityManifests = @(
+                    [pscustomobject]@{
+                        PackagePath = 'licenses/ROCm/runtime-sha256-manifest.txt'
+                        Entries = $RuntimeSha256Entries
+                    },
+                    [pscustomobject]@{
+                        PackagePath = 'licenses/ROCm/license-sha256-manifest.txt'
+                        Entries = $LicenseSha256Entries
+                    })
+                foreach ($IntegrityManifest in $IntegrityManifests) {
+                    Assert-ZipEntry $Entries $IntegrityManifest.PackagePath `
+                        'ROCm SHA-256 integrity manifest'
+                    $PackagedIntegrityEntry = $Archive.Entries |
+                        Where-Object { $_.FullName.Replace('\', '/').Equals(
+                                $IntegrityManifest.PackagePath,
+                                [System.StringComparison]::OrdinalIgnoreCase) } |
+                        Select-Object -First 1
+                    $Reader = [System.IO.StreamReader]::new(
+                        $PackagedIntegrityEntry.Open())
+                    try {
+                        $PackagedIntegrityLines = @($Reader.ReadToEnd() -split '\r?\n' |
+                            ForEach-Object { $_.Trim() } |
+                            Where-Object { $_ -ne '' })
+                    } finally {
+                        $Reader.Dispose()
+                    }
+                    $ExpectedIntegrityLines = @(
+                        $IntegrityManifest.Entries | ForEach-Object { $_.Line })
+                    if (($ExpectedIntegrityLines -join "`n") -cne
+                        ($PackagedIntegrityLines -join "`n")) {
+                        throw "Packaged integrity manifest differs from the generated contract: $($IntegrityManifest.PackagePath)"
+                    }
+                }
+
+                foreach ($RuntimeSha256Entry in $RuntimeSha256Entries) {
+                    if ([System.IO.Path]::GetFileName($RuntimeSha256Entry.Key) -ne
+                        $RuntimeSha256Entry.Key) {
+                        throw "ROCm runtime SHA-256 manifest has an invalid runtime path '$($RuntimeSha256Entry.Key)'."
+                    }
+                    $ActualHash = Get-ZipEntrySha256 $Archive `
+                        "bin/$($RuntimeSha256Entry.Key)"
+                    if ($ActualHash -cne $RuntimeSha256Entry.Hash) {
+                        throw "ROCm runtime SHA-256 mismatch: $($RuntimeSha256Entry.Key)"
+                    }
+                }
+                foreach ($LicenseSha256Entry in $LicenseSha256Entries) {
+                    if (-not $LicenseSha256Entry.Key.StartsWith(
+                            'licenses/ROCm/',
+                            [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw "ROCm license SHA-256 manifest has an invalid path '$($LicenseSha256Entry.Key)'."
+                    }
+                    $ActualHash = Get-ZipEntrySha256 $Archive $LicenseSha256Entry.Key
+                    if ($ActualHash -cne $LicenseSha256Entry.Hash) {
+                        throw "ROCm license SHA-256 mismatch: $($LicenseSha256Entry.Key)"
+                    }
+                }
+
+                $ProvenanceEntry = $Archive.Entries |
+                    Where-Object { $_.FullName.Replace('\', '/').Equals(
+                            $ProvenanceManifestPath,
+                            [System.StringComparison]::OrdinalIgnoreCase) } |
+                    Select-Object -First 1
+                $Reader = [System.IO.StreamReader]::new($ProvenanceEntry.Open())
+                try {
+                    $Provenance = $Reader.ReadToEnd() | ConvertFrom-Json
+                } finally {
+                    $Reader.Dispose()
+                }
+                $ExpectedTheRockCommit =
+                    '6d7f1714045261f62747f297f2f9e5f9c6d6b465'
+                if ($Provenance.the_rock_commit -cne $ExpectedTheRockCommit) {
+                    throw 'Packaged ROCm SDK provenance is not the audited TheRock build.'
+                }
+                $RequiredSubmodules = @{
+                    'llvm-project' = '5c9bfa94a37c59923dee3c55942566db7904b659'
+                    'rocm-libraries' = '46653de70f6d71031bed76e15525edd331318a99'
+                    'rocm-systems' = 'b8c378ef2c7220a68122d13b81dab5addd61e016'
+                }
+                foreach ($RequiredSubmodule in $RequiredSubmodules.GetEnumerator()) {
+                    $Submodule = $Provenance.submodules |
+                        Where-Object { $_.submodule_name -eq $RequiredSubmodule.Key } |
+                        Select-Object -First 1
+                    if (-not $Submodule -or
+                        $Submodule.pin_sha -cne $RequiredSubmodule.Value) {
+                        throw "Packaged ROCm SDK provenance does not match audited '$($RequiredSubmodule.Key)'."
+                    }
+                }
+                $SdkVersionPath =
+                    'licenses/ROCm/provenance/rocm-sdk-version.txt'
+                Assert-ZipEntry $Entries $SdkVersionPath 'ROCm SDK version'
+                $SdkVersionEntry = $Archive.Entries |
+                    Where-Object { $_.FullName.Replace('\', '/').Equals(
+                            $SdkVersionPath,
+                            [System.StringComparison]::OrdinalIgnoreCase) } |
+                    Select-Object -First 1
+                $Reader = [System.IO.StreamReader]::new($SdkVersionEntry.Open())
+                try {
+                    $SdkVersion = $Reader.ReadToEnd().Trim()
+                } finally {
+                    $Reader.Dispose()
+                }
+                if ($SdkVersion -cne '7.14.0') {
+                    throw "Packaged ROCm SDK version is not audited: '$SdkVersion'."
                 }
             }
         }
@@ -1212,6 +1539,21 @@ function Build-LichtFeldStudio {
             } else {
                 ''
             }
+            $RuntimeLicenseManifestPath = if ($GpuBackend -eq 'HIP') {
+                Join-Path $BuildDir 'rocm-runtime-license-manifest.txt'
+            } else {
+                ''
+            }
+            $RuntimeSha256ManifestPath = if ($GpuBackend -eq 'HIP') {
+                Join-Path $BuildDir 'rocm-runtime-sha256-manifest.txt'
+            } else {
+                ''
+            }
+            $LicenseSha256ManifestPath = if ($GpuBackend -eq 'HIP') {
+                Join-Path $BuildDir 'rocm-license-sha256-manifest.txt'
+            } else {
+                ''
+            }
 
             Remove-PackageOutputs @($PackageArchivePath, $PackageChecksumPath)
             $PackageGenerationStartedAt = [DateTime]::UtcNow
@@ -1243,7 +1585,9 @@ function Build-LichtFeldStudio {
             $PackageArchivePath = (Resolve-Path -LiteralPath $PackageArchivePath).Path
             $PackageChecksumPath = (Resolve-Path -LiteralPath $PackageChecksumPath).Path
             Test-PackageChecksum $PackageArchivePath $PackageChecksumPath
-            Test-PackageArchiveContract $PackageArchivePath $GpuBackend $RuntimeManifestPath
+            Test-PackageArchiveContract $PackageArchivePath $GpuBackend `
+                $RuntimeManifestPath $RuntimeLicenseManifestPath `
+                $RuntimeSha256ManifestPath $LicenseSha256ManifestPath
         }
 
         Write-Host ""
