@@ -114,7 +114,7 @@ jobs:
       VCPKG_FORCE_SYSTEM_BINARIES: 1
       VCPKG_DEFAULT_BINARY_CACHE: /github/home/.cache/vcpkg/archives
       VCPKG_MAX_CONCURRENCY: 2
-      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
       CMAKE_MAKE_PROGRAM: /usr/bin/ninja
 
     steps:
@@ -247,19 +247,21 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          cmake --build build-rocm-full --parallel 4 --verbose \
+          cmake --build build-rocm-full --parallel 2 --verbose \
             2>&1 | tee build-rocm-full/build.log
           build_status=${PIPESTATUS[0]}
           set -e
           if (( build_status != 0 )); then
-            error_tail="$({
-              grep -n -B 3 -A 16 -E \
-                'FAILED:|(^|[[:space:]])error:|fatal error:|undefined reference|collect2: error|ld(\\.lld)?: error|No space left|ninja: build stopped' \
-                build-rocm-full/build.log || true
-            } | tail -c 12000)"
+            error_tail="$(sed -n -E \
+              '/^FAILED:/,/^\[[0-9]+\/[0-9]+\]/p' \
+              build-rocm-full/build.log | tail -c 18000)"
             if [[ -z "${error_tail}" ]]; then
-              error_tail="$(tail -c 12000 build-rocm-full/build.log)"
+              error_tail="$(tail -c 18000 build-rocm-full/build.log)"
             fi
+            error_tail+=$'\n\n=== runner memory ===\n'
+            error_tail+="$(free -h)"
+            error_tail+=$'\n\n=== runner disk ===\n'
+            error_tail+="$(df -h)"
             error_tail="${error_tail//'%'/'%25'}"
             error_tail="${error_tail//$'\r'/'%0D'}"
             error_tail="${error_tail//$'\n'/'%0A'}"
