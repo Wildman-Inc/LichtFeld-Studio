@@ -118,6 +118,14 @@ jobs:
       CMAKE_MAKE_PROGRAM: /usr/bin/ninja
 
     steps:
+      - name: Prepare checkout dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git
+
       - name: Checkout source and submodules
         uses: actions/checkout@v4
         with:
