@@ -121,9 +121,14 @@ if(WIN32)
                 "$<TARGET_FILE_DIR:LichtFeld-Studio-Arc-Viewer>"
             COMMENT "Staging the Vulkan loader beside the Arc Viewer executable")
     else()
-        message(WARNING
-            "No redistributable vulkan-1.dll was found; the Arc Viewer package "
-            "will require the system Vulkan loader supplied by the GPU driver.")
+        if(BUILD_PORTABLE)
+            message(FATAL_ERROR
+                "Portable Arc Viewer packages require a redistributable vulkan-1.dll")
+        else()
+            message(WARNING
+                "No redistributable vulkan-1.dll was found; the Arc Viewer will "
+                "require the system Vulkan loader supplied by the GPU driver.")
+        endif()
     endif()
 endif()
 
@@ -135,9 +140,35 @@ if(WIN32 AND _LFS_ARC_SDL_TYPE STREQUAL "SHARED_LIBRARY")
         COMMENT "Staging SDL3 beside the Arc Viewer executable")
 endif()
 
-install(TARGETS LichtFeld-Studio-Arc-Viewer
-    RUNTIME DESTINATION .
-    COMPONENT ArcViewer)
+if(UNIX AND BUILD_PORTABLE)
+    set_target_properties(LichtFeld-Studio-Arc-Viewer PROPERTIES
+        BUILD_RPATH_USE_ORIGIN TRUE
+        INSTALL_RPATH "$ORIGIN")
+    install(TARGETS LichtFeld-Studio-Arc-Viewer
+        RUNTIME_DEPENDENCY_SET lfs_arc_viewer_runtime
+        RUNTIME DESTINATION .
+        COMPONENT ArcViewer)
+    install(RUNTIME_DEPENDENCY_SET lfs_arc_viewer_runtime
+        LIBRARY DESTINATION .
+        COMPONENT ArcViewer
+        DIRECTORIES
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib"
+        PRE_EXCLUDE_REGEXES
+            "^ld-linux.*"
+            "^lib(c|dl|m|pthread|rt)[.]so.*"
+            "^libgcc_s[.]so.*"
+            "^libstdc[+][+][.]so.*"
+        POST_INCLUDE_REGEXES
+            ".*/libSDL3[.]so([.].*)?$"
+            ".*/libvulkan[.]so([.].*)?$"
+        POST_EXCLUDE_REGEXES
+            "^/lib/.*"
+            "^/usr/lib/.*")
+else()
+    install(TARGETS LichtFeld-Studio-Arc-Viewer
+        RUNTIME DESTINATION .
+        COMPONENT ArcViewer)
+endif()
 install(FILES
     "${_LFS_ARC_VERTEX_SHADER}"
     "${_LFS_ARC_FRAGMENT_SHADER}"
@@ -158,6 +189,36 @@ if(MSVC)
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ".")
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT ArcViewer)
     include(InstallRequiredSystemLibraries)
+    if(BUILD_PORTABLE AND NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+        set(_LFS_ARC_VSWHERE_RESULT 1)
+        set(_LFS_ARC_VSWHERE
+            "$ENV{ProgramFiles}/../Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe")
+        if(EXISTS "${_LFS_ARC_VSWHERE}")
+            execute_process(
+                COMMAND "${_LFS_ARC_VSWHERE}" -latest -products * -property installationPath
+                OUTPUT_VARIABLE _LFS_ARC_VS_ROOT
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _LFS_ARC_VSWHERE_RESULT)
+        endif()
+        if(_LFS_ARC_VSWHERE_RESULT EQUAL 0 AND IS_DIRECTORY "${_LFS_ARC_VS_ROOT}")
+            file(TO_CMAKE_PATH "${_LFS_ARC_VS_ROOT}" _LFS_ARC_VS_ROOT)
+            file(GLOB _LFS_ARC_CRT_DIRS LIST_DIRECTORIES TRUE
+                "${_LFS_ARC_VS_ROOT}/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
+            list(SORT _LFS_ARC_CRT_DIRS COMPARE NATURAL ORDER DESCENDING)
+            if(_LFS_ARC_CRT_DIRS)
+                list(GET _LFS_ARC_CRT_DIRS 0 _LFS_ARC_CRT_DIR)
+                file(GLOB CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS
+                    "${_LFS_ARC_CRT_DIR}/*.dll")
+                install(FILES ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
+                    DESTINATION .
+                    COMPONENT ArcViewer)
+            endif()
+        endif()
+        if(NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+            message(FATAL_ERROR
+                "Portable Arc Viewer packages require Visual Studio C++ Redistributable DLLs")
+        endif()
+    endif()
     foreach(_LFS_ARC_MSVC_RUNTIME IN LISTS CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
         add_custom_command(TARGET LichtFeld-Studio-Arc-Viewer POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

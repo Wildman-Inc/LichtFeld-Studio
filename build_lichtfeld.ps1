@@ -257,6 +257,45 @@ function Assert-ZipNoticeDirectory {
     }
 }
 
+function Assert-ZipRuntimePolicy {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$EntryNames,
+        [Parameter(Mandatory = $true)][bool]$IsViewerPackage
+    )
+
+    $WindowsSystemDlls = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($Name in @(
+        'advapi32.dll', 'bcrypt.dll', 'cfgmgr32.dll', 'comdlg32.dll',
+        'combase.dll', 'crypt32.dll', 'cryptbase.dll', 'd3d12.dll', 'dbghelp.dll',
+        'dnsapi.dll', 'dwmapi.dll', 'dxcore.dll', 'dxgi.dll', 'gdi32.dll',
+        'imm32.dll', 'iphlpapi.dll', 'kernel32.dll', 'kernelbase.dll', 'mpr.dll',
+        'mswsock.dll', 'ncrypt.dll', 'netapi32.dll', 'normaliz.dll', 'ntdll.dll',
+        'ole32.dll', 'oleaut32.dll', 'powrprof.dll', 'propsys.dll', 'rpcrt4.dll',
+        'sechost.dll', 'secur32.dll', 'setupapi.dll', 'shcore.dll', 'shell32.dll',
+        'shlwapi.dll', 'user32.dll', 'userenv.dll', 'uxtheme.dll', 'version.dll',
+        'winhttp.dll', 'wininet.dll', 'winmm.dll', 'wintrust.dll', 'ws2_32.dll',
+        'win32u.dll', 'wtsapi32.dll', 'xmllite.dll')) {
+        [void]$WindowsSystemDlls.Add($Name)
+    }
+
+    foreach ($EntryName in $EntryNames) {
+        $LeafName = [System.IO.Path]::GetFileName($EntryName)
+        if ($WindowsSystemDlls.Contains($LeafName) -or
+            $LeafName -match '^(?i:api-ms-|ext-ms-).*[.]dll$') {
+            throw "Package ZIP must not redistribute Windows system DLL '$EntryName'."
+        }
+        if ($LeafName -match '^(?i:gtest|gmock|benchmark|catch2).*[.]dll$') {
+            throw "Package ZIP must not contain test-only runtime '$EntryName'."
+        }
+        if ($IsViewerPackage -and $LeafName.EndsWith('.dll',
+                [System.StringComparison]::OrdinalIgnoreCase) -and $LeafName -notmatch
+            '^(?i:SDL3|vulkan-1|concrt140|vccorlib140|msvcp140(?:_[a-z0-9_]+)?|vcruntime140(?:_[a-z0-9_]+)?)[.]dll$') {
+            throw "Arc Viewer package contains an unapproved runtime '$EntryName'."
+        }
+    }
+}
+
 function Test-PackageArchiveContract {
     param(
         [Parameter(Mandatory = $true)][string]$ArchivePath,
@@ -278,14 +317,44 @@ function Test-PackageArchiveContract {
                 throw "Package ZIP contains a duplicate entry: $EntryName"
             }
         }
+        Assert-ZipRuntimePolicy $EntryNames $IsViewerPackage
+        $RuntimeDirectory = if ($IsViewerPackage) { '' } else { 'bin/' }
+        foreach ($RuntimePattern in @('^(?i:msvcp140).*?[.]dll$',
+                '^(?i:vcruntime140).*?[.]dll$')) {
+            $LocatedRuntimePattern = '^' + [regex]::Escape($RuntimeDirectory) +
+                $RuntimePattern.Substring(1)
+            if (-not ($EntryNames -match $LocatedRuntimePattern)) {
+                throw "Package ZIP is missing a required MSVC runtime matching '$RuntimePattern'."
+            }
+        }
 
         if ($IsViewerPackage) {
             Assert-ZipEntry $Entries 'LichtFeld-Studio-Arc-Viewer.exe' 'Arc Viewer executable'
+            Assert-ZipEntry $Entries 'point.vert.spv' 'Arc Viewer vertex shader'
+            Assert-ZipEntry $Entries 'point.frag.spv' 'Arc Viewer fragment shader'
+            Assert-ZipEntry $Entries 'SDL3.dll' 'Arc Viewer SDL3 runtime'
+            Assert-ZipEntry $Entries 'vulkan-1.dll' 'Arc Viewer Vulkan loader'
             Assert-ZipEntry $Entries 'LICENSE.txt' 'Arc Viewer license'
             Assert-ZipEntry $Entries 'THIRD_PARTY_LICENSES.md' 'Arc Viewer third-party license notice'
             Assert-ZipEntry $Entries 'README.md' 'Arc Viewer README'
             foreach ($Notice in @('sdl3.txt', 'glm.txt', 'vulkan-loader.txt', 'vulkan-headers.txt')) {
                 Assert-ZipEntry $Entries "licenses/$Notice" 'Arc Viewer dependency notice'
+            }
+            foreach ($ShaderPath in @('point.vert.spv', 'point.frag.spv')) {
+                $ShaderEntry = $Archive.GetEntry($ShaderPath)
+                if ($ShaderEntry.Length -lt 20 -or $ShaderEntry.Length % 4 -ne 0) {
+                    throw "Arc Viewer package contains malformed SPIR-V bytecode '$ShaderPath'."
+                }
+                $ShaderStream = $ShaderEntry.Open()
+                try {
+                    $Header = [byte[]]::new(4)
+                    if ($ShaderStream.Read($Header, 0, $Header.Length) -ne $Header.Length -or
+                        [BitConverter]::ToUInt32($Header, 0) -ne 0x07230203) {
+                        throw "Arc Viewer package contains invalid SPIR-V bytecode '$ShaderPath'."
+                    }
+                } finally {
+                    $ShaderStream.Dispose()
+                }
             }
             return
         }
@@ -298,9 +367,27 @@ function Test-PackageArchiveContract {
             Assert-ZipNoticeDirectory $EntryNames 'licenses/ROCm/runtime' 'a ROCm redistribution notice'
         }
 
+        if ($Backend -eq 'HIP' -and -not $RuntimeManifestPath) {
+            throw 'HIP packages require a ROCm runtime manifest.'
+        }
         if ($RuntimeManifestPath) {
-            foreach ($RuntimeEntry in Get-PackageRuntimeManifestEntries $RuntimeManifestPath) {
+            $RuntimeManifestEntries = @(Get-PackageRuntimeManifestEntries $RuntimeManifestPath)
+            foreach ($RuntimeEntry in $RuntimeManifestEntries) {
                 Assert-ZipEntry $Entries "bin/$RuntimeEntry" "required $Backend runtime '$RuntimeEntry'"
+            }
+            if ($Backend -eq 'HIP') {
+                $PackagedRocmRuntimes = @($EntryNames |
+                    Where-Object { $_ -match '^bin/[^/]+[.]dll$' } |
+                    ForEach-Object { [System.IO.Path]::GetFileName($_).ToLowerInvariant() } |
+                    Where-Object { $_ -match '^(?:amd_comgr|amdhip.*|hip.*|roc.*)[.]dll$' } |
+                    Sort-Object -Unique)
+                $ExpectedRocmRuntimes = @($RuntimeManifestEntries |
+                    ForEach-Object { $_.ToLowerInvariant() } |
+                    Sort-Object -Unique)
+                $RuntimeDifference = @(Compare-Object $ExpectedRocmRuntimes $PackagedRocmRuntimes)
+                if ($RuntimeDifference) {
+                    throw "ROCm runtime manifest does not match the package: $($RuntimeDifference -join ', ')"
+                }
             }
         }
     } finally {

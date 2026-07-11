@@ -621,6 +621,10 @@ if(BUILD_PORTABLE)
         # Install to root Lib/ and DLLs/ to match getPythonHome() expectations
         set(VCPKG_PYTHON_STDLIB "${VCPKG_PYTHON_TOOLS_DIR}/Lib")
         set(VCPKG_PYTHON_DLLS "${VCPKG_PYTHON_TOOLS_DIR}/DLLs")
+        file(GLOB LFS_PYTHON_EXTENSION_MODULES LIST_DIRECTORIES FALSE
+            "${VCPKG_PYTHON_DLLS}/*.pyd")
+        set(LFS_PYTHON_EXTENSION_MODULES
+            "${LFS_PYTHON_EXTENSION_MODULES}" PARENT_SCOPE)
         set(PYTHON_INSTALL_STDLIB "Lib")
 
         # Install Python executable to bin/
@@ -718,6 +722,10 @@ if(BUILD_PORTABLE)
         # Linux: Python layout is tools/python3/python3.12, lib/python3.12/
         set(VCPKG_PYTHON_STDLIB "${VCPKG_PYTHON_TOOLS_DIR}/../../lib/python3.12")
         get_filename_component(VCPKG_PYTHON_STDLIB "${VCPKG_PYTHON_STDLIB}" ABSOLUTE)
+        file(GLOB LFS_PYTHON_EXTENSION_MODULES LIST_DIRECTORIES FALSE
+            "${VCPKG_PYTHON_STDLIB}/lib-dynload/*.so*")
+        set(LFS_PYTHON_EXTENSION_MODULES
+            "${LFS_PYTHON_EXTENSION_MODULES}" PARENT_SCOPE)
         set(PYTHON_INSTALL_STDLIB "${CMAKE_INSTALL_LIBDIR}/python3.12")
 
         # Install Python executable

@@ -110,10 +110,15 @@ target_link_libraries(lfs_core
 )
 
 # OpenMP for tensor multi-threaded operations
-find_package(OpenMP)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(lfs_core PRIVATE OpenMP::OpenMP_CXX)
-    message(STATUS "[ok] OpenMP support enabled for lfs_core")
+if(WIN32 AND USE_HIP AND BUILD_PORTABLE)
+    message(STATUS
+        "Windows HIP portable build: OpenMP disabled to avoid non-redistributable LLVM runtime")
+else()
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(lfs_core PRIVATE OpenMP::OpenMP_CXX)
+        message(STATUS "[ok] OpenMP support enabled for lfs_core")
+    endif()
 endif()
 
 # Platform-specific settings
