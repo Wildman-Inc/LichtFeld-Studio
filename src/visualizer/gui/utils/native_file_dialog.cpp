@@ -4,6 +4,13 @@
 
 #include "gui/utils/native_file_dialog.hpp"
 
+#ifdef __linux__
+// GLib must be parsed before HIP defines CUDA compatibility macros such as
+// __noinline__; otherwise GLib's attribute probes expand to invalid syntax.
+#include <cstdlib>
+#include <gtk/gtk.h>
+#endif
+
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "io/formats/colmap.hpp"
@@ -19,11 +26,6 @@
 #include <system_error>
 #include <utility>
 #include <vector>
-
-#ifdef __linux__
-#include <cstdlib>
-#include <gtk/gtk.h>
-#endif
 
 namespace lfs::vis::gui {
 
