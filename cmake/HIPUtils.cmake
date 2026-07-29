@@ -45,19 +45,25 @@ macro(lfs_hip_add_library target_name lib_type)
                 # mappings, but a few HIP-clean sources (e.g. cuda_gl_kernels.cu)
                 # should skip it to avoid runtime header conflicts.
                 if(_source_abs MATCHES "src/rendering/cuda_gl_kernels\\.cu$")
-                    file(WRITE "${_hip_file}"
+                    string(CONCAT _hip_wrapper_content
                         "// Auto-generated HIP wrapper for ${_source}\n"
                         "#include <hip/hip_runtime.h>\n"
-                        "#include \"${_source_abs}\"\n"
-                    )
+                        "#include \"${_source_abs}\"\n")
                 else()
-                    file(WRITE "${_hip_file}"
+                    string(CONCAT _hip_wrapper_content
                         "// Auto-generated HIP wrapper for ${_source}\n"
                         "#include \"${CMAKE_SOURCE_DIR}/src/core/include/core/cuda/hip_runtime_compat.h\"\n"
                         "#include <hip/hip_runtime.h>\n"
-                        "#include \"${_source_abs}\"\n"
-                    )
+                        "#include \"${_source_abs}\"\n")
                 endif()
+                # file(CONFIGURE), unlike file(WRITE), preserves the timestamp
+                # when the generated wrapper content is unchanged. This keeps a
+                # no-op CMake configure from rebuilding every HIP kernel.
+                file(CONFIGURE
+                    OUTPUT "${_hip_file}"
+                    CONTENT "${_hip_wrapper_content}"
+                    @ONLY
+                    NEWLINE_STYLE LF)
                 if(_source_abs MATCHES "(lod_page_dequant_cuda|rad_encode_quant)\\.cu$")
                     set_property(SOURCE "${_hip_file}" APPEND PROPERTY COMPILE_OPTIONS "-ffp-contract=off")
                 endif()
@@ -105,9 +111,9 @@ macro(lfs_hip_add_library target_name lib_type)
             foreach(_arch_flag ${_arch_flags})
                 set_property(SOURCE "${_hip_src}" APPEND PROPERTY COMPILE_OPTIONS "${_arch_flag}")
             endforeach()
-            # MSVC's C++23 <cmath> clang overloads collide with HIP's device math
-            # forward declarations. Keep generated HIP wrappers on C++20 while the
-            # host-side target can still use the project's C++23 setting.
+            # C++23 <cmath> overloads collide with HIP's device math forward
+            # declarations on Windows. Device-safe headers gate host-only C++23
+            # APIs for both nvcc and hipcc.
             set_property(SOURCE "${_hip_src}" APPEND PROPERTY COMPILE_OPTIONS "-std=gnu++20")
             set_property(SOURCE "${_hip_src}" APPEND PROPERTY COMPILE_OPTIONS "-fno-openmp")
         endforeach()

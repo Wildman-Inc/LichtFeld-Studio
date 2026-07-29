@@ -95,6 +95,9 @@ namespace lfs::core {
             float scaling_lr = 0.005f;
             float scaling_lr_end = 0.005f;
             float rotation_lr = 0.001f;
+            // Adam and refinement signals only; strategy noise, decay, and resets remain crop-unaware.
+            float cropbox_lr_scale = 0.1f;
+            float cropbox_loss_weight = 0.1f;
             float lambda_dssim = 0.2f;
             float min_opacity = 0.005f;
             size_t refine_every = 100;
@@ -129,9 +132,16 @@ namespace lfs::core {
             bool use_alpha_as_mask = true;            // Auto-use alpha channel from RGBA images as mask
 
             // Depth supervision
-            bool use_depth_loss = false;                        // Use dataset depth maps when available
-            float depth_loss_weight = 2.0f;                     // Depth supervision weight
-            std::string depth_loss_mode = "adaptive-warped-l1"; // pearson or adaptive-warped-l1
+            bool use_depth_loss = false;         // Use dataset depth maps when available
+            float depth_loss_weight = 2.0f;      // Depth supervision weight (decays over training)
+            std::string depth_loss_mode = "ssi"; // ssi (auto prior), ssi-disparity, or ssi-depth
+
+            // Normal supervision
+            bool use_normal_loss = false;            // Use dataset normal maps when available
+            float normal_loss_weight = 0.05f;        // Prior normal supervision weight
+            float normal_consistency_weight = 0.05f; // Depth-normal consistency weight
+            float normal_flatten_weight = 1.0f;      // L1 on the smallest scale axis while normal supervision is active
+            std::string normal_loss_space = "auto";  // auto, camera-opencv, camera-opengl, or world
 
             // Mip filter (anti-aliasing)
             bool mip_filter = false;
@@ -249,6 +259,7 @@ namespace lfs::core {
 
             nlohmann::json to_json() const;
             static DatasetConfig from_json(const nlohmann::json& j);
+            [[nodiscard]] std::string validate() const;
         };
 
         struct LFS_CORE_API ServerConfig {
@@ -288,6 +299,7 @@ namespace lfs::core {
             // Optional trained splats to append to the training model before optimizer initialization
             std::vector<std::filesystem::path> add_splat_paths;
             std::vector<bool> add_splat_freeze;
+            float freeze_lr_scale = 0.0f;
             bool exclude_frozen_add_splats_from_export = false;
 
             // Checkpoint to resume training from
@@ -366,6 +378,7 @@ namespace lfs::core {
             std::int64_t num_tokens = 1800;
             int threads = 0;
             int png_compression = 1;
+            int bit_depth = 16;
             bool force_cpu = false;
             bool overwrite = false;
             bool no_download = false;

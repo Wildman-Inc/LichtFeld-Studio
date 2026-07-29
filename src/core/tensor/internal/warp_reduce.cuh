@@ -7,13 +7,11 @@
 
 #pragma once
 
+#include "tensor_functors.hpp"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <type_traits>
-
-#ifndef LFS_CUDA_SYNC_MASK
-#define LFS_CUDA_SYNC_MASK 0xffffffffu
-#endif
 
 namespace lfs::core {
     namespace warp_ops {
@@ -36,8 +34,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_sum(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                val += __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, 32);
+            for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+                val += __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, warpSize);
             }
             return val;
         }
@@ -48,9 +46,9 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_max(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, 32);
-                val = (val > other) ? val : other;
+            for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+                T other = __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, warpSize);
+                val = ops::max_reduce_op{}(val, other);
             }
             return val;
         }
@@ -61,9 +59,9 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_min(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                T other = __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, 32);
-                val = (val < other) ? val : other;
+            for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+                T other = __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, warpSize);
+                val = ops::min_reduce_op{}(val, other);
             }
             return val;
         }
@@ -74,8 +72,8 @@ namespace lfs::core {
         template <typename T>
         __device__ inline T warp_reduce_prod(T val) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                val *= __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, 32);
+            for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+                val *= __shfl_xor_sync(LFS_CUDA_SYNC_MASK, val, offset, warpSize);
             }
             return val;
         }
@@ -97,8 +95,8 @@ namespace lfs::core {
         __device__ T block_reduce_sum(T val) {
             static __shared__ T shared[32]; // One value per warp (max 32 warps per block)
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % warpSize;
+            int warp_id = threadIdx.x / warpSize;
 
             // Reduce within warp
             val = warp_reduce_sum(val);
@@ -111,7 +109,7 @@ namespace lfs::core {
 
             // First warp reduces across warps
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : T(0);
+                val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : T(0);
                 val = warp_reduce_sum(val);
             }
 
@@ -125,8 +123,8 @@ namespace lfs::core {
         __device__ T block_reduce_max(T val) {
             static __shared__ T shared[32];
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % warpSize;
+            int warp_id = threadIdx.x / warpSize;
 
             val = warp_reduce_max(val);
 
@@ -136,7 +134,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : -std::numeric_limits<T>::infinity();
+                val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : -std::numeric_limits<T>::infinity();
                 val = warp_reduce_max(val);
             }
 
@@ -150,8 +148,8 @@ namespace lfs::core {
         __device__ T block_reduce_min(T val) {
             static __shared__ T shared[32];
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % warpSize;
+            int warp_id = threadIdx.x / warpSize;
 
             val = warp_reduce_min(val);
 
@@ -161,7 +159,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : std::numeric_limits<T>::infinity();
+                val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : std::numeric_limits<T>::infinity();
                 val = warp_reduce_min(val);
             }
 
@@ -175,8 +173,8 @@ namespace lfs::core {
         __device__ T block_reduce_prod(T val) {
             static __shared__ T shared[32];
 
-            int lane = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
+            int lane = threadIdx.x % warpSize;
+            int warp_id = threadIdx.x / warpSize;
 
             val = warp_reduce_prod(val);
 
@@ -186,7 +184,7 @@ namespace lfs::core {
             __syncthreads();
 
             if (warp_id == 0) {
-                val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[lane] : T(1);
+                val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : T(1);
                 val = warp_reduce_prod(val);
             }
 
@@ -255,10 +253,10 @@ namespace lfs::core {
 
                 if (is_aligned && idx + 3 < n) {
                     float4 vals = reinterpret_cast<const float4*>(input)[vec_idx];
-                    val = fmaxf(fmaxf(vals.x, vals.y), fmaxf(vals.z, vals.w));
+                    val = ops::max_reduce_op{}(ops::max_reduce_op{}(vals.x, vals.y), ops::max_reduce_op{}(vals.z, vals.w));
                 } else if (idx < n) {
                     for (size_t i = idx; i < n && i < idx + 4; ++i) {
-                        val = fmaxf(val, input[i]);
+                        val = ops::max_reduce_op{}(val, input[i]);
                     }
                 }
             } else {
@@ -286,10 +284,10 @@ namespace lfs::core {
 
                 if (is_aligned && idx + 3 < n) {
                     float4 vals = reinterpret_cast<const float4*>(input)[vec_idx];
-                    val = fminf(fminf(vals.x, vals.y), fminf(vals.z, vals.w));
+                    val = ops::min_reduce_op{}(ops::min_reduce_op{}(vals.x, vals.y), ops::min_reduce_op{}(vals.z, vals.w));
                 } else if (idx < n) {
                     for (size_t i = idx; i < n && i < idx + 4; ++i) {
-                        val = fminf(val, input[i]);
+                        val = ops::min_reduce_op{}(val, input[i]);
                     }
                 }
             } else {
@@ -410,10 +408,10 @@ namespace lfs::core {
 
                     if (is_aligned && idx + 3 < segment_size) {
                         float4 vals = reinterpret_cast<const float4*>(segment_start)[base / 4 + vec_idx];
-                        val = fmaxf(val, fmaxf(fmaxf(vals.x, vals.y), fmaxf(vals.z, vals.w)));
+                        val = ops::max_reduce_op{}(val, ops::max_reduce_op{}(ops::max_reduce_op{}(vals.x, vals.y), ops::max_reduce_op{}(vals.z, vals.w)));
                     } else if (idx < segment_size) {
                         for (size_t i = idx; i < segment_size && i < idx + 4; ++i) {
-                            val = fmaxf(val, segment_start[i]);
+                            val = ops::max_reduce_op{}(val, segment_start[i]);
                         }
                     }
                 }
@@ -451,10 +449,10 @@ namespace lfs::core {
 
                     if (is_aligned && idx + 3 < segment_size) {
                         float4 vals = reinterpret_cast<const float4*>(segment_start)[base / 4 + vec_idx];
-                        val = fminf(val, fminf(fminf(vals.x, vals.y), fminf(vals.z, vals.w)));
+                        val = ops::min_reduce_op{}(val, ops::min_reduce_op{}(ops::min_reduce_op{}(vals.x, vals.y), ops::min_reduce_op{}(vals.z, vals.w)));
                     } else if (idx < segment_size) {
                         for (size_t i = idx; i < segment_size && i < idx + 4; ++i) {
-                            val = fminf(val, segment_start[i]);
+                            val = ops::min_reduce_op{}(val, segment_start[i]);
                         }
                     }
                 }

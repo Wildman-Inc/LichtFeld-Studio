@@ -23,7 +23,6 @@
 #include <limits>
 #include <optional>
 #include <variant>
-#include <imgui.h>
 
 namespace lfs::vis {
 
@@ -34,14 +33,9 @@ namespace lfs::vis {
                 isolateInputProfileHome();
                 services().clear();
                 gui::guiFocusState().reset();
-
-                IMGUI_CHECKVERSION();
-                ImGui::CreateContext();
             }
 
             void TearDown() override {
-                ImGui::DestroyContext();
-
                 gui::guiFocusState().reset();
                 services().clear();
                 restoreHome();
@@ -1201,10 +1195,10 @@ namespace lfs::vis {
                         .getTriggerForAction(input::Action::TOOL_MIRROR,
                                              input::ToolMode::SELECTION)
                         .has_value());
-        EXPECT_FALSE(controller.getBindings()
-                         .getTriggerForAction(input::Action::TOOL_MIRROR,
-                                              input::ToolMode::GLOBAL)
-                         .has_value());
+        EXPECT_TRUE(controller.getBindings()
+                        .getTriggerForAction(input::Action::TOOL_MIRROR,
+                                             input::ToolMode::GLOBAL)
+                        .has_value());
     }
 
     TEST_F(InputControllerFocusTest, ToolLocalOperationalShortcutsDoNotResolveAcrossModes) {

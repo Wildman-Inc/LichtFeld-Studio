@@ -71,7 +71,29 @@ namespace lfs::io {
 
     std::vector<uint8_t> NvCodecImageLoader::encode_to_jpeg2k(
         const lfs::core::Tensor&,
-        void*) {
+        void*,
+        bool) {
+        throw_disabled();
+    }
+
+    std::vector<uint8_t> NvCodecImageLoader::encode_grayscale_to_jpeg2k(
+        const lfs::core::Tensor&,
+        void*,
+        bool) {
+        throw_disabled();
+    }
+
+    lfs::core::Tensor NvCodecImageLoader::decode_jpeg2k_16bit_from_memory_gpu(
+        const std::vector<uint8_t>&,
+        void*,
+        bool) {
+        throw_disabled();
+    }
+
+    std::vector<lfs::core::Tensor> NvCodecImageLoader::decode_jpeg2k_16bit_batch_from_spans(
+        const std::vector<std::pair<const uint8_t*, size_t>>&,
+        void*,
+        bool) {
         throw_disabled();
     }
 

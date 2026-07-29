@@ -184,9 +184,9 @@ namespace lfs::core {
         Scene(Scene&&) = default;
         Scene& operator=(Scene&&) = default;
 
-        void removeNode(const std::string& name, bool keep_children = false);
+        void removeNode(std::string name, bool keep_children = false);
         [[nodiscard]] std::vector<std::unique_ptr<lfs::core::SplatData>> detachSplatModelsForRemoval(
-            const std::string& name,
+            std::string name,
             bool keep_children = false);
         void replaceNodeModel(const std::string& name, std::unique_ptr<lfs::core::SplatData> model);
         // Swap a node's model in place, returning the previous model so the caller can
@@ -200,7 +200,7 @@ namespace lfs::core {
         void setNodeTransform(const std::string& name, const glm::mat4& transform);
         glm::mat4 getNodeTransform(const std::string& name) const;
         bool renameNode(NodeId id, const std::string& new_name);
-        bool renameNode(const std::string& old_name, const std::string& new_name);
+        bool renameNode(std::string old_name, const std::string& new_name);
         void clear();
         std::pair<std::string, std::string> cycleVisibilityWithNames();
 
@@ -221,7 +221,8 @@ namespace lfs::core {
         [[nodiscard]] bool reparent(NodeId node, NodeId new_parent);
         [[nodiscard]] bool moveNode(NodeId node, NodeId new_parent, int index);
         [[nodiscard]] std::string duplicateNode(const std::string& name);
-        [[nodiscard]] std::string mergeGroup(const std::string& group_name);
+        [[nodiscard]] std::string mergeGroup(NodeId group_id);
+        [[nodiscard]] std::string mergeGroup(std::string group_name);
         [[nodiscard]] const glm::mat4& getWorldTransform(NodeId node) const;
         [[nodiscard]] std::vector<NodeId> getRootNodes() const;
         [[nodiscard]] SceneNode* getNodeById(NodeId id);
@@ -244,11 +245,12 @@ namespace lfs::core {
             const CropBoxData* data = nullptr;
             glm::mat4 world_transform{1.0f};
             glm::mat4 local_transform{1.0f};
+            bool effectively_visible = false;
+            bool parent_effectively_visible = false;
         };
-        [[nodiscard]] std::vector<RenderableCropBox> getVisibleCropBoxes() const;
+        [[nodiscard]] std::vector<RenderableCropBox> getRenderableCropBoxes() const;
 
         [[nodiscard]] NodeId getEllipsoidForSplat(NodeId splat_id) const;
-        [[nodiscard]] NodeId getOrCreateEllipsoidForSplat(NodeId splat_id);
         [[nodiscard]] EllipsoidData* getEllipsoidData(NodeId ellipsoid_id);
         [[nodiscard]] const EllipsoidData* getEllipsoidData(NodeId ellipsoid_id) const;
         void setEllipsoidData(NodeId ellipsoid_id, const EllipsoidData& data);
@@ -260,8 +262,10 @@ namespace lfs::core {
             const EllipsoidData* data = nullptr;
             glm::mat4 world_transform{1.0f};
             glm::mat4 local_transform{1.0f};
+            bool effectively_visible = false;
+            bool parent_effectively_visible = false;
         };
-        [[nodiscard]] std::vector<RenderableEllipsoid> getVisibleEllipsoids() const;
+        [[nodiscard]] std::vector<RenderableEllipsoid> getRenderableEllipsoids() const;
 
         const lfs::core::SplatData* getCombinedModel() const;
 
@@ -300,8 +304,6 @@ namespace lfs::core {
         [[nodiscard]] std::shared_ptr<lfs::core::Tensor> getVisibleSelectionIndices() const;
         [[nodiscard]] std::shared_ptr<lfs::core::Tensor> getVisibleSelectionMask() const;
 
-        [[nodiscard]] std::unique_ptr<lfs::core::SplatData> createMergedModelWithTransforms() const;
-
         enum class MergeStorageMode {
             Clone,
             BorrowSingleIdentity,
@@ -311,9 +313,6 @@ namespace lfs::core {
             const std::vector<std::pair<const lfs::core::SplatData*, glm::mat4>>& splats,
             MergeStorageMode storage_mode = MergeStorageMode::Clone);
 
-        [[nodiscard]] const lfs::core::PointCloud* getVisiblePointCloud() const;
-        [[nodiscard]] std::optional<glm::mat4> getVisiblePointCloudTransform() const;
-
         struct VisibleMesh {
             const lfs::core::MeshData* mesh;
             glm::mat4 transform;
@@ -321,7 +320,6 @@ namespace lfs::core {
             bool is_selected = false;
         };
         [[nodiscard]] std::vector<VisibleMesh> getVisibleMeshes() const;
-        [[nodiscard]] bool hasVisibleMeshes() const;
 
         std::vector<glm::mat4> getVisibleNodeTransforms() const;
         std::shared_ptr<lfs::core::Tensor> getTransformIndices() const;
@@ -407,12 +405,6 @@ namespace lfs::core {
         [[nodiscard]] std::vector<glm::mat4> getVisibleCameraSceneTransforms() const;
         [[nodiscard]] std::optional<glm::mat4> getCameraSceneTransformByUid(int uid) const;
 
-        void pinForExport() const { ++export_pin_count_; }
-        void unpinForExport() const {
-            assert(export_pin_count_.load(std::memory_order_acquire) > 0);
-            --export_pin_count_;
-        }
-
         void invalidateCache() {
             model_cache_valid_.store(false, std::memory_order_release);
             transform_cache_valid_.store(false, std::memory_order_release);
@@ -437,7 +429,6 @@ namespace lfs::core {
         void removeConsolidatedNodeData(NodeId id);
         void rebuildConsolidatedTransformIndices() const;
         [[nodiscard]] NodeId insertNode(std::unique_ptr<SceneNode> node);
-        mutable std::atomic<int> export_pin_count_{0};
         mutable std::shared_ptr<lfs::core::SplatData> cached_combined_;
         mutable std::shared_ptr<lfs::core::Tensor> cached_transform_indices_;
         mutable std::shared_ptr<lfs::core::Tensor> cached_visible_selection_indices_;
@@ -467,7 +458,7 @@ namespace lfs::core {
         void rebuildModelCacheIfNeeded(bool include_hidden_splats) const;
         void rebuildTransformCacheIfNeeded() const;
         void updateWorldTransform(const SceneNode& node) const;
-        void removeNodeInternal(const std::string& name, bool keep_children, bool force);
+        void removeNodeInternal(std::string name, bool keep_children);
         [[nodiscard]] size_t currentSelectionCapacity() const;
         [[nodiscard]] lfs::core::Tensor liveSelectionMask(size_t expected_size,
                                                           Device device,

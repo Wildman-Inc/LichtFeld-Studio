@@ -140,6 +140,22 @@ using cudaExternalSemaphoreHandleType = hipExternalSemaphoreHandleType;
 #define cudaErrorUnknown hipErrorUnknown
 #endif
 
+#ifndef cudaErrorCudartUnloading
+#define cudaErrorCudartUnloading hipErrorDeinitialized
+#endif
+#ifndef cudaErrorStreamCaptureUnsupported
+#define cudaErrorStreamCaptureUnsupported hipErrorStreamCaptureUnsupported
+#endif
+#ifndef cudaErrorInitializationError
+#define cudaErrorInitializationError hipErrorInitializationError
+#endif
+#ifndef cudaErrorInsufficientDriver
+#define cudaErrorInsufficientDriver hipErrorInsufficientDriver
+#endif
+#ifndef cudaErrorNoDevice
+#define cudaErrorNoDevice hipErrorNoDevice
+#endif
+
 #ifndef cudaMemcpyHostToDevice
 #define cudaMemcpyHostToHost hipMemcpyHostToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice

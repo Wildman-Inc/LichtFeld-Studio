@@ -8,10 +8,6 @@ message(STATUS "Configuring Python components (runner + nanobind module)")
 find_package(Python REQUIRED COMPONENTS Interpreter Development Development.Module Development.SABIModule)
 find_package(nanobind CONFIG REQUIRED)
 
-option(LFS_DEV_IMPORT_SOURCE_PYTHON
-    "Import built-in Python packages from src/python in non-portable builds"
-    ON)
-
 # vcpkg extension modules use release ABI; debug libpython has Py_DEBUG which
 # changes _PyRuntimeState layout, causing ABI mismatch crashes.
 # Force release Python library for debug builds on both Python::Python and Python::Module
@@ -92,6 +88,7 @@ target_link_libraries(lfs_python_runtime
         Python::Python
         glm::glm
     PRIVATE
+        lfs_core
         lfs_logger
 )
 
@@ -175,6 +172,7 @@ nanobind_add_module(
     lfs_py
     NB_STATIC
     lfs/module.cpp
+    lfs/py_error.cpp
     lfs/py_animation.cpp
     lfs/py_command.cpp
     lfs/py_gizmo.cpp
@@ -222,26 +220,20 @@ nanobind_add_module(
 )
 
 set_target_properties(lfs_py PROPERTIES
+    CUDA_ARCHITECTURES ""
+    CUDA_SEPARABLE_COMPILATION OFF
     LINKER_LANGUAGE CXX
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     OUTPUT_NAME lichtfeld
 )
-if(USE_CUDA)
-    set_target_properties(lfs_py PROPERTIES
-        CUDA_ARCHITECTURES ""
-        CUDA_SEPARABLE_COMPILATION OFF
-    )
-endif()
 
 # Do not add --exclude-libs,ALL here while lfs_visualizer is static on Linux.
 # The embedded app and the lichtfeld extension currently share GUI registries
 # and hook bridges through ELF symbol interposition.
 target_compile_definitions(lfs_py PRIVATE
     LFS_PYTHON_EXECUTABLE="${Python_EXECUTABLE}"
-    $<$<CONFIG:Debug>:DEBUG_BUILD>
-    $<$<CONFIG:Release>:RELEASE_BUILD>
 )
 
 
@@ -269,12 +261,10 @@ target_link_libraries(lfs_py PRIVATE
     ${LFS_PY_INTERNAL_LINK_LIBS}
     OpenMeshCore
     OpenMeshTools
-    OpenImageIO::OpenImageIO
-    ${GPU_RUNTIME_LIBRARY}
-    ${GPU_RAND_LIBRARY}
+    CUDA::cudart
+    CUDA::curand
+    SDL3::SDL3
     ${CMAKE_DL_LIBS}
-    imgui::imgui
-    implot::implot
     GPUOpen::VulkanMemoryAllocator
     $<IF:$<PLATFORM_ID:Windows>,RmlUi::RmlUi,lfs_rmlui>
 )
@@ -312,30 +302,18 @@ if(WIN32)
         COMMENT "Copying project DLLs to Python module directory"
     )
 
-    if(USE_CUDA)
-        # Copy CUDA DLLs
-        file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
-        file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
-        set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
-        foreach(DLL ${CUDA_DLLS_FOR_PYD})
-            if(EXISTS "${DLL}")
-                add_custom_command(TARGET lfs_py POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
-                    COMMENT "Copying ${DLL} to Python module directory"
-                )
-            endif()
-        endforeach()
-    elseif(USE_HIP)
-        lfs_collect_windows_hip_runtime_dlls(_lfs_hip_pyd_runtime_dlls)
-        if(_lfs_hip_pyd_runtime_dlls)
+    # Copy CUDA DLLs
+    file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
+    file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
+    set(CUDA_DLLS_FOR_PYD ${CUDA_DLLS_1} ${CUDA_DLLS_2})
+    foreach(DLL ${CUDA_DLLS_FOR_PYD})
+        if(EXISTS "${DLL}")
             add_custom_command(TARGET lfs_py POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${_lfs_hip_pyd_runtime_dlls}
-                    "${CMAKE_CURRENT_BINARY_DIR}"
-                COMMENT "Copying ROCm/HIP runtime DLLs to Python module directory"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "${CMAKE_CURRENT_BINARY_DIR}"
+                COMMENT "Copying ${DLL} to Python module directory"
             )
         endif()
-    endif()
+    endforeach()
 
     # Copy vcpkg runtime DLLs
     add_custom_command(TARGET lfs_py POST_BUILD
@@ -621,10 +599,6 @@ if(BUILD_PORTABLE)
         # Install to root Lib/ and DLLs/ to match getPythonHome() expectations
         set(VCPKG_PYTHON_STDLIB "${VCPKG_PYTHON_TOOLS_DIR}/Lib")
         set(VCPKG_PYTHON_DLLS "${VCPKG_PYTHON_TOOLS_DIR}/DLLs")
-        file(GLOB LFS_PYTHON_EXTENSION_MODULES LIST_DIRECTORIES FALSE
-            "${VCPKG_PYTHON_DLLS}/*.pyd")
-        set(LFS_PYTHON_EXTENSION_MODULES
-            "${LFS_PYTHON_EXTENSION_MODULES}" PARENT_SCOPE)
         set(PYTHON_INSTALL_STDLIB "Lib")
 
         # Install Python executable to bin/
@@ -722,10 +696,6 @@ if(BUILD_PORTABLE)
         # Linux: Python layout is tools/python3/python3.12, lib/python3.12/
         set(VCPKG_PYTHON_STDLIB "${VCPKG_PYTHON_TOOLS_DIR}/../../lib/python3.12")
         get_filename_component(VCPKG_PYTHON_STDLIB "${VCPKG_PYTHON_STDLIB}" ABSOLUTE)
-        file(GLOB LFS_PYTHON_EXTENSION_MODULES LIST_DIRECTORIES FALSE
-            "${VCPKG_PYTHON_STDLIB}/lib-dynload/*.so*")
-        set(LFS_PYTHON_EXTENSION_MODULES
-            "${LFS_PYTHON_EXTENSION_MODULES}" PARENT_SCOPE)
         set(PYTHON_INSTALL_STDLIB "${CMAKE_INSTALL_LIBDIR}/python3.12")
 
         # Install Python executable

@@ -270,8 +270,6 @@ namespace lichtfeld::Strings {
         inline constexpr const char* GO_TO_CAM_VIEW = "scene.go_to_cam_view";
         inline constexpr const char* FIT_TO_SCENE = "scene.fit_to_scene";
         inline constexpr const char* FIT_TO_SCENE_TRIMMED = "scene.fit_to_scene_trimmed";
-        inline constexpr const char* ADD_CROP_BOX = "scene.add_crop_box";
-        inline constexpr const char* ADD_CROP_ELLIPSOID = "scene.add_crop_ellipsoid";
         inline constexpr const char* RESET_CROP = "scene.reset_crop";
         inline constexpr const char* MERGE_TO_SINGLE_PLY = "scene.merge_to_single_ply";
         inline constexpr const char* MOVE_TO = "scene.move_to";
@@ -308,6 +306,29 @@ namespace lichtfeld::Strings {
         inline constexpr const char* SAVE_ASSET = "scene.save_asset";
         inline constexpr const char* SAVE_ASSET_AS = "scene.save_asset_as";
         inline constexpr const char* SAVE_TO_DISK = "scene.save_to_disk";
+        inline constexpr const char* HISTORY = "scene.history";
+        inline constexpr const char* LOGGING = "scene.logging";
+        inline constexpr const char* HISTORY_SHARED = "scene.history_shared";
+        inline constexpr const char* HISTORY_EMPTY = "scene.history_empty";
+        inline constexpr const char* HISTORY_NOTE = "scene.history_note";
+        inline constexpr const char* UNDO_STACK = "scene.undo_stack";
+        inline constexpr const char* REDO_STACK = "scene.redo_stack";
+        inline constexpr const char* NOTHING_RECORDED = "scene.nothing_recorded";
+        inline constexpr const char* NO_ENTRIES_IN_STACK = "scene.no_entries_in_stack";
+        inline constexpr const char* LOG_MIRROR = "scene.log_mirror";
+        inline constexpr const char* LOG_LEVEL = "scene.log_level";
+        inline constexpr const char* LOG_EXPORT = "scene.log_export";
+        inline constexpr const char* LOG_COPY = "scene.log_copy";
+        inline constexpr const char* LOG_NOTE = "scene.log_note";
+        inline constexpr const char* NO_LOGS = "scene.no_logs";
+        inline constexpr const char* LOG_TRACE = "scene.log_trace";
+        inline constexpr const char* LOG_DEBUG = "scene.log_debug";
+        inline constexpr const char* LOG_INFO = "scene.log_info";
+        inline constexpr const char* LOG_PERFORMANCE = "scene.log_performance";
+        inline constexpr const char* LOG_WARN = "scene.log_warn";
+        inline constexpr const char* LOG_ERROR = "scene.log_error";
+        inline constexpr const char* LOG_CRITICAL = "scene.log_critical";
+        inline constexpr const char* LOG_OFF = "scene.log_off";
     } // namespace Scene
 
     namespace Export {
@@ -344,6 +365,8 @@ namespace lichtfeld::Strings {
         inline constexpr const char* APPLY = "common.apply";
         inline constexpr const char* RESET = "common.reset";
         inline constexpr const char* DOUBLE_CLICK_RESET = "common.double_click_reset";
+        inline constexpr const char* UNDO = "common.undo";
+        inline constexpr const char* REDO = "common.redo";
     } // namespace Common
 
     namespace Status {
@@ -411,6 +434,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* SECONDARY_VIEW = "status_bar.secondary_view";
         inline constexpr const char* GPU = "status_bar.gpu";
         inline constexpr const char* STRATEGY_DEFAULT = "status_bar.strategy_default";
+        inline constexpr const char* EXPORT_CANCELLED = "status_bar.export_cancelled";
     } // namespace StatusBar
 
     namespace Preferences {
@@ -800,7 +824,37 @@ namespace lichtfeld::Strings {
         inline constexpr const char* DROP_FILES_HINT = "startup.drop_files_hint";
         inline constexpr const char* DROP_TO_IMPORT = "startup.drop_to_import";
         inline constexpr const char* DROP_TO_IMPORT_SUBTITLE = "startup.drop_to_import_subtitle";
+        inline constexpr const char* DISCORD = "startup.discord";
+        inline constexpr const char* DONATE = "startup.donate";
     } // namespace Startup
+
+    namespace PythonConsole {
+        inline constexpr const char* NEW = "python_console.new";
+        inline constexpr const char* LOAD = "python_console.load";
+        inline constexpr const char* RELOAD = "python_console.reload";
+        inline constexpr const char* SAVE = "python_console.save";
+        inline constexpr const char* SAVE_AS = "python_console.save_as";
+        inline constexpr const char* FORMAT = "python_console.format";
+        inline constexpr const char* VIM = "python_console.vim";
+        inline constexpr const char* RUN = "python_console.run";
+        inline constexpr const char* STOP = "python_console.stop";
+        inline constexpr const char* PYTHON = "python_console.python";
+        inline constexpr const char* RUNNING = "python_console.running";
+        inline constexpr const char* SYNTAX = "python_console.syntax";
+        inline constexpr const char* OUTLINE = "python_console.outline";
+        inline constexpr const char* SCOPE = "python_console.scope";
+        inline constexpr const char* BLOCKS = "python_console.blocks";
+        inline constexpr const char* UNTITLED = "python_console.untitled";
+        inline constexpr const char* OUTPUT = "python_console.output";
+        inline constexpr const char* TERMINAL = "python_console.terminal";
+        inline constexpr const char* PACKAGES = "python_console.packages";
+        inline constexpr const char* REFRESH = "python_console.refresh";
+        inline constexpr const char* SEARCH_PACKAGES = "python_console.search_packages";
+        inline constexpr const char* NAME = "python_console.name";
+        inline constexpr const char* VERSION = "python_console.version";
+        inline constexpr const char* PATH = "python_console.path";
+        inline constexpr const char* NO_PACKAGES = "python_console.no_packages";
+    } // namespace PythonConsole
 
     namespace Axis {
         inline constexpr const char* X = "axis.x";
@@ -949,5 +1003,40 @@ namespace lichtfeld::Strings {
         inline constexpr const char* MENU_REGISTER = "file_association.menu_register";
         inline constexpr const char* MENU_UNREGISTER = "file_association.menu_unregister";
     } // namespace FileAssociation
+
+    namespace ErrorModal {
+        inline constexpr const char* TRAINING_FAILED = "error_modal.training_failed";
+        inline constexpr const char* OUT_OF_GPU_MEMORY = "error_modal.out_of_gpu_memory";
+        inline constexpr const char* DATASET_LOAD_FAILED = "error_modal.dataset_load_failed";
+        inline constexpr const char* EXPORT_FAILED = "error_modal.export_failed";
+        inline constexpr const char* VIDEO_EXPORT_FAILED = "error_modal.video_export_failed";
+        inline constexpr const char* MESH2SPLAT_FAILED = "error_modal.mesh2splat_failed";
+        inline constexpr const char* CONFIG_INVALID = "error_modal.config_invalid";
+        inline constexpr const char* FILE_OPEN_FAILED = "error_modal.file_open_failed";
+        inline constexpr const char* CUDA_UNAVAILABLE = "error_modal.cuda_unavailable";
+        inline constexpr const char* CUDA_UNSUPPORTED = "error_modal.cuda_unsupported";
+        inline constexpr const char* SAVE_FAILED = "error_modal.save_failed";
+        inline constexpr const char* PLUGINS_DISABLED = "error_modal.plugins_disabled";
+        inline constexpr const char* GENERIC = "error_modal.generic";
+        inline constexpr const char* OOM_HEADING = "error_modal.oom_heading";
+        inline constexpr const char* OOM_SUGGESTIONS = "error_modal.oom_suggestions";
+        inline constexpr const char* DETAILS = "error_modal.details";
+        inline constexpr const char* REPEATED = "error_modal.repeated";
+        inline constexpr const char* RENDERER_DEVICE_LOST = "error_modal.renderer_device_lost";
+        inline constexpr const char* RENDERER_DEVICE_LOST_BODY = "error_modal.renderer_device_lost_body";
+        inline constexpr const char* RENDERER_STALLED = "error_modal.renderer_stalled";
+        inline constexpr const char* RENDERER_STALLED_BODY = "error_modal.renderer_stalled_body";
+        inline constexpr const char* RENDERER_FAILED = "error_modal.renderer_failed";
+        inline constexpr const char* RENDERER_FAILED_BODY = "error_modal.renderer_failed_body";
+        inline constexpr const char* OOM_RENDER_PAUSED = "error_modal.oom_render_paused";
+        inline constexpr const char* GPU_PRESSURE_RETRYING = "error_modal.gpu_pressure_retrying";
+    } // namespace ErrorModal
+
+    namespace ErrorActions {
+        inline constexpr const char* RETRY = "error_actions.retry";
+        inline constexpr const char* CHOOSE_PATH = "error_actions.choose_path";
+        inline constexpr const char* OPEN_LOG = "error_actions.open_log";
+        inline constexpr const char* STOP_RENDERER = "error_actions.stop_renderer";
+    } // namespace ErrorActions
 
 } // namespace lichtfeld::Strings

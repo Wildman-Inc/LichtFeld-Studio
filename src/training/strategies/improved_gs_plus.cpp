@@ -322,6 +322,11 @@ namespace lfs::training {
         }
     }
 
+    lfs::core::Tensor ImprovedGSPlus::damp_densification_scores(
+        const lfs::core::Tensor& scores) const {
+        return apply_crop_damping_to_scores(*_optimizer, scores);
+    }
+
     void ImprovedGSPlus::densify_with_score(const lfs::core::Tensor& edge_scores, const lfs::core::Tensor& error_scores, const int64_t budget) {
         const int64_t current_size = static_cast<int64_t>(_splat_data->size());
         const int64_t curr_points = static_cast<int64_t>(active_count());
@@ -348,6 +353,7 @@ namespace lfs::training {
 
         const auto normalized_error = normalized_by_positive_median(error_scores);
         const auto normalized_edge = normalized_by_positive_median(edge_scores);
+        const auto candidate_error = damp_densification_scores(normalized_error);
         const auto device = _splat_data->means().device();
 
         auto active_mask = lfs::core::Tensor::zeros_bool({static_cast<size_t>(_splat_data->size())}, device);
@@ -356,19 +362,21 @@ namespace lfs::training {
 
         lfs::core::Tensor candidate_mask = active_mask;
         if (candidate_budget < total_active) {
-            const auto active_error = normalized_error.index_select(0, active_indices);
+            const auto active_error = candidate_error.index_select(0, active_indices);
             auto [sorted_error, _] = active_error.sort(0, true);
             const float threshold = sorted_error[candidate_budget - 1].item_as<float>();
-            candidate_mask = active_mask.logical_and(normalized_error >= threshold);
+            candidate_mask = active_mask.logical_and(candidate_error >= threshold);
         }
 
         auto sampling_scores = normalized_error * (normalized_edge * EDGE_SCORE_WEIGHT + 1.0f);
         sampling_scores = sampling_scores.masked_fill(~candidate_mask, 0.0f);
 
-        int64_t selectable = static_cast<int64_t>(sampling_scores.count_nonzero());
+        int64_t selectable = static_cast<int64_t>(
+            damp_densification_scores(sampling_scores).count_nonzero());
         if (selectable < budget_for_alloc) {
             auto edge_fallback = normalized_edge.masked_fill(~active_mask, 0.0f);
-            selectable = static_cast<int64_t>(edge_fallback.count_nonzero());
+            selectable = static_cast<int64_t>(
+                damp_densification_scores(edge_fallback).count_nonzero());
             if (selectable > 0) {
                 sampling_scores = std::move(edge_fallback);
             } else {
@@ -376,7 +384,8 @@ namespace lfs::training {
                 auto active_weight_vals = lfs::core::Tensor::ones({static_cast<size_t>(active_indices.numel())}, device);
                 active_weights.index_put_(active_indices, active_weight_vals);
                 sampling_scores = std::move(active_weights);
-                selectable = total_active;
+                selectable = static_cast<int64_t>(
+                    damp_densification_scores(sampling_scores).count_nonzero());
             }
         }
 
@@ -399,7 +408,9 @@ namespace lfs::training {
         _pending_failure_snapshot.sampled_scale_max = 0.0f;
         _pending_failure_snapshot.sampled_scale_exp_max = 0.0f;
 
-        LAS_densify(sampling_scores.clamp_min(1e-12f), std::min<int64_t>(budget_for_alloc, selectable));
+        LAS_densify(
+            damp_densification_scores(sampling_scores.clamp_min(1e-12f)),
+            std::min<int64_t>(budget_for_alloc, selectable));
     }
 
     void ImprovedGSPlus::LAS_densify(const lfs::core::Tensor& scores, const int64_t budget_for_alloc) {
@@ -715,7 +726,9 @@ namespace lfs::training {
     bool ImprovedGSPlus::is_refining(int iter) const {
         return (iter >= _params->start_refine &&
                 iter % _params->refine_every == 0 &&
-                iter <= _params->stop_refine);
+                iter <= _params->stop_refine &&
+                _current_step >= 0 &&
+                static_cast<size_t>(_current_step + 1) < _budget_schedule.size());
     }
 
     void ImprovedGSPlus::step(int iter) {
@@ -1139,41 +1152,96 @@ namespace lfs::training {
         }
 
         uint8_t has_optimizer = 0;
-        is.read(reinterpret_cast<char*>(&has_optimizer), sizeof(has_optimizer));
+        lfs::core::serialization_detail::read_exact(
+            is, &has_optimizer, sizeof(has_optimizer), "igs+ optimizer flag");
+        if (has_optimizer > 1)
+            throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: optimizer flag must be boolean");
         if (has_optimizer && _optimizer) {
             _optimizer->deserialize(is);
         }
 
         uint8_t has_scheduler = 0;
-        is.read(reinterpret_cast<char*>(&has_scheduler), sizeof(has_scheduler));
+        lfs::core::serialization_detail::read_exact(
+            is, &has_scheduler, sizeof(has_scheduler), "igs+ scheduler flag");
+        if (has_scheduler > 1)
+            throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: scheduler flag must be boolean");
         if (has_scheduler && _scheduler) {
             _scheduler->deserialize(is);
         }
 
-        is.read(reinterpret_cast<char*>(&_initial_points), sizeof(_initial_points));
-        is.read(reinterpret_cast<char*>(&_current_step), sizeof(_current_step));
-        is.read(reinterpret_cast<char*>(&_total_steps), sizeof(_total_steps));
+        int64_t initial_points = 0;
+        int current_step = 0;
+        int total_steps = 0;
+        lfs::core::serialization_detail::read_exact(
+            is, &initial_points, sizeof(initial_points), "igs+ initial point count");
+        lfs::core::serialization_detail::read_exact(
+            is, &current_step, sizeof(current_step), "igs+ current step");
+        lfs::core::serialization_detail::read_exact(
+            is, &total_steps, sizeof(total_steps), "igs+ total steps");
 
         uint32_t budget_size = 0;
-        is.read(reinterpret_cast<char*>(&budget_size), sizeof(budget_size));
-        _budget_schedule.resize(budget_size);
+        lfs::core::serialization_detail::read_exact(
+            is, &budget_size, sizeof(budget_size), "igs+ budget schedule length");
+        constexpr uint32_t MAX_BUDGET_SCHEDULE_STEPS = 10'000'000;
+        if (total_steps <= 0 || budget_size != static_cast<uint32_t>(total_steps) ||
+            budget_size > MAX_BUDGET_SCHEDULE_STEPS || current_step < 0 ||
+            current_step >= total_steps || initial_points < 0) {
+            throw std::runtime_error(std::format(
+                "Invalid ImprovedGSPlus checkpoint: inconsistent budget schedule "
+                "(initial={}, current={}, total={}, entries={})",
+                initial_points,
+                current_step,
+                total_steps,
+                budget_size));
+        }
+        std::vector<int64_t> budget_schedule(budget_size);
         if (budget_size > 0) {
-            is.read(reinterpret_cast<char*>(_budget_schedule.data()),
-                    static_cast<std::streamsize>(budget_size * sizeof(_budget_schedule.front())));
+            lfs::core::serialization_detail::read_exact(
+                is,
+                budget_schedule.data(),
+                static_cast<size_t>(budget_size) * sizeof(budget_schedule.front()),
+                "igs+ budget schedule");
+            const auto max_budget = _params && _params->max_cap > 0
+                                        ? static_cast<int64_t>(_params->max_cap)
+                                        : std::numeric_limits<int64_t>::max();
+            if (std::ranges::any_of(budget_schedule, [max_budget](const int64_t value) {
+                    return value < 0 || value > max_budget;
+                })) {
+                throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: budget value is out of bounds");
+            }
         }
 
         uint8_t has_free_mask = 0;
-        is.read(reinterpret_cast<char*>(&has_free_mask), sizeof(has_free_mask));
+        lfs::core::serialization_detail::read_exact(
+            is, &has_free_mask, sizeof(has_free_mask), "igs+ free-mask flag");
+        if (has_free_mask > 1)
+            throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: free-mask flag must be boolean");
+        lfs::core::Tensor free_mask;
         if (has_free_mask) {
-            is >> _free_mask;
+            is >> free_mask;
+            const auto model_size = static_cast<size_t>(_splat_data->size());
+            const auto max_capacity = _params && _params->max_cap > 0
+                                          ? static_cast<size_t>(_params->max_cap)
+                                          : model_size;
+            if (!free_mask.is_valid() || !lfs::core::is_bool_like(free_mask.dtype()) ||
+                free_mask.ndim() != 1 || free_mask.numel() < model_size ||
+                free_mask.numel() > max_capacity) {
+                throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: free mask has incompatible schema");
+            }
             if (_splat_data->means().device() == lfs::core::Device::CUDA) {
-                _free_mask = _free_mask.cuda();
+                free_mask = free_mask.cuda();
             }
         } else {
             const size_t capacity = _params->max_cap > 0 ? static_cast<size_t>(_params->max_cap)
                                                          : static_cast<size_t>(_splat_data->size());
-            _free_mask = lfs::core::Tensor::zeros_bool({capacity}, _splat_data->means().device());
+            free_mask = lfs::core::Tensor::zeros_bool({capacity}, _splat_data->means().device());
         }
+
+        _initial_points = initial_points;
+        _current_step = current_step;
+        _total_steps = total_steps;
+        _budget_schedule = std::move(budget_schedule);
+        _free_mask = std::move(free_mask);
         sync_deleted_mask_from_free_mask(*_splat_data, _free_mask);
 
         _precomputed_scores = lfs::core::Tensor();
@@ -1181,6 +1249,30 @@ namespace lfs::training {
         _precompute_valid = false;
 
         LOG_DEBUG("Deserialized ImprovedGSPlus (version {})", version);
+    }
+
+    bool ImprovedGSPlus::can_adopt_checkpoint_state(const IStrategy& loaded) const noexcept {
+        const auto* source = dynamic_cast<const ImprovedGSPlus*>(&loaded);
+        return source && static_cast<bool>(_optimizer) == static_cast<bool>(source->_optimizer) &&
+               static_cast<bool>(_scheduler) == static_cast<bool>(source->_scheduler);
+    }
+
+    void ImprovedGSPlus::adopt_checkpoint_state(IStrategy& loaded) noexcept {
+        auto& source = checked_checkpoint_source<ImprovedGSPlus>(loaded);
+        if (_optimizer)
+            _optimizer->adopt_checkpoint_state(*source._optimizer);
+        if (_scheduler)
+            _scheduler->adopt_checkpoint_state(*source._scheduler);
+        _params.swap(source._params);
+        std::swap(_initial_points, source._initial_points);
+        std::swap(_current_step, source._current_step);
+        std::swap(_total_steps, source._total_steps);
+        _budget_schedule.swap(source._budget_schedule);
+        std::swap(_precomputed_scores, source._precomputed_scores);
+        std::swap(_error_score_max, source._error_score_max);
+        std::swap(_precompute_valid, source._precompute_valid);
+        std::swap(_free_mask, source._free_mask);
+        std::swap(_pending_failure_snapshot, source._pending_failure_snapshot);
     }
 
 } // namespace lfs::training

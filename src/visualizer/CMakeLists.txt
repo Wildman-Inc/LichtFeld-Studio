@@ -13,16 +13,13 @@ else()
     set(LFS_VIS_LIB_TYPE STATIC)
 endif()
 
-option(LFS_DEV_IMPORT_SOURCE_RESOURCES
-        "Load RmlUI resources and locales from source in non-portable builds"
-        ON)
-
 lfs_add_gpu_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         # Core
         visualizer.cpp
         visualizer_impl.cpp
         app_store.cpp
         core/main_loop.cpp
+        core/frame_state_machine.cpp
         core/data_loading_service.cpp
         core/editor_context.cpp
         core/parameter_manager.cpp
@@ -43,14 +40,15 @@ lfs_add_gpu_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         rendering/rendering_manager_viewport.cpp
         rendering/lod_page_cache.cpp
         rendering/lod_upload_engine.cpp
+        rendering/lod_page_dequant_cuda.cu
         rendering/spark_lod_controller.cpp
         rendering/split_view_composition.cpp
         rendering/split_view_service.cpp
         rendering/viewport_artifact_service.cpp
         rendering/viewport_frame_lifecycle_service.cpp
+        rendering/viewport_interop_service.cpp
         rendering/viewport_appearance_correction.cpp
         rendering/viewport_request_builder.cpp
-        rendering/lod_page_dequant_cuda.cu
         rendering/vksplat_input_packer_cuda.cu
         rendering/passes/vulkan_scene_image_uploader.cpp
         rendering/passes/vulkan_viewport_pass.cpp
@@ -91,6 +89,9 @@ lfs_add_gpu_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/film_strip_renderer.cpp
         gui/sequencer_ui_manager.cpp
         gui/rml_modal_overlay.cpp
+        gui/rml_toast_overlay.cpp
+        gui/gui_error_consumer.cpp
+        gui/error_event_bridge.cpp
         gui/rml_sequencer_overlay.cpp
         gui/keyframe_scene_sync.cpp
         gui/gizmo_transform.cpp
@@ -229,8 +230,6 @@ target_link_libraries(lfs_visualizer
         lfs_python_utils
         lfs_sequencer
         SDL3::SDL3
-        imgui::imgui
-        implot::implot
         Zep::Zep
         glm::glm
         TBB::tbb
@@ -239,9 +238,16 @@ target_link_libraries(lfs_visualizer
         OpenSSL::SSL
         OpenSSL::Crypto
         ${GPU_RUNTIME_LIBRARY}
+        Freetype::Freetype
         nfd::nfd
         vterm
+        lfs_oiio
 )
+
+set_property(SOURCE
+    gui/gui_manager.cpp
+    rendering/passes/vulkan_environment_pass.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS FMT_HEADER_ONLY=1)
 
 # Linux folder pickers bypass NFD and call GTK directly so they can return
 # the currently-open folder rather than the highlighted child. Set up by
@@ -257,6 +263,7 @@ target_sources(lfs_visualizer
         rendering/vksplat_viewport_renderer.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
+
 # The CPU chunk decoders round multiplies and adds separately; FMA contraction
 # in the dequant kernel would break CPU/GPU bit-parity (guarded by gtest).
 set_property(SOURCE rendering/lod_page_dequant_cuda.cu APPEND PROPERTY
@@ -505,16 +512,32 @@ if(LFS_DEV_IMPORT_SOURCE_RESOURCES AND NOT BUILD_PORTABLE)
     message(STATUS "Resource dev mode: locales import from ${CMAKE_CURRENT_SOURCE_DIR}/gui/resources/locales")
 endif()
 
+if(LFS_ENABLE_VULKAN_VALIDATION)
+    if(WIN32)
+        set(_lfs_vulkan_validation_layer_dir
+                "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+    else()
+        set(_lfs_vulkan_validation_layer_dir
+                "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/vulkan/explicit_layer.d")
+    endif()
+    if(NOT EXISTS "${_lfs_vulkan_validation_layer_dir}/VkLayer_khronos_validation.json")
+        message(FATAL_ERROR
+                "Vulkan validation is enabled, but the pinned validation layer is missing from ${_lfs_vulkan_validation_layer_dir}")
+    endif()
+    set_property(SOURCE window/window_manager.cpp window/vulkan_context.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+            LFS_VULKAN_VALIDATION_LAYER_DIR="${_lfs_vulkan_validation_layer_dir}")
+    unset(_lfs_vulkan_validation_layer_dir)
+endif()
+
 # Compile definitions
 target_compile_definitions(lfs_visualizer PRIVATE
         LFS_VIS_EXPORTS
+        LFS_VULKAN_VALIDATION_DEFAULT=$<BOOL:${LFS_ENABLE_VULKAN_VALIDATION}>
         PROJECT_ROOT_PATH="${PROJECT_SOURCE_DIR}"
         VISUALIZER_ASSET_PATH="${VISUALIZER_BUILD_RESOURCE_DIR}/assets"
         VISUALIZER_LOCALE_PATH="${VISUALIZER_BUILD_RESOURCE_DIR}/locales"
         VISUALIZER_SOURCE_ASSET_PATH="${VISUALIZER_SOURCE_RESOURCE_DIR}/assets"
         ${LFS_VISUALIZER_DEV_RESOURCE_DEFINITIONS}
-        $<$<CONFIG:Debug>:DEBUG_BUILD>
-        $<$<CONFIG:Release>:RELEASE_BUILD>
 )
 
 # Platform-specific settings

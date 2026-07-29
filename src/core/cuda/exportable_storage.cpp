@@ -4,6 +4,7 @@
 
 #include "core/exportable_storage.hpp"
 
+#include "core/cuda_error.hpp"
 #include "core/logger.hpp"
 #include "diagnostics/vram_profiler.hpp"
 
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <format>
+#include <string_view>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -50,6 +52,7 @@ namespace lfs::core {
 
         bool vmm_supported(int device) {
             int supported = 0;
+            LFS_CUDA_BREADCRUMB("exportable.cuDeviceGetAttribute.vmm");
             const CUresult r = cuDeviceGetAttribute(
                 &supported,
                 CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
@@ -73,6 +76,7 @@ namespace lfs::core {
             constexpr CUdevice_attribute handle_attribute =
                 CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED;
 #endif
+            LFS_CUDA_BREADCRUMB("exportable.cuDeviceGetAttribute.handle_type");
             const CUresult r = cuDeviceGetAttribute(&supported, handle_attribute, device);
             return r == CUDA_SUCCESS && supported != 0;
 #endif
@@ -82,6 +86,12 @@ namespace lfs::core {
 #if defined(USE_HIP) && USE_HIP
             (void)cudaGetLastError();
 #endif
+        }
+
+        void log_cleanup_error(std::string_view operation, CUresult result) {
+            if (result != CUDA_SUCCESS) {
+                LOG_ERROR("{} failed during exportable CUDA cleanup: {}", operation, cu_error(result));
+            }
         }
 
         // Owns a CUDA VMM allocation: a fixed virtual reservation (va,
@@ -125,11 +135,17 @@ namespace lfs::core {
         void release_physical(OwnedAllocation& a) {
             close_native(a);
             if (a.mapped) {
-                cuMemUnmap(a.va, a.mapped_size);
+                LFS_CUDA_BREADCRUMB_ARGS(
+                    "exportable.cuMemUnmap.physical", 0, a.va, a.mapped_size);
+                const CUresult unmap_result = cuMemUnmap(a.va, a.mapped_size);
+                log_cleanup_error("cuMemUnmap", unmap_result);
                 a.mapped = false;
             }
             if (a.created) {
-                cuMemRelease(a.mem_handle);
+                LFS_CUDA_BREADCRUMB_ARGS(
+                    "exportable.cuMemRelease.physical", 0, a.va, a.mapped_size);
+                const CUresult release_result = cuMemRelease(a.mem_handle);
+                log_cleanup_error("cuMemRelease", release_result);
                 a.created = false;
                 a.mem_handle = 0;
             }
@@ -139,8 +155,13 @@ namespace lfs::core {
         void teardown(OwnedAllocation& a) {
             release_physical(a);
             if (a.reserved) {
-                cuMemAddressFree(a.va, a.reserved_size);
+                LFS_CUDA_BREADCRUMB_ARGS(
+                    "exportable.cuMemAddressFree.reservation", 0, a.va, a.reserved_size);
+                const CUresult free_result = cuMemAddressFree(a.va, a.reserved_size);
+                log_cleanup_error("cuMemAddressFree", free_result);
                 a.reserved = false;
+                a.va = 0;
+                a.reserved_size = 0;
             }
         }
 
@@ -149,12 +170,16 @@ namespace lfs::core {
         // a.va valid and aligned_size <= a.reserved_size. On failure the physical
         // is rolled back (the reservation is left intact for the caller).
         std::expected<void, std::string> commit_physical(OwnedAllocation& a, std::size_t aligned_size) {
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemCreate.commit", a.va, 0, aligned_size);
             if (const auto r = cuMemCreate(&a.mem_handle, aligned_size, &a.prop, 0); r != CUDA_SUCCESS) {
                 clear_failed_interop_status();
                 return std::unexpected("cuMemCreate (exportable) failed: " + cu_error(r));
             }
             a.created = true;
 
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemMap.commit", a.va, 0, aligned_size);
             if (const auto r = cuMemMap(a.va, aligned_size, 0, a.mem_handle, 0); r != CUDA_SUCCESS) {
                 release_physical(a);
                 return std::unexpected("cuMemMap failed: " + cu_error(r));
@@ -166,6 +191,8 @@ namespace lfs::core {
             access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             access.location.id = a.device;
             access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemSetAccess.commit", a.va, 0, aligned_size);
             if (const auto r = cuMemSetAccess(a.va, aligned_size, &access, 1); r != CUDA_SUCCESS) {
                 release_physical(a);
                 return std::unexpected("cuMemSetAccess failed: " + cu_error(r));
@@ -174,10 +201,21 @@ namespace lfs::core {
             // Zero the committed block. Capacity-backed tensor views can expose
             // slack rows before training fills them, and Vulkan reads those views
             // directly in the zero-copy path.
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cudaMemset.zero_fill", a.va, 0, aligned_size);
             if (const auto err = cudaMemset(reinterpret_cast<void*>(a.va), 0, aligned_size); err != cudaSuccess) {
                 release_physical(a);
                 return std::unexpected(std::format("cudaMemset on exportable block failed: {}",
                                                    cudaGetErrorString(err)));
+            }
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cudaStreamSynchronize.zero_fill", a.va, 0, aligned_size);
+            if (const auto err = cudaStreamSynchronize(nullptr); err != cudaSuccess) {
+                release_physical(a);
+                return std::unexpected(std::format(
+                    "cudaStreamSynchronize after exportable zero-fill failed: {} ({})",
+                    cudaGetErrorName(err),
+                    cudaGetErrorString(err)));
             }
 
 #ifdef _WIN32
@@ -185,6 +223,8 @@ namespace lfs::core {
 #else
             int native = -1;
 #endif
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemExportToShareableHandle.commit", 0, a.va, aligned_size);
             if (const auto r = cuMemExportToShareableHandle(&native, a.mem_handle, kCudaHandleType, 0);
                 r != CUDA_SUCCESS) {
                 release_physical(a);
@@ -216,6 +256,7 @@ namespace lfs::core {
         }
 
         // CUDA VMM allocations require a current context. cudaSetDevice ensures one exists.
+        LFS_CUDA_BREADCRUMB("exportable.cudaSetDevice.allocate");
         if (const auto err = cudaSetDevice(device); err != cudaSuccess) {
             return std::unexpected(std::format("cudaSetDevice({}) failed: {}",
                                                device,
@@ -229,15 +270,15 @@ namespace lfs::core {
         owned->prop.location.id = device;
         owned->prop.requestedHandleTypes = kCudaHandleType;
 #ifdef _WIN32
-        // CUDA requires explicit security attributes for WIN32-exportable VMM
-        // allocations. Keep the object inside OwnedAllocation because the same
-        // CUmemAllocationProp is reused when growing the block.
         owned->security_attributes.nLength = sizeof(SECURITY_ATTRIBUTES);
         owned->security_attributes.lpSecurityDescriptor = nullptr;
         owned->security_attributes.bInheritHandle = FALSE;
+        // CUDA 12.8 documents POBJECT_ATTRIBUTES here, while NVIDIA's memMapIPCDrv
+        // sample uses SECURITY_ATTRIBUTES; the sample form is field-verified on Windows.
         owned->prop.win32HandleMetaData = &owned->security_attributes;
 #endif
 
+        LFS_CUDA_BREADCRUMB("exportable.cuMemGetAllocationGranularity.allocate");
         if (const auto r = cuMemGetAllocationGranularity(&owned->granularity, &owned->prop,
                                                          CU_MEM_ALLOC_GRANULARITY_MINIMUM);
             r != CUDA_SUCCESS) {
@@ -250,6 +291,8 @@ namespace lfs::core {
         const std::size_t aligned_size = align_up(size, owned->granularity);
         const std::size_t reserved_size = align_up(std::max(reserve_bytes, size), owned->granularity);
 
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemAddressReserve.allocate", 0, 0, reserved_size);
         if (const auto r = cuMemAddressReserve(&owned->va, reserved_size, 0, 0, 0); r != CUDA_SUCCESS) {
             return std::unexpected("cuMemAddressReserve failed: " + cu_error(r));
         }
@@ -260,6 +303,8 @@ namespace lfs::core {
             teardown(*owned);
             return std::unexpected(ok.error());
         }
+        register_cuda_address_range(
+            reinterpret_cast<void*>(owned->va), aligned_size, "exportable-splat-block");
 
         if (track_splat_bytes) {
             diagnostics::VramProfiler::instance().setExportableSplatBytes(aligned_size);
@@ -284,6 +329,16 @@ namespace lfs::core {
                 if (track_splat_bytes) {
                     diagnostics::VramProfiler::instance().setExportableSplatBytes(0);
                 }
+                LFS_CUDA_BREADCRUMB_ARGS(
+                    "exportable.cudaDeviceSynchronize.destroy", 0,
+                    reinterpret_cast<uintptr_t>(p->device_ptr), p->size);
+                if (const cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess) {
+                    LOG_ERROR(
+                        "cudaDeviceSynchronize before exportable CUDA teardown failed: {} ({})",
+                        cudaGetErrorName(err),
+                        cudaGetErrorString(err));
+                }
+                unregister_cuda_address_range(p->device_ptr);
                 teardown(*owned);
                 delete p;
             });
@@ -306,6 +361,7 @@ namespace lfs::core {
                 aligned_new >> 20, owned->reserved_size >> 20));
         }
 
+        LFS_CUDA_BREADCRUMB("exportable.cudaSetDevice.grow");
         if (const auto err = cudaSetDevice(owned->device); err != cudaSuccess) {
             return std::unexpected(std::format("cudaSetDevice({}) failed: {}",
                                                owned->device, cudaGetErrorString(err)));
@@ -320,31 +376,51 @@ namespace lfs::core {
 
         // 1. Create + map the new (larger) physical at a temporary address.
         CUmemGenericAllocationHandle new_handle = 0;
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemCreate.grow", 0, 0, aligned_new);
         if (const auto r = cuMemCreate(&new_handle, aligned_new, &owned->prop, 0); r != CUDA_SUCCESS) {
             return std::unexpected("cuMemCreate (grow) failed: " + cu_error(r));
         }
         CUdeviceptr temp_va = 0;
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemAddressReserve.grow", 0, 0, aligned_new);
         if (const auto r = cuMemAddressReserve(&temp_va, aligned_new, 0, 0, 0); r != CUDA_SUCCESS) {
-            cuMemRelease(new_handle);
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemRelease.grow_reserve_failure", 0, 0, aligned_new);
+            log_cleanup_error("cuMemRelease", cuMemRelease(new_handle));
             return std::unexpected("cuMemAddressReserve (grow) failed: " + cu_error(r));
         }
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemMap.grow_temp", temp_va, 0, aligned_new);
         if (const auto r = cuMemMap(temp_va, aligned_new, 0, new_handle, 0); r != CUDA_SUCCESS) {
-            cuMemAddressFree(temp_va, aligned_new);
-            cuMemRelease(new_handle);
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemAddressFree.grow_map_failure", 0, temp_va, aligned_new);
+            log_cleanup_error("cuMemAddressFree", cuMemAddressFree(temp_va, aligned_new));
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemRelease.grow_map_failure", 0, temp_va, aligned_new);
+            log_cleanup_error("cuMemRelease", cuMemRelease(new_handle));
             return std::unexpected("cuMemMap (grow temp) failed: " + cu_error(r));
         }
         CUmemAccessDesc access{};
         access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         access.location.id = owned->device;
         access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemSetAccess.grow_temp", temp_va, 0, aligned_new);
         cuMemSetAccess(temp_va, aligned_new, &access, 1);
 
         // 2. Zero the new slack, then copy the live contents over.
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cudaMemset.grow", temp_va, 0, aligned_new);
         cudaMemset(reinterpret_cast<void*>(temp_va), 0, aligned_new);
         if (old_size > 0) {
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cudaMemcpy.grow", temp_va, owned->va, old_size);
             cudaMemcpy(reinterpret_cast<void*>(temp_va), reinterpret_cast<void*>(owned->va),
                        old_size, cudaMemcpyDeviceToDevice);
         }
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cudaDeviceSynchronize.grow", temp_va, owned->va, old_size);
         cudaDeviceSynchronize(); // copy must complete before the old mapping is torn down
 
         // 3. Export the new handle, then release the old physical.
@@ -353,20 +429,37 @@ namespace lfs::core {
 #else
         int new_native = -1;
 #endif
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemExportToShareableHandle.grow", 0, temp_va, aligned_new);
         if (const auto r = cuMemExportToShareableHandle(&new_native, new_handle, kCudaHandleType, 0);
             r != CUDA_SUCCESS) {
-            cuMemUnmap(temp_va, aligned_new);
-            cuMemAddressFree(temp_va, aligned_new);
-            cuMemRelease(new_handle);
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemUnmap.grow_export_failure", 0, temp_va, aligned_new);
+            log_cleanup_error("cuMemUnmap", cuMemUnmap(temp_va, aligned_new));
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemAddressFree.grow_export_failure", 0, temp_va, aligned_new);
+            log_cleanup_error("cuMemAddressFree", cuMemAddressFree(temp_va, aligned_new));
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemRelease.grow_export_failure", 0, temp_va, aligned_new);
+            log_cleanup_error("cuMemRelease", cuMemRelease(new_handle));
             return std::unexpected("cuMemExportToShareableHandle (grow) failed: " + cu_error(r));
         }
         release_physical(*owned); // unmap old from owned->va, release old handle, close old fd
+        unregister_cuda_address_range(block->device_ptr);
 
         // 4. Move the new physical onto the stable base address.
-        cuMemUnmap(temp_va, aligned_new);
-        cuMemAddressFree(temp_va, aligned_new);
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemUnmap.grow_temp", 0, temp_va, aligned_new);
+        log_cleanup_error("cuMemUnmap", cuMemUnmap(temp_va, aligned_new));
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemAddressFree.grow_temp", 0, temp_va, aligned_new);
+        log_cleanup_error("cuMemAddressFree", cuMemAddressFree(temp_va, aligned_new));
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemMap.grow_base", owned->va, 0, aligned_new);
         if (const auto r = cuMemMap(owned->va, aligned_new, 0, new_handle, 0); r != CUDA_SUCCESS) {
-            cuMemRelease(new_handle);
+            LFS_CUDA_BREADCRUMB_ARGS(
+                "exportable.cuMemRelease.grow_base_failure", 0, owned->va, aligned_new);
+            log_cleanup_error("cuMemRelease", cuMemRelease(new_handle));
 #ifdef _WIN32
             CloseHandle(new_native);
 #else
@@ -375,6 +468,8 @@ namespace lfs::core {
 #endif
             return std::unexpected("cuMemMap (grow base) failed: " + cu_error(r));
         }
+        LFS_CUDA_BREADCRUMB_ARGS(
+            "exportable.cuMemSetAccess.grow_base", owned->va, 0, aligned_new);
         cuMemSetAccess(owned->va, aligned_new, &access, 1);
 
         owned->mem_handle = new_handle;
@@ -387,6 +482,8 @@ namespace lfs::core {
         block->size = aligned_new;
         block->handle.native = owned->native;
         block->handle.size = aligned_new;
+        register_cuda_address_range(
+            block->device_ptr, aligned_new, "exportable-splat-block");
 
         LOG_INFO("Exportable CUDA block grew in place: device_ptr={} committed={} MiB reserved={} MiB",
                  block->device_ptr,

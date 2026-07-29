@@ -208,12 +208,12 @@ namespace lfs::core {
         return id;
     }
 
-    void Scene::removeNode(const std::string& name, const bool keep_children) {
-        removeNodeInternal(name, keep_children, false);
+    void Scene::removeNode(std::string name, const bool keep_children) {
+        removeNodeInternal(std::move(name), keep_children);
     }
 
     std::vector<std::unique_ptr<lfs::core::SplatData>> Scene::detachSplatModelsForRemoval(
-        const std::string& name,
+        std::string name,
         const bool keep_children) {
         std::vector<std::unique_ptr<lfs::core::SplatData>> detached;
 
@@ -248,7 +248,7 @@ namespace lfs::core {
         return detached;
     }
 
-    void Scene::removeNodeInternal(const std::string& name, const bool keep_children, [[maybe_unused]] const bool force) {
+    void Scene::removeNodeInternal(std::string name, const bool keep_children) {
         if (name.empty())
             return;
 
@@ -285,7 +285,7 @@ namespace lfs::core {
             const std::vector<NodeId> children_copy = node->children;
             for (const NodeId child_id : children_copy) {
                 if (const auto* child = getNodeById(child_id)) {
-                    removeNodeInternal(child->name, false, true);
+                    removeNodeInternal(child->name, false);
                 }
             }
         }
@@ -298,8 +298,7 @@ namespace lfs::core {
         assert(idx_it != id_to_index_.end());
         const size_t removed_index = idx_it->second;
 
-        const std::string name_copy = name;
-        const bool removed_training_model = (training_model_node_ == name_copy);
+        const bool removed_training_model = (training_model_node_ == name);
 
         removeConsolidatedNodeData(id);
 
@@ -329,8 +328,8 @@ namespace lfs::core {
         }
 
         notifyMutation(MutationType::NODE_REMOVED);
-        if (!name_copy.empty()) {
-            LOG_DEBUG("Removed node '{}'{}", name_copy, keep_children ? " (children kept)" : "");
+        if (!name.empty()) {
+            LOG_DEBUG("Removed node '{}'{}", name, keep_children ? " (children kept)" : "");
         }
     }
 
@@ -429,7 +428,6 @@ namespace lfs::core {
         nodes_.clear();
         id_to_index_.clear();
         name_to_id_.clear();
-        next_node_id_ = 0;
 
         cached_combined_.reset();
         cached_transform_indices_.reset();
@@ -524,9 +522,6 @@ namespace lfs::core {
                 return node->type == NodeType::SPLAT && node->model;
             });
         if (loaded_splat_count < 2) {
-            return 0;
-        }
-        if (export_pin_count_.load(std::memory_order_acquire) > 0) {
             return 0;
         }
 
@@ -848,24 +843,6 @@ namespace lfs::core {
         return mask;
     }
 
-    const lfs::core::PointCloud* Scene::getVisiblePointCloud() const {
-        for (const auto& node : nodes_) {
-            if (node->type == NodeType::POINTCLOUD && isNodeEffectivelyVisible(node->id) && node->point_cloud) {
-                return node->point_cloud.get();
-            }
-        }
-        return nullptr;
-    }
-
-    std::optional<glm::mat4> Scene::getVisiblePointCloudTransform() const {
-        for (const auto& node : nodes_) {
-            if (node->type == NodeType::POINTCLOUD && isNodeEffectivelyVisible(node->id) && node->point_cloud) {
-                return getWorldTransform(node->id);
-            }
-        }
-        return std::nullopt;
-    }
-
     std::vector<Scene::VisibleMesh> Scene::getVisibleMeshes() const {
         std::vector<VisibleMesh> result;
         for (const auto& node : nodes_) {
@@ -874,14 +851,6 @@ namespace lfs::core {
             }
         }
         return result;
-    }
-
-    bool Scene::hasVisibleMeshes() const {
-        for (const auto& node : nodes_) {
-            if (node->type == NodeType::MESH && node->mesh && isNodeEffectivelyVisible(node->id))
-                return true;
-        }
-        return false;
     }
 
     size_t Scene::getTotalGaussianCount() const {
@@ -1151,9 +1120,6 @@ namespace lfs::core {
 
         std::lock_guard<std::mutex> lock(combined_model_mutex_);
         if (!include_hidden_splats && model_cache_valid_.load(std::memory_order_acquire))
-            return;
-
-        if (export_pin_count_.load(std::memory_order_acquire) > 0)
             return;
 
         if (!include_hidden_splats && consolidated_ && cached_combined_) {
@@ -1796,6 +1762,10 @@ namespace lfs::core {
     }
 
     bool Scene::renameNode(const NodeId id, const std::string& new_name) {
+        if (id == NULL_NODE) {
+            return false;
+        }
+
         auto* node = getNodeById(id);
         if (!node) {
             LOG_WARN("Scene: Cannot find node id {} to rename", id);
@@ -1816,6 +1786,7 @@ namespace lfs::core {
         }
 
         const std::string old_name = node->name;
+        assert(!old_name.empty());
         name_to_id_.erase(old_name);
         name_to_id_[new_name] = id;
         node->name = new_name;
@@ -1828,7 +1799,7 @@ namespace lfs::core {
         return true;
     }
 
-    bool Scene::renameNode(const std::string& old_name, const std::string& new_name) {
+    bool Scene::renameNode(std::string old_name, const std::string& new_name) {
         if (old_name.empty())
             return false;
 
@@ -2223,8 +2194,11 @@ namespace lfs::core {
 
         glm::vec3 bounds_min, bounds_max;
         if (getNodeBounds(parent_id, bounds_min, bounds_max)) {
-            node->cropbox->min = bounds_min;
-            node->cropbox->max = bounds_max;
+            const glm::vec3 center = (bounds_min + bounds_max) * 0.5f;
+            const glm::vec3 half_size = glm::max((bounds_max - bounds_min) * 0.5f, glm::vec3(1e-4f));
+            node->cropbox->min = -half_size;
+            node->cropbox->max = half_size;
+            node->local_transform = glm::translate(glm::mat4(1.0f), center);
         }
 
         const NodeId id = insertNode(std::move(node));
@@ -2350,7 +2324,7 @@ namespace lfs::core {
             }
         }
         for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
-            removeNodeInternal(*it, false, true);
+            removeNodeInternal(*it, false);
         }
     }
 
@@ -2462,9 +2436,18 @@ namespace lfs::core {
         return result_name;
     }
 
-    std::string Scene::mergeGroup(const std::string& group_name) {
-        const auto* const group_node = getNode(group_name);
-        if (!group_node || group_node->type != NodeType::GROUP) {
+    std::string Scene::mergeGroup(const NodeId group_id) {
+        if (group_id == NULL_NODE) {
+            return "";
+        }
+
+        const auto* const group_node = getNodeById(group_id);
+        if (!group_node) {
+            return "";
+        }
+        const std::string group_name = group_node->name;
+        assert(!group_name.empty());
+        if (group_node->type != NodeType::GROUP) {
             return "";
         }
 
@@ -2481,7 +2464,7 @@ namespace lfs::core {
         };
 
         const NodeId parent_id = group_node->parent_id;
-        collect(group_node->id);
+        collect(group_id);
 
         auto merged = mergeSplatsWithTransforms(splats);
         if (!merged) {
@@ -2490,19 +2473,22 @@ namespace lfs::core {
 
         Transaction txn(*this);
         removeNode(group_name, false);
-        addSplat(group_name, std::move(merged), parent_id);
+        const NodeId merged_id = addSplat(group_name, std::move(merged), parent_id);
+        if (merged_id == NULL_NODE) {
+            LOG_ERROR("Failed to add merged group '{}'", group_name);
+            return "";
+        }
+        assert(getNodeIdByName(group_name) == merged_id);
 
         return group_name;
     }
 
-    std::unique_ptr<lfs::core::SplatData> Scene::createMergedModelWithTransforms() const {
-        std::vector<std::pair<const lfs::core::SplatData*, glm::mat4>> splats;
-        for (const auto& node : nodes_) {
-            if (node->type == NodeType::SPLAT && node->model && isNodeEffectivelyVisible(node->id)) {
-                splats.emplace_back(node->model.get(), getWorldTransform(node->id));
-            }
+    std::string Scene::mergeGroup(std::string group_name) {
+        const NodeId group_id = getNodeIdByName(group_name);
+        if (group_id == NULL_NODE) {
+            return "";
         }
-        return mergeSplatsWithTransforms(splats);
+        return mergeGroup(group_id);
     }
 
     std::unique_ptr<lfs::core::SplatData> Scene::mergeSplatsWithTransforms(
@@ -3232,15 +3218,17 @@ namespace lfs::core {
         *node->cropbox = data;
     }
 
-    std::vector<Scene::RenderableCropBox> Scene::getVisibleCropBoxes() const {
+    std::vector<Scene::RenderableCropBox> Scene::getRenderableCropBoxes() const {
         std::vector<RenderableCropBox> result;
 
         for (const auto& node : nodes_) {
             if (node->type != NodeType::CROPBOX)
                 continue;
-            if (!isNodeEffectivelyVisible(node->id))
-                continue;
             if (!node->cropbox)
+                continue;
+            const bool effectively_visible = isNodeEffectivelyVisible(node->id);
+            const bool parent_effectively_visible = isNodeEffectivelyVisible(node->parent_id);
+            if (!effectively_visible && !node->cropbox->enabled)
                 continue;
 
             RenderableCropBox rcb;
@@ -3250,6 +3238,8 @@ namespace lfs::core {
             rcb.data = node->cropbox.get();
             rcb.world_transform = getWorldTransform(node->id);
             rcb.local_transform = node->local_transform.get();
+            rcb.effectively_visible = effectively_visible;
+            rcb.parent_effectively_visible = parent_effectively_visible;
             result.push_back(rcb);
         }
 
@@ -3273,21 +3263,6 @@ namespace lfs::core {
             }
         }
         return NULL_NODE;
-    }
-
-    NodeId Scene::getOrCreateEllipsoidForSplat(const NodeId splat_id) {
-        const NodeId existing = getEllipsoidForSplat(splat_id);
-        if (existing != NULL_NODE) {
-            return existing;
-        }
-
-        const auto* node = getNodeById(splat_id);
-        if (!node || (node->type != NodeType::SPLAT && node->type != NodeType::POINTCLOUD)) {
-            return NULL_NODE;
-        }
-
-        const std::string ellipsoid_name = node->name + "_ellipsoid";
-        return addEllipsoid(ellipsoid_name, splat_id);
     }
 
     EllipsoidData* Scene::getEllipsoidData(const NodeId ellipsoid_id) {
@@ -3314,15 +3289,17 @@ namespace lfs::core {
         *node->ellipsoid = data;
     }
 
-    std::vector<Scene::RenderableEllipsoid> Scene::getVisibleEllipsoids() const {
+    std::vector<Scene::RenderableEllipsoid> Scene::getRenderableEllipsoids() const {
         std::vector<RenderableEllipsoid> result;
 
         for (const auto& node : nodes_) {
             if (node->type != NodeType::ELLIPSOID)
                 continue;
-            if (!isNodeEffectivelyVisible(node->id))
-                continue;
             if (!node->ellipsoid)
+                continue;
+            const bool effectively_visible = isNodeEffectivelyVisible(node->id);
+            const bool parent_effectively_visible = isNodeEffectivelyVisible(node->parent_id);
+            if (!effectively_visible && !node->ellipsoid->enabled)
                 continue;
 
             RenderableEllipsoid rel;
@@ -3332,6 +3309,8 @@ namespace lfs::core {
             rel.data = node->ellipsoid.get();
             rel.world_transform = getWorldTransform(node->id);
             rel.local_transform = node->local_transform.get();
+            rel.effectively_visible = effectively_visible;
+            rel.parent_effectively_visible = parent_effectively_visible;
             result.push_back(rel);
         }
 

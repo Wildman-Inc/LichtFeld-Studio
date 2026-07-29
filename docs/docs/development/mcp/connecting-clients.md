@@ -67,22 +67,15 @@ Notes:
 
 The repository's [`.mcp.json`](https://github.com/MrNeRF/LichtFeld-Studio/blob/master/.mcp.json) launches `scripts/lichtfeld_mcp_bridge.py`, a stdio-to-HTTP proxy that also starts LichtFeld Studio on demand: it pings the endpoint, launches the executable if nothing answers, then forwards JSON-RPC messages to HTTP.
 
-This path targets coding agents that operate inside a checkout of this repository. Current limitation to know about:
+This path targets coding agents that operate inside a checkout of this repository. Current limitations to know about:
 
 - The bridge frames stdio messages with `Content-Length` headers. Clients that use spec-standard newline-delimited framing (including Claude Desktop) will hang; use `mcp-remote` or direct HTTP for those instead.
+- Auto-launch passes `--no-splash`, which portable builds (the released binaries) do not recognize, so the launched app exits immediately. Use a regular development build, or set `LFS_EXECUTABLE` to one.
 
-Auto-launch invokes the executable without optional UI flags, so both development and portable builds are supported. The bridge checks HIP and Linux ROCm build directories before generic build directories, including multi-config outputs such as `build/Release`; `LICHTFELD_EXECUTABLE` remains the highest-priority override. The checked-in `.mcp.json` runs a CMake launcher that selects a working Python 3.9+ interpreter on Windows, Linux, and macOS.
+See [issue #1399](https://github.com/MrNeRF/LichtFeld-Studio/issues/1399) for the status of these limitations.
 
-See [issue #1399](https://github.com/MrNeRF/LichtFeld-Studio/issues/1399) for the background on bridge compatibility.
-
-Bridge environment variables:
-
-| Variable | Default | Use |
-| --- | --- | --- |
-| `LICHTFELD_EXECUTABLE` | repo build directories | Explicit path to the app binary |
-| `LICHTFELD_MCP_ENDPOINT` | `http://127.0.0.1:45677/mcp` | Target endpoint |
-| `LICHTFELD_MCP_START_TIMEOUT_S` | `90` | Seconds to wait for the endpoint after launch |
-| `LICHTFELD_MCP_BRIDGE_LOG` | `~/.codex/log/lichtfeld-mcp-bridge.log` | Bridge and app log output |
+The bridge overrides are listed with the rest of the canonical environment
+surface in [Developer flags and diagnostics](../flags#mcp-bridge-variables).
 
 ## Verify the Connection
 

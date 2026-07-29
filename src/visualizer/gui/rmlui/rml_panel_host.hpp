@@ -47,6 +47,7 @@ namespace lfs::vis::gui {
         bool ensureContext();
         bool ensureDocumentLoaded();
         bool reloadDocument();
+        void releaseRendererResources();
 
         void setInput(const PanelInputState* input) { input_ = input; }
         bool hasInput() const { return input_ != nullptr; }
@@ -63,6 +64,7 @@ namespace lfs::vis::gui {
             direct_cache_dirty_ = true;
         }
         void setForeground(bool fg) { foreground_ = fg; }
+        void setFloating(bool floating);
         void setInputClipY(float y_min, float y_max) {
             clip_y_min_ = y_min;
             clip_y_max_ = y_max;
@@ -76,16 +78,6 @@ namespace lfs::vis::gui {
         bool isDocumentLoaded() const { return document_ != nullptr; }
 
     private:
-        struct ShadowRect {
-            float x = 0.0f;
-            float y = 0.0f;
-            float w = 0.0f;
-            float h = 0.0f;
-            float rounding = 0.0f;
-        };
-
-        std::optional<ShadowRect> collectVisibleColorPickerPopupShadow(float panel_screen_x,
-                                                                       float panel_screen_y) const;
         std::optional<RmlRect> openDropdownBounds() const;
         bool openDropdownContainsPoint(float local_x, float local_y) const;
         Rml::Element* openDropdownOptionAtPoint(float local_x, float local_y) const;
@@ -103,6 +95,8 @@ namespace lfs::vis::gui {
         void restoreScrollTop(float scroll_top);
         void resolveDirectRenderHeight(float requested_h, int& ph, float& display_h) const;
         bool updateContextLayout(int pw, int ph);
+        int renderPadding() const;
+        void applyPanelSpaceClass();
         void renderIfDirty(int pw, int ph, float& display_h);
         void compositeDirectToScreen(float x, float y, float w, float h);
 
@@ -132,6 +126,7 @@ namespace lfs::vis::gui {
         bool wants_keyboard_ = false;
 
         bool foreground_ = false;
+        bool floating_ = false;
         float clip_y_min_ = -1.0f;
         float clip_y_max_ = -1.0f;
         const PanelInputState* input_ = nullptr;
@@ -142,8 +137,10 @@ namespace lfs::vis::gui {
         CachedVulkanContextRender direct_cache_;
         int last_fbo_w_ = 0;
         int last_fbo_h_ = 0;
+        int last_fbo_padding_ = 0;
         int last_layout_w_ = 0;
         int last_layout_h_ = 0;
+        int last_layout_padding_ = -1;
         int last_forwarded_mx_ = -1;
         int last_forwarded_my_ = -1;
         bool last_hovered_ = false;

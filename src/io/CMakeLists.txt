@@ -30,10 +30,10 @@ target_link_libraries(lfs_io_cuda
 
 if(USE_CUDA)
     set_target_properties(lfs_io_cuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON
     )
 else()
     set_target_properties(lfs_io_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -42,12 +42,12 @@ endif()
 # CUDA compiler options for lfs_io_cuda
 target_compile_options(lfs_io_cuda PRIVATE
         # CUDA device code + MSVC host compiler flags (Windows only)
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
 
         # CUDA device code for non-Windows
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} -lineinfo --extended-lambda --expt-relaxed-constexpr>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
 )
 
 if(MSVC)
@@ -67,29 +67,31 @@ lfs_add_gpu_library(lfs_io_rad_quant_cuda STATIC
 target_include_directories(lfs_io_rad_quant_cuda
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src/core/include
         ${CMAKE_SOURCE_DIR}/src
 )
 
 target_link_libraries(lfs_io_rad_quant_cuda
         PRIVATE
+        lfs_diagnostics
         ${GPU_RUNTIME_LIBRARY}
 )
 
 if(USE_CUDA)
     set_target_properties(lfs_io_rad_quant_cuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON
     )
 else()
     set_target_properties(lfs_io_rad_quant_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 target_compile_options(lfs_io_rad_quant_cuda PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} -lineinfo --fmad=false -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -lineinfo --fmad=false -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 --fmad=false -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} -lineinfo --fmad=false>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -lineinfo --fmad=false>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --fmad=false>
 )
 
@@ -112,6 +114,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
         libswscale
         libavutil
 )
+pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
 
 lfs_add_gpu_library(lfs_video STATIC
         include/io/video/video_encoder_interface.hpp
@@ -123,6 +126,11 @@ lfs_add_gpu_library(lfs_video STATIC
         video/color_convert.cu
         video_frame_extractor.hpp
         video_frame_extractor.cpp
+        hdr_tonemap.hpp
+        hdr_tonemap.cpp
+        hdr_libplacebo.hpp
+        hdr_libplacebo.cpp
+        hdr_libplacebo_av.c
         video_player.hpp
         video_player.cpp
 )
@@ -147,23 +155,36 @@ target_link_libraries(lfs_video
         ${GPU_RUNTIME_LIBRARY}
 )
 
+# libplacebo's static pkg-config dependency chain includes shaderc and
+# SPIR-V Tools. GNU ld resolves static archives left-to-right, so rescan the
+# complete chain on ELF platforms.
+if(UNIX AND NOT APPLE)
+    target_link_libraries(lfs_video PRIVATE
+            "-Wl,--start-group"
+            PkgConfig::LIBPLACEBO
+            "-Wl,--end-group"
+    )
+else()
+    target_link_libraries(lfs_video PRIVATE PkgConfig::LIBPLACEBO)
+endif()
+
 target_compile_features(lfs_video PUBLIC cxx_std_23)
 
 if(USE_CUDA)
     set_target_properties(lfs_video PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON
     )
 else()
     set_target_properties(lfs_video PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 target_compile_options(lfs_video PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} --extended-lambda -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --extended-lambda -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda -Xcompiler=/O2 -Xcompiler=/utf-8>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g ${LFS_CUDA_DEVICE_DEBUG_FLAGS} --extended-lambda>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --extended-lambda>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda>
 )
 
@@ -331,7 +352,7 @@ endif()
 if(TARGET nvimgcodec_imgproc_static)
     target_compile_options(nvimgcodec_imgproc_static PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=860,3004>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:-Xcompiler "/wd4834">
+        "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:-Xcompiler=/wd4834>"
     )
 endif()
 

@@ -11,10 +11,12 @@
 #include "optimizer/scheduler.hpp"
 #include <memory>
 
+class CropDampingStrategyTest_McmcRejectedRowsAreNeverSampledAtZeroScale_Test;
+
 namespace lfs::training {
 
     /// MCMC-based optimization strategy. SplatData owned by Scene.
-    class MCMC : public IStrategy {
+    class MCMC : public IStrategy, public ICheckpointStateAdopter {
     public:
         MCMC() = delete;
         /// SplatData must be owned by Scene
@@ -46,6 +48,9 @@ namespace lfs::training {
         // Serialization for checkpoints
         void serialize(std::ostream& os) const override;
         void deserialize(std::istream& is) override;
+        bool has_checkpoint_runtime_state() const noexcept override { return static_cast<bool>(_optimizer); }
+        bool can_adopt_checkpoint_state(const IStrategy& loaded) const noexcept override;
+        void adopt_checkpoint_state(IStrategy& loaded) noexcept override;
         const char* strategy_type() const override { return "mcmc"; }
 
         // Reserve optimizer capacity for future growth (e.g., after checkpoint load)
@@ -60,6 +65,8 @@ namespace lfs::training {
         int relocate_gs_test() { return relocate_gs(); }
 
     private:
+        friend class ::CropDampingStrategyTest_McmcRejectedRowsAreNeverSampledAtZeroScale_Test;
+
         // Helper functions
         lfs::core::Tensor multinomial_sample(const lfs::core::Tensor& weights, int n, bool replacement = true);
         int relocate_gs();
@@ -70,6 +77,7 @@ namespace lfs::training {
                                            ParamType param_type);
         lfs::core::Tensor get_sampling_weights() const;
         void ensure_densification_info_shape();
+        void ensure_ratio_workspace_size(size_t required);
 
         // Member variables
         std::unique_ptr<AdamOptimizer> _optimizer;
@@ -82,7 +90,7 @@ namespace lfs::training {
         // State variables
         int _n_max = 0;                  // max relocation ratio
         lfs::core::Tensor _noise_buffer; // Reusable buffer for noise injection
-        lfs::core::Tensor _ones_int32;   // [max_cap] cached ones for ratio counting
+        lfs::core::Tensor _ones_int32;   // Cached ones for ratio counting; grows with the live model.
         lfs::core::Tensor _error_score_max;
         int _error_score_windows = 0;
     };

@@ -12,9 +12,11 @@
 
 #include <vector>
 
+class CropDampingStrategyTest_IgsPlusRejectedRowsAreNeverSampledAtZeroScale_Test;
+
 namespace lfs::training {
 
-    class ImprovedGSPlus : public IStrategy {
+    class ImprovedGSPlus : public IStrategy, public ICheckpointStateAdopter {
     public:
         ImprovedGSPlus() = delete;
 
@@ -52,6 +54,9 @@ namespace lfs::training {
         // Serialization for checkpoints
         void serialize(std::ostream& os) const override;
         void deserialize(std::istream& is) override;
+        bool has_checkpoint_runtime_state() const noexcept override { return static_cast<bool>(_optimizer); }
+        bool can_adopt_checkpoint_state(const IStrategy& loaded) const noexcept override;
+        void adopt_checkpoint_state(IStrategy& loaded) noexcept override;
         const char* strategy_type() const override { return "igs+"; }
 
         // Reserve optimizer capacity for future growth (e.g., after checkpoint load)
@@ -74,6 +79,8 @@ namespace lfs::training {
         lfs::core::Tensor get_active_indices() const;
 
     private:
+        friend class ::CropDampingStrategyTest_IgsPlusRejectedRowsAreNeverSampledAtZeroScale_Test;
+
         // Helper Functions
         inline const int64_t get_current_budget() const noexcept { return _budget_schedule[_current_step + 1]; }
         inline const unsigned global_seed() const noexcept { return _current_step; } // for camera sampling
@@ -83,6 +90,8 @@ namespace lfs::training {
 
         const lfs::core::Tensor compute_gaussian_score();
         void ensure_error_score_shape();
+        [[nodiscard]] lfs::core::Tensor damp_densification_scores(
+            const lfs::core::Tensor& scores) const;
         void densify_with_score(const lfs::core::Tensor& edge_scores, const lfs::core::Tensor& error_scores, const int64_t budget);
         void LAS_densify(const lfs::core::Tensor& scores, const int64_t allocation_budget);
 

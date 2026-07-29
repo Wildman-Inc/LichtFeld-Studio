@@ -13,21 +13,54 @@ endif()
 
 cmake_minimum_required(VERSION 3.30)
 
+# Manifest-mode vcpkg runs only while CMake configures. Track overlay-port
+# contents explicitly so the usual `cmake --build` regeneration also reruns
+# vcpkg when a portfile, patch or overlay manifest changes.
+file(GLOB_RECURSE LFS_VCPKG_OVERLAY_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES FALSE
+    "${CMAKE_CURRENT_SOURCE_DIR}/.github/overlays/*")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LFS_VCPKG_OVERLAY_FILES})
+
+# Keep test-only packages out of the application dependency graph. Command-line
+# cache values are visible before project(), when the vcpkg toolchain resolves
+# manifest features.
+list(REMOVE_ITEM VCPKG_MANIFEST_FEATURES tests vulkan-validation)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY)
+    list(APPEND VCPKG_MANIFEST_FEATURES tests)
+endif()
+
+set(_lfs_vulkan_validation_feature OFF)
+if(DEFINED LFS_ENABLE_VULKAN_VALIDATION)
+    set(_lfs_vulkan_validation_feature "${LFS_ENABLE_VULKAN_VALIDATION}")
+elseif(NOT CMAKE_CONFIGURATION_TYPES AND CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
+    set(_lfs_vulkan_validation_feature ON)
+endif()
+if(_lfs_vulkan_validation_feature)
+    list(APPEND VCPKG_MANIFEST_FEATURES vulkan-validation)
+endif()
+list(REMOVE_DUPLICATES VCPKG_MANIFEST_FEATURES)
+unset(_lfs_vulkan_validation_feature)
+
 # vcpkg manifest install runs during CMake configure/regeneration, outside the
 # native build tool's `cmake --build -j ...` limit. Cap vcpkg separately before
 # the toolchain is loaded by project().
-set(LFS_VCPKG_MAX_CONCURRENCY "" CACHE STRING "Maximum number of concurrent jobs vcpkg may use while building packages; empty uses environment or auto-detects at least 32")
+set(LFS_VCPKG_MAX_CONCURRENCY "" CACHE STRING "Maximum number of concurrent jobs vcpkg may use while building packages; empty uses an explicit vcpkg setting or caps auto-detection at 6")
 set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY "${LFS_VCPKG_MAX_CONCURRENCY}")
 if(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY STREQUAL "")
     if(DEFINED ENV{VCPKG_MAX_CONCURRENCY} AND NOT "$ENV{VCPKG_MAX_CONCURRENCY}" STREQUAL "")
         set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY "$ENV{VCPKG_MAX_CONCURRENCY}")
     elseif(DEFINED ENV{CMAKE_BUILD_PARALLEL_LEVEL} AND NOT "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}" STREQUAL "")
         set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}")
+        if(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY MATCHES "^[1-9][0-9]*$" AND
+           _LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY GREATER 6)
+            set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY 6)
+        endif()
     else()
         include(ProcessorCount)
         ProcessorCount(_LFS_HOST_PROCESSOR_COUNT)
-        if(_LFS_HOST_PROCESSOR_COUNT LESS 32)
-            set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY 32)
+        if(_LFS_HOST_PROCESSOR_COUNT EQUAL 0)
+            set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY 6)
+        elseif(_LFS_HOST_PROCESSOR_COUNT GREATER 6)
+            set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY 6)
         else()
             set(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY "${_LFS_HOST_PROCESSOR_COUNT}")
         endif()
@@ -42,7 +75,6 @@ unset(_LFS_EFFECTIVE_VCPKG_MAX_CONCURRENCY)
 unset(_LFS_HOST_PROCESSOR_COUNT)
 
 option(LFS_ENFORCE_LINUX_GUI_BACKENDS "Fail configure when Linux SDL3 would lack X11 and Wayland support" ON)
-option(BUILD_PORTABLE "Build portable distribution" OFF)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxGuiSanity.cmake")
 lfs_linux_preflight_gui_backends()
@@ -70,7 +102,7 @@ set(USE_CUDA OFF)
 set(USE_HIP OFF)
 if(LFS_GPU_BACKEND STREQUAL "CUDA")
     set(USE_CUDA ON)
-elseif(LFS_GPU_BACKEND STREQUAL "HIP")
+else()
     set(USE_HIP ON)
 endif()
 
@@ -79,11 +111,14 @@ if(USE_HIP)
     lfs_configure_amdgpu_architectures(_lfs_amdgpu_archs)
 endif()
 
+# Windows HIP uses the ROCm clang toolchain for both host and device sources.
+# Select it before project() so CMake does not lock in MSVC/NVCC first.
 if(USE_HIP AND CMAKE_HOST_WIN32)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsROCm.cmake")
     lfs_windows_rocm_find_root(_lfs_rocm_root)
     if(NOT _lfs_rocm_root)
-        message(FATAL_ERROR "Windows ROCm/HIP SDK not found. Set LFS_ROCM_PATH, ROCM_PATH, or HIP_PATH.")
+        message(FATAL_ERROR
+            "Windows ROCm/HIP SDK not found. Set LFS_ROCM_PATH, ROCM_PATH, or HIP_PATH.")
     endif()
     set(LFS_ROCM_PATH "${_lfs_rocm_root}" CACHE PATH "ROCm/HIP SDK root" FORCE)
     lfs_windows_rocm_find_clang("${LFS_ROCM_PATH}" _lfs_hip_clang)
@@ -142,10 +177,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     unset(_LFS_EXCLUDE_STATIC_ARCHIVES)
 endif()
 
+# The application ships CUDA DLLs and links CUDA::cudart throughout the target graph.
+# Keep CUDA language targets on the shared runtime as well; MSVC otherwise adds
+# cudart_static.lib implicitly, which collides with cudart.lib when linking DLLs.
 if(USE_CUDA)
-    # The application ships CUDA DLLs and links CUDA::cudart throughout the target graph.
-    # Keep CUDA language targets on the shared runtime as well; MSVC otherwise adds
-    # cudart_static.lib implicitly, which collides with cudart.lib when linking DLLs.
     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared CACHE STRING "CUDA runtime linkage" FORCE)
 endif()
 
@@ -171,59 +206,73 @@ endif()
 # Disable C++20 module scanning
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
-# Get git version info
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_COMMIT_HASH_SHORT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-execute_process(
-    COMMAND git describe --tags --dirty --always --match "v*"
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_TAGGED_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(NOT GIT_COMMIT_HASH_SHORT AND DEFINED ENV{GITHUB_SHA} AND NOT "$ENV{GITHUB_SHA}" STREQUAL "")
-    string(SUBSTRING "$ENV{GITHUB_SHA}" 0 7 GIT_COMMIT_HASH_SHORT)
-endif()
-if(NOT GIT_TAGGED_VERSION)
-    if(DEFINED ENV{GITHUB_REF_TYPE} AND "$ENV{GITHUB_REF_TYPE}" STREQUAL "tag" AND
-       DEFINED ENV{GITHUB_REF_NAME} AND NOT "$ENV{GITHUB_REF_NAME}" STREQUAL "")
-        set(GIT_TAGGED_VERSION "$ENV{GITHUB_REF_NAME}")
-    elseif(GIT_COMMIT_HASH_SHORT)
-        set(GIT_TAGGED_VERSION "${GIT_COMMIT_HASH_SHORT}")
-    endif()
-endif()
-if(NOT GIT_COMMIT_HASH_SHORT)
-    set(GIT_COMMIT_HASH_SHORT "unknown")
-endif()
-if(NOT GIT_TAGGED_VERSION)
-    set(GIT_TAGGED_VERSION "unknown")
-endif()
-
-# Generate git_version.h at configure time
-file(WRITE "${CMAKE_BINARY_DIR}/include/git_version.h"
-"#pragma once\n\
-#define GIT_COMMIT_HASH_SHORT \"${GIT_COMMIT_HASH_SHORT}\"\n\
-#define GIT_TAGGED_VERSION \"${GIT_TAGGED_VERSION}\"\n"
+set(GIT_SRC_DIR "${CMAKE_SOURCE_DIR}")
+set(GIT_VERSION_HEADER "${CMAKE_BINARY_DIR}/include/git_version.h")
+include("${CMAKE_SOURCE_DIR}/cmake/GenerateGitVersion.cmake")
+add_custom_target(lfs_git_version ALL
+    BYPRODUCTS "${CMAKE_BINARY_DIR}/include/git_version.h"
+    COMMAND ${CMAKE_COMMAND}
+            "-DGIT_SRC_DIR=${CMAKE_SOURCE_DIR}"
+            "-DGIT_VERSION_HEADER=${CMAKE_BINARY_DIR}/include/git_version.h"
+            -P "${CMAKE_SOURCE_DIR}/cmake/GenerateGitVersion.cmake"
+    COMMENT "Refreshing git_version.h"
+    VERBATIM
 )
 
-# Setup
-get_filename_component(PROJ_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}" ABSOLUTE)
+# App/core ABI tripwire. Hash every lfs_core implementation and interface input,
+# because a dirty-worktree rebuild cannot rely on the Git commit alone to
+# distinguish a newly linked app from a stale shared library.
+file(GLOB_RECURSE LFS_CORE_BUILD_INPUTS CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/src/core/*.cpp"
+    "${CMAKE_SOURCE_DIR}/src/core/*.cu"
+    "${CMAKE_SOURCE_DIR}/src/core/*.cuh"
+    "${CMAKE_SOURCE_DIR}/src/core/*.hpp"
+)
+list(APPEND LFS_CORE_BUILD_INPUTS
+    "${CMAKE_SOURCE_DIR}/src/core/CMakeLists.txt"
+)
+list(SORT LFS_CORE_BUILD_INPUTS)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${LFS_CORE_BUILD_INPUTS}
+)
+set(_lfs_core_abi_material
+    "${PROJECT_VERSION}|${GIT_COMMIT_HASH_SHORT}|${CMAKE_BUILD_TYPE}|${CMAKE_SYSTEM_NAME}|${CMAKE_SIZEOF_VOID_P}|${CMAKE_CXX_COMPILER_ID}|${CMAKE_CXX_COMPILER_VERSION}|${CMAKE_CUDA_COMPILER_ID}|${CMAKE_CUDA_COMPILER_VERSION}|${CMAKE_CUDA_ARCHITECTURES}|${VCPKG_TARGET_TRIPLET}")
+foreach(_lfs_core_build_input IN LISTS LFS_CORE_BUILD_INPUTS)
+    file(SHA256 "${_lfs_core_build_input}" _lfs_core_build_input_hash)
+    string(APPEND _lfs_core_abi_material "|${_lfs_core_build_input_hash}")
+endforeach()
+string(SHA256 LFS_CORE_ABI_STAMP "${_lfs_core_abi_material}")
+configure_file(
+    "${CMAKE_SOURCE_DIR}/cmake/lfs_core_abi_stamp.h.in"
+    "${CMAKE_BINARY_DIR}/include/lfs_core_abi_stamp.h"
+    @ONLY
+)
 
 option(BUILD_TESTS "Build tests" OFF)
 option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path test (no CUDA)" OFF)
-option(ENABLE_ALLOCATION_PROFILING "Enable tensor allocation profiling" OFF)
 option(LFS_FAST_COMPILE "Optimize measured slow C++ components for build speed instead of runtime speed (WIN32 only)" OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Debug options
-option(ENABLE_TENSOR_VALIDATION "Enable runtime tensor NaN/Inf validation" OFF)
-option(ENABLE_CUDA_DEBUG_SYNC "Enable synchronous CUDA kernel checking (slow)" OFF)
-option(ENABLE_TENSOR_OP_TRACING "Enable tensor operation tracing" OFF)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeveloperOptions.cmake")
+
+# Keep immutable third-party archives outside individual build trees. A clean
+# configure still verifies each declared checksum and extracts into its own
+# tree, but it does not redownload hundreds of MiB already fetched locally.
+if(WIN32 AND DEFINED ENV{LOCALAPPDATA})
+    file(TO_CMAKE_PATH "$ENV{LOCALAPPDATA}/LichtFeldStudio/downloads" _lfs_download_cache_default)
+elseif(APPLE AND DEFINED ENV{HOME})
+    set(_lfs_download_cache_default "$ENV{HOME}/Library/Caches/LichtFeldStudio/downloads")
+elseif(DEFINED ENV{XDG_CACHE_HOME} AND NOT "$ENV{XDG_CACHE_HOME}" STREQUAL "")
+    set(_lfs_download_cache_default "$ENV{XDG_CACHE_HOME}/lichtfeld/downloads")
+elseif(DEFINED ENV{HOME})
+    set(_lfs_download_cache_default "$ENV{HOME}/.cache/lichtfeld/downloads")
+else()
+    set(_lfs_download_cache_default "${CMAKE_BINARY_DIR}/_downloads")
+endif()
+set(LFS_DOWNLOAD_CACHE_DIR "${_lfs_download_cache_default}" CACHE PATH
+    "Shared cache for checksum-pinned third-party download archives")
+file(MAKE_DIRECTORY "${LFS_DOWNLOAD_CACHE_DIR}")
+unset(_lfs_download_cache_default)
 
 # Add -rdynamic for backtrace symbol resolution
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -233,49 +282,116 @@ endif()
 # PTX-only: smaller binary (~66MB vs ~750MB), JIT compiles at runtime
 option(BUILD_CUDA_PTX_ONLY "Build PTX-only (JIT at runtime, ~5-15s first startup)" OFF)
 
-# Portable: bundle runtime libraries and disable tests. CUDA additionally uses PTX-only output.
+# Portable: bundled runtime libraries, no tests. CUDA additionally uses PTX-only.
+option(BUILD_PORTABLE "Build portable distribution" OFF)
 if(BUILD_PORTABLE)
     if(USE_CUDA)
         set(BUILD_CUDA_PTX_ONLY ON CACHE BOOL "" FORCE)
+    else()
+        set(BUILD_CUDA_PTX_ONLY OFF CACHE BOOL "" FORCE)
     endif()
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
     add_compile_definitions(LFS_BUILD_PORTABLE=1)
     if(USE_CUDA)
-        message(STATUS "Portable: PTX-only CUDA output, bundled libraries, tests disabled")
+        message(STATUS "Portable: PTX-only, tests disabled")
     else()
-        message(STATUS "Portable: bundled libraries, tests disabled")
+        message(STATUS "Portable: native ${LFS_GPU_BACKEND} kernels, tests disabled")
     endif()
 endif()
 
-# Compiler cache is opt-in. Auto-enabling a broken local launcher can silently
-# poison object files and make the build non-reproducible.
-option(ENABLE_COMPILER_CACHE "Enable sccache/ccache compiler launchers when available" OFF)
+# Compiler caching is part of the default developer loop. Disable it for clean
+# compiler benchmarks or when diagnosing a launcher-specific problem.
+option(ENABLE_COMPILER_CACHE "Auto-detect and use sccache/ccache compiler launchers" ON)
 if(ENABLE_COMPILER_CACHE)
+    if(NOT WIN32 AND
+       NOT MSVC AND
+       CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
+        option(COMPILER_CACHE_PATH_INDEPENDENT
+            "Normalize checkout-local compiler paths for cross-worktree cache hits in Release/MinSizeRel builds"
+            ON)
+    endif()
+
     # CUDA caching disabled on Windows due to nvcc compatibility issues.
     find_program(SCCACHE_PROGRAM sccache)
     find_program(CCACHE_PROGRAM ccache)
     if(SCCACHE_PROGRAM)
-        set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-        if(WIN32)
-            message(STATUS "Compiler cache: sccache (C/C++ only, CUDA uncached)")
-        else()
-            set(CMAKE_CUDA_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-            set(CMAKE_HIP_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-            message(STATUS "Compiler cache: sccache")
-        endif()
+        set(_lfs_compiler_cache_program "${SCCACHE_PROGRAM}")
+        set(_lfs_compiler_cache_name "sccache")
     elseif(CCACHE_PROGRAM)
-        set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-        if(WIN32)
-            message(STATUS "Compiler cache: ccache (C/C++ only, CUDA uncached)")
-        else()
-            set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-            set(CMAKE_HIP_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-            message(STATUS "Compiler cache: ccache")
-        endif()
+        set(_lfs_compiler_cache_program "${CCACHE_PROGRAM}")
+        set(_lfs_compiler_cache_name "ccache")
     else()
         message(STATUS "Compiler cache: requested, but no launcher was found")
+    endif()
+
+    if(_lfs_compiler_cache_program)
+        set(_lfs_compiler_cache_launcher "${_lfs_compiler_cache_program}")
+        set(_lfs_compiler_cache_paths_normalized OFF)
+
+        # MSVC has no equivalent prefix-map support, and the existing Windows
+        # launcher behavior (including uncached CUDA) must remain unchanged.
+        if(NOT WIN32 AND
+           NOT MSVC AND
+           CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$" AND
+           COMPILER_CACHE_PATH_INDEPENDENT AND
+           NOT _IS_MULTI_CONFIG AND
+           CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+            # Prefix maps normalize __FILE__, but older cache versions still
+            # hash absolute input paths and the map argument itself.
+            set(_lfs_compiler_cache_source_alias "${CMAKE_BINARY_DIR}/.lfs-cache-source")
+            if(EXISTS "${_lfs_compiler_cache_source_alias}" OR
+               IS_SYMLINK "${_lfs_compiler_cache_source_alias}")
+                file(REMOVE "${_lfs_compiler_cache_source_alias}")
+            endif()
+            file(CREATE_LINK
+                "${CMAKE_SOURCE_DIR}"
+                "${_lfs_compiler_cache_source_alias}"
+                SYMBOLIC
+                RESULT _lfs_compiler_cache_link_result)
+            if(NOT _lfs_compiler_cache_link_result STREQUAL "0")
+                message(FATAL_ERROR
+                    "Failed to create compiler-cache source alias: ${_lfs_compiler_cache_link_result}")
+            endif()
+
+            set(_lfs_compiler_cache_launcher
+                "${CMAKE_COMMAND}"
+                "-DLFS_COMPILER_CACHE_PROGRAM=${_lfs_compiler_cache_program}"
+                "-DLFS_COMPILER_CACHE_SOURCE_ROOT=${CMAKE_SOURCE_DIR}"
+                "-DLFS_COMPILER_CACHE_BINARY_ROOT=${CMAKE_BINARY_DIR}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/CompilerCacheLauncher.cmake"
+                --)
+
+            add_compile_options(
+                "$<$<COMPILE_LANG_AND_ID:C,GNU,Clang,AppleClang>:-ffile-prefix-map=.lfs-cache-source=.>"
+                "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-ffile-prefix-map=.lfs-cache-source=.>")
+            set(_lfs_compiler_cache_paths_normalized ON)
+        endif()
+
+        set(CMAKE_C_COMPILER_LAUNCHER ${_lfs_compiler_cache_launcher})
+        set(CMAKE_CXX_COMPILER_LAUNCHER ${_lfs_compiler_cache_launcher})
+        if(WIN32)
+            message(STATUS "Compiler cache: ${_lfs_compiler_cache_name} (C/C++ only, CUDA uncached)")
+        else()
+            # Keep the existing CUDA launcher unchanged. sccache decomposes
+            # nvcc compilations after canonicalizing their input path, so the
+            # C/C++ source alias does not provide cross-worktree CUDA hits.
+            if(USE_CUDA)
+                set(CMAKE_CUDA_COMPILER_LAUNCHER "${_lfs_compiler_cache_program}")
+            elseif(USE_HIP)
+                set(CMAKE_HIP_COMPILER_LAUNCHER "${_lfs_compiler_cache_program}")
+            endif()
+            message(STATUS "Compiler cache: ${_lfs_compiler_cache_name}")
+            if(_lfs_compiler_cache_paths_normalized)
+                message(STATUS "Compiler cache: C/C++ checkout-local paths normalized")
+            endif()
+        endif()
+
+        unset(_lfs_compiler_cache_launcher)
+        unset(_lfs_compiler_cache_link_result)
+        unset(_lfs_compiler_cache_name)
+        unset(_lfs_compiler_cache_paths_normalized)
+        unset(_lfs_compiler_cache_program)
+        unset(_lfs_compiler_cache_source_alias)
     endif()
 else()
     message(STATUS "Compiler cache: disabled")
@@ -292,19 +408,6 @@ if(USE_CUDA)
 elseif(USE_HIP AND NOT WIN32)
     set(CMAKE_HIP_STANDARD 20)
     set(CMAKE_HIP_STANDARD_REQUIRED ON)
-endif()
-
-# Parallel build
-include(ProcessorCount)
-ProcessorCount(total_cores)
-if(total_cores GREATER 1)
-    if(total_cores LESS 32)
-        set(used_cores 32)
-    else()
-        set(used_cores "${total_cores}")
-    endif()
-    set(ENV{MAKEFLAGS} "-j${used_cores}")
-    message(STATUS "Building with ${used_cores} cores")
 endif()
 
 if(USE_CUDA)
@@ -381,6 +484,7 @@ else()
     message(STATUS "CUDA: native (${LichtFeld-Studio_CUDA_ARCH})")
 endif()
 
+enable_language(CUDA)
 find_package(CUDAToolkit 12.8 REQUIRED)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr")
 if(WIN32)
@@ -490,20 +594,27 @@ set(GPU_DRIVER_LIBRARY CUDA::cuda_driver)
 set(GPU_RAND_LIBRARY CUDA::curand)
 set(GPU_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
 elseif(USE_HIP)
-    set(HIP_ARCHITECTURES "${_lfs_amdgpu_archs}" CACHE STRING "HIP target architectures" FORCE)
+    set(HIP_ARCHITECTURES "${_lfs_amdgpu_archs}" CACHE STRING
+        "HIP target architectures" FORCE)
 
     if(WIN32)
         lfs_windows_rocm_get_short_path("${LFS_ROCM_PATH}" _lfs_rocm_path)
         lfs_windows_rocm_find_devel_root("${LFS_ROCM_PATH}" LFS_ROCM_DEVEL_PATH)
         if(LFS_ROCM_DEVEL_PATH)
-            lfs_windows_rocm_get_short_path("${LFS_ROCM_DEVEL_PATH}" _lfs_rocm_devel_path)
+            lfs_windows_rocm_get_short_path(
+                "${LFS_ROCM_DEVEL_PATH}" _lfs_rocm_devel_path)
         endif()
-        lfs_windows_rocm_find_runtime_dirs("${LFS_ROCM_PATH}" LFS_ROCM_RUNTIME_DIRS)
-        lfs_windows_rocm_read_hip_version("${LFS_ROCM_PATH}" HIP_VERSION HIP_VERSION_MAJOR HIP_VERSION_MINOR HIP_VERSION_PATCH)
-        lfs_windows_rocm_find_device_lib_path("${LFS_ROCM_PATH}" HIP_DEVICE_LIB_PATH)
+        lfs_windows_rocm_find_runtime_dirs(
+            "${LFS_ROCM_PATH}" LFS_ROCM_RUNTIME_DIRS)
+        lfs_windows_rocm_read_hip_version(
+            "${LFS_ROCM_PATH}"
+            HIP_VERSION HIP_VERSION_MAJOR HIP_VERSION_MINOR HIP_VERSION_PATCH)
+        lfs_windows_rocm_find_device_lib_path(
+            "${LFS_ROCM_PATH}" HIP_DEVICE_LIB_PATH)
 
         set(HIP_INCLUDE_DIRS "${_lfs_rocm_path}/include")
-        if(_lfs_rocm_devel_path AND NOT _lfs_rocm_devel_path STREQUAL _lfs_rocm_path)
+        if(_lfs_rocm_devel_path AND
+           NOT _lfs_rocm_devel_path STREQUAL _lfs_rocm_path)
             list(APPEND HIP_INCLUDE_DIRS "${_lfs_rocm_devel_path}/include")
         endif()
         set(CUDAToolkit_INCLUDE_DIRS "${HIP_INCLUDE_DIRS}")
@@ -511,10 +622,13 @@ elseif(USE_HIP)
         set(CUDAToolkit_LIBRARY_DIR "${_lfs_rocm_path}/lib")
         set(CUDAToolkit_VERSION "${HIP_VERSION}")
 
-        find_library(AMDHIP64_LIBRARY NAMES amdhip64 PATHS "${_lfs_rocm_path}/lib" NO_DEFAULT_PATH)
-        find_library(HIPRTC_LIBRARY NAMES hiprtc PATHS "${_lfs_rocm_path}/lib" NO_DEFAULT_PATH)
+        find_library(AMDHIP64_LIBRARY NAMES amdhip64
+            PATHS "${_lfs_rocm_path}/lib" NO_DEFAULT_PATH)
+        find_library(HIPRTC_LIBRARY NAMES hiprtc
+            PATHS "${_lfs_rocm_path}/lib" NO_DEFAULT_PATH)
         if(NOT AMDHIP64_LIBRARY)
-            message(FATAL_ERROR "amdhip64.lib not found under ${_lfs_rocm_path}/lib")
+            message(FATAL_ERROR
+                "amdhip64.lib not found under ${_lfs_rocm_path}/lib")
         endif()
 
         set(_lfs_rocm_library_paths "${_lfs_rocm_path}/lib")
@@ -523,11 +637,14 @@ elseif(USE_HIP)
                 "${_lfs_rocm_devel_path}/lib"
                 "${_lfs_rocm_devel_path}/bin")
         endif()
-
-        find_library(HIPRAND_LIBRARY NAMES hiprand PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
-        find_library(ROCRAND_LIBRARY NAMES rocrand PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
-        find_library(HIPRTC_BUILTINS_LIBRARY NAMES hiprtc-builtins PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
-        find_library(AMD_COMGR_LIBRARY NAMES amd_comgr PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        find_library(HIPRAND_LIBRARY NAMES hiprand
+            PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        find_library(ROCRAND_LIBRARY NAMES rocrand
+            PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        find_library(HIPRTC_BUILTINS_LIBRARY NAMES hiprtc-builtins
+            PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
+        find_library(AMD_COMGR_LIBRARY NAMES amd_comgr
+            PATHS ${_lfs_rocm_library_paths} NO_DEFAULT_PATH)
         file(GLOB _lfs_rocm_builtins_candidates
             "${LFS_ROCM_PATH}/lib/llvm/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
         if(_lfs_rocm_builtins_candidates)
@@ -535,19 +652,14 @@ elseif(USE_HIP)
         endif()
 
         set(_lfs_rocm_base_libraries "${AMDHIP64_LIBRARY}")
-        if(HIPRTC_LIBRARY)
-            list(APPEND _lfs_rocm_base_libraries "${HIPRTC_LIBRARY}")
-        endif()
-        if(HIPRTC_BUILTINS_LIBRARY)
-            list(APPEND _lfs_rocm_base_libraries "${HIPRTC_BUILTINS_LIBRARY}")
-        endif()
-        if(AMD_COMGR_LIBRARY)
-            list(APPEND _lfs_rocm_base_libraries "${AMD_COMGR_LIBRARY}")
-        endif()
-        if(CLANG_RT_BUILTINS_LIBRARY)
-            list(APPEND _lfs_rocm_base_libraries "${CLANG_RT_BUILTINS_LIBRARY}")
-        endif()
-
+        foreach(_lfs_rocm_library IN ITEMS
+                HIPRTC_LIBRARY HIPRTC_BUILTINS_LIBRARY
+                AMD_COMGR_LIBRARY CLANG_RT_BUILTINS_LIBRARY)
+            if(${_lfs_rocm_library})
+                list(APPEND _lfs_rocm_base_libraries
+                    "${${_lfs_rocm_library}}")
+            endif()
+        endforeach()
         set(_lfs_rocm_rand_libraries ${_lfs_rocm_base_libraries})
         if(HIPRAND_LIBRARY)
             list(APPEND _lfs_rocm_rand_libraries "${HIPRAND_LIBRARY}")
@@ -571,14 +683,12 @@ elseif(USE_HIP)
                 INTERFACE_INCLUDE_DIRECTORIES "${HIP_INCLUDE_DIRS}")
         endif()
 
-        set(HIP_HIPCC_FLAGS "--rocm-path=${_lfs_rocm_path} --rocm-device-lib-path=${HIP_DEVICE_LIB_PATH}")
+        set(HIP_HIPCC_FLAGS
+            "--rocm-path=${_lfs_rocm_path} --rocm-device-lib-path=${HIP_DEVICE_LIB_PATH}")
         set(ENV{HIP_PATH} "${LFS_ROCM_PATH}")
         set(ENV{ROCM_PATH} "${LFS_ROCM_PATH}")
         set(ENV{HIP_PLATFORM} "amd")
         set(ENV{HIP_CLANG_PATH} "${_lfs_hip_clang_dir}")
-        if(LFS_ROCM_RUNTIME_DIRS)
-            message(STATUS "Windows ROCm runtime DLL dirs: ${LFS_ROCM_RUNTIME_DIRS}")
-        endif()
     else()
         find_package(hip CONFIG REQUIRED)
         find_package(hiprand CONFIG REQUIRED)
@@ -591,47 +701,34 @@ elseif(USE_HIP)
         elseif(TARGET hiprand)
             set(_lfs_hiprand_target hiprand)
         else()
-            message(FATAL_ERROR "hiprand was found, but it did not export a supported CMake target")
+            message(FATAL_ERROR
+                "hiprand was found, but it did not export a supported CMake target")
         endif()
         if(TARGET hip::host)
             set(_lfs_hip_runtime_target hip::host)
         elseif(TARGET hip::device)
             set(_lfs_hip_runtime_target hip::device)
-            message(WARNING
-                "hip::host is unavailable; falling back to the legacy hip::device target")
         else()
-            message(FATAL_ERROR "HIP was found, but it did not export hip::host or hip::device")
+            message(FATAL_ERROR
+                "HIP was found, but it did not export hip::host or hip::device")
         endif()
-        set(HIP_INCLUDE_DIRS "")
         get_target_property(HIP_INCLUDE_DIRS
             ${_lfs_hip_runtime_target} INTERFACE_INCLUDE_DIRECTORIES)
         if(HIP_INCLUDE_DIRS STREQUAL "HIP_INCLUDE_DIRS-NOTFOUND")
             set(HIP_INCLUDE_DIRS "")
         endif()
-        if(NOT TARGET CUDA::cudart)
-            add_library(CUDA::cudart INTERFACE IMPORTED)
-            set_target_properties(CUDA::cudart PROPERTIES
-                INTERFACE_LINK_LIBRARIES ${_lfs_hip_runtime_target})
-        endif()
-        if(NOT TARGET CUDA::cuda_driver)
-            add_library(CUDA::cuda_driver INTERFACE IMPORTED)
-            set_target_properties(CUDA::cuda_driver PROPERTIES
-                INTERFACE_LINK_LIBRARIES ${_lfs_hip_runtime_target})
-        endif()
+        foreach(_target CUDA::cudart CUDA::cuda_driver CUDA::cupti CUDA::nvToolsExt)
+            if(NOT TARGET ${_target})
+                add_library(${_target} INTERFACE IMPORTED)
+                set_target_properties(${_target} PROPERTIES
+                    INTERFACE_LINK_LIBRARIES ${_lfs_hip_runtime_target})
+            endif()
+        endforeach()
         if(NOT TARGET CUDA::curand)
             add_library(CUDA::curand INTERFACE IMPORTED)
             set_target_properties(CUDA::curand PROPERTIES
-                INTERFACE_LINK_LIBRARIES "${_lfs_hip_runtime_target};${_lfs_hiprand_target}")
-        endif()
-        if(NOT TARGET CUDA::cupti)
-            add_library(CUDA::cupti INTERFACE IMPORTED)
-            set_target_properties(CUDA::cupti PROPERTIES
-                INTERFACE_LINK_LIBRARIES ${_lfs_hip_runtime_target})
-        endif()
-        if(NOT TARGET CUDA::nvToolsExt)
-            add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
-            set_target_properties(CUDA::nvToolsExt PROPERTIES
-                INTERFACE_LINK_LIBRARIES ${_lfs_hip_runtime_target})
+                INTERFACE_LINK_LIBRARIES
+                    "${_lfs_hip_runtime_target};${_lfs_hiprand_target}")
         endif()
     endif()
 
@@ -641,9 +738,11 @@ elseif(USE_HIP)
     set(GPU_INCLUDE_DIRS ${HIP_INCLUDE_DIRS})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HIPUtils.cmake")
     if(WIN32)
-        add_compile_definitions(WIN32 _USE_MATH_DEFINES NOMINMAX _CRT_SECURE_NO_WARNINGS)
+        add_compile_definitions(
+            WIN32 _USE_MATH_DEFINES NOMINMAX _CRT_SECURE_NO_WARNINGS)
     endif()
-    message(STATUS "ROCm/HIP ${HIP_VERSION} backend enabled (${HIP_ARCHITECTURES})")
+    message(STATUS
+        "ROCm/HIP ${HIP_VERSION} backend enabled (${HIP_ARCHITECTURES})")
 endif()
 
 function(lfs_add_gpu_library target_name lib_type)
@@ -652,65 +751,6 @@ function(lfs_add_gpu_library target_name lib_type)
     else()
         add_library(${target_name} ${lib_type} ${ARGN})
     endif()
-endfunction()
-
-function(lfs_get_windows_hip_runtime_search_dirs out_var)
-    set(_dirs "")
-    if(CUDAToolkit_BIN_DIR)
-        list(APPEND _dirs "${CUDAToolkit_BIN_DIR}" "${CUDAToolkit_BIN_DIR}/x64")
-    endif()
-    if(LFS_ROCM_RUNTIME_DIRS)
-        list(APPEND _dirs ${LFS_ROCM_RUNTIME_DIRS})
-    endif()
-    if(LFS_ROCM_DEVEL_PATH)
-        list(APPEND _dirs "${LFS_ROCM_DEVEL_PATH}/bin")
-    endif()
-
-    set(_existing_dirs "")
-    foreach(_dir IN LISTS _dirs)
-        if(_dir AND IS_DIRECTORY "${_dir}")
-            list(APPEND _existing_dirs "${_dir}")
-        endif()
-    endforeach()
-    if(_existing_dirs)
-        list(REMOVE_DUPLICATES _existing_dirs)
-    endif()
-    set(${out_var} "${_existing_dirs}" PARENT_SCOPE)
-endfunction()
-
-function(lfs_collect_windows_hip_runtime_dlls out_var)
-    lfs_get_windows_hip_runtime_search_dirs(_search_dirs)
-    set(_dlls "")
-    foreach(_dir IN LISTS _search_dirs)
-        file(GLOB _dir_dlls CONFIGURE_DEPENDS
-            "${_dir}/amdhip64*.dll"
-            "${_dir}/hiprtc*.dll"
-            "${_dir}/hiprtc-builtins*.dll"
-            "${_dir}/amd_comgr*.dll"
-            "${_dir}/hiprand*.dll"
-            "${_dir}/rocrand*.dll"
-            "${_dir}/rocm-openblas*.dll"
-            "${_dir}/rocm_kpack*.dll")
-        foreach(_dir_dll IN LISTS _dir_dlls)
-            get_filename_component(_dll_name "${_dir_dll}" NAME)
-            string(TOLOWER "${_dll_name}" _dll_name_lower)
-            string(MAKE_C_IDENTIFIER "${_dll_name_lower}" _dll_key)
-            set(_dll_path_var "_lfs_rocm_runtime_path_${_dll_key}")
-            if(DEFINED ${_dll_path_var})
-                file(SHA256 "${${_dll_path_var}}" _existing_hash)
-                file(SHA256 "${_dir_dll}" _candidate_hash)
-                if(NOT _existing_hash STREQUAL _candidate_hash)
-                    message(FATAL_ERROR
-                        "Conflicting ROCm runtime '${_dll_name}' has different binaries: "
-                        "${${_dll_path_var}} and ${_dir_dll}")
-                endif()
-            else()
-                set(${_dll_path_var} "${_dir_dll}")
-                list(APPEND _dlls "${_dir_dll}")
-            endif()
-        endforeach()
-    endforeach()
-    set(${out_var} "${_dlls}" PARENT_SCOPE)
 endfunction()
 
 # Find packages
@@ -722,8 +762,6 @@ find_package(volk CONFIG REQUIRED)
 find_package(SDL3 REQUIRED)
 lfs_validate_linux_sdl_video_backends()
 find_package(glm REQUIRED)
-find_package(imgui REQUIRED)
-find_package(implot REQUIRED)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupNativeFileDialog.cmake")
 find_package(nlohmann_json REQUIRED)
 find_package(args REQUIRED)
@@ -739,6 +777,29 @@ find_package(pxr CONFIG REQUIRED)
 find_package(assimp REQUIRED)
 find_package(RmlUi CONFIG REQUIRED)
 
+# OpenImageIO's static vcpkg target exposes fmt::fmt-header-only through
+# OpenImageIO_Util. That definition is needed by TUs which include OIIO, but it
+# otherwise makes every source in a consumer instantiate fmt. Preserve OIIO's
+# own public compile interface while making the static archive closure link-only;
+# each of our five OIIO source files opts into FMT_HEADER_ONLY explicitly.
+add_library(lfs_oiio INTERFACE)
+target_link_libraries(lfs_oiio INTERFACE "$<LINK_ONLY:OpenImageIO::OpenImageIO>")
+get_target_property(_lfs_oiio_includes OpenImageIO::OpenImageIO INTERFACE_INCLUDE_DIRECTORIES)
+if(_lfs_oiio_includes)
+    target_include_directories(lfs_oiio SYSTEM INTERFACE ${_lfs_oiio_includes})
+endif()
+get_target_property(_lfs_oiio_definitions OpenImageIO::OpenImageIO INTERFACE_COMPILE_DEFINITIONS)
+if(_lfs_oiio_definitions)
+    target_compile_definitions(lfs_oiio INTERFACE ${_lfs_oiio_definitions})
+endif()
+get_target_property(_lfs_oiio_features OpenImageIO::OpenImageIO INTERFACE_COMPILE_FEATURES)
+if(_lfs_oiio_features)
+    target_compile_features(lfs_oiio INTERFACE ${_lfs_oiio_features})
+endif()
+unset(_lfs_oiio_includes)
+unset(_lfs_oiio_definitions)
+unset(_lfs_oiio_features)
+
 # Vulkan-native depth: glm::perspective/ortho/frustum must emit clip-space z in
 # [0, 1], not OpenGL's [-1, 1]. Keeps gl_FragDepth, the grid pass, the depth-
 # blit pass and the CPU-side NDC bound checks on a single convention.
@@ -746,7 +807,7 @@ target_compile_definitions(glm::glm INTERFACE GLM_FORCE_DEPTH_ZERO_TO_ONE)
 
 # TORCH_CUDA_ARCH_LIST is already defined by Torch
 # use it here as the global default CUDA architecture list too
-if(USE_CUDA AND LichtFeld-Studio_CUDA_ARCH)
+if(LichtFeld-Studio_CUDA_ARCH)
     set(CMAKE_CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}" CACHE STRING "CUDA architectures" FORCE)
 endif()
 
@@ -757,26 +818,9 @@ configure_file(
         @ONLY
 )
 
-
-# Project-wide definitions
-add_definitions(-DPROJECT_ROOT_PATH="${PROJ_ROOT_DIR}")
-
-# CUDA device debugging (-G flag) generates huge object files. Disable in CI.
-option(CUDA_DEVICE_DEBUG "Enable CUDA device debugging (-G flag)" ON)
-
-if(CUDA_DEVICE_DEBUG)
-    set(LFS_CUDA_DEVICE_DEBUG_FLAGS "-G" CACHE INTERNAL "")
-else()
-    set(LFS_CUDA_DEVICE_DEBUG_FLAGS "" CACHE INTERNAL "")
-endif()
-
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
-    if(USE_CUDA AND CUDA_DEVICE_DEBUG)
-        set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -g -G -O0")
-    elseif(USE_CUDA)
-        set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -g -O0")
-    endif()
+    set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -g -O0")
 endif()
 
 # External dependencies (EXCLUDE_FROM_ALL to handle install ourselves)
@@ -784,8 +828,29 @@ add_subdirectory(external EXCLUDE_FROM_ALL)
 
 if(USE_HIP)
     include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_shim")
-    add_compile_definitions(USE_HIP=1 LFS_USE_HIP=1 USE_ROCM=1 __HIP_PLATFORM_AMD__)
+    add_compile_definitions(
+        USE_HIP=1 LFS_USE_HIP=1 USE_ROCM=1 __HIP_PLATFORM_AMD__)
 endif()
+
+# Keep LichtFeld's ordinary MSVC translation units on nvcc's conforming host
+# preprocessor and report the selected C++ language version accurately.
+# This is intentionally added after external/ so vendored targets keep their
+# upstream compiler settings.
+if(MSVC)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+    )
+endif()
+
+if(LFS_ENABLE_CUDA_DEVICE_DEBUG)
+    add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-G>)
+endif()
+
+add_compile_definitions(
+    $<$<CONFIG:Debug>:DEBUG_BUILD>
+    $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:RELEASE_BUILD>
+)
 
 # =============================================================================
 # LIBRARY MODULES
@@ -811,7 +876,7 @@ add_subdirectory(src/python)
 # LichtFeld-Studio
 # -----------------------------------------------------------------------------
 
-set(LFS_APP_SOURCES
+add_executable(${PROJECT_NAME}
     src/app/main.cpp
     src/app/application.cpp
     src/app/mcp_gui_tools.cpp
@@ -823,15 +888,21 @@ set(LFS_APP_SOURCES
     resources/lichtfeld-studio.rc
 )
 
-add_executable(${PROJECT_NAME} ${LFS_APP_SOURCES})
+foreach(_lfs_git_version_consumer IN ITEMS
+        ${PROJECT_NAME}
+        lfs_visualizer
+        lfs_py
+        lfs_mcp)
+    if(TARGET ${_lfs_git_version_consumer})
+        add_dependencies(${_lfs_git_version_consumer} lfs_git_version)
+    endif()
+endforeach()
 
 
-if(USE_CUDA)
-    set_target_properties(${PROJECT_NAME} PROPERTIES
+set_target_properties(${PROJECT_NAME} PROPERTIES
         CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
         CUDA_SEPARABLE_COMPILATION OFF
-    )
-endif()
+)
 
 target_include_directories(${PROJECT_NAME}
         PRIVATE
@@ -844,7 +915,7 @@ target_include_directories(${PROJECT_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/tcp          # For tcp event server
         ${CMAKE_CURRENT_SOURCE_DIR}/external         # For external headers
 
-        ${GPU_INCLUDE_DIRS}
+        ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 if(CMAKE_CXX_LINK_GROUP_USING_RESCAN_SUPPORTED)
@@ -873,11 +944,10 @@ target_link_libraries(${PROJECT_NAME}
         PRIVATE
         ${LFS_APP_INTERNAL_LINK_LIBS}
 
-        ${GPU_RUNTIME_LIBRARY}
-        ${GPU_RAND_LIBRARY}
+        CUDA::cudart
+        CUDA::curand
         spdlog::spdlog
         taywee::args
-        OpenImageIO::OpenImageIO
         SDL3::SDL3
 )
 
@@ -938,8 +1008,9 @@ if(TARGET nvimgcodec)
     message(STATUS "Post-build: nvImageCodec libraries will be copied to executable directory")
 endif()
 
-# Keep the selected ONNX Runtime core/provider libraries beside the executable
-# so local and packaged preprocessing use the same inference configuration.
+# ONNX Runtime dlopens its CUDA execution providers at runtime. Keep the core
+# runtime and CUDA/shared provider libraries beside the exe so local and packaged
+# preprocess runs do not silently fall back to CPU.
 set(_lfs_ort_runtime_libs ${LFS_ONNXRUNTIME_RUNTIME_LIBS})
 if(NOT _lfs_ort_runtime_libs AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
     file(GLOB _lfs_ort_runtime_libs
@@ -958,8 +1029,7 @@ if(_lfs_ort_runtime_libs)
         )
     endforeach()
 else()
-    message(WARNING
-        "ONNX Runtime runtime libraries were not found; preprocessing may fail at startup")
+    message(WARNING "ONNX Runtime runtime libraries were not found; preprocess CUDA inference may fall back to CPU or fail at startup")
 endif()
 
 # Copy Python DLLs for Windows runtime (Python is embedded in the application)
@@ -983,7 +1053,7 @@ if(WIN32)
 endif()
 
 # Copy CUDA runtime DLLs for Windows (needed for Python module loading)
-if(WIN32 AND USE_CUDA AND CUDAToolkit_FOUND)
+if(WIN32 AND CUDAToolkit_FOUND)
     file(GLOB CUDA_DLLS_1 "${CUDAToolkit_BIN_DIR}/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/curand64*.dll")
     file(GLOB CUDA_DLLS_2 "${CUDAToolkit_BIN_DIR}/x64/cudart64*.dll" "${CUDAToolkit_BIN_DIR}/x64/curand64*.dll")
     set(CUDA_RUNTIME_DLLS ${CUDA_DLLS_1} ${CUDA_DLLS_2})
@@ -998,140 +1068,6 @@ if(WIN32 AND USE_CUDA AND CUDAToolkit_FOUND)
         endif()
     endforeach()
     message(STATUS "Post-build: CUDA DLLs will be copied from ${CUDAToolkit_BIN_DIR}")
-endif()
-
-if(WIN32 AND USE_HIP)
-    lfs_collect_windows_hip_runtime_dlls(_lfs_hip_runtime_dlls)
-    if(BUILD_PORTABLE)
-        if(NOT _lfs_hip_runtime_dlls)
-            message(FATAL_ERROR
-                "Portable ROCm packages require the collected ROCm/HIP runtime DLL contract")
-        endif()
-        set(_lfs_hip_runtime_manifest_names "")
-        set(_lfs_hip_runtime_license_manifest_entries "")
-        set(_lfs_hip_runtime_sha256_manifest_entries "")
-        set(_lfs_hip_license_sha256_manifest_entries "")
-        foreach(_lfs_hip_runtime_dll IN LISTS _lfs_hip_runtime_dlls)
-            get_filename_component(_lfs_hip_runtime_name "${_lfs_hip_runtime_dll}" NAME)
-            list(APPEND _lfs_hip_runtime_manifest_names "${_lfs_hip_runtime_name}")
-            file(SHA256 "${_lfs_hip_runtime_dll}" _lfs_hip_runtime_sha256)
-            list(APPEND _lfs_hip_runtime_sha256_manifest_entries
-                "${_lfs_hip_runtime_name}|${_lfs_hip_runtime_sha256}")
-            string(TOLOWER "${_lfs_hip_runtime_name}" _lfs_hip_runtime_name_lower)
-            if(_lfs_hip_runtime_name_lower STREQUAL "amd_comgr.dll")
-                set(_lfs_hip_runtime_license
-                    "licenses/ROCm/runtime/amd_comgr/LICENSE.txt")
-            elseif(_lfs_hip_runtime_name_lower MATCHES "^(amdhip.*|hiprtc.*)[.]dll$")
-                set(_lfs_hip_runtime_license
-                    "licenses/ROCm/components/HIP-Runtime-LICENSE.md")
-            elseif(_lfs_hip_runtime_name_lower STREQUAL "hiprand.dll")
-                set(_lfs_hip_runtime_license
-                    "licenses/ROCm/components/hipRAND-LICENSE.md")
-            elseif(_lfs_hip_runtime_name_lower STREQUAL "rocrand.dll")
-                set(_lfs_hip_runtime_license
-                    "licenses/ROCm/components/rocRAND-LICENSE.md")
-            elseif(_lfs_hip_runtime_name_lower MATCHES "^rocm-openblas(64)?[.]dll$")
-                set(_lfs_hip_runtime_license
-                    "licenses/ROCm/components/OpenBLAS-LICENSE,licenses/ROCm/components/LAPACK-LICENSE,licenses/ROCm/components/LAPACKE-LICENSE,licenses/ROCm/components/Reference-BLAS-LICENSE")
-            elseif(_lfs_hip_runtime_name_lower STREQUAL "rocm_kpack.dll")
-                set(_lfs_hip_runtime_license
-                    "licenses/ROCm/components/rocm-kpack-LICENSE,licenses/ROCm/components/msgpack-COPYING,licenses/ROCm/components/msgpack-Boost-LICENSE_1_0.txt,licenses/ROCm/components/zstd-LICENSE")
-            else()
-                message(FATAL_ERROR
-                    "Portable ROCm runtime '${_lfs_hip_runtime_name}' has no audited license mapping")
-            endif()
-            list(APPEND _lfs_hip_runtime_license_manifest_entries
-                "${_lfs_hip_runtime_name}|${_lfs_hip_runtime_license}")
-            string(REPLACE "," ";" _lfs_hip_runtime_license_paths
-                "${_lfs_hip_runtime_license}")
-            foreach(_lfs_hip_runtime_license_path IN LISTS _lfs_hip_runtime_license_paths)
-                if(_lfs_hip_runtime_license_path STREQUAL
-                   "licenses/ROCm/runtime/amd_comgr/LICENSE.txt")
-                    set(_lfs_hip_runtime_license_source
-                        "${LFS_ROCM_PATH}/share/doc/amd_comgr/LICENSE.txt")
-                else()
-                    get_filename_component(_lfs_hip_runtime_license_name
-                        "${_lfs_hip_runtime_license_path}" NAME)
-                    set(_lfs_hip_runtime_license_source
-                        "${CMAKE_SOURCE_DIR}/licenses/ROCm/${_lfs_hip_runtime_license_name}")
-                endif()
-                if(NOT EXISTS "${_lfs_hip_runtime_license_source}")
-                    message(FATAL_ERROR
-                        "Audited ROCm license source is missing: ${_lfs_hip_runtime_license_source}")
-                endif()
-                file(SHA256 "${_lfs_hip_runtime_license_source}"
-                    _lfs_hip_runtime_license_sha256)
-                list(APPEND _lfs_hip_license_sha256_manifest_entries
-                    "${_lfs_hip_runtime_license_path}|${_lfs_hip_runtime_license_sha256}")
-            endforeach()
-        endforeach()
-        list(REMOVE_DUPLICATES _lfs_hip_runtime_manifest_names)
-        list(SORT _lfs_hip_runtime_manifest_names COMPARE NATURAL)
-        list(JOIN _lfs_hip_runtime_manifest_names "\n" _lfs_hip_runtime_manifest_content)
-        string(APPEND _lfs_hip_runtime_manifest_content "\n")
-        file(GENERATE
-            OUTPUT "${CMAKE_BINARY_DIR}/rocm-runtime-manifest.txt"
-            CONTENT "${_lfs_hip_runtime_manifest_content}")
-        list(SORT _lfs_hip_runtime_license_manifest_entries COMPARE NATURAL)
-        list(REMOVE_DUPLICATES _lfs_hip_runtime_license_manifest_entries)
-        list(JOIN _lfs_hip_runtime_license_manifest_entries "\n"
-            _lfs_hip_runtime_license_manifest_content)
-        string(APPEND _lfs_hip_runtime_license_manifest_content "\n")
-        file(GENERATE
-            OUTPUT "${CMAKE_BINARY_DIR}/rocm-runtime-license-manifest.txt"
-            CONTENT "${_lfs_hip_runtime_license_manifest_content}")
-        list(SORT _lfs_hip_runtime_sha256_manifest_entries COMPARE NATURAL)
-        list(REMOVE_DUPLICATES _lfs_hip_runtime_sha256_manifest_entries)
-        list(JOIN _lfs_hip_runtime_sha256_manifest_entries "\n"
-            _lfs_hip_runtime_sha256_manifest_content)
-        string(APPEND _lfs_hip_runtime_sha256_manifest_content "\n")
-        file(READ "${CMAKE_SOURCE_DIR}/licenses/ROCm/audited-runtime-sha256.txt"
-            _lfs_audited_runtime_sha256_manifest_content)
-        string(REPLACE "\r\n" "\n" _lfs_audited_runtime_sha256_manifest_content
-            "${_lfs_audited_runtime_sha256_manifest_content}")
-        string(STRIP "${_lfs_audited_runtime_sha256_manifest_content}"
-            _lfs_audited_runtime_sha256_manifest_content)
-        string(STRIP "${_lfs_hip_runtime_sha256_manifest_content}"
-            _lfs_hip_runtime_sha256_manifest_compare)
-        if(NOT _lfs_hip_runtime_sha256_manifest_compare STREQUAL
-           _lfs_audited_runtime_sha256_manifest_content)
-            message(FATAL_ERROR
-                "ROCm runtime binaries do not match the audited 7.14 SHA-256 manifest")
-        endif()
-        file(GENERATE
-            OUTPUT "${CMAKE_BINARY_DIR}/rocm-runtime-sha256-manifest.txt"
-            CONTENT "${_lfs_hip_runtime_sha256_manifest_content}")
-        list(SORT _lfs_hip_license_sha256_manifest_entries COMPARE NATURAL)
-        list(REMOVE_DUPLICATES _lfs_hip_license_sha256_manifest_entries)
-        list(JOIN _lfs_hip_license_sha256_manifest_entries "\n"
-            _lfs_hip_license_sha256_manifest_content)
-        string(APPEND _lfs_hip_license_sha256_manifest_content "\n")
-        file(READ "${CMAKE_SOURCE_DIR}/licenses/ROCm/audited-license-sha256.txt"
-            _lfs_audited_license_sha256_manifest_content)
-        string(REPLACE "\r\n" "\n" _lfs_audited_license_sha256_manifest_content
-            "${_lfs_audited_license_sha256_manifest_content}")
-        string(STRIP "${_lfs_audited_license_sha256_manifest_content}"
-            _lfs_audited_license_sha256_manifest_content)
-        string(STRIP "${_lfs_hip_license_sha256_manifest_content}"
-            _lfs_hip_license_sha256_manifest_compare)
-        if(NOT _lfs_hip_license_sha256_manifest_compare STREQUAL
-           _lfs_audited_license_sha256_manifest_content)
-            message(FATAL_ERROR
-                "ROCm license inputs do not match the audited SHA-256 manifest")
-        endif()
-        file(GENERATE
-            OUTPUT "${CMAKE_BINARY_DIR}/rocm-license-sha256-manifest.txt"
-            CONTENT "${_lfs_hip_license_sha256_manifest_content}")
-    endif()
-    if(_lfs_hip_runtime_dlls)
-        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${_lfs_hip_runtime_dlls}
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-            COMMENT "Copying ROCm/HIP runtime DLLs to executable directory"
-        )
-        message(STATUS "Post-build: ROCm/HIP DLLs will be copied")
-    endif()
 endif()
 
 if(WIN32 AND _lfs_cudnn_runtime_libs)
@@ -1233,6 +1169,58 @@ if(TARGET nvjpeg2k_ext)
             "$<TARGET_FILE_DIR:${PROJECT_NAME}>/extensions/"
         COMMENT "Copying nvjpeg2k extension binary only"
     )
+
+    if(WITH_DYNAMIC_NVJPEG2K)
+        if(CUDAToolkit_VERSION_MAJOR)
+            set(_lfs_nvjpeg2k_cuda_major "${CUDAToolkit_VERSION_MAJOR}")
+        else()
+            set(_lfs_nvjpeg2k_cuda_major "12")
+        endif()
+        set(_lfs_nvjpeg2k_runtime_dir
+            "${CMAKE_BINARY_DIR}/_deps/nvjpeg2k_headers-src/lib/${_lfs_nvjpeg2k_cuda_major}")
+        if(WIN32)
+            set(_lfs_nvjpeg2k_runtime_name "nvjpeg2k_0.dll")
+            set(_lfs_nvjpeg2k_runtime_file
+                "${_lfs_nvjpeg2k_runtime_dir}/${_lfs_nvjpeg2k_runtime_name}")
+            if(EXISTS "${_lfs_nvjpeg2k_runtime_file}")
+                add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_lfs_nvjpeg2k_runtime_file}"
+                        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/${_lfs_nvjpeg2k_runtime_name}"
+                    COMMENT "Copying nvjpeg2k runtime library"
+                )
+            else()
+                message(WARNING
+                    "WITH_DYNAMIC_NVJPEG2K is ON but nvjpeg2k_0.dll was not found in "
+                    "${_lfs_nvjpeg2k_runtime_dir}")
+            endif()
+        elseif(UNIX)
+            file(GLOB _lfs_nvjpeg2k_runtime_candidates
+                "${_lfs_nvjpeg2k_runtime_dir}/libnvjpeg2k.so.*.*")
+            list(SORT _lfs_nvjpeg2k_runtime_candidates)
+            if(_lfs_nvjpeg2k_runtime_candidates)
+                list(GET _lfs_nvjpeg2k_runtime_candidates -1 _lfs_nvjpeg2k_runtime_file)
+                get_filename_component(_lfs_nvjpeg2k_runtime_name
+                    "${_lfs_nvjpeg2k_runtime_file}" NAME)
+                add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_lfs_nvjpeg2k_runtime_file}"
+                        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/${_lfs_nvjpeg2k_runtime_name}"
+                    COMMAND ${CMAKE_COMMAND} -E create_symlink
+                        "${_lfs_nvjpeg2k_runtime_name}"
+                        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/libnvjpeg2k.so.0"
+                    COMMAND ${CMAKE_COMMAND} -E create_symlink
+                        "libnvjpeg2k.so.0"
+                        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/libnvjpeg2k.so"
+                    COMMENT "Copying nvjpeg2k runtime library"
+                )
+            else()
+                message(WARNING
+                    "WITH_DYNAMIC_NVJPEG2K is ON but no libnvjpeg2k.so runtime was found in "
+                    "${_lfs_nvjpeg2k_runtime_dir}")
+            endif()
+        endif()
+    endif()
 endif()
 
 # =============================================================================
@@ -1486,58 +1474,16 @@ elseif(WIN32)
     endif()
 endif()
 
-# Build type configuration function
-function(configure_build_type target)
-    get_target_property(target_type ${target} TYPE)
-
-    if(target_type STREQUAL "INTERFACE_LIBRARY")
-        if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-            target_compile_definitions(${target} INTERFACE DEBUG_BUILD)
-        elseif(CMAKE_BUILD_TYPE STREQUAL "Release|RelWithDebInfo|MinSizeRel")
-            target_compile_definitions(${target} INTERFACE RELEASE_BUILD)
-        endif()
-        # Debug options for interface libraries
-        if(ENABLE_TENSOR_VALIDATION)
-            target_compile_definitions(${target} INTERFACE TENSOR_VALIDATION_ENABLED)
-        endif()
-        if(ENABLE_CUDA_DEBUG_SYNC)
-            target_compile_definitions(${target} INTERFACE CUDA_DEBUG_SYNC)
-        endif()
-        if(ENABLE_TENSOR_OP_TRACING)
-            target_compile_definitions(${target} INTERFACE TENSOR_OP_TRACING)
-        endif()
-    else()
-        if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-            target_compile_definitions(${target} PRIVATE DEBUG_BUILD)
-        elseif(CMAKE_BUILD_TYPE STREQUAL "Release|RelWithDebInfo|MinSizeRel")
-            target_compile_definitions(${target} PRIVATE RELEASE_BUILD)
-        endif()
-        # Debug options for regular libraries
-        if(ENABLE_TENSOR_VALIDATION)
-            target_compile_definitions(${target} PRIVATE TENSOR_VALIDATION_ENABLED)
-        endif()
-        if(ENABLE_CUDA_DEBUG_SYNC)
-            target_compile_definitions(${target} PRIVATE CUDA_DEBUG_SYNC)
-        endif()
-        if(ENABLE_TENSOR_OP_TRACING)
-            target_compile_definitions(${target} PRIVATE TENSOR_OP_TRACING)
-        endif()
-    endif()
-endfunction()
-
-# Apply build configuration to all targets
-configure_build_type(fastlfs_backend)
-configure_build_type(lfs_core)
-configure_build_type(lfs_core_cuda)
-configure_build_type(lfs_training)
-configure_build_type(lfs_preprocessing)
-configure_build_type(lfs_rendering_tensor)
-configure_build_type(lfs_rendering)
-configure_build_type(lfs_visualizer)
-configure_build_type(lfs_io)
-configure_build_type(lfs_geometry)
-configure_build_type(lfs_tcp)
-configure_build_type(${PROJECT_NAME})
+if(UNIX)
+    add_custom_target(validate-gui
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_vulkan_validation.sh"
+                --binary "$<TARGET_FILE:${PROJECT_NAME}>"
+        DEPENDS ${PROJECT_NAME}
+        USES_TERMINAL
+        COMMENT "Launching LichtFeld Studio with source-built Vulkan validation"
+        VERBATIM
+    )
+endif()
 
 if(LFS_FAST_COMPILE AND MSVC)
     function(lfs_enable_fast_cxx_compile target)
@@ -1580,7 +1526,7 @@ if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY)
     if(BUILD_UNICODE_TEST_ONLY)
         message(STATUS "Unicode path test enabled. Build with 'ninja unicode_path_test' and run with 'ctest -R UnicodePathTest'")
     else()
-        message(STATUS "Tests enabled. Build with 'ninja lichtfeld_tests' and run with 'ninja run_tests' or 'ctest'")
+        message(STATUS "Tests enabled. Build with 'ninja lichtfeld_tests' and run with 'ninja run_tests' or 'ctest -L fast'")
     endif()
 endif()
 
@@ -1593,9 +1539,9 @@ message(STATUS "  GPU Backend: ${LFS_GPU_BACKEND}")
 if(USE_CUDA)
     message(STATUS "  CUDA Version: ${CUDAToolkit_VERSION}")
     message(STATUS "  CUDA Archs: ${CMAKE_CUDA_ARCHITECTURES}")
-elseif(USE_HIP)
+else()
     message(STATUS "  ROCm/HIP Version: ${HIP_VERSION}")
-    message(STATUS "  AMDGPU Archs: ${HIP_ARCHITECTURES}")
+    message(STATUS "  AMD GPU Archs: ${HIP_ARCHITECTURES}")
 endif()
 message(STATUS "  Vulkan Found: ${Vulkan_FOUND}")
 message(STATUS "  Vulkan Include Dirs: ${Vulkan_INCLUDE_DIRS}")
@@ -1606,17 +1552,18 @@ message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 if(USE_CUDA)
     message(STATUS "  CUDA Standard: ${CMAKE_CUDA_STANDARD}")
-elseif(USE_HIP AND NOT WIN32)
-    message(STATUS "  HIP Standard: ${CMAKE_HIP_STANDARD}")
+else()
+    message(STATUS "  HIP Standard: 20")
 endif()
 message(STATUS "  OpenImageIO Found: ${OpenImageIO_FOUND}")
 message(STATUS "  Tests: ${BUILD_TESTS}")
 message(STATUS "  Unicode Test Only: ${BUILD_UNICODE_TEST_ONLY}")
 message(STATUS "  Portable Build: ${BUILD_PORTABLE}")
-if(BUILD_PORTABLE)
-    if(USE_CUDA)
-        message(STATUS "  -> PTX-only: ON (SM >= ${BUILD_CUDA_MIN_SM}, JIT at runtime)")
-    endif()
+if(BUILD_PORTABLE AND USE_CUDA)
+    message(STATUS "  -> PTX-only: ON (SM >= ${BUILD_CUDA_MIN_SM}, JIT at runtime)")
+    message(STATUS "  -> Use: cmake --install build --prefix ./dist")
+elseif(BUILD_PORTABLE)
+    message(STATUS "  -> Native ${LFS_GPU_BACKEND} kernels: ${HIP_ARCHITECTURES}")
     message(STATUS "  -> Use: cmake --install build --prefix ./dist")
 endif()
 message(STATUS "===========================================")
@@ -1631,35 +1578,8 @@ endif()
 set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
 set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
 
+include(GNUInstallDirs)
 include(InstallRequiredSystemLibraries)
-
-if(WIN32 AND BUILD_PORTABLE AND NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
-    set(_lfs_vswhere_result 1)
-    set(_lfs_vswhere
-        "$ENV{ProgramFiles}/../Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe")
-    if(EXISTS "${_lfs_vswhere}")
-        execute_process(
-            COMMAND "${_lfs_vswhere}" -latest -products * -property installationPath
-            OUTPUT_VARIABLE _lfs_vs_install_root
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            RESULT_VARIABLE _lfs_vswhere_result)
-    endif()
-    if(_lfs_vswhere_result EQUAL 0 AND IS_DIRECTORY "${_lfs_vs_install_root}")
-        file(TO_CMAKE_PATH "${_lfs_vs_install_root}" _lfs_vs_install_root)
-        file(GLOB _lfs_msvc_crt_dirs LIST_DIRECTORIES TRUE
-            "${_lfs_vs_install_root}/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
-        list(SORT _lfs_msvc_crt_dirs COMPARE NATURAL ORDER DESCENDING)
-        if(_lfs_msvc_crt_dirs)
-            list(GET _lfs_msvc_crt_dirs 0 _lfs_msvc_crt_dir)
-            file(GLOB _lfs_msvc_runtime_files "${_lfs_msvc_crt_dir}/*.dll")
-        endif()
-    endif()
-    if(NOT _lfs_msvc_runtime_files)
-        message(FATAL_ERROR
-            "Portable Windows packages require Visual Studio C++ Redistributable DLLs")
-    endif()
-    install(FILES ${_lfs_msvc_runtime_files} DESTINATION ${CMAKE_INSTALL_BINDIR})
-endif()
 
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS lfs_core
@@ -1694,174 +1614,10 @@ if(_lfs_ort_runtime_libs)
     endif()
     install(FILES ${_lfs_ort_runtime_libs} DESTINATION ${_lfs_ort_install_dest})
 endif()
-if(WIN32 AND USE_HIP AND _lfs_hip_runtime_dlls)
-    install(FILES ${_lfs_hip_runtime_dlls} DESTINATION ${CMAKE_INSTALL_BINDIR})
-endif()
 if(WIN32 AND BUILD_PORTABLE AND _lfs_cudnn_runtime_libs)
     install(FILES ${_lfs_cudnn_runtime_libs} DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
-install(FILES "${CMAKE_SOURCE_DIR}/THIRD_PARTY_LICENSES.md"
-    DESTINATION "licenses")
-install(FILES
-    "${CMAKE_SOURCE_DIR}/src/rendering/resources/assets/JetBrainsMono-LICENSE.txt"
-    DESTINATION "licenses/JetBrains-Mono")
-install(FILES
-    "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/shader/src/radix_sort/LICENSE"
-    DESTINATION "licenses/AMD-vk_radix_sort")
-install(FILES
-    "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/LICENSE-VKSPLAT"
-    DESTINATION "licenses/VkSplat")
-
-if(LFS_ONNXRUNTIME_NOTICE_FILES)
-    install(FILES ${LFS_ONNXRUNTIME_NOTICE_FILES}
-        DESTINATION "licenses/ONNX-Runtime")
-endif()
-
-if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
-    file(GLOB _lfs_vcpkg_copyright_files LIST_DIRECTORIES FALSE
-        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/*/copyright")
-    foreach(_lfs_vcpkg_copyright IN LISTS _lfs_vcpkg_copyright_files)
-        get_filename_component(_lfs_vcpkg_share_dir "${_lfs_vcpkg_copyright}" DIRECTORY)
-        get_filename_component(_lfs_vcpkg_port "${_lfs_vcpkg_share_dir}" NAME)
-        install(FILES "${_lfs_vcpkg_copyright}"
-            DESTINATION "licenses/vcpkg/${_lfs_vcpkg_port}")
-    endforeach()
-endif()
-
-if(USE_HIP AND WIN32)
-    set(_lfs_rocm_component_license_files
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/HIP-Runtime-LICENSE.md"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/hipRAND-LICENSE.md"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/rocRAND-LICENSE.md"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/rocm-kpack-LICENSE"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/OpenBLAS-LICENSE"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/LAPACK-LICENSE"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/LAPACKE-LICENSE"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/Reference-BLAS-LICENSE"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/msgpack-COPYING"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/msgpack-Boost-LICENSE_1_0.txt"
-        "${CMAKE_SOURCE_DIR}/licenses/ROCm/zstd-LICENSE")
-    foreach(_lfs_rocm_component_license IN LISTS _lfs_rocm_component_license_files)
-        if(NOT EXISTS "${_lfs_rocm_component_license}")
-            message(FATAL_ERROR
-                "Required ROCm component license is missing: ${_lfs_rocm_component_license}")
-        endif()
-    endforeach()
-    install(FILES ${_lfs_rocm_component_license_files}
-        DESTINATION "licenses/ROCm/components")
-    install(FILES "${CMAKE_SOURCE_DIR}/licenses/ROCm/README.md"
-        DESTINATION "licenses/ROCm")
-    if(BUILD_PORTABLE)
-        set(_lfs_rocm_sdk_provenance_manifest
-            "${LFS_ROCM_PATH}/share/therock/therock_manifest.json")
-        set(_lfs_rocm_sdk_version_file "${LFS_ROCM_PATH}/.info/version")
-        if(NOT EXISTS "${_lfs_rocm_sdk_provenance_manifest}")
-            message(FATAL_ERROR
-                "Portable ROCm packages require SDK provenance at ${_lfs_rocm_sdk_provenance_manifest}")
-        endif()
-        if(NOT EXISTS "${_lfs_rocm_sdk_version_file}")
-            message(FATAL_ERROR
-                "Portable ROCm packages require an SDK version at ${_lfs_rocm_sdk_version_file}")
-        endif()
-        file(READ "${_lfs_rocm_sdk_version_file}" _lfs_rocm_sdk_version)
-        string(STRIP "${_lfs_rocm_sdk_version}" _lfs_rocm_sdk_version)
-        if(NOT _lfs_rocm_sdk_version STREQUAL "7.14.0")
-            message(FATAL_ERROR
-                "This audited portable package requires ROCm SDK 7.14.0, got '${_lfs_rocm_sdk_version}'")
-        endif()
-        file(READ "${_lfs_rocm_sdk_provenance_manifest}" _lfs_rocm_sdk_provenance_json)
-        string(JSON _lfs_rocm_the_rock_commit GET
-            "${_lfs_rocm_sdk_provenance_json}" the_rock_commit)
-        if(NOT _lfs_rocm_the_rock_commit STREQUAL
-           "6d7f1714045261f62747f297f2f9e5f9c6d6b465")
-            message(FATAL_ERROR
-                "ROCm SDK TheRock commit is not the audited 7.14 build: ${_lfs_rocm_the_rock_commit}")
-        endif()
-        set(_lfs_rocm_expected_submodules
-            "llvm-project|5c9bfa94a37c59923dee3c55942566db7904b659"
-            "rocm-libraries|46653de70f6d71031bed76e15525edd331318a99"
-            "rocm-systems|b8c378ef2c7220a68122d13b81dab5addd61e016")
-        string(JSON _lfs_rocm_submodule_count LENGTH
-            "${_lfs_rocm_sdk_provenance_json}" submodules)
-        math(EXPR _lfs_rocm_submodule_last "${_lfs_rocm_submodule_count} - 1")
-        foreach(_lfs_rocm_expected_submodule IN LISTS _lfs_rocm_expected_submodules)
-            string(REPLACE "|" ";" _lfs_rocm_expected_submodule_parts
-                "${_lfs_rocm_expected_submodule}")
-            list(GET _lfs_rocm_expected_submodule_parts 0 _lfs_rocm_expected_name)
-            list(GET _lfs_rocm_expected_submodule_parts 1 _lfs_rocm_expected_sha)
-            set(_lfs_rocm_submodule_matches FALSE)
-            foreach(_lfs_rocm_submodule_index RANGE 0 ${_lfs_rocm_submodule_last})
-                string(JSON _lfs_rocm_submodule_name GET
-                    "${_lfs_rocm_sdk_provenance_json}"
-                    submodules ${_lfs_rocm_submodule_index} submodule_name)
-                if(_lfs_rocm_submodule_name STREQUAL _lfs_rocm_expected_name)
-                    string(JSON _lfs_rocm_submodule_sha GET
-                        "${_lfs_rocm_sdk_provenance_json}"
-                        submodules ${_lfs_rocm_submodule_index} pin_sha)
-                    if(NOT _lfs_rocm_submodule_sha STREQUAL _lfs_rocm_expected_sha)
-                        message(FATAL_ERROR
-                            "ROCm SDK ${_lfs_rocm_expected_name} commit is not audited: ${_lfs_rocm_submodule_sha}")
-                    endif()
-                    set(_lfs_rocm_submodule_matches TRUE)
-                    break()
-                endif()
-            endforeach()
-            if(NOT _lfs_rocm_submodule_matches)
-                message(FATAL_ERROR
-                    "ROCm SDK provenance is missing ${_lfs_rocm_expected_name}")
-            endif()
-        endforeach()
-        install(FILES "${CMAKE_BINARY_DIR}/rocm-runtime-license-manifest.txt"
-            DESTINATION "licenses/ROCm"
-            RENAME "runtime-license-manifest.txt")
-        install(FILES "${CMAKE_BINARY_DIR}/rocm-runtime-sha256-manifest.txt"
-            DESTINATION "licenses/ROCm"
-            RENAME "runtime-sha256-manifest.txt")
-        install(FILES "${CMAKE_BINARY_DIR}/rocm-license-sha256-manifest.txt"
-            DESTINATION "licenses/ROCm"
-            RENAME "license-sha256-manifest.txt")
-        install(FILES "${_lfs_rocm_sdk_provenance_manifest}"
-            DESTINATION "licenses/ROCm/provenance")
-        install(FILES "${_lfs_rocm_sdk_version_file}"
-            DESTINATION "licenses/ROCm/provenance"
-            RENAME "rocm-sdk-version.txt")
-    endif()
-
-    set(_lfs_rocm_notice_roots "${LFS_ROCM_PATH}")
-    set(_lfs_rocm_notice_destinations runtime)
-    if(DEFINED LFS_ROCM_DEVEL_PATH
-       AND NOT LFS_ROCM_DEVEL_PATH STREQUAL ""
-       AND NOT LFS_ROCM_DEVEL_PATH STREQUAL LFS_ROCM_PATH)
-        list(APPEND _lfs_rocm_notice_roots "${LFS_ROCM_DEVEL_PATH}")
-        list(APPEND _lfs_rocm_notice_destinations devel)
-    endif()
-    list(LENGTH _lfs_rocm_notice_roots _lfs_rocm_notice_count)
-    math(EXPR _lfs_rocm_notice_last "${_lfs_rocm_notice_count} - 1")
-    foreach(_lfs_rocm_notice_index RANGE 0 ${_lfs_rocm_notice_last})
-        list(GET _lfs_rocm_notice_roots
-            ${_lfs_rocm_notice_index} _lfs_rocm_notice_root)
-        list(GET _lfs_rocm_notice_destinations
-            ${_lfs_rocm_notice_index} _lfs_rocm_notice_destination)
-        file(GLOB_RECURSE _lfs_rocm_notice_files LIST_DIRECTORIES FALSE
-            "${_lfs_rocm_notice_root}/share/doc/LICENSE*"
-            "${_lfs_rocm_notice_root}/share/doc/COPYING*"
-            "${_lfs_rocm_notice_root}/share/doc/NOTICE*")
-        if(BUILD_PORTABLE AND NOT _lfs_rocm_notice_files)
-            message(FATAL_ERROR
-                "Portable ROCm packages require redistributable notices under "
-                "${_lfs_rocm_notice_root}/share/doc")
-        endif()
-        if(IS_DIRECTORY "${_lfs_rocm_notice_root}/share/doc")
-            install(DIRECTORY "${_lfs_rocm_notice_root}/share/doc/"
-                DESTINATION "licenses/ROCm/${_lfs_rocm_notice_destination}"
-                FILES_MATCHING
-                PATTERN "LICENSE*"
-                PATTERN "COPYING*"
-                PATTERN "NOTICE*")
-        endif()
-    endforeach()
-endif()
 
 set(INSTALL_RESOURCE_DIR "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio")
 if(_LFS_VULKAN_RASTERIZER_SPV_DIR)
@@ -1931,18 +1687,33 @@ if(TARGET nvimgcodec)
             LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/extensions"
             RUNTIME DESTINATION "extensions"
         )
+        if(WITH_DYNAMIC_NVJPEG2K AND DEFINED _lfs_nvjpeg2k_runtime_file AND EXISTS "${_lfs_nvjpeg2k_runtime_file}")
+            if(WIN32)
+                install(FILES "${_lfs_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+            elseif(UNIX)
+                install(FILES "${_lfs_nvjpeg2k_runtime_file}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
+                install(CODE "
+                    execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+                        \"${_lfs_nvjpeg2k_runtime_name}\"
+                        \"libnvjpeg2k.so.0\"
+                        WORKING_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\")
+                    execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+                        \"libnvjpeg2k.so.0\"
+                        \"libnvjpeg2k.so\"
+                        WORKING_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\")
+                ")
+            endif()
+        endif()
     endif()
 endif()
 
 # Portable build: bundle runtime dependencies via GET_RUNTIME_DEPENDENCIES
 if(BUILD_PORTABLE)
     # Exclusion patterns for system libraries
-    # Driver and optional Windows system DLLs are supplied by the host OS.
-    set(_PRE_EXCLUDE
-            [[api-ms-.*]] [[ext-ms-.*]] [[API-MS-.*]] [[EXT-MS-.*]]
-            [[nvcuda[.]dll]] [[libcuda[.]so.*]] [[hvsifiletrust[.]dll]])
+    # nvcuda.dll is provided by the NVIDIA GPU driver, not the CUDA Toolkit
+    set(_PRE_EXCLUDE [[api-ms-.*]] [[ext-ms-.*]] [[API-MS-.*]] [[EXT-MS-.*]] [[nvcuda[.]dll]] [[libcuda[.]so.*]])
     set(_POST_EXCLUDE
-            [[^[A-Za-z]:[/\\][Ww]indows[/\\].*]]
+            [[.*[Ss]ystem32.*]] [[.*[Ww]indows.*]]
             [[/lib/x86_64-linux-gnu/.*]] [[/lib64/ld-linux.*]] [[/usr/lib.*]]
             [[.*ld-linux.*]] [[.*libc[.]so[.].*]] [[.*libpthread.*]]
             [[.*libdl[.]so.*]] [[.*libm[.]so[.].*]] [[.*librt[.]so.*]]
@@ -1963,9 +1734,10 @@ if(BUILD_PORTABLE)
     if(DEFINED VCPKG_TARGET_TRIPLET)
         list(APPEND _RUNTIME_SEARCH_DIRS
                 "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin"
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib"
+                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin"
+                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/lib")
     endif()
-    list(REMOVE_DUPLICATES _RUNTIME_SEARCH_DIRS)
 
     set(_SEARCH_DIRS_STR "")
     foreach(_runtime_search_dir IN LISTS _RUNTIME_SEARCH_DIRS)
@@ -1979,112 +1751,32 @@ if(BUILD_PORTABLE)
     else()
         set(_BUNDLE_DEST "${CMAKE_INSTALL_LIBDIR}")
     endif()
-    set(_LFS_WINDOWS_SYSTEM_DLL_NAMES
-        advapi32.dll bcrypt.dll cfgmgr32.dll comdlg32.dll crypt32.dll
-        combase.dll cryptbase.dll d3d12.dll dbghelp.dll dnsapi.dll dwmapi.dll
-        dxcore.dll dxgi.dll gdi32.dll imm32.dll iphlpapi.dll kernel32.dll
-        kernelbase.dll mpr.dll mswsock.dll ncrypt.dll netapi32.dll normaliz.dll
-        ntdll.dll ole32.dll oleaut32.dll powrprof.dll
-        propsys.dll rpcrt4.dll sechost.dll secur32.dll setupapi.dll shcore.dll
-        shell32.dll shlwapi.dll user32.dll userenv.dll uxtheme.dll version.dll
-        win32u.dll winhttp.dll wininet.dll winmm.dll wintrust.dll ws2_32.dll
-        wtsapi32.dll xmllite.dll)
-    set(_LFS_WINDOWS_SYSTEM_ROOT "")
-    if(WIN32)
-        if(NOT DEFINED ENV{SystemRoot} OR "$ENV{SystemRoot}" STREQUAL "")
-            message(FATAL_ERROR
-                "Portable Windows packages require the SystemRoot environment variable")
+    function(bundle_runtime_deps TARGET_FILE IS_LIBRARY)
+        if(IS_LIBRARY)
+            set(_type "LIBRARIES")
+        else()
+            set(_type "EXECUTABLES")
         endif()
-        file(REAL_PATH "$ENV{SystemRoot}" _LFS_WINDOWS_SYSTEM_ROOT)
-        file(TO_CMAKE_PATH "${_LFS_WINDOWS_SYSTEM_ROOT}" _LFS_WINDOWS_SYSTEM_ROOT)
-        string(TOLOWER "${_LFS_WINDOWS_SYSTEM_ROOT}" _LFS_WINDOWS_SYSTEM_ROOT)
-        string(REGEX REPLACE "/+$" "" _LFS_WINDOWS_SYSTEM_ROOT
-            "${_LFS_WINDOWS_SYSTEM_ROOT}")
-    endif()
+        install(CODE "
+            file(GET_RUNTIME_DEPENDENCIES
+                ${_type} \"${TARGET_FILE}\"
+                RESOLVED_DEPENDENCIES_VAR _deps
+                DIRECTORIES ${_SEARCH_DIRS_STR}
+                PRE_EXCLUDE_REGEXES ${_PRE_EXCLUDE}
+                POST_EXCLUDE_REGEXES ${_POST_EXCLUDE})
+            foreach(_d IN LISTS _deps)
+                file(INSTALL \"\${_d}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${_BUNDLE_DEST}\" FOLLOW_SYMLINK_CHAIN)
+            endforeach()
+        " COMPONENT runtime)
+    endfunction()
 
-    set(_LFS_RUNTIME_EXECUTABLES "$<TARGET_FILE:${PROJECT_NAME}>")
-    set(_LFS_RUNTIME_LIBRARIES "")
-    set(_LFS_RUNTIME_MODULES "")
-    if(TARGET lfs_py)
-        list(APPEND _LFS_RUNTIME_MODULES "$<TARGET_FILE:lfs_py>")
-    endif()
-    list(APPEND _LFS_RUNTIME_MODULES ${LFS_PYTHON_EXTENSION_MODULES})
+    bundle_runtime_deps("$<TARGET_FILE:${PROJECT_NAME}>" FALSE)
     if(TARGET nvjpeg_ext)
-        list(APPEND _LFS_RUNTIME_LIBRARIES "$<TARGET_FILE:nvjpeg_ext>")
+        bundle_runtime_deps("$<TARGET_FILE:nvjpeg_ext>" TRUE)
     endif()
-    if(TARGET nvjpeg2k_ext)
-        list(APPEND _LFS_RUNTIME_LIBRARIES "$<TARGET_FILE:nvjpeg2k_ext>")
-    endif()
-    list(APPEND _LFS_RUNTIME_LIBRARIES ${_lfs_ort_runtime_libs})
-
-    set(_RUNTIME_ROOT_ARGS "")
-    foreach(_runtime_root_type IN ITEMS EXECUTABLES LIBRARIES MODULES)
-        set(_runtime_root_list "_LFS_RUNTIME_${_runtime_root_type}")
-        if(${_runtime_root_list})
-            string(APPEND _RUNTIME_ROOT_ARGS "\n                ${_runtime_root_type}")
-            foreach(_runtime_root IN LISTS ${_runtime_root_list})
-                string(APPEND _RUNTIME_ROOT_ARGS " \"${_runtime_root}\"")
-            endforeach()
-        endif()
+    foreach(_lfs_ort_runtime_lib IN LISTS _lfs_ort_runtime_libs)
+        bundle_runtime_deps("${_lfs_ort_runtime_lib}" TRUE)
     endforeach()
-
-    install(CODE "
-        file(GET_RUNTIME_DEPENDENCIES
-            ${_RUNTIME_ROOT_ARGS}
-            RESOLVED_DEPENDENCIES_VAR _deps
-            UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
-            CONFLICTING_DEPENDENCIES_PREFIX _dependency_conflicts
-            DIRECTORIES ${_SEARCH_DIRS_STR}
-            PRE_EXCLUDE_REGEXES ${_PRE_EXCLUDE}
-            POST_EXCLUDE_REGEXES ${_POST_EXCLUDE})
-        if(_unresolved_deps)
-            list(JOIN _unresolved_deps \", \" _unresolved_text)
-            message(FATAL_ERROR
-                \"Unresolved portable package dependencies: \${_unresolved_text}\")
-        endif()
-        foreach(_conflict_name IN LISTS _dependency_conflicts_FILENAMES)
-            set(_conflict_var \"_dependency_conflicts_\${_conflict_name}\")
-            set(_conflict_paths \"\${\${_conflict_var}}\")
-            set(_conflict_hash \"\")
-            foreach(_conflict_path IN LISTS _conflict_paths)
-                file(SHA256 \"\${_conflict_path}\" _candidate_hash)
-                if(NOT _conflict_hash)
-                    set(_conflict_hash \"\${_candidate_hash}\")
-                elseif(NOT _candidate_hash STREQUAL _conflict_hash)
-                    list(JOIN _conflict_paths \", \" _conflict_text)
-                    message(FATAL_ERROR
-                        \"Conflicting runtime dependency '\${_conflict_name}' has different binaries: \${_conflict_text}\")
-                endif()
-            endforeach()
-            list(GET _conflict_paths 0 _resolved_conflict_path)
-            list(APPEND _deps \"\${_resolved_conflict_path}\")
-        endforeach()
-        list(REMOVE_DUPLICATES _deps)
-        set(_windows_system_dll_names ${_LFS_WINDOWS_SYSTEM_DLL_NAMES})
-        set(_windows_system_root \"${_LFS_WINDOWS_SYSTEM_ROOT}\")
-        foreach(_d IN LISTS _deps)
-            file(REAL_PATH \"\${_d}\" _d_real)
-            file(TO_CMAKE_PATH \"\${_d_real}\" _d_normalized)
-            string(TOLOWER \"\${_d_normalized}\" _d_normalized_lower)
-            get_filename_component(_d_name \"\${_d_normalized}\" NAME)
-            string(TOLOWER \"\${_d_name}\" _d_name_lower)
-            list(FIND _windows_system_dll_names \"\${_d_name_lower}\" _system_dll_index)
-            string(FIND \"\${_d_normalized_lower}/\" \"\${_windows_system_root}/\" _system_root_prefix)
-            if((_windows_system_root AND _system_root_prefix EQUAL 0)
-               OR _d_normalized_lower MATCHES \"^[a-z]:/windows/\"
-               OR _system_dll_index GREATER -1
-               OR _d_name_lower MATCHES \"^(api-ms-|ext-ms-)\")
-                continue()
-            endif()
-            if(_d_name_lower MATCHES \"^(gtest|gmock|benchmark|catch2).*[.]dll$\")
-                message(FATAL_ERROR
-                    \"Test-only runtime dependency reached the portable package: \${_d_normalized}\")
-            endif()
-            file(INSTALL \"\${_d_real}\"
-                DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${_BUNDLE_DEST}\"
-                FOLLOW_SYMLINK_CHAIN)
-        endforeach()
-    " COMPONENT runtime)
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         configure_file(
@@ -2092,6 +1784,35 @@ if(BUILD_PORTABLE)
                 "${CMAKE_BINARY_DIR}/run_lichtfeld.sh"
                 @ONLY)
         install(PROGRAMS "${CMAKE_BINARY_DIR}/run_lichtfeld.sh" DESTINATION ${CMAKE_INSTALL_BINDIR})
+    elseif(WIN32)
+        install(CODE "
+            # Copy extensions/ from build to dist/extensions/
+            # Handle both single-config (Ninja) and multi-config (VS) generators
+            foreach(_cfg IN ITEMS \"\" \"Release\" \"Debug\" \"RelWithDebInfo\" \"MinSizeRel\")
+                if(_cfg)
+                    set(_ext_dir \"${CMAKE_BINARY_DIR}/\${_cfg}/extensions\")
+                else()
+                    set(_ext_dir \"${CMAKE_BINARY_DIR}/extensions\")
+                endif()
+                if(EXISTS \"\${_ext_dir}\")
+                    # Install only DLLs from the build extensions directory to avoid non-binary files
+                    file(GLOB _ext_dlls \"\${_ext_dir}/*.dll\")
+                    if(_ext_dlls)
+                        foreach(_e IN LISTS _ext_dlls)
+                            file(INSTALL \"\${_e}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/extensions\")
+                        endforeach()
+                    endif()
+                    break()
+                endif()
+            endforeach()
+            # Copy vcpkg DLLs
+            if(EXISTS \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin\")
+                file(GLOB _vcpkg \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll\")
+                foreach(_v IN LISTS _vcpkg)
+                    file(INSTALL \"\${_v}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
+                endforeach()
+            endif()
+        " COMPONENT runtime)
     endif()
 endif()
 
@@ -2127,40 +1848,4 @@ elseif(SCCACHE_PROGRAM)
         COMMAND ${SCCACHE_PROGRAM} --zero-stats
         COMMENT "Cleaning build and resetting sccache stats"
     )
-endif()
-
-# Package the selected CUDA or HIP Studio backend.
-if(BUILD_PORTABLE)
-    string(TOLOWER "${LFS_GPU_BACKEND}" _lfs_package_backend)
-    if(WIN32)
-        set(_lfs_package_platform "windows-x64")
-    else()
-        string(TOLOWER "${CMAKE_SYSTEM_NAME}" _lfs_package_system)
-        set(_lfs_package_platform "${_lfs_package_system}-${CMAKE_SYSTEM_PROCESSOR}")
-    endif()
-    if(USE_HIP)
-        set(CPACK_PACKAGE_NAME "LichtFeld-Studio-for-ROCm")
-        set(_lfs_package_description
-            "LichtFeld Studio fork for AMD ROCm/HIP")
-    else()
-        set(CPACK_PACKAGE_NAME "LichtFeld-Studio")
-        set(_lfs_package_description "LichtFeld Studio")
-    endif()
-    set(CPACK_PACKAGE_VENDOR "Wildman-Inc")
-    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${_lfs_package_description}")
-    set(CPACK_PACKAGE_HOMEPAGE_URL
-        "https://github.com/Wildman-Inc/LichtFeld-Studio")
-    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
-    if(USE_HIP)
-        set(CPACK_PACKAGE_FILE_NAME
-            "LichtFeld-Studio-for-ROCm-${PROJECT_VERSION}-${_lfs_package_platform}")
-    else()
-        set(CPACK_PACKAGE_FILE_NAME
-            "LichtFeld-Studio-${PROJECT_VERSION}-${_lfs_package_backend}-${_lfs_package_platform}")
-    endif()
-    set(CPACK_GENERATOR ZIP)
-    set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
-    set(CPACK_PACKAGE_CHECKSUM SHA256)
-    set(CPACK_MONOLITHIC_INSTALL ON)
-    include(CPack)
 endif()
