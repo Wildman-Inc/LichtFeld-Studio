@@ -8,6 +8,9 @@
 # Tensor CUDA kernels (STATIC, linked privately)
 add_subdirectory(tensor)
 
+# Neural inference kernels (STATIC, linked privately)
+add_subdirectory(nn)
+
 # Core CUDA library (STATIC, linked privately)
 add_subdirectory(cuda)
 
@@ -21,6 +24,7 @@ add_subdirectory(logger)
 set(TENSOR_SOURCES
         tensor/cuda_event_pool.cpp
         tensor/cuda_stream_context.cpp
+        tensor/stream_lifetime.cpp
         tensor/gpu_slab_allocator.cpp
         tensor/size_bucketed_pool.cpp
         tensor/lazy_config.cpp
@@ -41,26 +45,36 @@ set(TENSOR_SOURCES
         tensor/tensor_row_proxy.cpp
         tensor/tensor_nn_ops.cpp
         tensor/pinned_memory_allocator.cpp
-        tensor/offset_allocator.cpp
         tensor/tensor_exports.cu
+        nn/ops.cpp
+        nn/weight_file.cpp
+        nn/activation_arena.cpp
+        nn/models/moge2.cpp
+        nn/models/lpips.cpp
 )
 
 # Core module sources
 set(CORE_SOURCES
         abi.cpp
+        alloc_counter.cpp
         crash_handler.cpp
+        training_churn_metrics.cpp
         cuda_error.cpp
         cuda_error_typed.cpp
         device_fault.cpp
         error.cpp
         error_bus.cpp
+        exif.cpp
         error_envelope.cpp
         error_latch.cpp
         error_reporter.cpp
         guarded_task.cpp
+        host_metrics.cpp
         failure_report.cpp
         cuda/memory_arena_owner.cpp
+        cuda/vmm_device_buffer.cpp
         memory_pressure.cpp
+        memory_domain.cpp
         operator_callbacks.cpp
         animatable_property.cpp
         argument_parser.cpp
@@ -69,11 +83,16 @@ set(CORE_SOURCES
         image_loader.cpp
         cuda_version.cpp
         image_io.cpp
+        image_codecs.cpp
         mapped_file.cpp
+        optimization_properties.cpp
         parameters.cpp
         property_registry.cpp
+        provenance.cpp
         reactive_store.cpp
         scene.cpp
+        session_breadcrumb.cpp
+        uuid.cpp
         splat_simplify.cpp
         bhatt_lod.cpp
         octree_lod.cpp
@@ -81,12 +100,20 @@ set(CORE_SOURCES
         splat_data_mirror.cpp
         splat_data_transform.cpp
         splat_exportable_storage.cpp
+        sh_value_quant.cpp
+        shareable_allocation_limit.cpp
         tensor_debug.cpp
         training_snapshot.cpp
         mesh_data.cpp
+        system_info.cpp
+        user_paths.cpp
+        legacy_settings_migration.cpp
 )
 
 lfs_add_gpu_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
+
+add_dependencies(lfs_core lfs_core_abi_stamp)
+target_include_directories(lfs_core BEFORE PRIVATE "${LFS_CORE_ABI_INCLUDE_DIR}")
 
 target_compile_definitions(lfs_core PRIVATE LFS_CORE_EXPORTS)
 
@@ -97,7 +124,9 @@ target_include_directories(lfs_core
         ${GPU_INCLUDE_DIRS}
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/io/include
         ${CMAKE_CURRENT_SOURCE_DIR}/tensor  # For internal/ headers
+        ${CMAKE_CURRENT_SOURCE_DIR}/nn
 )
 target_include_directories(lfs_core SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/external
@@ -119,13 +148,15 @@ target_link_libraries(lfs_core
     PRIVATE
         lfs_core_cuda
         lfs_tensor_kernels
+        lfs_nn_kernels
         taywee::args
-        lfs_oiio
+        JPEG::JPEG
+        PNG::PNG
+        TIFF::TIFF
+        WebP::webp
+        unofficial::tinyexr::tinyexr
         OpenMeshCore
 )
-
-set_property(SOURCE image_io.cpp APPEND PROPERTY COMPILE_DEFINITIONS FMT_HEADER_ONLY=1)
-
 # OpenMP for tensor multi-threaded operations
 if(WIN32 AND USE_HIP AND BUILD_PORTABLE)
     message(STATUS
@@ -141,6 +172,10 @@ endif()
 # Platform-specific settings
 if(UNIX)
     target_link_libraries(lfs_core PUBLIC dl)
+endif()
+
+if(WIN32)
+    target_link_libraries(lfs_core PRIVATE bcrypt)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)

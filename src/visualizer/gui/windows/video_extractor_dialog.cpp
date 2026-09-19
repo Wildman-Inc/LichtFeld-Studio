@@ -24,7 +24,6 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -184,11 +183,44 @@ namespace lfs::gui {
             return true;
         }
 
-        template <typename... Args>
-        [[nodiscard]] std::string localizedFormat(const char* const key, Args... args) {
-            char buffer[256]{};
-            std::snprintf(buffer, sizeof(buffer), LOC(key), args...);
-            return buffer;
+        template <size_t N>
+        [[nodiscard]] bool setCachedSelectLabels(
+            Rml::ElementFormControlSelect* const select,
+            const std::array<const char*, N>& keys) {
+            if (!select)
+                return false;
+
+            bool changed = false;
+            for (size_t i = 0; i < N; ++i) {
+                auto* const option = select->GetOption(static_cast<int>(i));
+                if (!option)
+                    continue;
+
+                const std::string localized = LOC(keys[i]);
+                if (option->GetInnerRML() == localized)
+                    continue;
+
+                option->SetInnerRML(localized);
+                changed = true;
+            }
+
+            if (!changed)
+                return false;
+
+            auto* const selected = select->GetOption(select->GetSelection());
+            if (!selected)
+                return true;
+
+            const std::string selected_rml = selected->GetInnerRML();
+            for (int i = 0; i < select->GetNumChildren(true); ++i) {
+                auto* const child = select->GetChild(i);
+                if (child && child->GetTagName() == "selectvalue") {
+                    child->SetInnerRML(selected_rml);
+                    break;
+                }
+            }
+
+            return true;
         }
 
         [[nodiscard]] float readFloatValue(const Rml::Element* const el, const float fallback) {
@@ -307,6 +339,10 @@ namespace lfs::gui {
     }
 
     bool VideoExtractorDialog::needsAnimationFrame() const {
+        const std::string current_language =
+            lfs::event::LocalizationManager::getInstance().getCurrentLanguage();
+        if (!current_language.empty() && current_language != last_language_)
+            return true;
         return hasDynamicState() || (host_ && host_->needsAnimationFrame());
     }
 
@@ -359,7 +395,7 @@ namespace lfs::gui {
 
             std::string error;
             if (!extractor.extract(extract_params, error)) {
-                if (stop_extraction_requested_.load()) {
+                if (extractor.lastOutcome() == io::ExtractionOutcome::Cancelled) {
                     LOG_INFO("Video frame extraction stopped");
                     setExtractionStopped();
                 } else {
@@ -896,6 +932,31 @@ namespace lfs::gui {
         changed |= setCachedAttribute(custom_width_input_el_, "title", LOC(VideoExtractor::WIDTH));
         changed |= setCachedAttribute(custom_height_input_el_, "title", LOC(VideoExtractor::HEIGHT));
         changed |= setCachedAttribute(pattern_input_el_, "title", LOC(VideoExtractor::PATTERN_TOOLTIP));
+        changed |= setCachedSelectLabels(
+            mode_select_el_,
+            std::array{"video_extractor.mode_fps", "video_extractor.mode_interval"});
+        changed |= setCachedSelectLabels(
+            format_select_el_,
+            std::array{"video_extractor.format_png", "video_extractor.format_jpeg"});
+        changed |= setCachedSelectLabels(
+            resolution_select_el_,
+            std::array{"video_extractor.res_original", "video_extractor.res_scale",
+                       "video_extractor.res_custom"});
+        changed |= setCachedSelectLabels(
+            sharpness_algorithm_select_el_,
+            std::array{"video_extractor.sharpness_algo_combined",
+                       "video_extractor.sharpness_algo_tenengrad",
+                       "video_extractor.sharpness_algo_laplacian"});
+        changed |= setCachedSelectLabels(
+            sharpness_mode_select_el_,
+            std::array{"video_extractor.sharpness_mode_threshold",
+                       "video_extractor.sharpness_mode_window"});
+        changed |= setCachedSelectLabels(
+            dynamic_cast<Rml::ElementFormControlSelect*>(window_candidates_select_el_),
+            std::array{"video_extractor.candidates_auto", "video_extractor.candidates_fast",
+                       "video_extractor.candidates_balanced", "video_extractor.candidates_quality",
+                       "video_extractor.candidates_high_quality",
+                       "video_extractor.candidates_very_high", "video_extractor.candidates_all"});
         changed |= setCachedText(stop_btn_el_, LOC(VideoExtractor::STOP));
         changed |= setCachedText(cancel_btn_el_, LOC(VideoExtractor::CANCEL));
         markContentDirty();
@@ -1071,7 +1132,7 @@ namespace lfs::gui {
 
         changed |= setCachedControlValue(trim_start_input_el_, std::format("{:.1f}", start));
         changed |= setCachedControlValue(trim_end_input_el_, std::format("{:.1f}", end));
-        changed |= setCachedText(estimated_frames_el_, localizedFormat(VideoExtractor::ESTIMATED_FRAMES, frame_count));
+        changed |= setCachedText(estimated_frames_el_, LOCF(VideoExtractor::ESTIMATED_FRAMES, frame_count));
 
         if (changed)
             markContentDirty();
@@ -1148,7 +1209,7 @@ namespace lfs::gui {
                 candidates = std::min(window_candidates_target_, std::max(1, est_window));
             }
             changed |= setCachedText(window_candidates_readout_el_,
-                                     localizedFormat(VideoExtractor::CANDIDATES_READOUT_FMT, candidates, est_window));
+                                     LOCF(VideoExtractor::CANDIDATES_READOUT_FMT, candidates, est_window));
         }
 
         if (sharpness_threshold_slider_el_ && sharpness_threshold_value_el_) {
@@ -1194,7 +1255,7 @@ namespace lfs::gui {
             if (total > 0) {
                 const int discarded = discarded_frames_.load();
                 const std::string discard_str = discarded > 0
-                                                    ? localizedFormat(VideoExtractor::DISCARDED_FORMAT, discarded)
+                                                    ? LOCF(VideoExtractor::DISCARDED_FORMAT, discarded)
                                                     : "";
                 changed |= setCachedText(progress_text_el_,
                                          std::format("{}/{}{}", current, total, discard_str));
@@ -1213,9 +1274,9 @@ namespace lfs::gui {
             const int discarded = discarded_frames_.load();
             std::string complete_msg = std::format("{} {}",
                                                    LOC(VideoExtractor::COMPLETE),
-                                                   localizedFormat(VideoExtractor::EXTRACTED, saved));
+                                                   LOCF(VideoExtractor::EXTRACTED, saved));
             if (discarded > 0)
-                complete_msg += localizedFormat(VideoExtractor::DISCARDED_FORMAT, discarded);
+                complete_msg += LOCF(VideoExtractor::DISCARDED_FORMAT, discarded);
             changed |= setCachedText(complete_text_el_, complete_msg);
         }
 
@@ -1229,9 +1290,8 @@ namespace lfs::gui {
         const bool has_error = !snapshot.error_message.empty();
         changed |= setCachedProperty(error_section_el_, "display", has_error ? "flex" : "none");
         if (has_error) {
-            char buffer[512]{};
-            std::snprintf(buffer, sizeof(buffer), LOC(VideoExtractor::ERROR_MSG), snapshot.error_message.c_str());
-            changed |= setCachedText(error_text_el_, buffer);
+            changed |= setCachedText(error_text_el_,
+                                     LOCF(VideoExtractor::ERROR_MSG, snapshot.error_message));
         }
 
         if (changed)
@@ -1256,12 +1316,12 @@ namespace lfs::gui {
 
         changed |= setCachedText(output_resolution_el_,
                                  player_->isOpen()
-                                     ? localizedFormat(VideoExtractor::OUTPUT_RES, out_w, out_h)
+                                     ? LOCF(VideoExtractor::OUTPUT_RES, out_w, out_h)
                                      : std::format("{} --", LOC(VideoExtractor::OUTPUT)));
         const char* const ext = format_selection_ == 0 ? ".png" : ".jpg";
         const std::string preview = io::formatFrameFilenameStem(filename_pattern_.data(), 1);
         changed |= setCachedText(pattern_example_el_,
-                                 localizedFormat(VideoExtractor::EXAMPLE, preview.c_str(), ext));
+                                 LOCF(VideoExtractor::EXAMPLE, preview.c_str(), ext));
 
         if (changed)
             markContentDirty();

@@ -137,6 +137,7 @@ namespace lfs::app {
                 {"playback_speed", controller.playbackSpeed()},
                 {"has_ply_sequence", has_ply_sequence},
                 {"ply_sequence_node", has_ply_sequence ? controller.plySequence()->node_name : ""},
+                {"ply_sequence_uuid", has_ply_sequence ? controller.plySequence()->node_uuid.to_string() : ""},
                 {"ply_sequence_fps", controller.plySequenceFps()},
                 {"ply_sequence_frame_count", has_ply_sequence ? controller.plySequence()->frames.size() : 0},
                 {"show_camera_path", ui_state ? ui_state->show_camera_path : true},
@@ -206,6 +207,7 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
+                        {"time", json{{"type", "number"}, {"description", "Keyframe time in seconds; defaults to the playhead. Times past the clip duration extend it, which scrubbing cannot reach."}}},
                         {"eye", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera eye position [x,y,z]"}}},
                         {"target", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera target [x,y,z]"}}},
                         {"up", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera up vector [x,y,z]"}}},
@@ -228,9 +230,15 @@ namespace lfs::app {
                 const std::optional<float> fov = args.contains("fov_degrees")
                                                      ? std::optional<float>(args["fov_degrees"].get<float>())
                                                      : std::nullopt;
+                const bool has_time = args.contains("time") && !args["time"].is_null();
+                const std::optional<float> time = has_time
+                                                      ? std::optional<float>(args["time"].get<float>())
+                                                      : std::nullopt;
+                if (time && *time < 0.0f)
+                    return json{{"error", "Field 'time' must not be negative"}};
                 const bool show_sequencer = args.value("show_sequencer", true);
 
-                return post_and_wait(viewer, [backend, eye = *eye, target = *target, up = *up, fov, show_sequencer]() -> json {
+                return post_and_wait(viewer, [backend, eye = *eye, target = *target, up = *up, fov, time, show_sequencer]() -> json {
                     auto controller = ensure_ready_controller(backend);
                     if (!controller)
                         return json{{"error", controller.error()}};
@@ -239,7 +247,7 @@ namespace lfs::app {
                         backend.set_visible(true);
                     apply_camera_args(eye, target, up, fov);
                     if (backend.add_keyframe)
-                        backend.add_keyframe();
+                        backend.add_keyframe(time);
                     return sequencer_state_json(backend, **controller);
                 });
             });
@@ -583,20 +591,22 @@ namespace lfs::app {
         registry.register_tool(
             McpTool{
                 .name = "sequencer.scrub",
-                .description = "Move the sequencer playhead to a time (seconds) or PLY-sequence frame index",
+                .description = "Move the sequencer playhead to a time (seconds) or PLY-sequence frame index, optionally updating the viewport camera",
                 .input_schema = {
                     .type = "object",
                     .properties = json{
                         {"time", json{{"type", "number"}, {"description", "Playhead time in seconds"}}},
-                        {"frame", json{{"type", "integer"}, {"description", "PLY-sequence frame index (overrides time)"}}}},
+                        {"frame", json{{"type", "integer"}, {"description", "PLY-sequence frame index (overrides time)"}}},
+                        {"update_camera", json{{"type", "boolean"}, {"description", "Apply the interpolated camera pose to the viewport (default: false)"}}}},
                     .required = {}}},
             [viewer, backend](const json& args) -> json {
                 const bool has_time = args.contains("time") && !args["time"].is_null();
                 const bool has_frame = args.contains("frame") && !args["frame"].is_null();
                 const std::optional<float> time = has_time ? std::optional<float>(args["time"].get<float>()) : std::nullopt;
                 const std::optional<int64_t> frame = has_frame ? std::optional<int64_t>(args["frame"].get<int64_t>()) : std::nullopt;
+                const bool update_camera = args.value("update_camera", false);
 
-                return post_and_wait(viewer, [backend, time, frame]() -> json {
+                return post_and_wait(viewer, [backend, time, frame, update_camera]() -> json {
                     auto controller = ensure_ready_controller(backend);
                     if (!controller)
                         return json{{"error", controller.error()}};
@@ -606,13 +616,16 @@ namespace lfs::app {
                         const float fps = (*controller)->plySequenceFps();
                         target_time = static_cast<float>(std::max<int64_t>(*frame, 0)) / (fps > 0.0f ? fps : 24.0f);
                     }
-                    if (backend.scrub_to_time)
-                        backend.scrub_to_time(target_time);
-                    else
+                    bool camera_updated = false;
+                    if (backend.scrub_to_time) {
+                        camera_updated = backend.scrub_to_time(target_time, update_camera);
+                    } else {
                         (*controller)->seek(target_time);
+                    }
 
                     json result = sequencer_state_json(backend, **controller);
                     result["scrubbed_to_time"] = target_time;
+                    result["camera_updated"] = camera_updated;
                     return result;
                 });
             });

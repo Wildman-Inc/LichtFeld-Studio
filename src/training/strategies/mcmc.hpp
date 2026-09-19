@@ -9,6 +9,7 @@
 #include "istrategy.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/scheduler.hpp"
+#include <cassert>
 #include <memory>
 
 class CropDampingStrategyTest_McmcRejectedRowsAreNeverSampledAtZeroScale_Test;
@@ -33,6 +34,7 @@ namespace lfs::training {
         void post_backward(int iter, RenderOutput& render_output) override;
         bool is_refining(int iter) const override;
         void step(int iter) override;
+        void permute_gaussian_rows(const lfs::core::Tensor& perm) override;
 
         lfs::core::SplatData& get_model() override { return *_splat_data; }
         const lfs::core::SplatData& get_model() const override { return *_splat_data; }
@@ -40,10 +42,14 @@ namespace lfs::training {
         void remove_gaussians(const lfs::core::Tensor& mask) override;
 
         // IStrategy interface - optimizer access
-        AdamOptimizer& get_optimizer() override { return *_optimizer; }
-        const AdamOptimizer& get_optimizer() const override { return *_optimizer; }
-        ExponentialLR* get_scheduler() { return _scheduler.get(); }
-        const ExponentialLR* get_scheduler() const { return _scheduler.get(); }
+        AdamOptimizer& get_optimizer() override {
+            assert(_optimizer);
+            return *_optimizer;
+        }
+        const AdamOptimizer& get_optimizer() const override {
+            assert(_optimizer);
+            return *_optimizer;
+        }
 
         // Serialization for checkpoints
         void serialize(std::ostream& os) const override;
@@ -55,9 +61,7 @@ namespace lfs::training {
 
         // Reserve optimizer capacity for future growth (e.g., after checkpoint load)
         void reserve_optimizer_capacity(size_t capacity) override;
-        void set_optimization_params(const lfs::core::param::OptimizationParameters& params) override {
-            _params = std::make_unique<const lfs::core::param::OptimizationParameters>(params);
-        }
+        void set_optimization_params(const lfs::core::param::OptimizationParameters& params) override;
 
         // Exposed for testing
         int add_new_gs_test() { return add_new_gs(); }
@@ -88,11 +92,11 @@ namespace lfs::training {
         static constexpr float NOISE_LR = 5e5f;
 
         // State variables
-        int _n_max = 0;                  // max relocation ratio
-        lfs::core::Tensor _noise_buffer; // Reusable buffer for noise injection
-        lfs::core::Tensor _ones_int32;   // Cached ones for ratio counting; grows with the live model.
+        int _n_max = 0;                // max relocation ratio
+        lfs::core::Tensor _ones_int32; // Cached ones for ratio counting; grows with the live model.
         lfs::core::Tensor _error_score_max;
         int _error_score_windows = 0;
+        int _current_iteration = 0;
     };
 
 } // namespace lfs::training

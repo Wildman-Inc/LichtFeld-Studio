@@ -174,17 +174,40 @@ namespace lfs::vis::gui {
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
         VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VulkanImageBarrierTracker image_barriers;
+        std::uint64_t image_generation_ = 0;
         struct PendingUpload {
             VkFence fence = VK_NULL_HANDLE;
             VkCommandBuffer command_buffer = VK_NULL_HANDLE;
             VkBuffer staging_buffer = VK_NULL_HANDLE;
             VmaAllocation staging_allocation = VK_NULL_HANDLE;
         };
+        struct RgbaRegion {
+            const std::uint8_t* pixels = nullptr;
+            std::size_t size = 0;
+            int texture_width = 0;
+            int texture_height = 0;
+            int x = 0;
+            int y = 0;
+            int width = 0;
+            int height = 0;
+        };
         // Bounded ring of in-flight uploads. Uploads to the same image serialize on the graphics
         // queue (no semaphores), so a depth > 1 only defers staging-buffer reclamation; it does not
         // race the GPU. The main thread blocks only when the ring is full.
         static constexpr std::size_t kMaxPendingUploads = 3;
         std::vector<PendingUpload> pending_uploads;
+
+        struct RetiredImage {
+            VkImage image = VK_NULL_HANDLE;
+            VkImageView image_view = VK_NULL_HANDLE;
+            VmaAllocation allocation = VK_NULL_HANDLE;
+            std::uint64_t retire_serial = 0;
+            std::uint64_t generation = 0;
+            std::string vram_label;
+            std::vector<PendingUpload> pending_uploads;
+        };
+        static constexpr std::size_t kMaxRetiredImages = 8;
+        std::vector<RetiredImage> retired_images;
 
         int width = 0;
         int height = 0;
@@ -262,6 +285,105 @@ namespace lfs::vis::gui {
                 }
             }
             pending_uploads.erase(write, pending_uploads.end());
+        }
+
+        [[nodiscard]] bool releaseRetiredUploads(RetiredImage& retired, const bool wait) {
+            auto write = retired.pending_uploads.begin();
+            bool all_ready = true;
+            for (auto read = retired.pending_uploads.begin();
+                 read != retired.pending_uploads.end(); ++read) {
+                bool ready = read->fence == VK_NULL_HANDLE;
+                if (!ready && wait) {
+                    lfs::rendering::WaitContext wait_ctx;
+                    wait_ctx.fingerprint = "ui_texture.retired_upload.wait";
+                    const auto wait_outcome = lfs::rendering::wait_fence_bounded(
+                        device,
+                        read->fence,
+                        std::stop_token{},
+                        lfs::rendering::VulkanWaitPolicy{},
+                        wait_ctx);
+                    ready = wait_outcome.has_value() &&
+                            *wait_outcome == lfs::rendering::WaitOutcome::Ready;
+                } else if (!ready) {
+                    ready = vkGetFenceStatus(device, read->fence) == VK_SUCCESS;
+                }
+
+                if (ready) {
+                    destroyPendingUpload(*read);
+                } else {
+                    all_ready = false;
+                    if (write != read)
+                        *write = *read;
+                    ++write;
+                }
+            }
+            retired.pending_uploads.erase(write, retired.pending_uploads.end());
+            return all_ready;
+        }
+
+        void releaseRetiredImages(const bool wait) {
+            if (wait && context) {
+                const auto serial = context->lastSuccessfulFrameSubmitSerial();
+                if (serial != 0 && !context->waitForRetiredFrameSubmitSerial(serial))
+                    LOG_WARN("Vulkan UI texture could not retire frame serial {}: {}",
+                             serial,
+                             context->lastError());
+            }
+            const auto retired_serial = context ? context->retiredFrameSubmitSerial()
+                                                : std::numeric_limits<std::uint64_t>::max();
+            auto write = retired_images.begin();
+            for (auto read = retired_images.begin(); read != retired_images.end(); ++read) {
+                const bool uploads_ready = releaseRetiredUploads(*read, wait);
+                if (read->retire_serial <= retired_serial && uploads_ready) {
+                    image_barriers.forgetImage(read->image, read->generation);
+                    if (read->image_view != VK_NULL_HANDLE)
+                        vkDestroyImageView(device, read->image_view, nullptr);
+                    if (read->image != VK_NULL_HANDLE)
+                        vmaDestroyImage(allocator, read->image, read->allocation);
+                    if (!read->vram_label.empty()) {
+                        lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
+                            "vulkan.ui_texture.image", read->vram_label, 0);
+                    }
+                    continue;
+                }
+                if (write != read)
+                    *write = std::move(*read);
+                ++write;
+            }
+            retired_images.erase(write, retired_images.end());
+        }
+
+        void retireCurrentImage() {
+            if (image == VK_NULL_HANDLE)
+                return;
+            tryReleasePendingUpload();
+            const std::uint64_t serial = context ? context->lastSuccessfulFrameSubmitSerial() : 0;
+            if (serial == 0) {
+                image_barriers.forgetImage(image, image_generation_);
+                if (image_view != VK_NULL_HANDLE)
+                    vkDestroyImageView(device, image_view, nullptr);
+                vmaDestroyImage(allocator, image, image_allocation);
+                image = VK_NULL_HANDLE;
+                image_view = VK_NULL_HANDLE;
+                image_allocation = VK_NULL_HANDLE;
+                return;
+            }
+            if (retired_images.size() >= kMaxRetiredImages)
+                releaseRetiredImages(true);
+            retired_images.push_back({
+                .image = image,
+                .image_view = image_view,
+                .allocation = image_allocation,
+                .retire_serial = serial,
+                .generation = image_generation_,
+                .vram_label = std::move(image_vram_label),
+                .pending_uploads = std::move(pending_uploads),
+            });
+            pending_uploads.clear();
+            image = VK_NULL_HANDLE;
+            image_view = VK_NULL_HANDLE;
+            image_allocation = VK_NULL_HANDLE;
+            image_vram_label.clear();
         }
 
         // Block only when the ring is full: wait on the oldest entry to free a slot.
@@ -393,22 +515,6 @@ namespace lfs::vis::gui {
             return true;
         }
 
-        [[nodiscard]] bool writeAllocation(const VmaAllocation allocation,
-                                           const void* const source,
-                                           const VkDeviceSize size) const {
-            if (allocation == VK_NULL_HANDLE || !source || size == 0) {
-                return false;
-            }
-            void* mapped = nullptr;
-            if (vmaMapMemory(allocator, allocation, &mapped) != VK_SUCCESS || !mapped) {
-                return false;
-            }
-            std::memcpy(mapped, source, static_cast<std::size_t>(size));
-            const VkResult flush_result = vmaFlushAllocation(allocator, allocation, 0, size);
-            vmaUnmapMemory(allocator, allocation);
-            return flush_result == VK_SUCCESS;
-        }
-
         [[nodiscard]] VkCommandBuffer beginSingleTimeCommands() const {
             VkCommandBufferAllocateInfo alloc_info{};
             alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -451,7 +557,7 @@ namespace lfs::vis::gui {
             bool submitted = false;
             bool wait_ready = false;
             if (submit_status == VK_SUCCESS) {
-                submit_status = vkQueueSubmit(graphics_queue, 1, &submit_info, submit_fence);
+                submit_status = lfs::rendering::vk_queue_submit_synced(graphics_queue, 1, &submit_info, submit_fence);
                 if (submit_status == VK_SUCCESS) {
                     submitted = true;
                 }
@@ -507,8 +613,8 @@ namespace lfs::vis::gui {
             if (command_buffer == VK_NULL_HANDLE || image == VK_NULL_HANDLE || old_layout == new_layout) {
                 return;
             }
-            image_barriers.registerImage(image, VK_IMAGE_ASPECT_COLOR_BIT, old_layout);
-            image_barriers.transitionImage(command_buffer, image, VK_IMAGE_ASPECT_COLOR_BIT, new_layout);
+            image_barriers.registerImage(image, image_generation_, VK_IMAGE_ASPECT_COLOR_BIT, old_layout);
+            image_barriers.transitionImage(command_buffer, image, image_generation_, VK_IMAGE_ASPECT_COLOR_BIT, new_layout);
         }
 
         [[nodiscard]] bool ensureImage(const int new_width, const int new_height) {
@@ -521,31 +627,8 @@ namespace lfs::vis::gui {
             }
 
             if (image != VK_NULL_HANDLE) {
-                waitAndReleasePendingUpload();
-                // Descriptor updates and image destruction are only legal once
-                // every submitted RmlUI draw that can reference the old view has
-                // retired. Resize is already a cold path; pay the bounded fence
-                // wait here instead of retaining every historical image forever.
-                if (context != nullptr && !context->waitForSubmittedFrames()) {
-                    LOG_ERROR("Vulkan UI texture resize could not drain submitted frames: {}",
-                              context->lastError());
-                    return false;
-                }
-                if (!image_vram_label.empty()) {
-                    lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
-                        "vulkan.ui_texture.image",
-                        image_vram_label,
-                        0);
-                }
-                image_barriers.forgetImage(image);
-                if (image_view != VK_NULL_HANDLE) {
-                    vkDestroyImageView(device, image_view, nullptr);
-                }
-                vmaDestroyImage(allocator, image, image_allocation);
-                image = VK_NULL_HANDLE;
-                image_view = VK_NULL_HANDLE;
-                image_allocation = VK_NULL_HANDLE;
-                image_vram_label.clear();
+                releaseRetiredImages(false);
+                retireCurrentImage();
             }
             width = new_width;
             height = new_height;
@@ -606,7 +689,8 @@ namespace lfs::vis::gui {
                                          "ui.texture.cpu[{}x{}].view",
                                          new_width,
                                          new_height);
-            image_barriers.registerImage(image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+            ++image_generation_;
+            image_barriers.registerImage(image, image_generation_, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
 
             if (descriptor_set == VK_NULL_HANDLE) {
                 VkDescriptorSetAllocateInfo alloc_info{};
@@ -668,7 +752,7 @@ namespace lfs::vis::gui {
                                               interop_image,
                                               "vulkan.ui_texture.interop_image",
                                               "rgba8") ||
-                !context->createExternalTimelineSemaphore(0, interop_semaphore)) {
+                !context->createExternalTimelineSemaphore(0, interop_semaphore, "vulkan.ui_texture.interop_semaphore")) {
                 LOG_WARN("Vulkan UI texture interop setup failed: {}", context->lastError());
                 destroyImage();
                 interop_disabled = true;
@@ -719,7 +803,8 @@ namespace lfs::vis::gui {
             image = interop_image.image;
             image_view = interop_image.view;
             image_layout = VK_IMAGE_LAYOUT_GENERAL;
-            image_barriers.registerImage(image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+            ++image_generation_;
+            image_barriers.registerImage(image, image_generation_, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
             mode = Mode::CudaInterop;
 
             // Skip allocating an internal descriptor set: the interop path is consumed via RmlUi
@@ -785,21 +870,25 @@ namespace lfs::vis::gui {
             return true;
         }
 
-        [[nodiscard]] bool uploadRgbaRegion(const std::uint8_t* const rgba,
-                                            const std::size_t rgba_size,
-                                            const int texture_width,
-                                            const int texture_height,
-                                            const int offset_x,
-                                            const int offset_y,
-                                            const int region_width,
-                                            const int region_height) {
-            if (!rgba || rgba_size == 0 || texture_width <= 0 || texture_height <= 0 ||
-                offset_x < 0 || offset_y < 0 || region_width <= 0 || region_height <= 0 ||
-                offset_x + region_width > texture_width ||
-                offset_y + region_height > texture_height ||
-                rgba_size != static_cast<std::size_t>(region_width) *
-                                 static_cast<std::size_t>(region_height) * 4u) {
+        [[nodiscard]] bool uploadRgbaRegions(const std::span<const RgbaRegion> regions) {
+            if (regions.empty())
                 return false;
+
+            const int texture_width = regions.front().texture_width;
+            const int texture_height = regions.front().texture_height;
+            std::size_t total_size = 0;
+            for (const RgbaRegion& region : regions) {
+                if (!region.pixels || region.size == 0 || region.texture_width != texture_width ||
+                    region.texture_height != texture_height || texture_width <= 0 || texture_height <= 0 ||
+                    region.x < 0 || region.y < 0 || region.width <= 0 || region.height <= 0 ||
+                    region.x + region.width > texture_width ||
+                    region.y + region.height > texture_height ||
+                    region.size != static_cast<std::size_t>(region.width) *
+                                       static_cast<std::size_t>(region.height) * 4u ||
+                    total_size > std::numeric_limits<std::size_t>::max() - region.size) {
+                    return false;
+                }
+                total_size += region.size;
             }
             VulkanContext* const ctx = getVulkanUiTextureContext();
             if (!ctx || !init(*ctx)) {
@@ -815,7 +904,7 @@ namespace lfs::vis::gui {
                 return false;
             }
 
-            const VkDeviceSize upload_size = static_cast<VkDeviceSize>(rgba_size);
+            const VkDeviceSize upload_size = static_cast<VkDeviceSize>(total_size);
             VkBuffer staging_buffer = VK_NULL_HANDLE;
             VmaAllocation staging_allocation = VK_NULL_HANDLE;
             if (!createBuffer(upload_size,
@@ -825,8 +914,35 @@ namespace lfs::vis::gui {
                 return false;
             }
 
-            if (!writeAllocation(staging_allocation, rgba, upload_size)) {
+            void* mapped = nullptr;
+            if (vmaMapMemory(allocator, staging_allocation, &mapped) != VK_SUCCESS || !mapped) {
                 LOG_ERROR("Failed to map Vulkan UI texture staging memory");
+                vmaDestroyBuffer(allocator, staging_buffer, staging_allocation);
+                return false;
+            }
+            std::vector<VkBufferImageCopy> copy_regions;
+            copy_regions.reserve(regions.size());
+            VkDeviceSize buffer_offset = 0;
+            for (const RgbaRegion& region : regions) {
+                std::memcpy(static_cast<std::uint8_t*>(mapped) + buffer_offset,
+                            region.pixels,
+                            region.size);
+                VkBufferImageCopy& copy = copy_regions.emplace_back();
+                copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copy.imageSubresource.mipLevel = 0;
+                copy.imageSubresource.baseArrayLayer = 0;
+                copy.imageSubresource.layerCount = 1;
+                copy.bufferOffset = buffer_offset;
+                copy.imageOffset = {region.x, region.y, 0};
+                copy.imageExtent = {static_cast<std::uint32_t>(region.width),
+                                    static_cast<std::uint32_t>(region.height),
+                                    1};
+                buffer_offset += static_cast<VkDeviceSize>(region.size);
+            }
+            const VkResult flush_result = vmaFlushAllocation(allocator, staging_allocation, 0, upload_size);
+            vmaUnmapMemory(allocator, staging_allocation);
+            if (flush_result != VK_SUCCESS) {
+                LOG_ERROR("Failed to flush Vulkan UI texture staging memory");
                 vmaDestroyBuffer(allocator, staging_buffer, staging_allocation);
                 return false;
             }
@@ -839,21 +955,12 @@ namespace lfs::vis::gui {
 
             transitionImageLayout(command_buffer, image_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-            VkBufferImageCopy copy_region{};
-            copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copy_region.imageSubresource.mipLevel = 0;
-            copy_region.imageSubresource.baseArrayLayer = 0;
-            copy_region.imageSubresource.layerCount = 1;
-            copy_region.imageOffset = {offset_x, offset_y, 0};
-            copy_region.imageExtent = {static_cast<std::uint32_t>(region_width),
-                                       static_cast<std::uint32_t>(region_height),
-                                       1};
             vkCmdCopyBufferToImage(command_buffer,
                                    staging_buffer,
                                    image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                   1,
-                                   &copy_region);
+                                   static_cast<std::uint32_t>(copy_regions.size()),
+                                   copy_regions.data());
 
             transitionImageLayout(command_buffer,
                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -880,7 +987,7 @@ namespace lfs::vis::gui {
             submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit_info.commandBufferCount = 1;
             submit_info.pCommandBuffers = &command_buffer;
-            const VkResult submit_status = vkQueueSubmit(graphics_queue, 1, &submit_info, fence);
+            const VkResult submit_status = lfs::rendering::vk_queue_submit_synced(graphics_queue, 1, &submit_info, fence);
             if (submit_status != VK_SUCCESS) {
                 LOG_ERROR("Failed to submit Vulkan UI texture upload: {}",
                           static_cast<int>(submit_status));
@@ -897,6 +1004,27 @@ namespace lfs::vis::gui {
             return true;
         }
 
+        [[nodiscard]] bool uploadRgbaRegion(const std::uint8_t* const rgba,
+                                            const std::size_t rgba_size,
+                                            const int texture_width,
+                                            const int texture_height,
+                                            const int offset_x,
+                                            const int offset_y,
+                                            const int region_width,
+                                            const int region_height) {
+            const RgbaRegion region{
+                .pixels = rgba,
+                .size = rgba_size,
+                .texture_width = texture_width,
+                .texture_height = texture_height,
+                .x = offset_x,
+                .y = offset_y,
+                .width = region_width,
+                .height = region_height,
+            };
+            return uploadRgbaRegions(std::span<const RgbaRegion>(&region, 1));
+        }
+
         [[nodiscard]] bool uploadRgba(const std::vector<std::uint8_t>& rgba,
                                       const int new_width,
                                       const int new_height) {
@@ -904,7 +1032,40 @@ namespace lfs::vis::gui {
                                     0, 0, new_width, new_height);
         }
 
-        [[nodiscard]] bool uploadRegion(const std::uint8_t* pixels,
+        [[nodiscard]] bool uploadRegions(const std::span<const VulkanUiTexture::Region> regions) {
+            if (regions.empty())
+                return false;
+
+            std::vector<std::vector<std::uint8_t>> rgba_regions;
+            rgba_regions.reserve(regions.size());
+            std::vector<RgbaRegion> upload_regions;
+            upload_regions.reserve(regions.size());
+            for (const VulkanUiTexture::Region& region : regions) {
+                if (!region.pixels || region.width <= 0 || region.height <= 0 ||
+                    region.channels <= 0 || region.channels > 4) {
+                    return false;
+                }
+                rgba_regions.push_back(toRgba(region.pixels,
+                                              region.width,
+                                              region.height,
+                                              region.channels));
+                if (rgba_regions.back().empty())
+                    return false;
+                upload_regions.push_back({
+                    .pixels = rgba_regions.back().data(),
+                    .size = rgba_regions.back().size(),
+                    .texture_width = region.texture_width,
+                    .texture_height = region.texture_height,
+                    .x = region.x,
+                    .y = region.y,
+                    .width = region.width,
+                    .height = region.height,
+                });
+            }
+            return uploadRgbaRegions(upload_regions);
+        }
+
+        [[nodiscard]] bool uploadRegion(const std::uint8_t* const pixels,
                                         const int texture_width,
                                         const int texture_height,
                                         const int x,
@@ -912,16 +1073,17 @@ namespace lfs::vis::gui {
                                         const int region_width,
                                         const int region_height,
                                         const int channels) {
-            if (!pixels || region_width <= 0 || region_height <= 0 || channels <= 0 || channels > 4) {
-                return false;
-            }
-            const std::vector<std::uint8_t> rgba = toRgba(pixels, region_width, region_height, channels);
-            return uploadRgbaRegion(rgba.data(), rgba.size(), texture_width,
-                                    texture_height,
-                                    x,
-                                    y,
-                                    region_width,
-                                    region_height);
+            const VulkanUiTexture::Region region{
+                .pixels = pixels,
+                .texture_width = texture_width,
+                .texture_height = texture_height,
+                .x = x,
+                .y = y,
+                .width = region_width,
+                .height = region_height,
+                .channels = channels,
+            };
+            return uploadRegions(std::span<const VulkanUiTexture::Region>(&region, 1));
         }
 
         [[nodiscard]] bool upload(const std::uint8_t* pixels,
@@ -942,6 +1104,7 @@ namespace lfs::vis::gui {
 
         void destroyImage() {
             waitAndReleasePendingUpload();
+            releaseRetiredImages(true);
             const bool has_interop_resources =
                 mode == Mode::CudaInterop || interop.valid() ||
                 interop_image.image != VK_NULL_HANDLE ||
@@ -962,7 +1125,7 @@ namespace lfs::vis::gui {
                     }
                 }
                 if (image != VK_NULL_HANDLE) {
-                    image_barriers.forgetImage(image);
+                    image_barriers.forgetImage(image, image_generation_);
                 }
                 interop.reset();
                 if (context) {
@@ -988,7 +1151,7 @@ namespace lfs::vis::gui {
                             image_vram_label,
                             0);
                     }
-                    image_barriers.forgetImage(image);
+                    image_barriers.forgetImage(image, image_generation_);
                     vmaDestroyImage(allocator, image, image_allocation);
                     image = VK_NULL_HANDLE;
                     image_allocation = VK_NULL_HANDLE;
@@ -1075,6 +1238,13 @@ namespace lfs::vis::gui {
         return impl_->uploadRegion(pixels, texture_width, texture_height, x, y, width, height, channels);
     }
 
+    bool VulkanUiTexture::uploadRegions(const std::span<const Region> regions) {
+        if (!impl_) {
+            impl_ = new Impl();
+        }
+        return impl_->uploadRegions(regions);
+    }
+
     bool VulkanUiTexture::upload(const lfs::core::Tensor& image,
                                  const int expected_width,
                                  const int expected_height,
@@ -1082,11 +1252,15 @@ namespace lfs::vis::gui {
         if (!impl_) {
             impl_ = new Impl();
         }
+#if !defined(_WIN32) || !defined(USE_HIP) || !USE_HIP
         if (image.is_valid() && image.device() == lfs::core::Device::CUDA &&
             impl_->mode != Impl::Mode::Cpu) {
             if (impl_->uploadCudaTensorImpl(image, expected_width, expected_height, flip_y))
                 return true;
         }
+#endif
+        // Windows HIP uses host uploads for UI thumbnails because imported image
+        // surfaces are unreliable; viewport images use shared GPU buffers instead.
         const std::vector<std::uint8_t> rgba = tensorToRgba(image, expected_width, expected_height, flip_y);
         return impl_->uploadRgba(rgba, expected_width, expected_height);
     }

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <functional>
 #include <span>
@@ -43,6 +44,11 @@ namespace lfs::io {
 
         inline std::string normalize_lookup_key(const fs::path& value) {
             return normalize_lookup_key(lfs::core::path_to_utf8(value.lexically_normal()));
+        }
+
+        inline std::string raw_lookup_key(const fs::path& value) {
+            const auto utf8 = value.generic_u8string();
+            return {utf8.begin(), utf8.end()};
         }
 
         inline void throw_if_scan_cancel_requested(const CancelCallback& cancel_requested,
@@ -93,6 +99,20 @@ namespace lfs::io {
         ".tiff",
     };
 
+    // Priors may use any resolution, with up to 1% aspect-ratio rounding error.
+    [[nodiscard]] inline bool sidecar_dimensions_match_contract(
+        const int sidecar_width,
+        const int sidecar_height,
+        const int requested_width,
+        const int requested_height) noexcept {
+        if (requested_width <= 0 || requested_height <= 0 || sidecar_width <= 0 || sidecar_height <= 0) {
+            return false;
+        }
+        const double ratio = (static_cast<double>(sidecar_width) * requested_height) /
+                             (static_cast<double>(sidecar_height) * requested_width);
+        return std::abs(ratio - 1.0) <= 0.01;
+    }
+
     // Safe filesystem operations that don't throw
     inline bool safe_exists(const fs::path& path) {
         std::error_code ec;
@@ -102,6 +122,11 @@ namespace lfs::io {
     inline bool safe_is_directory(const fs::path& path) {
         std::error_code ec;
         return fs::is_directory(path, ec);
+    }
+
+    inline bool safe_is_regular_file(const fs::path& path) {
+        std::error_code ec;
+        return fs::is_regular_file(path, ec);
     }
 
     // Case-insensitive file finding
@@ -188,8 +213,13 @@ namespace lfs::io {
                 if (rel.empty())
                     continue;
 
+                raw_entries_.emplace(detail::raw_lookup_key(rel), entry.path());
+
                 const std::string rel_key = detail::normalize_lookup_key(rel);
-                exact_entries_.emplace(rel_key, entry.path());
+                if (auto [it_exact, inserted] = exact_entries_.emplace(rel_key, entry.path());
+                    !inserted && it_exact->second != entry.path()) {
+                    ambiguous_exact_.insert(rel_key);
+                }
 
                 const std::string basename_key =
                     detail::normalize_lookup_key(entry.path().filename());
@@ -200,7 +230,7 @@ namespace lfs::io {
                 }
 
                 if (const std::string digit_key =
-                        trailing_digit_run(entry.path().stem().string());
+                        trailing_digit_run(lfs::core::path_to_utf8(entry.path().stem()));
                     !digit_key.empty()) {
                     if (auto [it_digits, inserted] =
                             digit_entries_.emplace(digit_key, entry.path());
@@ -240,16 +270,32 @@ namespace lfs::io {
             return {};
         }
 
-        [[nodiscard]] FileLookupResult lookup(const fs::path& relative_or_name) const {
+        [[nodiscard]] FileLookupResult lookup_exact(const fs::path& relative_or_name) const {
             if (relative_or_name.empty())
                 return {};
 
+            if (auto it = raw_entries_.find(detail::raw_lookup_key(relative_or_name));
+                it != raw_entries_.end()) {
+                return FileLookupResult{LookupStatus::Found, it->second};
+            }
+
             const std::string exact_key =
                 detail::normalize_lookup_key(relative_or_name);
+            if (ambiguous_exact_.contains(exact_key))
+                return FileLookupResult{LookupStatus::Ambiguous, {}};
             if (auto it = exact_entries_.find(exact_key);
                 it != exact_entries_.end()) {
                 return FileLookupResult{LookupStatus::Found, it->second};
             }
+
+            return {};
+        }
+
+        [[nodiscard]] FileLookupResult lookup(const fs::path& relative_or_name) const {
+            if (relative_or_name.empty())
+                return {};
+            if (auto result = lookup_exact(relative_or_name); result.status != LookupStatus::NotFound)
+                return result;
 
             const std::string basename_key =
                 detail::normalize_lookup_key(relative_or_name.filename());
@@ -272,8 +318,10 @@ namespace lfs::io {
         }
 
     private:
+        std::unordered_map<std::string, fs::path> raw_entries_;
         std::unordered_map<std::string, fs::path> exact_entries_;
         std::unordered_map<std::string, fs::path> basename_entries_;
+        std::unordered_set<std::string> ambiguous_exact_;
         std::unordered_set<std::string> ambiguous_basenames_;
         std::unordered_map<std::string, fs::path> digit_entries_;
         std::unordered_set<std::string> ambiguous_digits_;
@@ -330,6 +378,20 @@ namespace lfs::io {
 
             const std::vector<fs::path> lookup_keys = build_lookup_keys(image_name);
             bool saw_ambiguous_match = false;
+
+            // Check every relative-path/extension candidate before considering a
+            // basename match, which may belong to a different camera subfolder.
+            for (const auto& dir_index : dir_indices_) {
+                for (const auto& key : lookup_keys) {
+                    if (auto result = dir_index.lookup_exact(key); result.found()) {
+                        return result;
+                    } else if (result.ambiguous()) {
+                        saw_ambiguous_match = true;
+                    }
+                }
+            }
+            if (saw_ambiguous_match)
+                return FileLookupResult{LookupStatus::Ambiguous, {}};
 
             for (const auto& dir_index : dir_indices_) {
                 for (const auto& key : lookup_keys) {
@@ -432,7 +494,7 @@ namespace lfs::io {
             // not apply (e.g. several sidecar kinds per frame), so it degrades
             // to "no match" instead of failing the dataset.
             const std::string digit_key = RecursiveFileCache::trailing_digit_run(
-                lfs::core::utf8_to_path(image_name).stem().string());
+                lfs::core::path_to_utf8(lfs::core::utf8_to_path(image_name).stem()));
             for (const auto& dir_index : dir_indices_) {
                 if (auto result = dir_index.lookup_by_digit_suffix(digit_key); result.found()) {
                     return result;

@@ -3,17 +3,22 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "window_manager.hpp"
+#include "core/environment.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "input/input_controller.hpp"
 #include "input/sdl_key_mapping.hpp"
 #include "rendering/cuda_vulkan_interop.hpp"
 #include "vulkan_context.hpp"
 #include "vulkan_loader_probe.hpp"
+#include "window_state_utils.hpp"
 #include <SDL3/SDL.h>
 #if defined(__linux__)
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <dlfcn.h>
+#include <unistd.h>
 #endif
 #include <algorithm>
 #include <cmath>
@@ -30,6 +35,8 @@ namespace lfs::vis {
         constexpr int kResizeBorder = 6;
         constexpr int kMinWindowWidth = 640;
         constexpr int kMinWindowHeight = 360;
+        constexpr int kMinimumVisibleWindowWidth = 96;
+        constexpr int kMinimumVisibleWindowHeight = 64;
 #if defined(_WIN32)
         constexpr bool kUseManualBorderlessResize = true;
 #else
@@ -40,6 +47,75 @@ namespace lfs::vis {
         constexpr unsigned kResizeTop = 1u << 2;
         constexpr unsigned kResizeBottom = 1u << 3;
 
+        std::vector<WindowRectangle> availableDisplayRectangles() {
+            int display_count = 0;
+            SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
+            if (!displays)
+                return {};
+
+            std::vector<WindowRectangle> rectangles;
+            rectangles.reserve(static_cast<std::size_t>(std::max(0, display_count)));
+            for (int display = 0; display < display_count; ++display) {
+                SDL_Rect bounds{};
+                if (!SDL_GetDisplayUsableBounds(displays[display], &bounds) &&
+                    !SDL_GetDisplayBounds(displays[display], &bounds))
+                    continue;
+                rectangles.push_back({bounds.x, bounds.y, bounds.w, bounds.h});
+            }
+            SDL_free(displays);
+            return rectangles;
+        }
+
+        WindowRectangle centeredWindowRectangleOnPrimaryDisplay(const int width,
+                                                                const int height) {
+            WindowRectangle target{0, 0, width, height};
+            SDL_Rect available{};
+            const SDL_DisplayID primary_display = SDL_GetPrimaryDisplay();
+            if (primary_display &&
+                (SDL_GetDisplayUsableBounds(primary_display, &available) ||
+                 SDL_GetDisplayBounds(primary_display, &available)) &&
+                available.w > 0 && available.h > 0) {
+                return centerWindowOnDisplay(
+                    target, {available.x, available.y, available.w, available.h},
+                    kMinWindowWidth, kMinWindowHeight);
+            }
+
+            target.x = SDL_WINDOWPOS_CENTERED;
+            target.y = SDL_WINDOWPOS_CENTERED;
+            return target;
+        }
+
+        void sanitizeInitialWindowState(WindowManager::PersistentWindowState& state) {
+            const WindowRectangle saved{state.x, state.y, state.width, state.height};
+            SDL_Rect fallback{};
+            const SDL_DisplayID primary_display = SDL_GetPrimaryDisplay();
+            if (primary_display &&
+                (SDL_GetDisplayUsableBounds(primary_display, &fallback) ||
+                 SDL_GetDisplayBounds(primary_display, &fallback))) {
+                const auto recovered = recoverWindowRectangle(
+                    saved, availableDisplayRectangles(),
+                    {fallback.x, fallback.y, fallback.w, fallback.h},
+                    kMinimumVisibleWindowWidth, kMinimumVisibleWindowHeight,
+                    kMinWindowWidth, kMinWindowHeight);
+                if (recovered == saved)
+                    return;
+                state.x = recovered.x;
+                state.y = recovered.y;
+                state.width = recovered.width;
+                state.height = recovered.height;
+                LOG_WARN("Saved window geometry does not fit the available displays; recovered to {}x{} at {},{}",
+                         state.width, state.height, state.x, state.y);
+            } else {
+                if (windowRectangleVisible(saved, availableDisplayRectangles(),
+                                           kMinimumVisibleWindowWidth,
+                                           kMinimumVisibleWindowHeight))
+                    return;
+                state.x = SDL_WINDOWPOS_CENTERED;
+                state.y = SDL_WINDOWPOS_CENTERED;
+                LOG_WARN("Saved window geometry is outside all displays; using SDL default positioning");
+            }
+        }
+
         void configureValidationLayerSearchPath() {
 #ifdef LFS_VULKAN_VALIDATION_LAYER_DIR
 #ifdef _WIN32
@@ -48,22 +124,22 @@ namespace lfs::vis {
             constexpr char path_separator = ':';
 #endif
             std::string layer_path = LFS_VULKAN_VALIDATION_LAYER_DIR;
-            if (const char* const existing_path = std::getenv("VK_ADD_LAYER_PATH");
-                existing_path && *existing_path) {
+            if (const auto existing_path = lfs::core::environment::value("VK_ADD_LAYER_PATH")) {
                 layer_path += path_separator;
-                layer_path += existing_path;
+                layer_path += *existing_path;
             }
 
 #ifdef _WIN32
-            const bool configured = _putenv_s("VK_ADD_LAYER_PATH", layer_path.c_str()) == 0;
+            const bool configured = SetEnvironmentVariableW(
+                                        L"VK_ADD_LAYER_PATH",
+                                        lfs::core::utf8_to_wstring(layer_path).c_str()) != 0;
 #else
             const bool configured = ::setenv("VK_ADD_LAYER_PATH", layer_path.c_str(), 1) == 0;
 #endif
             if (!configured) {
                 LOG_WARN("Failed to configure the pinned Vulkan validation layer path");
-            } else if (const char* const override_path = std::getenv("VK_LAYER_PATH");
-                       override_path && *override_path) {
-                LOG_WARN("VK_LAYER_PATH overrides the pinned Vulkan validation layer path: {}", override_path);
+            } else if (const auto override_path = lfs::core::environment::value("VK_LAYER_PATH")) {
+                LOG_WARN("VK_LAYER_PATH overrides the pinned Vulkan validation layer path: {}", *override_path);
             } else {
                 LOG_INFO("Vulkan validation layer path: {}", LFS_VULKAN_VALIDATION_LAYER_DIR);
             }
@@ -349,6 +425,82 @@ namespace lfs::vis {
             }
 #endif
         }
+
+#if defined(__linux__)
+        // Xlib handlers for external window destruction (e.g. xdotool windowclose / XDestroyWindow).
+        // Resolved via dlsym so we do not add a hard link requirement beyond what SDL already loads.
+        // Handlers run on the event-pump thread; plain stores match the should_close_ convention.
+        WindowManager* g_x11_error_owner = nullptr;
+        unsigned long g_x11_main_window_id = 0;
+        unsigned g_x11_error_main_count = 0;
+        unsigned g_x11_error_other_count = 0;
+        bool g_x11_io_error_logged = false;
+
+        using XErrorHandlerFn = int (*)(Display*, XErrorEvent*);
+        using XIOErrorHandlerFn = int (*)(Display*);
+        using XSetErrorHandlerFn = XErrorHandlerFn (*)(XErrorHandlerFn);
+        using XSetIOErrorHandlerFn = XIOErrorHandlerFn (*)(XIOErrorHandlerFn);
+
+        bool g_x11_handlers_installed = false;
+        XErrorHandlerFn g_x11_previous_error_handler = nullptr;
+        XIOErrorHandlerFn g_x11_previous_io_error_handler = nullptr;
+
+        int x11ErrorHandler(Display* /*display*/, XErrorEvent* event) {
+            if (!event) {
+                return 0;
+            }
+
+            const unsigned long resource_id = static_cast<unsigned long>(event->resourceid);
+            // Unknown main-window id must not force-exit on unrelated errors;
+            // those errors take the swallow branch instead.
+            const bool is_main_window =
+                g_x11_main_window_id != 0 && resource_id == g_x11_main_window_id;
+
+            if (is_main_window) {
+                ++g_x11_error_main_count;
+                if (g_x11_error_main_count == 1) {
+                    LOG_WARN(
+                        "X11 error on main window (error={}, request={}.{}, resourceid=0x{:x}, serial={}); "
+                        "requesting clean shutdown (further main-window X errors suppressed)",
+                        event->error_code,
+                        event->request_code,
+                        event->minor_code,
+                        resource_id,
+                        event->serial);
+                }
+                // Window is already gone: requestClose alone is cancelled by the exit-confirm UI.
+                // ForceExit is the census-clean path that skips confirmation (same as requestApplicationClose).
+                if (g_x11_error_owner) {
+                    g_x11_error_owner->requestClose();
+                }
+                lfs::core::events::cmd::ForceExit{}.emit();
+            } else {
+                ++g_x11_error_other_count;
+                if (g_x11_error_other_count == 1) {
+                    LOG_WARN(
+                        "X11 error on non-main resource (error={}, request={}.{}, resourceid=0x{:x}, "
+                        "serial={}, main_window=0x{:x}); swallowing (further non-main X errors suppressed)",
+                        event->error_code,
+                        event->request_code,
+                        event->minor_code,
+                        resource_id,
+                        event->serial,
+                        g_x11_main_window_id);
+                }
+            }
+            // Swallow: do not chain to the previous handler (_XDefaultError calls exit()).
+            return 0;
+        }
+
+        int x11IOErrorHandler(Display* /*display*/) {
+            // Teardown cannot run against a dead display and Python atexit finalization is unsafe here; _exit skips both.
+            if (!g_x11_io_error_logged) {
+                g_x11_io_error_logged = true;
+                LOG_ERROR("X11 IO error: display connection dead; aborting without teardown");
+            }
+            _exit(1);
+        }
+#endif
     } // namespace
 
     void* WindowManager::callback_handler_ = nullptr;
@@ -366,11 +518,142 @@ namespace lfs::vis {
     }
 
     WindowManager::~WindowManager() {
+#if defined(__linux__)
+        if (g_x11_error_owner == this) {
+            g_x11_error_owner = nullptr;
+        }
+#endif
         vulkan_context_.reset();
         if (window_) {
             SDL_DestroyWindow(window_);
         }
         SDL_Quit();
+#if defined(__linux__)
+        // Restore after SDL teardown so our swallow handler covers Xlib calls against an
+        // externally destroyed window; XSetErrorHandler is display-independent.
+        if (g_x11_handlers_installed) {
+            const auto set_error_handler =
+                reinterpret_cast<XSetErrorHandlerFn>(::dlsym(RTLD_DEFAULT, "XSetErrorHandler"));
+            const auto set_io_error_handler =
+                reinterpret_cast<XSetIOErrorHandlerFn>(::dlsym(RTLD_DEFAULT, "XSetIOErrorHandler"));
+            if (set_error_handler) {
+                set_error_handler(g_x11_previous_error_handler);
+            }
+            if (set_io_error_handler) {
+                set_io_error_handler(g_x11_previous_io_error_handler);
+            }
+            g_x11_handlers_installed = false;
+        }
+#endif
+    }
+
+    void WindowManager::installX11ErrorHandlers() {
+#if defined(__linux__)
+        const char* const video_driver = SDL_GetCurrentVideoDriver();
+        if (!video_driver || std::strcmp(video_driver, "x11") != 0) {
+            return;
+        }
+
+        const auto set_error_handler =
+            reinterpret_cast<XSetErrorHandlerFn>(::dlsym(RTLD_DEFAULT, "XSetErrorHandler"));
+        const auto set_io_error_handler =
+            reinterpret_cast<XSetIOErrorHandlerFn>(::dlsym(RTLD_DEFAULT, "XSetIOErrorHandler"));
+        if (!set_error_handler || !set_io_error_handler) {
+            LOG_DEBUG("X11 error handler symbols unavailable via dlsym; skipping install");
+            return;
+        }
+
+        g_x11_error_owner = this;
+        g_x11_main_window_id = 0;
+        g_x11_error_main_count = 0;
+        g_x11_error_other_count = 0;
+        g_x11_io_error_logged = false;
+        Display* display = nullptr;
+        ::Window xwindow = 0;
+        if (getX11WindowHandle(window_, display, xwindow)) {
+            g_x11_main_window_id = static_cast<unsigned long>(xwindow);
+        } else {
+            LOG_WARN("X11 main window id unresolved; X errors will be swallowed, not escalated");
+        }
+
+        g_x11_previous_error_handler = set_error_handler(x11ErrorHandler);
+        g_x11_previous_io_error_handler = set_io_error_handler(x11IOErrorHandler);
+        g_x11_handlers_installed = true;
+        LOG_DEBUG("Installed X11 error handlers (main window id=0x{:x})", g_x11_main_window_id);
+#endif
+    }
+
+    void WindowManager::setInitialWindowState(PersistentWindowState state) {
+        if (state.width <= 0 || state.height <= 0)
+            return;
+        initial_window_state_ = state;
+    }
+
+    WindowManager::PersistentWindowState WindowManager::persistentWindowState() const {
+        PersistentWindowState state;
+        state.maximized = isMaximized();
+        if (!window_)
+            return state;
+
+        // Fullscreen is process-local presentation state. Persist the last
+        // windowed rectangle instead so the next launch never inherits the
+        // fullscreen display dimensions as ordinary window geometry.
+        if (is_fullscreen_) {
+            const auto restore_position = is_borderless_maximized_
+                                              ? borderless_restore_pos_
+                                              : windowed_pos_;
+            const auto restore_size = is_borderless_maximized_
+                                          ? borderless_restore_size_
+                                          : windowed_size_;
+            state.x = restore_position.x;
+            state.y = restore_position.y;
+            state.width = restore_size.x;
+            state.height = restore_size.y;
+            return state;
+        }
+
+        if (is_borderless_maximized_) {
+            state.x = borderless_restore_pos_.x;
+            state.y = borderless_restore_pos_.y;
+            state.width = borderless_restore_size_.x;
+            state.height = borderless_restore_size_.y;
+            return state;
+        }
+
+        SDL_GetWindowPosition(window_, &state.x, &state.y);
+        SDL_GetWindowSize(window_, &state.width, &state.height);
+        return state;
+    }
+
+    bool WindowManager::resetPersistentWindowState() {
+        initial_window_state_.reset();
+        if (!window_)
+            return true;
+
+        if (is_fullscreen_)
+            setFullscreen(false);
+        if (isMaximized())
+            restoreMaximized("reset-persistent-window-state");
+        if (is_fullscreen_ || isMaximized()) {
+            LOG_WARN("Failed to restore the window before resetting its persistent geometry");
+            return false;
+        }
+
+        const WindowRectangle target = centeredWindowRectangleOnPrimaryDisplay(1280, 720);
+
+        const bool size_set = SDL_SetWindowSize(window_, target.width, target.height);
+        const bool position_set = SDL_SetWindowPosition(window_, target.x, target.y);
+        if (!size_set || !position_set) {
+            LOG_WARN("Failed to reset window geometry to {}x{} at {},{}: {}",
+                     target.width, target.height, target.x, target.y, SDL_GetError());
+            return false;
+        }
+
+        borderless_restore_pos_ = {target.x, target.y};
+        borderless_restore_size_ = {target.width, target.height};
+        updateWindowSize("reset-persistent-window-state", ResizeIntent::Exact);
+        wakeEventLoop();
+        return true;
     }
 
     void WindowManager::setInputController(InputController* ic) {
@@ -428,6 +711,10 @@ namespace lfs::vis {
             LOG_DEBUG("Using X11 native titlebar move for borderless window drag");
         }
 
+        // After SDL video init + window create: swallow BadWindow when the WM destroys our X11
+        // window out from under SDL, and request a clean app shutdown instead of _XDefaultError/exit.
+        installX11ErrorHandlers();
+
         if (!SDL_SetWindowHitTest(window_, borderlessWindowHitTest, this)) {
             LOG_DEBUG("SDL window hit testing unavailable: {}", SDL_GetError());
         }
@@ -437,6 +724,31 @@ namespace lfs::vis {
             const int xpos = monitor_pos_.x + (monitor_size_.x - window_size_.x) / 2;
             const int ypos = monitor_pos_.y + (monitor_size_.y - window_size_.y) / 2;
             SDL_SetWindowPosition(window_, xpos, ypos);
+        }
+
+        if (initial_window_state_) {
+            auto state = *initial_window_state_;
+            sanitizeInitialWindowState(state);
+            const bool position_set = SDL_SetWindowPosition(window_, state.x, state.y);
+            const bool size_set = SDL_SetWindowSize(window_, state.width, state.height);
+            if (!position_set || !size_set) {
+                LOG_WARN("Failed to restore saved window geometry {}x{} at {},{}: {}",
+                         state.width, state.height, state.x, state.y, SDL_GetError());
+            } else if (state.maximized) {
+                saveBorderlessRestoreGeometry();
+                maximizeBorderless("restore-saved-window-state", false);
+            }
+        } else if (monitor_size_.x <= 0 || monitor_size_.y <= 0) {
+            const auto target = centeredWindowRectangleOnPrimaryDisplay(
+                window_size_.x, window_size_.y);
+            const bool size_set = SDL_SetWindowSize(window_, target.width, target.height);
+            const bool position_set = SDL_SetWindowPosition(window_, target.x, target.y);
+            if (!size_set || !position_set) {
+                LOG_WARN("Failed to apply initial window geometry {}x{} at {},{}: {}",
+                         target.width, target.height, target.x, target.y, SDL_GetError());
+            } else {
+                window_size_ = {target.width, target.height};
+            }
         }
 
         int fb_w = 0;
@@ -543,14 +855,6 @@ namespace lfs::vis {
             return false;
         }
         return std::chrono::steady_clock::now() - last_window_size_change_time_ <= max_age;
-    }
-
-    void WindowManager::swapBuffers() {
-        if (vulkan_context_) {
-            if (!vulkan_context_->presentBootstrapFrame(0.11f, 0.11f, 0.14f, 1.0f)) {
-                LOG_WARN("Vulkan bootstrap present failed: {}", vulkan_context_->lastError());
-            }
-        }
     }
 
     void WindowManager::pollEvents() {
@@ -846,6 +1150,8 @@ namespace lfs::vis {
         }
 
         case SDL_EVENT_DROP_FILE:
+            LOG_DEBUG("SDL drop file: window={} data={}", event.drop.windowID,
+                      event.drop.data ? event.drop.data : "(null)");
             if (!eventTargetsWindow(event, main_window_id))
                 break;
             if (event.drop.data) {
@@ -853,7 +1159,20 @@ namespace lfs::vis {
             }
             break;
 
+        case SDL_EVENT_DROP_TEXT:
+            // A file drag that reached us as text (e.g. an X11 source offering
+            // text/plain ahead of text/uri-list) carries no usable file list.
+            LOG_DEBUG("SDL drop text ignored: window={} text={}", event.drop.windowID,
+                      event.drop.data ? event.drop.data : "(null)");
+            break;
+
+        case SDL_EVENT_DROP_BEGIN:
+            LOG_DEBUG("SDL drop begin: window={}", event.drop.windowID);
+            break;
+
         case SDL_EVENT_DROP_COMPLETE:
+            LOG_DEBUG("SDL drop complete: window={} pending_files={}", event.drop.windowID,
+                      pending_drop_files_.size());
             if (!eventTargetsWindow(event, main_window_id))
                 break;
             if (input_controller_ && !pending_drop_files_.empty()) {
@@ -1178,6 +1497,8 @@ namespace lfs::vis {
         frame_input_.mouse_released[1] = false;
         frame_input_.mouse_released[2] = false;
         frame_input_.mouse_wheel = 0.0f;
+        frame_input_.mouse_wheel_x = 0.0f;
+        frame_input_.mouse_button_events.clear();
         frame_input_.mouse_moved = false;
     }
 
@@ -1264,6 +1585,16 @@ namespace lfs::vis {
             return;
         }
 
+#if !defined(_WIN32)
+        // The WM may maximize a window that already spans the work area (e.g.
+        // auto-maximize at map). Undoing that shrinks the window to a WM-invented
+        // restore size; accept the native maximize state instead.
+        if (is_borderless_maximized_) {
+            updateWindowSize(reason, ResizeIntent::Exact);
+            return;
+        }
+#endif
+
         bool restored_sdl_maximize = false;
         if (isSdlMaximized()) {
             if (!SDL_RestoreWindow(window_)) {
@@ -1318,11 +1649,10 @@ namespace lfs::vis {
             return;
         }
 
-        SDL_Rect target_bounds = usable_bounds;
-        // Keep work-area dimensions so taskbars stay visible. Ask for the
-        // display top; some WMs may still clamp managed windows to work-area y.
-        target_bounds.y = display_bounds.y;
-        target_bounds.h = std::min(usable_bounds.h, display_bounds.h);
+        // Borderless windows are not constrained by the native non-client area.
+        // Respect the complete work area, including its origin: a top taskbar or
+        // desktop dock moves usable_bounds.y below display_bounds.y.
+        const SDL_Rect target_bounds = usable_bounds;
 
         const bool size_set = SDL_SetWindowSize(window_, target_bounds.w, target_bounds.h);
         const bool position_set = SDL_SetWindowPosition(window_, target_bounds.x, target_bounds.y);

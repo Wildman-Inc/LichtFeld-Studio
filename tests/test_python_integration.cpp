@@ -155,9 +155,49 @@ namespace {
         std::expected<void, std::string> startTraining() override {
             return std::unexpected("not implemented");
         }
-        std::expected<std::filesystem::path, std::string> saveCheckpoint(
-            const std::optional<std::filesystem::path>&) override {
-            return std::unexpected("not implemented");
+        lfs::Result<void> projectSave(bool) override {
+            return {};
+        }
+        lfs::Result<void> projectSaveAs(
+            const std::filesystem::path&, bool) override {
+            return {};
+        }
+        lfs::Result<void> projectCreateAt(
+            const std::filesystem::path&,
+            lfs::vis::ProjectSwitchDisposition,
+            bool = false) override {
+            return {};
+        }
+        lfs::Result<lfs::vis::ProjectOpenOutcome> projectOpen(
+            const std::filesystem::path&,
+            lfs::vis::ProjectSwitchDisposition) override {
+            return project_open_outcome;
+        }
+        lfs::Result<void> projectCompact() override {
+            return {};
+        }
+        lfs::Result<bool> projectIsDirty() override {
+            return false;
+        }
+        lfs::Result<bool> projectHasPath() override {
+            return false;
+        }
+        lfs::Result<lfs::vis::ProjectInfo>
+        projectGetInfo() override {
+            return lfs::vis::ProjectInfo{};
+        }
+        lfs::Result<std::optional<lfs::io::project::ProjectLicense>>
+        projectGetLicense() override {
+            return project_license_;
+        }
+        lfs::Result<void> projectSetLicense(
+            const lfs::io::project::ProjectLicense& license) override {
+            project_license_ = license;
+            return {};
+        }
+        lfs::Result<void> projectClearLicense() override {
+            project_license_.reset();
+            return {};
         }
 
         [[nodiscard]] bool waitForQueuedWork(const std::chrono::milliseconds timeout) {
@@ -185,9 +225,13 @@ namespace {
         bool accepts_posted_work = true;
         bool queue_posted_work = false;
         int post_work_calls = 0;
+        lfs::vis::ProjectOpenOutcome
+            project_open_outcome =
+                lfs::vis::ProjectOpenOutcome::Opened;
 
     private:
         lfs::core::Scene scene_;
+        std::optional<lfs::io::project::ProjectLicense> project_license_;
         std::mutex queued_work_mutex;
         std::condition_variable queued_work_cv;
         std::deque<WorkItem> queued_work;
@@ -456,6 +500,30 @@ namespace {
 TEST_F(PythonIntegrationTest, InitializationSucceeds) {
     // Just verify that initialization doesn't throw
     EXPECT_NO_THROW((void)lfs::python::ensure_initialized());
+}
+
+TEST_F(PythonIntegrationTest, SceneTimeCallbackSupportsSetTickClearAndUnsetTick) {
+    struct SceneTimeCallbackReset {
+        ~SceneTimeCallbackReset() { lfs::python::clear_scene_time_callback(); }
+    } reset;
+
+    lfs::python::clear_scene_time_callback();
+    EXPECT_FALSE(lfs::python::has_scene_time_callback());
+    EXPECT_NO_THROW(lfs::python::tick_scene_time_callback(-1.0f));
+
+    std::vector<float> clip_times;
+    lfs::python::set_scene_time_callback(
+        [&clip_times](const float clip_time) { clip_times.push_back(clip_time); });
+    EXPECT_TRUE(lfs::python::has_scene_time_callback());
+
+    lfs::python::tick_scene_time_callback(0.0f);
+    lfs::python::tick_scene_time_callback(1.25f);
+    EXPECT_EQ(clip_times, (std::vector<float>{0.0f, 1.25f}));
+
+    lfs::python::clear_scene_time_callback();
+    EXPECT_FALSE(lfs::python::has_scene_time_callback());
+    EXPECT_NO_THROW(lfs::python::tick_scene_time_callback(2.0f));
+    EXPECT_EQ(clip_times, (std::vector<float>{0.0f, 1.25f}));
 }
 
 TEST_F(PythonIntegrationTest, ForcedInitFailureLatchesQueryableError) {
@@ -858,6 +926,47 @@ result_values = [float(viewport.image.cpu().sum().item())]
     EXPECT_EQ(viewer.post_work_calls, 1);
 }
 
+TEST_F(PythonIntegrationTest,
+       ProjectOpenSurfacesRecoveryPromptPendingOutcome) {
+    TestVisualizer viewer;
+    viewer.project_open_outcome =
+        lfs::vis::ProjectOpenOutcome::
+            RecoveryPromptPending;
+    const ScopedVisualizer scoped_viewer(&viewer);
+
+    const auto result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+outcome = lf.project_open("pending.licht", discard_changes=True)
+result_shape = (1,)
+result_values = [1.0 if outcome is lf.ProjectOpenOutcome.RECOVERY_PROMPT_PENDING else 0.0]
+)PY");
+
+    ASSERT_EQ(result.values.size(), 1u);
+    EXPECT_FLOAT_EQ(result.values[0], 1.0F);
+    EXPECT_EQ(viewer.post_work_calls, 1);
+}
+
+TEST_F(PythonIntegrationTest, ProjectLicenseRoundTripsThroughBinding) {
+    TestVisualizer viewer;
+    const ScopedVisualizer scoped_viewer(&viewer);
+
+    const auto result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+assert lf.project_get_license() is None
+lf.project_set_license("CC BY-NC", "Use with attribution")
+license = lf.project_get_license()
+set_ok = license == {"identifier": "CC BY-NC", "notice": "Use with attribution"}
+lf.project_clear_license()
+clear_ok = lf.project_get_license() is None
+result_shape = (2,)
+result_values = [1.0 if set_ok else 0.0, 1.0 if clear_ok else 0.0]
+)PY");
+
+    ASSERT_EQ(result.values.size(), 2u);
+    EXPECT_FLOAT_EQ(result.values[0], 1.0F);
+    EXPECT_FLOAT_EQ(result.values[1], 1.0F);
+}
+
 TEST_F(PythonIntegrationTest, CaptureViewportReleasesGilWhileWaitingForViewerThread) {
     using namespace std::chrono_literals;
 
@@ -956,7 +1065,7 @@ TEST_F(PythonIntegrationTest, SceneCameraExposesVisualizerRenderContract) {
 import lichtfeld as lf
 import warnings
 result = lf.io.load(r")PY") +
-                        dataset_dir.string() + R"PY(", resize_factor=8, images_folder="images_8")
+                        dataset_dir.string() + R"PY(", resize_factor=4, images_folder="images_4")
 camera = result.cameras[0]
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always", DeprecationWarning)

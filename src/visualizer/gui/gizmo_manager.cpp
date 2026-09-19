@@ -459,51 +459,6 @@ namespace lfs::vis::gui {
         return false;
     }
 
-    bool GizmoManager::computeCropToolTargetBounds(const core::NodeId target_id,
-                                                   const bool use_percentile,
-                                                   glm::vec3& bounds_min,
-                                                   glm::vec3& bounds_max) const {
-        const auto* const sm = viewer_ ? viewer_->getSceneManager() : nullptr;
-        if (!sm)
-            return false;
-
-        const auto* const node = sm->getScene().getNodeById(target_id);
-        if (!node)
-            return false;
-
-        if (node->type == core::NodeType::SPLAT && node->model && node->model->size() > 0)
-            return core::compute_bounds(*node->model, bounds_min, bounds_max, 0.0f, use_percentile);
-
-        if (node->type == core::NodeType::POINTCLOUD && node->point_cloud && node->point_cloud->size() > 0)
-            return core::compute_bounds(*node->point_cloud, bounds_min, bounds_max, 0.0f, use_percentile);
-
-        return false;
-    }
-
-    void GizmoManager::setCropToolBounds(const core::NodeId target_id,
-                                         const glm::vec3& bounds_min,
-                                         const glm::vec3& bounds_max) {
-        auto* const sm = viewer_ ? viewer_->getSceneManager() : nullptr;
-        if (!sm) {
-            crop_tool_initialized_ = false;
-            crop_tool_target_node_id_ = core::NULL_NODE;
-            clearCropToolOverlayState();
-            return;
-        }
-
-        const glm::vec3 center = (bounds_min + bounds_max) * 0.5f;
-        const glm::vec3 half_size = glm::max((bounds_max - bounds_min) * 0.5f, glm::vec3(MIN_GIZMO_SCALE));
-
-        crop_tool_box_min_ = -half_size;
-        crop_tool_box_max_ = half_size;
-        crop_tool_ellipsoid_radii_ = half_size * 1.732050808f; // sqrt(3): circumscribe the fitted box.
-        crop_tool_visualizer_transform_ =
-            scene_coords::nodeVisualizerWorldTransform(sm->getScene(), target_id) *
-            glm::translate(glm::mat4(1.0f), center);
-        crop_tool_target_node_id_ = target_id;
-        crop_tool_initialized_ = true;
-    }
-
     bool GizmoManager::syncCropToolStateFromNode(const core::NodeId target_id,
                                                  const core::NodeId volume_node_id,
                                                  bool* const changed) {
@@ -907,30 +862,6 @@ namespace lfs::vis::gui {
         return "translate";
     }
 
-    void GizmoManager::fitActiveCropTool(const bool use_percentile) {
-        if (!isVolumeGizmoToolActive())
-            return;
-
-        if (!ensureCropToolState())
-            return;
-
-        glm::vec3 bounds_min(0.0f);
-        glm::vec3 bounds_max(0.0f);
-        if (!computeCropToolTargetBounds(crop_tool_target_node_id_, use_percentile, bounds_min, bounds_max)) {
-            crop_tool_initialized_ = false;
-            crop_tool_target_node_id_ = core::NULL_NODE;
-            crop_tool_volume_node_id_ = core::NULL_NODE;
-            clearCropToolOverlayState();
-            LOG_WARN("Cannot compute bounds for active crop tool target");
-            return;
-        }
-
-        setCropToolBounds(crop_tool_target_node_id_, bounds_min, bounds_max);
-        if (isCropToolActive())
-            (void)persistActiveCropToolToNode(false);
-        updateCropToolOverlayState();
-    }
-
     void GizmoManager::applyActiveCropTool() {
         using namespace lfs::core::events;
 
@@ -1102,8 +1033,13 @@ namespace lfs::vis::gui {
                 break;
             }
 
-            if (auto* gui = viewer_->getGuiManager()) {
-                gui->panelLayout().setShowSequencer(false);
+            // Selecting an editing tool gives the viewport its working space,
+            // but clearing the active tool is a lifecycle operation and must
+            // not mutate the live workspace.
+            if (tool != ToolType::None) {
+                if (auto* gui = viewer_->getGuiManager()) {
+                    gui->panelLayout().setShowSequencer(false);
+                }
             }
         });
 
@@ -1788,6 +1724,7 @@ namespace lfs::vis::gui {
         }
 
         if (gizmo_changed && is_using) {
+            core::Scene::Transaction txn(scene_manager->getScene());
             if (node_gizmo_operation_ == GizmoOperation::Rotate) {
                 const glm::mat3 delta_rot = extractRotation(delta_matrix);
                 // Individual mode uses one drag-defined rotation path for the selection and

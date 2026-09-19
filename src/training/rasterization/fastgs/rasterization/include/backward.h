@@ -31,16 +31,18 @@ namespace fast_lfs::rasterization {
         char* per_primitive_buffers_blob,
         char* per_tile_buffers_blob,
         const uint* sorted_primitive_indices,
+        const uint* primitive_work_indices,
         float* grad_opacity_helper,
         float3* grad_color_helper,
         float2* grad_mean2d_helper,
-        float* grad_conic_helper,
+        float3* grad_conic_helper,
         float* grad_depth_helper,
         float3* grad_normal_helper, // [N] or nullptr, required when grad_normal != nullptr
         float4* grad_w2c,
         float* densification_info,
         const int n_primitives,
         const int n_instances,
+        const int n_visible,
         const int active_sh_bases,
         const int sh_layout_bases,
         const int width,
@@ -52,6 +54,15 @@ namespace fast_lfs::rasterization {
         bool mip_filter,
         DensificationType densification_type,
         FusedAdamSettings fused_adam,
+        // model-truth shN-rest decode binds (fused Adam's copy is
+        // enablement-gated and null during SH warmup).
+        const float2* shN_value_bounds,
+        const uint shN_value_n_cells,
+        const uint shN_value_bits,
+        const bool* mean_step_far_mask,
+        const int mean_step_far_mask_n,
+        const float* edge_weight_map,
+        float* edge_score_out,
         cudaStream_t stream);
 
-}
+} // namespace fast_lfs::rasterization

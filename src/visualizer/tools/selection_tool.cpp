@@ -5,6 +5,7 @@
 #include "tools/selection_tool.hpp"
 #include "geometry/euclidean_transform.hpp"
 #include "gui/gui_focus_state.hpp"
+#include "gui/gui_manager.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "rendering/screen_overlay_renderer.hpp"
@@ -108,6 +109,28 @@ namespace lfs::vis::tools {
         if (auto* const sm = ctx.getSceneManager()) {
             if (auto* const service = sm->getSelectionService()) {
                 auto* const rm = ctx.getRenderingManager();
+                if (const auto* input = InputController::instance();
+                    rm && input && input->isCameraNavigating() &&
+                    !service->isInteractiveSelectionActive()) {
+                    rm->clearCursorPreviewState();
+                    rm->clearPreviewSelection();
+                    return;
+                }
+                const bool passive_hover =
+                    mouse_buttons == 0 &&
+                    !gui::guiFocusState().want_capture_mouse &&
+                    pointInViewportBounds(ctx.getViewportBounds(), last_mouse_pos_);
+                if (rm && rm->getSelectionPreviewMode() == lfs::vis::SelectionPreviewMode::Centers &&
+                    !service->isInteractiveSelectionActive()) {
+                    if (passive_hover) {
+                        const SDL_Keymod kmods = SDL_GetModState();
+                        service->updatePassiveBrushHoverPreview(
+                            last_mouse_pos_, brush_radius_, selectionModeFromModifiers(kmods));
+                    } else if (rm->isCursorPreviewActive()) {
+                        rm->clearCursorPreviewState();
+                    }
+                    return;
+                }
                 const bool passive_ring_mode =
                     rm &&
                     rm->getSelectionPreviewMode() == lfs::vis::SelectionPreviewMode::Rings &&
@@ -123,7 +146,8 @@ namespace lfs::vis::tools {
                         SelectionFilterState filters{};
                         filters.crop_filter = crop_filter_enabled_;
                         filters.depth_filter = depth_filter_enabled_;
-                        filters.restrict_to_selected_nodes = true;
+                        filters.restrict_to_selected_nodes =
+                            restrict_to_selected_nodes_;
                         service->updatePassiveRingHoverPreview(last_mouse_pos_, mode, filters);
                     } else {
                         if (rm->isCursorPreviewActive()) {
@@ -149,6 +173,10 @@ namespace lfs::vis::tools {
             }
         }
 
+        if (preserve_restored_render_state_) {
+            preserve_restored_render_state_ = false;
+            return;
+        }
         if (enabled) {
             applySelectionFilterSettings(*tool_context_);
         } else {
@@ -178,7 +206,8 @@ namespace lfs::vis::tools {
         frustum_half_width_ = std::max(frustum_half_width, 0.05f);
 
         depth_filter_enabled_ = enabled;
-        if (!tool_context_ || !isEnabled()) {
+        if (!tool_context_ || !isEnabled() ||
+            preserve_restored_render_state_) {
             return;
         }
 
@@ -327,7 +356,10 @@ namespace lfs::vis::tools {
             }
         }
 
-        if (mode_name) {
+        const bool hardware_ring_active =
+            tool_context_->getGuiManager() &&
+            tool_context_->getGuiManager()->isHardwareSelectionRingActive();
+        if (mode_name && !hardware_ring_active) {
             char label_buf[32];
             std::snprintf(label_buf, sizeof(label_buf), "%s%s", mode_name, op_suffix);
             const float label_size = t.fonts.large_size;

@@ -8,10 +8,12 @@
 #include "core/reactive/store.hpp"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace lfs::diagnostics {
     struct VramProfilerSnapshot;
@@ -56,6 +58,35 @@ namespace lfs::vis {
             }
         };
 
+        struct LFS_VIS_API PerfHudSnapshot {
+            std::size_t vram_process_bytes = 0;
+            std::size_t vram_used_bytes = 0;
+            std::size_t vram_total_bytes = 0;
+            std::size_t ram_process_bytes = 0;
+            std::size_t ram_used_bytes = 0;
+            std::size_t ram_total_bytes = 0;
+            float gpu_utilization_percent = -1.0f;
+            float process_cpu_percent = -1.0f;
+            std::vector<float> per_core_cpu_percent;
+            float rate = 0.0f;
+            bool gpu_utilization_valid = false;
+            bool cpu_valid = false;
+            bool ledger_valid = false; // false when profiler off → badge unknown (not GAP)
+            bool ledger_closed = false;
+            bool ledger_over = false;
+        };
+
+        struct LFS_VIS_API PerfHud {
+            bool visible = false;
+            bool expanded = true;
+            std::shared_ptr<const PerfHudSnapshot> snapshot;
+
+            [[nodiscard]] bool operator==(const PerfHud& other) const noexcept {
+                return visible == other.visible && expanded == other.expanded &&
+                       snapshot == other.snapshot;
+            }
+        };
+
         struct LFS_VIS_API ImportOverlayState {
             bool active = false;
             bool show_completion = false;
@@ -72,6 +103,38 @@ namespace lfs::vis {
             bool operator==(const ImportOverlayState&) const = default;
         };
 
+        struct LFS_VIS_API AccountState {
+            bool signed_in = false;
+            bool linking = false;
+            bool disconnecting = false;
+            bool membership_required = false;
+            std::string error;
+            std::string label;
+            std::string email;
+            std::string connected_since;
+            std::string tier;
+            std::string tooltip;
+
+            bool operator==(const AccountState&) const = default;
+        };
+
+        struct LFS_VIS_API GalleryState {
+            bool signed_in = false;
+            bool relink_required = false;
+            int active_uploads = 0;
+            int active_downloads = 0;
+            int paused = 0;
+            int attention = 0;
+            int percent = -1;
+            std::string label;
+            std::string detail;
+            std::string tooltip;
+            std::string tone{"idle"};
+            std::uint64_t epoch = 0;
+
+            bool operator==(const GalleryState&) const = default;
+        };
+
         struct LFS_VIS_API VideoExportOverlayState {
             bool active = false;
             float progress = 0.0f;
@@ -86,6 +149,7 @@ namespace lfs::vis {
             bool active = false;
             float progress = 0.0f;
             std::string stage;
+            std::string outcome{"idle"};
             std::string format;
             std::string error;
             std::string path;
@@ -94,6 +158,7 @@ namespace lfs::vis {
                 return active == other.active &&
                        std::abs(progress - other.progress) <= 0.0005f &&
                        stage == other.stage &&
+                       outcome == other.outcome &&
                        format == other.format &&
                        error == other.error &&
                        path == other.path;
@@ -129,6 +194,7 @@ namespace lfs::vis {
             TrainerLoaded,
             EvalPsnr,
             EvalSsim,
+            EvalLpips,
             SceneGeneration,
             SelectionGeneration,
             Fps,
@@ -136,12 +202,14 @@ namespace lfs::vis {
             CameraMetricsValue,
             GTMetricsOverlayConfigValue,
             VramHudValue,
+            PerfHudValue,
             ActiveTool,
             ActiveSubmode,
             TransformSpaceValue,
             PivotModeValue,
             MultiTransformModeValue,
             ImportOverlayStateValue,
+            AccountStateValue,
             VideoExportOverlayStateValue,
             ExportProgressStateValue,
             Mesh2SplatStateValue,
@@ -150,6 +218,7 @@ namespace lfs::vis {
             LanguageGeneration,
             RenderSettingsGeneration,
             ViewportToolbarGeneration,
+            GalleryStateValue,
         };
 
         AppStore();
@@ -167,6 +236,7 @@ namespace lfs::vis {
         lfs::core::reactive::Observable<bool> trainer_loaded;
         lfs::core::reactive::Observable<std::optional<float>> eval_psnr;
         lfs::core::reactive::Observable<std::optional<float>> eval_ssim;
+        lfs::core::reactive::Observable<std::optional<float>> eval_lpips;
         lfs::core::reactive::Observable<std::uint64_t> scene_generation;
         lfs::core::reactive::Observable<std::uint64_t> selection_generation;
         lfs::core::reactive::Observable<float> fps;
@@ -174,12 +244,15 @@ namespace lfs::vis {
         lfs::core::reactive::Observable<std::optional<CameraMetrics>> camera_metrics;
         lfs::core::reactive::Observable<GTMetricsOverlayConfig> gt_metrics_overlay_config;
         lfs::core::reactive::Observable<VramHud> vram_hud;
+        lfs::core::reactive::Observable<PerfHud> perf_hud;
         lfs::core::reactive::Observable<std::string> active_tool;
         lfs::core::reactive::Observable<std::string> active_submode;
         lfs::core::reactive::Observable<int> transform_space;
         lfs::core::reactive::Observable<int> pivot_mode;
         lfs::core::reactive::Observable<int> multi_transform_mode;
         lfs::core::reactive::Observable<ImportOverlayState> import_overlay_state;
+        lfs::core::reactive::Observable<AccountState> account_state;
+        lfs::core::reactive::Observable<GalleryState> gallery_state;
         lfs::core::reactive::Observable<VideoExportOverlayState> video_export_overlay_state;
         lfs::core::reactive::Observable<ExportProgressState> export_progress_state;
         lfs::core::reactive::Observable<TaskProgressState> mesh2splat_state;

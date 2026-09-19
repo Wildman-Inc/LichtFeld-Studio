@@ -33,19 +33,26 @@ namespace lfs::rendering {
         R32Sfloat,
     };
 
+    // GPU-free size check: tensor may be a top-left subrect of a padded import surface.
+    // Returns true when tensor extents are positive and fit within the imported surface.
+    [[nodiscard]] inline bool cudaVulkanTensorFitsImport(
+        const std::uint32_t tensor_width,
+        const std::uint32_t tensor_height,
+        const std::uint32_t import_width,
+        const std::uint32_t import_height) noexcept {
+        return tensor_width > 0 && tensor_height > 0 && tensor_width <= import_width &&
+               tensor_height <= import_height;
+    }
+
     struct CudaVulkanExternalImageImport {
         CudaVulkanExternalHandle memory_handle = kInvalidCudaVulkanExternalHandle;
         std::size_t allocation_size = 0;
         CudaVulkanExtent2D extent{};
         CudaVulkanImageFormat format = CudaVulkanImageFormat::Rgba8Unorm;
         bool dedicated_allocation = false;
-    };
-
-    struct CudaVulkanExternalBufferImport {
-        CudaVulkanExternalHandle memory_handle = kInvalidCudaVulkanExternalHandle;
-        std::size_t allocation_size = 0;
-        std::size_t size = 0;
-        bool dedicated_allocation = false;
+        // Linear RGBA8/R32F storage with row pitch extent.width * 4 bytes.
+        // Vulkan copies this buffer into its image after the upload signal.
+        bool linear_buffer = false;
     };
 
     struct CudaVulkanExternalSemaphoreImport {
@@ -112,8 +119,6 @@ namespace lfs::rendering {
     class CudaVulkanInterop {
     public:
         CudaVulkanInterop() = default;
-        CudaVulkanInterop(CudaVulkanExternalImageImport image,
-                          CudaVulkanExternalSemaphoreImport semaphore);
         ~CudaVulkanInterop();
 
         CudaVulkanInterop(const CudaVulkanInterop&) = delete;
@@ -127,10 +132,9 @@ namespace lfs::rendering {
 
         [[nodiscard]] bool valid() const;
         [[nodiscard]] const std::string& lastError() const { return last_error_; }
-        [[nodiscard]] CudaVulkanExtent2D extent() const { return extent_; }
-        [[nodiscard]] CudaVulkanImageFormat format() const { return format_; }
 
-        // flip_y: when true, vertically mirror the image during the surface copy. The rasterizer
+        // Copies into the imported surface or linear image buffer.
+        // flip_y: when true, vertically mirror the image during the copy. The rasterizer
         // emits images with OpenGL's bottom-left origin (FrameMetadata::flip_y); pass true when
         // the consuming Vulkan image samples top-left (e.g., RmlUi-bound textures).
         [[nodiscard]] bool copyTensorToSurface(const lfs::core::Tensor& tensor,
@@ -145,6 +149,7 @@ namespace lfs::rendering {
 
     private:
         cudaExternalMemory_t cuda_mem_ = nullptr;
+        void* cuda_buffer_ = nullptr;
         cudaMipmappedArray_t cuda_mip_ = nullptr;
         cudaArray_t cuda_array_ = nullptr;
         cudaSurfaceObject_t surface_ = 0;
@@ -192,44 +197,6 @@ namespace lfs::rendering {
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
         mutable std::uint64_t last_signaled_ = 0;
         mutable std::uint64_t last_waited_ = 0;
-        mutable std::string last_error_;
-    };
-
-    class CudaVulkanBufferInterop {
-    public:
-        CudaVulkanBufferInterop() = default;
-        explicit CudaVulkanBufferInterop(CudaVulkanExternalBufferImport buffer);
-        ~CudaVulkanBufferInterop();
-
-        CudaVulkanBufferInterop(const CudaVulkanBufferInterop&) = delete;
-        CudaVulkanBufferInterop& operator=(const CudaVulkanBufferInterop&) = delete;
-        CudaVulkanBufferInterop(CudaVulkanBufferInterop&& other) noexcept;
-        CudaVulkanBufferInterop& operator=(CudaVulkanBufferInterop&& other) noexcept;
-
-        [[nodiscard]] bool init(CudaVulkanExternalBufferImport buffer);
-        void reset();
-
-        [[nodiscard]] bool valid() const;
-        [[nodiscard]] const std::string& lastError() const { return last_error_; }
-        [[nodiscard]] void* devicePointer() const { return device_ptr_; }
-        [[nodiscard]] std::size_t size() const { return size_; }
-        [[nodiscard]] bool copyFromTensor(const lfs::core::Tensor& tensor,
-                                          std::size_t byte_count,
-                                          cudaStream_t stream) const;
-        // Offset-aware variant for coalesced layouts where one CUDA-imported
-        // VkBuffer holds multiple sub-regions (xyz | rotations | scales+opacs |
-        // sh) instead of four separate allocations.
-        [[nodiscard]] bool copyFromTensor(const lfs::core::Tensor& tensor,
-                                          std::size_t byte_count,
-                                          std::size_t dst_offset,
-                                          cudaStream_t stream) const;
-
-    private:
-        cudaExternalMemory_t cuda_mem_ = nullptr;
-        void* device_ptr_ = nullptr;
-        std::size_t allocation_size_ = 0;
-        std::size_t size_ = 0;
-        mutable lfs::core::Tensor upload_source_;
         mutable std::string last_error_;
     };
 

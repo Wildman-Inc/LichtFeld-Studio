@@ -54,6 +54,7 @@ TOOLS_CACHE_PATH = Path(
 _spawned_processes: list[tuple[subprocess.Popen[Any], int | None]] = []
 _attached_to_existing_instance = False
 _cleanup_in_progress = False
+_native_initialized = False
 
 
 def log(message: str) -> None:
@@ -70,7 +71,8 @@ def post_json(payload: Any, timeout_s: float = 5.0) -> Any:
         headers={"content-type": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=timeout_s) as response:
-        return json.loads(response.read().decode("utf-8"))
+        body = response.read()
+        return json.loads(body.decode("utf-8")) if body else None
 
 
 def endpoint_ready() -> bool:
@@ -94,6 +96,7 @@ def executable_candidates() -> list[Path]:
         names = ["LichtFeld-Studio", "run_lichtfeld.sh"]
 
     search_roots = [
+        REPO_ROOT / "build-rocm10",
         REPO_ROOT / "build-hip",
         REPO_ROOT / "build-rocm",
         REPO_ROOT / "build-rocm-multi",
@@ -501,8 +504,64 @@ def write_tools_cache(response: Any) -> None:
     log(f"Refreshed tools cache from live app at {TOOLS_CACHE_PATH}.")
 
 
+def ensure_native_initialized() -> None:
+    global _native_initialized
+
+    if _native_initialized:
+        return
+
+    # The stdio handshake is served locally so discovery does not launch the app.
+    # Establish our independent HTTP client handshake only on the first live call.
+    response = post_json(
+        {
+            "jsonrpc": "2.0",
+            "id": f"{BRIDGE_NAME}:initialize",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": BRIDGE_NAME, "version": BRIDGE_VERSION},
+            },
+        },
+        timeout_s=30.0,
+    )
+    if (
+        not isinstance(response, dict)
+        or response.get("error") is not None
+        or not isinstance(response.get("result"), dict)
+    ):
+        raise RuntimeError(f"Native MCP initialization failed: {response!r}")
+
+    response = post_json(
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        timeout_s=30.0,
+    )
+    if isinstance(response, dict) and response.get("error") is not None:
+        raise RuntimeError(f"Native MCP initialized notification failed: {response!r}")
+    _native_initialized = True
+
+
 def forward_message(message: Any) -> Any:
-    return post_json(message, timeout_s=30.0)
+    global _native_initialized
+
+    try:
+        ensure_native_initialized()
+        response = post_json(message, timeout_s=30.0)
+        error = response.get("error") if isinstance(response, dict) else None
+        if (
+            isinstance(error, dict)
+            and error.get("code") == -32600
+            and error.get("message") == "Server not initialized. Call 'initialize' first."
+        ):
+            # A restarted app may be reachable without a transport failure. Only
+            # replay this explicit pre-dispatch rejection, never arbitrary errors.
+            _native_initialized = False
+            ensure_native_initialized()
+            response = post_json(message, timeout_s=30.0)
+        return response
+    except Exception:
+        _native_initialized = False
+        raise
 
 
 def main() -> int:

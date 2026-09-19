@@ -1,11 +1,13 @@
 # ROCm runtime license provenance
 
-The Windows portable package generates `runtime-license-manifest.txt` to map
-every bundled ROCm runtime DLL to one of these notices or to the matching
-notice supplied by the installed ROCm SDK. The adjacent runtime and license
-SHA-256 manifests bind the packaged files to the audited inputs. Their values
-must match the source-controlled `audited-*-sha256.txt` manifests at configure
-time and again during ZIP validation.
+Current Windows portable packages generate `artifact-sha256-manifest.txt` from
+the selected SDK's DLLs, required device archives, available SDK notices and
+provenance. ZIP validation checks those exact inputs and hashes. This verifies
+package integrity; it does not establish a redistribution-license audit for
+that SDK. The historical notices and audited hashes below are retained as a
+record of the 7.14 review and are not used to certify newer SDKs.
+
+## Historical ROCm 7.14 audit
 
 The vendored notices come from the exact sources recorded by the ROCm SDK's
 `share/therock/therock_manifest.json`. The package preserves that manifest
@@ -31,6 +33,6 @@ under `provenance/`. For the audited 7.14.0 SDK, the pins are TheRock
   reference BLAS notices are all included.
 
 `amd_comgr.dll` maps to `amd_comgr/LICENSE.txt` from the same installed ROCm
-SDK root that supplies the DLL. Portable package configuration fails if that
-SDK notice or the SDK provenance manifest is absent or differs from the
-audited ROCm 7.14.0 build.
+SDK root that supplies the DLL. The historical portable package configuration
+required that SDK notice and provenance manifest to match the audited ROCm
+7.14.0 build.

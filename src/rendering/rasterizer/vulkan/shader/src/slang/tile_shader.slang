@@ -25,13 +25,6 @@ import utils;
 #define ENTRY 0
 #endif
 
-// LFS_VISIBLE_BOUNDED=1 (HiGS chain): the primitive domain is the compact
-// visible set, bounded by a GPU-resident count instead of uniforms.num_splats,
-// and the cumsum tail lives at [visible_count - 1].
-#ifndef LFS_VISIBLE_BOUNDED
-#define LFS_VISIBLE_BOUNDED 0
-#endif
-
 static const uint32_t FLOAT32_FRACTION_BITS = 23;
 
 
@@ -61,11 +54,7 @@ layout(binding=4) StructuredBuffer<int32_t> primitive_sort_indices;
 
 layout(binding=5) RWStructuredBuffer<sortingKey_t> out_unsorted_keys;
 layout(binding=6) RWStructuredBuffer<int32_t> out_unsorted_gauss_idx;
-#if LFS_VISIBLE_BOUNDED
-layout(binding=7) StructuredBuffer<uint32_t> visible_count;
-#else
 layout(binding=7) StructuredBuffer<uint32_t> depth_wave_dispatch;
-#endif
 
 #define BLOCK_SIZE 64
 #define NUM_SUBGROUPS (BLOCK_SIZE / SUBGROUP_SIZE)
@@ -83,9 +72,6 @@ void main(
     const uint grid_width = uniforms.grid_width;
     const bool wrap_x = base_camera_model(uniforms.camera_model) == uint(CameraModel::EQUIRECTANGULAR);
 
-#if LFS_VISIBLE_BOUNDED
-    int32_t depth_rank = dispatchThreadID.x;
-#else
     const uint record = (1u + uniforms.depth_wave) * LFS_VK_DEPTH_WAVE_RECORD_STRIDE_WORDS;
     const uint local_rank = dispatchThreadID.x;
     const uint rank_count = depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_RANK_COUNT_WORD];
@@ -93,26 +79,14 @@ void main(
         return;
     int32_t depth_rank = int32_t(
         depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_RANK_BASE_WORD] + local_rank);
-#endif
 
-#if LFS_VISIBLE_BOUNDED
-    // The cumsum only covers [0, visible_count) entries; offsets past it are
-    // uninitialized, so this bound is a correctness gate, not an optimization.
-    if (uint32_t(depth_rank) >= min(visible_count[0], uint32_t(uniforms.num_splats)))
-        return;
-#else
     if (depth_rank >= uniforms.num_splats)
         return;
-#endif
 
     // index_buffer_offset is cumsum'd over the depth-ordered tiles_touched
     // array, so the offset interval for this depth_rank is contiguous.
-#if LFS_VISIBLE_BOUNDED
-    const int instance_base = 0;
-#else
     const int instance_base =
         int(depth_wave_dispatch[record + LFS_VK_DEPTH_WAVE_INSTANCE_BASE_WORD]);
-#endif
     int offset = (depth_rank == 0 ? 0 : index_buffer_offset[depth_rank-1]) - instance_base;
     int offset_max = index_buffer_offset[depth_rank] - instance_base;
     const int sort_capacity = int(uniforms.sort_capacity);
@@ -125,6 +99,16 @@ void main(
 #if TILE_CULLING_MODE > 0
     float2 xy = read_t2_float2(primitive_idx, xy_vs);
     float4 inv_cov_opac = read_t4_float4(primitive_idx, inv_cov_vs_opacity);
+
+    if (uniforms.splat_render_profile == 1u &&
+        is_gut_projection_mode(uniforms.camera_model) && !(uniforms.lod_enabled & 4u)) {
+        // The vertex pass counts tiles using an ellipse enclosing the capped
+        // portal quad. Emit that same ellipse; the stored inverse covariance
+        // remains uncapped for the fragment shader's ray and quad evaluation.
+        const uint camera_height = uniforms.camera_height == 0 ? image_height : uniforms.camera_height;
+        const uint camera_width = uniforms.camera_width == 0 ? image_width : uniforms.camera_width;
+        inv_cov_opac.xyz = portal_gut_bin_inverse(inv_cov_opac.xyz, camera_width, camera_height);
+    }
 
     float extend = extend_from_opacity(inv_cov_opac.w);
     float3 inv_cov = inv_cov_opac.xyz / (extend*extend);

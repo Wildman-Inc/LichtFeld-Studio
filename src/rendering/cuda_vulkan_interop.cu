@@ -73,7 +73,9 @@ namespace lfs::rendering::detail {
             int channels,
             CudaVulkanTensorLayout layout,
             CudaVulkanTensorElementType element_type,
-            bool flip_y) {
+            bool flip_y,
+            void* linear_buffer,
+            std::uint32_t destination_width) {
             const std::uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
             const std::uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
             if (x >= width || y >= height) {
@@ -96,13 +98,15 @@ namespace lfs::rendering::detail {
             }
 
             const std::uint32_t out_y = flip_y ? (height - 1u - y) : y;
+            if (linear_buffer != nullptr) {
+                static_cast<uchar4*>(linear_buffer)[static_cast<std::size_t>(out_y) * destination_width + x] = rgba;
+            } else {
 #if defined(__HIP_NO_IMAGE_SUPPORT) && __HIP_NO_IMAGE_SUPPORT
-            (void)rgba;
-            (void)surface;
-            (void)out_y;
+                (void)surface;
 #else
-            surf2Dwrite(rgba, surface, static_cast<int>(x * sizeof(uchar4)), static_cast<int>(out_y));
+                surf2Dwrite(rgba, surface, static_cast<int>(x * sizeof(uchar4)), static_cast<int>(out_y));
 #endif
+            }
         }
 
         __global__ void copyTensorToSurfaceR32fKernel(
@@ -112,7 +116,9 @@ namespace lfs::rendering::detail {
             std::uint32_t height,
             int channels,
             CudaVulkanTensorLayout layout,
-            bool flip_y) {
+            bool flip_y,
+            void* linear_buffer,
+            std::uint32_t destination_width) {
             const std::uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
             const std::uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
             if (x >= width || y >= height) {
@@ -123,13 +129,15 @@ namespace lfs::rendering::detail {
                                     ? source[(static_cast<std::size_t>(y) * width + x) * channels]
                                     : source[(static_cast<std::size_t>(y) * width + x)];
             const std::uint32_t out_y = flip_y ? (height - 1u - y) : y;
+            if (linear_buffer != nullptr) {
+                static_cast<float*>(linear_buffer)[static_cast<std::size_t>(out_y) * destination_width + x] = value;
+            } else {
 #if defined(__HIP_NO_IMAGE_SUPPORT) && __HIP_NO_IMAGE_SUPPORT
-            (void)value;
-            (void)surface;
-            (void)out_y;
+                (void)surface;
 #else
-            surf2Dwrite(value, surface, static_cast<int>(x * sizeof(float)), static_cast<int>(out_y));
+                surf2Dwrite(value, surface, static_cast<int>(x * sizeof(float)), static_cast<int>(out_y));
 #endif
+            }
         }
 
     } // namespace
@@ -143,11 +151,15 @@ namespace lfs::rendering::detail {
         const CudaVulkanTensorLayout layout,
         const CudaVulkanTensorElementType element_type,
         const bool flip_y,
-        const cudaStream_t stream) {
-        if (surface == cudaSurfaceObject_t{} || source == nullptr || width == 0 || height == 0) {
+        const cudaStream_t stream,
+        void* linear_buffer,
+        const std::uint32_t destination_width) {
+        if ((surface == cudaSurfaceObject_t{} && linear_buffer == nullptr) ||
+            source == nullptr || width == 0 || height == 0 ||
+            (linear_buffer != nullptr && destination_width < width)) {
             return cudaErrorInvalidValue;
         }
-        const cudaError_t support_status = requireImageSupport();
+        const cudaError_t support_status = linear_buffer != nullptr ? cudaSuccess : requireImageSupport();
         if (support_status != cudaSuccess) {
             return support_status;
         }
@@ -166,7 +178,9 @@ namespace lfs::rendering::detail {
             channels,
             layout,
             element_type,
-            flip_y);
+            flip_y,
+            linear_buffer,
+            destination_width);
         return cudaGetLastError();
     }
 
@@ -178,11 +192,15 @@ namespace lfs::rendering::detail {
         const int channels,
         const CudaVulkanTensorLayout layout,
         const bool flip_y,
-        const cudaStream_t stream) {
-        if (surface == cudaSurfaceObject_t{} || source == nullptr || width == 0 || height == 0) {
+        const cudaStream_t stream,
+        void* linear_buffer,
+        const std::uint32_t destination_width) {
+        if ((surface == cudaSurfaceObject_t{} && linear_buffer == nullptr) ||
+            source == nullptr || width == 0 || height == 0 ||
+            (linear_buffer != nullptr && destination_width < width)) {
             return cudaErrorInvalidValue;
         }
-        const cudaError_t support_status = requireImageSupport();
+        const cudaError_t support_status = linear_buffer != nullptr ? cudaSuccess : requireImageSupport();
         if (support_status != cudaSuccess) {
             return support_status;
         }
@@ -193,7 +211,7 @@ namespace lfs::rendering::detail {
             1,
         };
         copyTensorToSurfaceR32fKernel<<<grid, block, 0, stream>>>(
-            surface, source, width, height, channels, layout, flip_y);
+            surface, source, width, height, channels, layout, flip_y, linear_buffer, destination_width);
         return cudaGetLastError();
     }
 

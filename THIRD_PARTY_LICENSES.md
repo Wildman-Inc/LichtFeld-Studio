@@ -16,9 +16,10 @@ This project builds upon and is inspired by the following:
 | Project | Description | License |
 |---------|-------------|---------|
 | [SuperSplat](https://github.com/playcanvas/supersplat) | PlayCanvas Gaussian Splat editor | MIT |
+| [PlayCanvas Engine](https://github.com/playcanvas/engine) | WebGL/WebGPU engine; the exported HTML viewer bundles a trimmed supersplat-viewer build plus a vendored, adapted `TranslateGizmo` (`src/visualizer/gui/resources/viewer/gizmo.js`) | MIT |
 | [SplatShop](https://github.com/m-schuetz/Splatshop) | Gaussian Splat editing tool | MIT |
 | [splat-transform](https://github.com/playcanvas/splat-transform) | Transformation utilities for splats | MIT |
-| [spz](https://github.com/nianticlabs/spz) | Niantic's compressed splat format | MIT |
+| [spz](https://github.com/nianticlabs/spz) | Niantic's compressed splat format (vendored at affd0ec) | MIT |
 
 ## Mesh-to-Splat Conversion
 | Project | Description | License |
@@ -66,7 +67,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 ## ML Inference & Models
 | Project | Description | License |
 |---------|-------------|---------|
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Cross-platform ML inference engine (preprocess CLI) | MIT |
+
 | [MoGe-2](https://github.com/microsoft/MoGe) | Monocular geometry estimation, depth/normal maps. Code and [model weights](https://huggingface.co/Ruicheng/moge-2-vitb-normal) © Microsoft, MIT; DINOv2 backbone components © Meta AI, Apache-2.0. Model downloaded at first use of `preprocess`, redistributed with attribution via GitHub release assets | MIT / Apache-2.0 |
 
 ## Video Encoding
@@ -79,10 +80,16 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 | Project | Description | License |
 |---------|-------------|---------|
 | [tinyply](https://github.com/ddiakopoulos/tinyply) | Lightweight PLY file loader | Public Domain / BSD-2 |
-| [OpenImageIO](https://github.com/AcademySoftwareFoundation/OpenImageIO) | Image I/O library | Apache-2.0 |
+| [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo) | JPEG codec | IJG License / BSD-3-Clause / zlib |
+| [libpng](https://libpng.sourceforge.net/) | PNG codec | PNG Reference Library License v2 |
+| [libtiff](https://libtiff.gitlab.io/libtiff/) | TIFF codec | libtiff License, BSD-style |
+| [tinyexr](https://github.com/syoyo/tinyexr) | OpenEXR codec | BSD-3-Clause |
+| [stb](https://github.com/nothings/stb) | Image decode and encode headers | MIT / Public Domain |
 | [nlohmann/json](https://github.com/nlohmann/json) | JSON for Modern C++ | MIT |
 | [LibArchive](https://libarchive.org/) | Multi-format archive library | BSD |
 | [libwebp](https://github.com/webmproject/libwebp) | WebP image format library | BSD-3-Clause |
+| [TinyUSDZ](https://github.com/lighttransport/tinyusdz) | Flat USD/USDZ reader and writer | Apache-2.0 |
+| [lz4](https://github.com/lz4/lz4) | USD crate compression | BSD-2-Clause |
 
 ## Utilities
 | Project | Description | License |

@@ -80,6 +80,7 @@ namespace lfs::core {
         t.device_ = device;
         t.dtype_ = dtype;
         t.is_view_ = false;
+        t.ensure_state();
         t.state_->capacity = effective_capacity;
         t.state_->logical_size = t.shape_.rank() > 0 ? t.shape_[0] : 0;
         t.state_->stream = stream;
@@ -101,14 +102,12 @@ namespace lfs::core {
         return load(LoadOp::Empty, args);
     }
 
+    Tensor Tensor::empty_pageable_host(TensorShape shape, DataType dtype) {
+        return empty(std::move(shape), Device::CPU, dtype, false);
+    }
+
     Tensor Tensor::empty_unpinned(TensorShape shape, DataType dtype) {
-        LoadArgs args;
-        args.shape = shape;
-        args.device = Device::CPU;
-        args.dtype = dtype;
-        args.use_pinned = false;
-        args.args = std::monostate{};
-        return load(LoadOp::Empty, args);
+        return empty_pageable_host(std::move(shape), dtype);
     }
 
     Tensor Tensor::zeros(TensorShape shape, Device device, DataType dtype) {

@@ -36,7 +36,7 @@ environment variables:
 | `ENABLE_COMPILER_CACHE` | `ON` | Auto-detects `sccache`, then `ccache`; disable for cold compiler measurements. |
 | `COMPILER_CACHE_PATH_INDEPENDENT` | `ON` when supported | Makes C/C++ compiler paths worktree-independent for single-config GNU/Clang Release and MinSizeRel builds. |
 | `LFS_VCPKG_MAX_CONCURRENCY` | empty | Uses an explicit vcpkg environment setting or caps automatic package-build concurrency at six. |
-| `LFS_DOWNLOAD_CACHE_DIR` | platform cache directory | Stores checksum-verified ONNX Runtime and uv archives outside disposable build trees. |
+| `LFS_DOWNLOAD_CACHE_DIR` | platform cache directory | Stores checksum-verified uv archives outside disposable build trees. |
 
 Multi-config generators default the configuration-dependent options to `OFF`;
 enable the required option explicitly when configuring them. Source-tree Python
@@ -51,13 +51,15 @@ and RmlUI imports are controlled by `LFS_DEV_IMPORT_SOURCE_PYTHON` and
 | `LFS_CUDA_SYNC_DEBUG` | unset (no modes) | The single runtime diagnostics control. Comma-separated mode list: `cuda-sync`, `device-trap`, `vk-fatal`. See below. |
 | `LFS_NO_CRASH_HANDLER` | `OFF` | Leaves fatal signals and unhandled exceptions to an attached debugger or sanitizer. |
 | `LFS_VK_VALIDATION` | CMake default | Requests Vulkan validation at startup. Set `0` to override a validation-enabled developer build. |
+| `LFS_GSPLAT_PAIR_BUDGET` | automatic | Lowers the gsplat pair budget for tile-batching validation; see below. |
 | `LFS_VRAM_RESERVE_MB` | `512` | Memory-pressure headroom, clamped to 128 MiB through one quarter of device VRAM. |
 | `LFS_PINNED_CACHE_LIMIT_MB` | `1024` | Pinned-host cache byte budget. |
 | `LFS_NVCODEC_DIAGNOSTICS` | `OFF` | Logs nvImageCodec and dependent-library discovery details. |
 | `LFS_RML_DEBUGGER` | `OFF` | Starts the RmlUi debugger overlay. |
 | `LFS_DEV_HOT_RELOAD` | `ON` | Enables Python, RmlUI, and locale watching when source imports were compiled in. |
 | `LFS_PLUGIN_AUTOLOAD` | `ON` | Automation override for scheduling startup plugin loading. Per-plugin `load_on_startup` remains persisted in plugin settings. |
-| `LFS_ASSET_MANAGER_DIR` | Platform data directory | Overrides Asset Manager storage for isolated development and tests. |
+| `LFS_ASSET_MANAGER_DIR` | `data/asset_library` | Overrides the Asset Manager catalog directory for isolated development and tests. |
+| `LFS_ASSET_MANAGER_ASSETS_DIR` | `~/.lichtfeld/projects` | Overrides the real filesystem directory represented by the Asset Manager's Default folder. The Project location preference remains the normal user-facing control. |
 | `LFS_PLUGIN_REGISTRY_URL` | Built-in registries | Overrides the plugin registry endpoint for development and tests. |
 | `LFS_PYTHON_LSP` | Auto-discovered | Overrides the Python language-server executable. |
 | `LFS_PYTHON_LSP_WORKSPACE` | `~/.lichtfeld` | Overrides the language-server workspace directory. |
@@ -143,3 +145,23 @@ The packaged `1.4.313.0~rc2` validation layer is not accepted as proof for this
 codebase: its GPU-assisted push-descriptor behavior is stale and it has missed
 violations detected by current upstream builds. Do not suppress either class of
 message.
+
+## gsplat tile-batching validation
+
+`LFS_GSPLAT_PAIR_BUDGET=<positive integer>` lowers the target intersection count
+per batch. The automatic target is the smaller of `INT32_MAX` pairs and free CUDA
+bytes / 64, sampled on first use of the thread-local intersection cache. Invalid
+or zero values retain the automatic target. A whole tile is indivisible, so the
+target can be exceeded by a single-tile batch (at most `C*N` pairs).
+Releasing the intersection cache also resets the budget.
+
+Only frames above that budget are split. Batches contain disjoint whole tiles,
+use the original full-image camera, and replay the same partition in backward.
+The override is useful for comparing RGB/alpha exactly and gradients within the
+existing atomic-accumulation tolerance on small fixtures. It does not cap splat
+footprints or discard intersections.
+
+```sh
+LFS_GSPLAT_PAIR_BUDGET=1 build/tests/gsplat_tests --gtest_filter='GsplatRasterizerTest.GutFromWorld*'
+GUT_LARGE_FRAME=1 build/tests/gsplat_tests --gtest_filter=GsplatRasterizerTest.AggregateOverflowTrainingStep
+```

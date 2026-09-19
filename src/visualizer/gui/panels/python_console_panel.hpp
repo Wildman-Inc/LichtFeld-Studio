@@ -40,12 +40,11 @@ namespace lfs::vis::gui::panels {
         void clear();
 
         void addToHistory(const std::string& cmd);
-        void historyUp();
-        void historyDown();
 
         terminal::TerminalWidget* getTerminal();
         terminal::TerminalWidget* getOutputTerminal();
         editor::PythonEditor* getEditor();
+        const editor::PythonEditor* getEditor() const;
         void setEditorText(const std::string& text);
         void focusEditor();
         [[nodiscard]] std::string getEditorText() const;
@@ -71,6 +70,10 @@ namespace lfs::vis::gui::panels {
         void increaseFontScale();
         void decreaseFontScale();
         void resetFontScale() { font_scale_ = 1.0f; }
+        void setFontScale(float scale);
+
+        [[nodiscard]] static float splitterRatio();
+        static void setSplitterRatio(float ratio);
 
         // Script execution
         bool isScriptRunning() const { return script_running_.load(); }

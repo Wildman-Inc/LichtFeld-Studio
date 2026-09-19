@@ -127,6 +127,7 @@ scrollbarhorizontal sliderbar:hover {
 button,
 input[type="text"],
 input[type="checkbox"],
+input[type="radio"],
 input[type="range"],
 select,
 textarea,
@@ -147,6 +148,24 @@ input[type="checkbox"] {
     margin: 0 6dp 0 0;
     padding: 0;
     transition: background-color 0.12s quadratic-out, border-color 0.12s quadratic-out;
+}
+
+/* ── Form: Radio ────────────────────────────────────────── */
+
+input[type="radio"] {
+    width: 14dp;
+    height: 14dp;
+    border-width: 1dp;
+    border-radius: 7dp;
+    border-color: #585b70;
+    background-color: #313244;
+    margin: 0 6dp 0 0;
+    padding: 0;
+}
+
+input[type="radio"]:checked {
+    background-color: #89b4fa;
+    border-color: #89b4fa;
 }
 
 input[type="checkbox"]:checked {
@@ -199,6 +218,24 @@ input[type="text"] {
     transition: border-color 0.12s quadratic-out;
 }
 
+textarea {
+    font-size: 12dp;
+    color: #cdd6f4;
+    background-color: #313244;
+    border-width: 1dp;
+    border-color: #45475a;
+    padding: 2dp 4dp;
+    transition: border-color 0.12s quadratic-out;
+}
+
+textarea:focus,
+textarea:focus-visible {
+    color: #cdd6f4;
+    background-color: #313244;
+    border-color: #89b4fa;
+    box-shadow: none;
+}
+
 input[type="text"]:focus {
     border-color: #89b4fa;
 }
@@ -214,7 +251,9 @@ select:focus-visible,
 button:focus-visible,
 .btn:focus-visible,
 .context-menu-item:focus-visible,
-.section-header:focus-visible {
+.section-header:focus-visible,
+.asset-filter-row:focus-visible,
+.asset-sidebar-title:focus-visible {
     border-color: #89b4fa;
     box-shadow: 0 0 0 1dp rgba(137, 180, 250, 160);
 }
@@ -390,17 +429,6 @@ progress fill {
     margin-left: 4dp;
     flex-shrink: 0;
 }
-
-/* ── Structured Setting Grid ───────────────────────────── */
-
-.setting-group {
-    margin-bottom: 10dp;
-}
-
-.setting-group:last-child {
-    margin-bottom: 0;
-}
-
 .setting-row--aligned {
     min-width: 0;
 }
@@ -738,6 +766,7 @@ progress fill {
     display: none;
     position: absolute;
     z-index: 100;
+    box-sizing: border-box;
     background-color: #313244;
     border-width: 1dp;
     border-color: #45475a;
@@ -759,6 +788,7 @@ progress fill {
     font-size: 12dp;
     width: 100%;
     text-align: left;
+    white-space: normal;
     background-color: transparent;
     border-width: 0;
     transition: background-color 0.1s quadratic-out;
@@ -1098,6 +1128,13 @@ crf-curve {
     box-sizing: border-box;
 }
 
+.asset-button--toolbar24 {
+    box-sizing: border-box;
+    height: 24dp;
+    min-height: 24dp;
+    max-height: 24dp;
+}
+
 /* ── Disabled overlay ──────────────────────────────────── */
 
 .disabled-overlay {
@@ -1173,6 +1210,8 @@ crf-curve {
     padding: 4dp 8dp;
     font-size: 12dp;
     max-width: 320dp;
+    white-space: normal;
+    word-break: break-all;
     pointer-events: none;
 }
 

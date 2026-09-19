@@ -196,7 +196,8 @@ namespace lfs::io {
                     .scene_center = Tensor::zeros({3}, Device::CPU),
                     .loader_used = name(),
                     .load_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time),
-                    .warnings = (has_points || has_points_text || has_points_ply) ? std::vector<std::string>{} : std::vector<std::string>{"No sparse point cloud found (points3D.bin|txt|ply) - will use random initialization"}};
+                    .warnings = (has_points || has_points_text || has_points_ply) ? std::vector<std::string>{} : std::vector<std::string>{"No sparse point cloud found (points3D.bin|txt|ply) - will use random initialization"},
+                    .georeference = std::nullopt};
             }
 
             // Load cameras and images
@@ -207,11 +208,13 @@ namespace lfs::io {
             std::vector<std::shared_ptr<Camera>> cameras;
             Tensor scene_center;
             std::vector<std::string> warnings;
+            ColmapPointCloudRecords binary_point_records;
 
             if (has_cameras && has_images) {
                 LOG_DEBUG("Reading binary COLMAP data");
                 LOG_TIMER_DEBUG("COLMAP read binary cameras and images");
-                auto result = read_colmap_cameras_and_images(path, actual_images_folder, options);
+                auto result = read_colmap_cameras_and_images(
+                    path, actual_images_folder, options, &binary_point_records);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
@@ -292,7 +295,8 @@ namespace lfs::io {
                 LOG_DEBUG("Loading binary point cloud");
                 LOG_TIMER_DEBUG("COLMAP load binary point cloud");
                 if (use_colmap_track_filter) {
-                    auto pc_result = read_colmap_point_cloud_with_stats(path, options);
+                    auto pc_result = read_colmap_point_cloud_with_stats(
+                        path, options, &binary_point_records);
                     if (!pc_result) {
                         return std::unexpected(pc_result.error());
                     }
@@ -309,7 +313,7 @@ namespace lfs::io {
                         warnings.push_back(diagnostic.message);
                     }
                 } else {
-                    auto pc_result = read_colmap_point_cloud(path, options);
+                    auto pc_result = read_colmap_point_cloud(path, options, &binary_point_records);
                     if (!pc_result) {
                         return std::unexpected(pc_result.error());
                     }
@@ -356,9 +360,13 @@ namespace lfs::io {
             }
 
             // Centralize scene
+            std::optional<ImportGeoreference> import_georeference;
             {
                 LOG_TIMER_DEBUG("COLMAP centralize scene");
-                scene_center = centralize_scene(cameras, point_cloud, options.centralize, scene_center);
+                auto centralization =
+                    centralize_scene(cameras, point_cloud, options.centralize, scene_center);
+                scene_center = std::move(centralization.scene_center);
+                import_georeference = std::move(centralization.georeference);
             }
 
             if (options.progress) {
@@ -381,7 +389,8 @@ namespace lfs::io {
                 .images_have_alpha = images_have_alpha,
                 .loader_used = name(),
                 .load_time = load_time,
-                .warnings = std::move(warnings)};
+                .warnings = std::move(warnings),
+                .georeference = std::move(import_georeference)};
 
             if (!has_points && !has_points_text && !has_points_ply) {
                 result.warnings.push_back("No sparse point cloud found - using random initialization");

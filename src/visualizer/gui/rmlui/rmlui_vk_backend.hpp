@@ -22,14 +22,18 @@
 #include <vulkan/vulkan.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -81,11 +85,35 @@ public:
     void SetContextClipRect(float x1, float y1, float x2, float y2);
     void RenderTextureQuad(Rml::TextureHandle texture, float x, float y, float w, float h);
 
+    struct FrostedGlassRegion {
+        float x = 0.0f;
+        float y = 0.0f;
+        float width = 0.0f;
+        float height = 0.0f;
+        float radius = 0.0f;
+    };
+    // Draw a blurred copy of the current swapchain beneath viewport chrome.
+    // Returns false when the swapchain or format cannot support the low-cost blit path.
+    bool RenderFrostedGlass(Rml::Span<const FrostedGlassRegion> regions);
+
+    // Restrict layer render-pass area (and thus loadOp clears / scissor bounds) to the
+    // capture clip rect while recording a cached-panel refresh. Pair with EndCacheCapture.
+    // Nested PushLayer during the capture inherits the same restricted area. Normal
+    // (non-capture) layer usage is unaffected when capture is inactive.
+    void BeginCacheCapture(int x, int y, int width, int height);
+    void EndCacheCapture();
+
     // Build a Rml::Image src URL referencing an externally-owned VkImageView/VkSampler.
     // The view+sampler must remain alive while any element references this URL. The
     // returned URL form is "lfs-vk://?v=<view_hex>&s=<sampler_hex>&w=W&h=H".
     static std::string MakeExternalTextureSource(VkImageView image_view, VkSampler sampler, int width, int height);
     void SetTextureDebugName(Rml::TextureHandle texture_handle, std::string_view debug_name) const;
+
+    struct VmaStatistics {
+        VkDeviceSize block_bytes = 0;
+        VkDeviceSize allocation_bytes = 0;
+    };
+    [[nodiscard]] VmaStatistics QueryVmaStatistics() const;
 
     // -- Inherited from Rml::RenderInterface --
 
@@ -128,6 +156,12 @@ public:
     void PopLayer() override;
     /// Called by RmlUi when it wants to capture the current layer as a texture.
     Rml::TextureHandle SaveLayerAsTexture() override;
+    /// Captures an explicit layer region for manager-owned context caches.
+    /// When `reuse_texture` has the same extent as `region`, reuses that image instead of
+    /// allocating a new one.
+    /// On extent mismatch or invalid handle, allocates a new texture (caller must release
+    /// the old one if it is no longer needed).
+    Rml::TextureHandle SaveLayerRegionAsTexture(VkRect2D region, Rml::TextureHandle reuse_texture);
 
     /// Called by RmlUi when it wants to set the current transform matrix to a new matrix.
     void SetTransform(const Rml::Matrix4f* transform) override;
@@ -155,7 +189,22 @@ private:
         std::string m_vram_scope;
         std::string m_vram_label;
         VkDeviceSize m_vram_allocation_size = 0;
+        int m_width = 0;
+        int m_height = 0;
         bool m_is_async_preview = false;
+        // Resource identity for VulkanImageBarrierTracker (#1478).
+        std::uint64_t m_barrier_generation = 0;
+    };
+
+    struct frosted_glass_backdrop_t {
+        texture_data_t primary{};
+        texture_data_t secondary{};
+        VkImageLayout primary_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout secondary_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        int primary_width = 0;
+        int primary_height = 0;
+        int secondary_width = 0;
+        int secondary_height = 0;
     };
 
     struct async_preview_result_t {
@@ -170,6 +219,14 @@ private:
         std::mutex mutex;
         async_preview_result_t result;
         std::atomic<bool> ready = false;
+        std::atomic<bool> cancelled = false;
+    };
+
+    struct preview_work_t {
+        std::shared_ptr<async_preview_state_t> state;
+        std::filesystem::path path;
+        int max_size = 0;
+        bool embedded_project_preview = false;
     };
 
     struct geometry_handle_t {
@@ -345,7 +402,7 @@ private:
             info.pCommandBuffers = &m_p_command_buffer;
             info.commandBufferCount = 1;
 
-            return vkQueueSubmit(m_p_graphics_queue, 1, &info, m_p_fence) == VK_SUCCESS;
+            return lfs::rendering::vk_queue_submit_synced(m_p_graphics_queue, 1, &info, m_p_fence) == VK_SUCCESS;
         }
 
     private:
@@ -524,8 +581,13 @@ private:
     Rml::TextureHandle LoadAsyncPreviewTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source);
     void ProcessAsyncPreviewUploads();
     void DropAsyncPreviewTexture(texture_data_t* texture);
+    void EnsurePreviewWorkerPool();
+    void StopPreviewWorkerPool() noexcept;
+    void EnqueuePreviewWork(preview_work_t work);
     void QueueTextureForDeferredDeletion(texture_data_t* texture);
-    static async_preview_result_t DecodePreviewTexture(std::filesystem::path path, int max_size);
+    static async_preview_result_t DecodePreviewTexture(std::filesystem::path path,
+                                                       int max_size,
+                                                       bool embedded_project_preview);
 
     void Initialize_Resources(const VkPhysicalDeviceProperties& physical_device_properties) noexcept;
     void Initialize_Allocator() noexcept;
@@ -567,13 +629,20 @@ private:
     void BeginSwapchainRendering(VkAttachmentLoadOp color_load_op, VkAttachmentLoadOp depth_load_op);
     void EndActiveRendering();
     bool CopySwapchainToLayer(Rml::LayerHandle destination);
-    void TransitionImageLayout(VkImage image, VkImageAspectFlags aspect_mask, VkImageLayout old_layout, VkImageLayout new_layout);
+    void TransitionImageLayout(VkImage image, std::uint64_t generation, VkImageAspectFlags aspect_mask, VkImageLayout old_layout, VkImageLayout new_layout);
     VkImageAspectFlags DepthStencilAspectMask() const noexcept;
     void ApplyTransformState();
     VkRect2D ContextClipScissor() const noexcept;
     VkRect2D IntersectContextClip(VkRect2D scissor) const noexcept;
+    // Intersect with the active cache-capture render area when capture is active; no-op otherwise.
+    VkRect2D ClampToCacheCaptureArea(VkRect2D rect) const noexcept;
     void ResetDynamicRenderState();
     void RenderFullscreenTexture(texture_data_t& texture, Rml::BlendMode blend_mode);
+    bool EnsureFrostedGlassBackdrop();
+    bool CreateFrostedGlassTexture(texture_data_t& texture, int width, int height,
+                                   std::string_view label);
+    void DestroyFrostedGlassBackdrop(bool deferred) noexcept;
+    void RenderFrostedGlassQuad(texture_data_t& texture);
 
     void Update_PendingForDeletion_Textures_By_Frame(uint32_t resource_slot) noexcept;
     void Update_PendingForDeletion_Geometries(uint32_t resource_slot) noexcept;
@@ -621,6 +690,7 @@ private:
     VkSampler m_p_sampler_linear;
     VkSampler m_p_sampler_nearest;
     VkRect2D m_scissor;
+    VkRect2D m_scissor_requested;
 
     // @ means it captures the window size full width and full height, offset equals both x and y to 0
     VkRect2D m_scissor_original;
@@ -637,14 +707,27 @@ private:
     VkRect2D m_context_clip_scissor{};
     bool m_context_clip_enabled = false;
     bool m_current_context_used_preview_texture = false;
+    bool m_frosted_glass_blit_supported = false;
+    // When true, layer render passes clear/draw only this sub-rect of the full-size layer.
+    bool m_cache_capture_active = false;
+    VkRect2D m_cache_capture_render_area{};
 
     Rml::Matrix4f m_projection;
     Rml::Vector<VkShaderModule> m_shaders;
     Rml::Array<Rml::Vector<texture_data_t*>, kSwapchainBackBufferCount> m_pending_for_deletion_textures_by_frames;
     std::unordered_set<texture_data_t*> m_live_textures;
     std::vector<std::shared_ptr<async_preview_state_t>> m_async_preview_textures;
+    std::mutex m_preview_queue_mutex;
+    std::condition_variable m_preview_queue_cv;
+    std::deque<preview_work_t> m_preview_queue;
+    std::vector<std::thread> m_preview_workers;
+    bool m_preview_workers_stopping = false;
     std::atomic<uint64_t> m_preview_texture_generation{0};
     Rml::Vector<render_layer_t> m_render_layers;
+    frosted_glass_backdrop_t m_frosted_glass_backdrop;
+    Rml::CompiledGeometryHandle m_frosted_glass_quad_geometry = {};
+    int m_frosted_glass_quad_width = 0;
+    int m_frosted_glass_quad_height = 0;
     Rml::CompiledGeometryHandle m_texture_quad_geometry = {};
     float m_texture_quad_x = 0.0f;
     float m_texture_quad_y = 0.0f;
@@ -656,6 +739,10 @@ private:
     VkImageView m_external_depth_stencil_image_view = VK_NULL_HANDLE;
     VkImageLayout m_external_swapchain_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     lfs::vis::VulkanImageBarrierTracker m_image_barriers;
+    // Per-image resource generation (same counter as textures; stored on texture_data_t /
+    // layer color+depth / external swapchain — no parallel handle map).
+    std::uint64_t m_image_barrier_generation = 0;
+    std::uint64_t m_external_swapchain_barrier_generation = 0;
     active_render_target_t m_active_render_target = active_render_target_t::None;
     Rml::LayerHandle m_active_layer = 0;
     int m_render_layer_stack_size = 0;

@@ -9,6 +9,7 @@
 #include "core/export.hpp"
 #include "core/parameters.hpp"
 #include "core/splat_exportable_storage.hpp"
+#include "io/session_chapters.hpp"
 #include "training/trainer.hpp"
 #include "training_state.hpp"
 #include <atomic>
@@ -16,20 +17,32 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <expected>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 namespace lfs::core {
     class Scene;
 }
 
+class TrainingSceneInitConcurrencyTest;
+
 namespace lfs::vis {
 
     // Forward declarations
     class VisualizerImpl;
+    class VulkanExternalTensorStorage;
+    class VisualizerImplResetTest_ForceExitWhileStoppingArmsWatcher_Test;
+    class VisualizerImplResetTest_NewProjectWhileCompletionPendingStillErrors_Test;
+    class VisualizerImplResetTest_SaveWhilePausedTrainingRoutesThroughLiveTrainer_Test;
+    class VisualizerImplResetTest_SaveWhileStoppingStillBlocksUntilSnapshotPublished_Test;
+    class VisualizerImplResetTest_SaveAsWhilePausedTrainingRoutesThroughLiveTrainer_Test;
 
     class LFS_VIS_API TrainerManager {
     public:
@@ -62,32 +75,39 @@ namespace lfs::vis {
         [[nodiscard]] const core::Scene* getScene() const { return scene_; }
 
         // Training control
+        using EvaluationWeightsPreparer =
+            std::function<std::optional<std::filesystem::path>(bool allow_download)>;
+
+        void set_evaluation_weights_preparer(EvaluationWeightsPreparer preparer) {
+            evaluation_weights_preparer_ = std::move(preparer);
+        }
+
         bool startTraining();
+        // Wait for the off-thread initialization phase. Callers must not be the
+        // viewer thread; the GUI start path intentionally returns in Starting.
+        [[nodiscard]] lfs::Result<void> waitForInitialization();
         void pauseTraining();
         void resumeTraining();
         void stopTraining();
-        void requestSaveCheckpoint();
+        bool requestSaveProject();
+        // Suppress the completion notification modal for the next TrainingCompleted
+        // dispatch (stop initiated by New Project / app close / reset, issue #1604).
+        void suppressCompletionNotification() { suppress_completion_notification_.store(true, std::memory_order_relaxed); }
 
-        // Temporary pause (for camera movement - doesn't change UI state)
-        struct TemporaryPauseResult {
-            bool synchronized = false;
-            bool resume_required = false;
-        };
-
+        // Temporary pause for short synchronization-sensitive operations; does not change UI state.
         void pauseTrainingTemporary();
-        [[nodiscard]] bool pauseTrainingTemporaryIfActive();
-        [[nodiscard]] TemporaryPauseResult pauseTrainingTemporaryAndWait(std::chrono::milliseconds timeout);
         void resumeTrainingTemporary();
 
         // State machine access
         [[nodiscard]] const TrainingStateMachine& getStateMachine() const { return state_machine_; }
-        [[nodiscard]] bool canPerform(TrainingAction action) const { return state_machine_.canPerform(action); }
+        [[nodiscard]] bool canPerform(TrainingAction action) const;
         [[nodiscard]] std::string_view getActionBlockedReason(TrainingAction action) const {
             return state_machine_.getActionBlockedReason(action);
         }
 
-        // State queries (delegate to state machine)
-        [[nodiscard]] TrainingState getState() const { return state_machine_.getState(); }
+        // State queries (delegate to the state machine). getState() overlays
+        // a stored, not-yet-hydrated project session as Paused or Finished.
+        [[nodiscard]] TrainingState getState() const;
         [[nodiscard]] bool isRunning() const { return state_machine_.isInState(TrainingState::Running); }
         [[nodiscard]] bool isPaused() const { return state_machine_.isInState(TrainingState::Paused); }
         [[nodiscard]] bool isFinished() const { return state_machine_.isInState(TrainingState::Finished); }
@@ -100,6 +120,18 @@ namespace lfs::vis {
         [[nodiscard]] bool isCompletionPending() const {
             return completion_pending_.load(std::memory_order_acquire);
         }
+        // True while a training completion is pending (running or paused
+        // mid-run). The reaper steals training_thread_ immediately, so
+        // joinable() is not the live-worker signal. Checkpoint-installed
+        // paused trainers have no worker and report false.
+        [[nodiscard]] bool hasLiveTrainingThread() const;
+        [[nodiscard]] bool isPublishingFinalSnapshot() const {
+            return isCompletionPending() && !isTrainingActive();
+        }
+        [[nodiscard]] bool isPausedAtCheckpointBaseline() const;
+        [[nodiscard]] std::optional<int> checkpointBaselineIteration() const {
+            return checkpoint_baseline_iteration_;
+        }
 
         // Progress information - directly query trainer
         int getCurrentIteration() const;
@@ -108,8 +140,7 @@ namespace lfs::vis {
         int getNumSplats() const;
         int getMaxGaussians() const;
         std::vector<size_t> getSaveSteps() const;
-        bool setSaveSteps(std::vector<size_t> save_steps);
-        bool canEditSaveSteps() const;
+        void setSaveSteps(std::vector<size_t> save_steps);
         const char* getStrategyType() const;
         bool isGutEnabled() const;
 
@@ -126,15 +157,20 @@ namespace lfs::vis {
             int iteration = 0;
             float psnr = 0.0f;
             float ssim = 0.0f;
+            std::optional<float> lpips;
         };
 
         std::deque<float> getPSNRBuffer() const;
         void updatePSNR(float psnr);
-        void setLastPSNR(float psnr) { last_psnr_.store(psnr); }
-        float getLastPSNR() const { return last_psnr_.load(); }
-        void updateEvaluationMetrics(int iteration, float psnr, float ssim);
+        void updateEvaluationMetrics(int iteration, float psnr, float ssim, std::optional<float> lpips);
         std::optional<EvaluationMetricsSnapshot> getLastEvaluationMetrics() const;
         void clearEvaluationMetrics();
+        [[nodiscard]] lfs::io::project::MetricsChapter
+        captureProjectMetrics() const;
+        void restoreProjectMetrics(
+            const lfs::io::project::MetricsChapter& metrics);
+        void clearRestoredProjectMetrics();
+        void publishStoredSessionPresentation();
 
         // Access to trainer (for rendering, etc.)
         lfs::training::Trainer* getTrainer() { return trainer_.get(); }
@@ -153,7 +189,7 @@ namespace lfs::vis {
         // Get last error message
         const std::string& getLastError() const { return last_error_; }
 
-        // Most recent training failure as a typed error (Phase 10). During an
+        // Most recent training failure as a typed error. During an
         // active run this may briefly differ from the legacy getLastError()
         // string, which keeps its exact current lifecycle for the deprecation
         // window.
@@ -163,7 +199,6 @@ namespace lfs::vis {
 
         // Camera access
         std::shared_ptr<const lfs::core::Camera> getCamById(int camId) const;
-        std::vector<std::shared_ptr<lfs::core::Camera>> getCamList() const;
         std::vector<std::shared_ptr<lfs::core::Camera>> getAllCamList() const;
         std::expected<lfs::training::Trainer::CameraMetricsSnapshot, std::string> computeCameraMetricsForCameraId(
             int camera_id,
@@ -190,8 +225,19 @@ namespace lfs::vis {
             std::optional<lfs::Error> typed_error;
         };
 
-        // Training thread function
+        friend class VisualizerImplResetTest_ForceExitWhileStoppingArmsWatcher_Test;
+        friend class VisualizerImplResetTest_NewProjectWhileCompletionPendingStillErrors_Test;
+        friend class VisualizerImplResetTest_SaveWhilePausedTrainingRoutesThroughLiveTrainer_Test;
+        friend class VisualizerImplResetTest_SaveWhileStoppingStillBlocksUntilSnapshotPublished_Test;
+        friend class VisualizerImplResetTest_SaveAsWhilePausedTrainingRoutesThroughLiveTrainer_Test;
+        friend class ::TrainingSceneInitConcurrencyTest;
+
+        // Training initialization and execution thread functions
+        void trainingInitializationThreadFunc(std::stop_token stop_token);
         void trainingThreadFunc(std::stop_token stop_token);
+        [[nodiscard]] lfs::Result<void>
+        initializeTrainingOnWorker(std::stop_token stop_token);
+        void runOnSceneOwnerThread(std::function<void()> run, std::function<void()> cancel);
         void launchTrainingThread();
         void completionReaperLoop(std::stop_token stop_token);
         void finishTrainingThreadJoin();
@@ -204,20 +250,49 @@ namespace lfs::vis {
         void setupEventHandlers();
         void setupStateMachineCallbacks();
 
-        [[nodiscard]] lfs::core::SplatTensorAllocator createTrainingSplatTensorAllocator(
+        [[nodiscard]] lfs::Result<lfs::core::SplatTensorAllocator> createTrainingSplatTensorAllocator(
             const lfs::core::param::TrainingParameters& params,
-            std::size_t min_capacity = 0);
+            std::size_t min_capacity);
+
+        // Install densify-time grow/rebind hook on the training model.
+        void installExportableCapacityEnsure(lfs::core::SplatData& model);
+        // Install densify barrier on the live trainer (no-op
+        // when there is no exportable block / no trainer).
+        void installExportableDensifyBarrier();
+        // Body of the capacity-ensure hook (member so rebind cannot destroy the
+        // running std::function target mid-call).
+        [[nodiscard]] bool growExportableForDensify(std::size_t needed_rows);
+
+        [[nodiscard]] bool beginExportableDensifyBarrier();
+        [[nodiscard]] bool endExportableDensifyBarrier();
 
         // Member variables
         std::unique_ptr<lfs::training::Trainer> trainer_;
+        EvaluationWeightsPreparer evaluation_weights_preparer_;
+        std::unique_ptr<std::jthread> initialization_thread_;
         std::unique_ptr<std::jthread> training_thread_;
         std::optional<std::stop_source> training_stop_source_;
         std::mutex training_thread_mutex_;
         std::condition_variable training_thread_cv_;
+        bool initialization_thread_done_ = true;
+        std::mutex initialization_mutex_;
+        std::condition_variable initialization_cv_;
+        bool initialization_complete_ = true;
+        std::optional<lfs::Error> initialization_error_;
+        std::mutex initialization_gate_mutex_;
+        std::condition_variable initialization_gate_cv_;
+        bool initialization_gate_open_ = true;
+        bool initialization_main_step_failed_ = false;
+        std::atomic<bool> initialization_pause_requested_{false};
         std::jthread completion_reaper_;
         VisualizerImpl* viewer_ = nullptr;
         core::Scene* scene_ = nullptr;
+        std::function<bool(std::function<void()>, std::function<void()>)> test_scene_owner_poster_;
         std::optional<lfs::core::SplatExportableStorage> splat_storage_;
+        std::shared_ptr<VulkanExternalTensorStorage> splat_interop_parent_;
+        lfs::core::SplatTensorAllocator splat_interop_allocator_;
+        // Nesting depth for densify-window Vulkan exclusion.
+        int exportable_densify_barrier_depth_ = 0;
 
         // State machine (single source of truth for state)
         TrainingStateMachine state_machine_;
@@ -232,6 +307,7 @@ namespace lfs::vis {
         bool training_joined_ = true;
         std::optional<TrainingCompletionData> pending_completion_;
         std::atomic<bool> completion_pending_{false};
+        std::atomic<bool> suppress_completion_notification_{false};
 
         static constexpr int COMPLETION_TIMEOUT_SEC = 30;
         static constexpr int MAX_LOSS_POINTS = 200;
@@ -240,12 +316,13 @@ namespace lfs::vis {
         static constexpr int MAX_PSNR_POINTS = 200;
         std::deque<float> psnr_buffer_;
         mutable std::mutex psnr_buffer_mutex_;
-        std::atomic<float> last_psnr_{0.0f};
         std::mutex temporary_pause_mutex_;
         std::uint32_t temporary_pause_depth_ = 0;
         bool temporary_pause_initially_paused_ = false;
         bool temporary_pause_resume_in_flight_ = false;
         std::optional<EvaluationMetricsSnapshot> last_eval_metrics_;
+        std::vector<EvaluationMetricsSnapshot>
+            evaluation_history_;
         mutable std::mutex eval_metrics_mutex_;
 
         // Training time tracking
@@ -254,6 +331,22 @@ namespace lfs::vis {
 
         lfs::core::param::OptimizationParameters pending_opt_params_;
         lfs::core::param::DatasetConfig pending_dataset_params_;
+        std::optional<int> checkpoint_baseline_iteration_;
+        std::optional<std::chrono::steady_clock::duration>
+            restored_accumulated_training_time_;
+        std::optional<lfs::io::project::TrainingFinishReason>
+            restored_finish_reason_;
+        bool restored_finish_published_ = false;
+        bool stored_session_presentation_active_ = false;
+        bool stored_session_presentation_completed_ = false;
+        int stored_session_presentation_iteration_ = 0;
+        int stored_session_presentation_max_iterations_ = 0;
+        std::string stored_session_presentation_strategy_;
+
+        [[nodiscard]] FinishReason resolvedRestoredFinishReason() const;
+        void applyRestoredCheckpointPresentation();
+        void publishRestoredTrainingStore();
+        void clearStoredSessionPresentation();
     };
 
 } // namespace lfs::vis

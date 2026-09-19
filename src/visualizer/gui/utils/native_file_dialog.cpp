@@ -440,7 +440,7 @@ namespace lfs::vis::gui {
         }
 
         [[nodiscard]] std::vector<DialogFilter> pointCloudFilters() {
-            return {makeFilter("Point Cloud Files", {".ply", ".sog", ".spz", ".rad", ".usd", ".usda", ".usdc", ".usdz"})};
+            return {makeFilter("Point Cloud Files", {".ply", ".sog", ".ssog", ".spz", ".rad", ".usd", ".usda", ".usdc", ".usdz"})};
         }
 
         [[nodiscard]] std::vector<DialogFilter> meshFilters() {
@@ -454,6 +454,13 @@ namespace lfs::vis::gui {
 
         [[nodiscard]] std::vector<DialogFilter> ppispFilters() {
             return {makeFilter("PPISP Sidecar Files", {".ppisp"})};
+        }
+
+        // Native NFD/GTK filters are extension-only and cannot exclude
+        // *.tmp.licht. Unpublished picks are rejected later by
+        // ProjectLifecycle::normalizedProjectPath / isPublishedLichtPath.
+        [[nodiscard]] std::vector<DialogFilter> projectFilters() {
+            return {makeFilter("LichtFeld Projects", {".licht"})};
         }
 
         [[nodiscard]] std::vector<DialogFilter> jsonFilters() {
@@ -560,6 +567,10 @@ namespace lfs::vis::gui {
 
     } // namespace
 
+    void warmupNativeFileDialogBackend() {
+        (void)ensureDialogBackendInitialized();
+    }
+
     std::filesystem::path OpenImageFileDialog(const std::filesystem::path& defaultPath) {
         std::filesystem::path result;
         runDialog(makeOpenFileRequest(imageFilters(), defaultPath), result);
@@ -627,6 +638,13 @@ namespace lfs::vis::gui {
     std::filesystem::path OpenPPISPFileDialog(const std::filesystem::path& defaultPath) {
         std::filesystem::path result;
         runDialog(makeOpenFileRequest(ppispFilters(), defaultPath), result);
+        return result;
+    }
+
+    std::filesystem::path OpenProjectFileDialog(const std::filesystem::path& defaultPath) {
+        // Filter stays {".licht"}; unpublished temps are rejected after pick.
+        std::filesystem::path result;
+        runDialog(makeOpenFileRequest(projectFilters(), defaultPath), result);
         return result;
     }
 
@@ -763,6 +781,16 @@ namespace lfs::vis::gui {
         return result;
     }
 
+    std::filesystem::path SaveSsogFileDialog(const std::string& defaultName) {
+        std::filesystem::path result;
+        runDialog(makeSaveFileRequest(singleExtensionFilter("SSOG Files", ".ssog"),
+                                      {},
+                                      defaultName,
+                                      ".ssog"),
+                  result);
+        return result;
+    }
+
     std::filesystem::path SaveSpzFileDialog(const std::string& defaultName,
                                             const std::filesystem::path& defaultPath) {
         std::filesystem::path result;
@@ -833,6 +861,14 @@ namespace lfs::vis::gui {
                                                const std::filesystem::path& defaultPath) {
         std::filesystem::path result;
         runDialog(makeSaveFileRequest(pythonFilters(), defaultPath, defaultName, ".py"), result);
+        return result;
+    }
+
+    std::filesystem::path SaveProjectFileDialog(const std::string& defaultName,
+                                                const std::filesystem::path& defaultPath) {
+        // Filter stays {".licht"}; unpublished temps are rejected after pick.
+        std::filesystem::path result;
+        runDialog(makeSaveFileRequest(projectFilters(), defaultPath, defaultName, ".licht"), result);
         return result;
     }
 

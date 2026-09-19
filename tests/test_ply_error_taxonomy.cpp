@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/alloc_counter.hpp"
 #include "core/failure_report.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
@@ -12,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -91,6 +93,47 @@ namespace {
         stream.write(header.data(), static_cast<std::streamsize>(header.size()));
         stream.write(body.data(), static_cast<std::streamsize>(body.size()));
         ASSERT_TRUE(stream.good());
+    }
+
+    lfs::io::LoadOptions cpu_splat_load_options() {
+        lfs::io::LoadOptions options;
+        options.splat_tensor_allocator =
+            [](lfs::core::TensorShape shape, const size_t,
+               const lfs::core::DataType dtype, const std::string_view) {
+                return lfs::core::Tensor::empty(
+                    std::move(shape), lfs::core::Device::CPU, dtype);
+            };
+        return options;
+    }
+
+    void append_gaussian_row(std::string& bytes,
+                             const float x,
+                             const float scale,
+                             const float opacity,
+                             const float rot_w,
+                             const float sh0 = 0.0f) {
+        append_row(bytes, std::array<float, 14>{
+                              x, 2.0f, 3.0f,
+                              scale, scale, scale, opacity,
+                              rot_w, 0.0f, 0.0f, 0.0f,
+                              sh0, 0.0f, 0.0f});
+    }
+
+    std::string gaussian_properties_with_dc() {
+        return std::format(
+            "{}"
+            "property float f_dc_0\n"
+            "property float f_dc_1\n"
+            "property float f_dc_2\n",
+            kGaussianProperties);
+    }
+
+    std::vector<float> opacity_values(const lfs::core::SplatData& splat) {
+        return splat.opacity_raw().cpu().contiguous().to_vector();
+    }
+
+    float sigmoid(const float value) {
+        return 1.0f / (1.0f + std::exp(-value));
     }
 
     template <class T>
@@ -306,6 +349,171 @@ namespace {
         ASSERT_EQ(loader_result->warnings.size(), 1u);
         EXPECT_NE(loader_result->warnings.front().find("1 invalid splat(s)"),
                   std::string::npos);
+    }
+
+    TEST_F(PlyErrorTaxonomyTest, RepairsPositiveInfiniteOpacityInFusedDecode) {
+        const fs::path input = path("positive_infinite_opacity.ply");
+        std::string body;
+        append_gaussian_row(body, 1.0f, -2.0f,
+                            std::numeric_limits<float>::infinity(), 1.0f);
+        write_binary_file(input, make_binary_header(1, gaussian_properties_with_dc()), body);
+
+        const auto result = lfs::io::load_ply(input, cpu_splat_load_options());
+
+        ASSERT_TRUE(result.has_value()) << lfs::format_for_developer(result.error());
+        EXPECT_EQ(result->value.size(), 1u);
+        const std::vector<float> opacity = opacity_values(result->value);
+        ASSERT_EQ(opacity.size(), 1u);
+        EXPECT_TRUE(std::isfinite(opacity[0]));
+        EXPECT_FLOAT_EQ(opacity[0], 20.0f);
+        ASSERT_EQ(result->warnings.size(), 1u);
+        EXPECT_EQ(find_field<std::int64_t>(
+                      result->warnings.front().fields,
+                      "repaired_opacity_values"),
+                  1);
+        EXPECT_FALSE(find_field<std::int64_t>(
+            result->warnings.front().fields, "invalid_rows"));
+    }
+
+    TEST_F(PlyErrorTaxonomyTest, RepairsNegativeInfiniteOpacityInFusedDecode) {
+        const fs::path input = path("negative_infinite_opacity.ply");
+        std::string body;
+        append_gaussian_row(body, 1.0f, -2.0f,
+                            -std::numeric_limits<float>::infinity(), 1.0f);
+        write_binary_file(input, make_binary_header(1, gaussian_properties_with_dc()), body);
+
+        const auto result = lfs::io::load_ply(input, cpu_splat_load_options());
+
+        ASSERT_TRUE(result.has_value()) << lfs::format_for_developer(result.error());
+        EXPECT_EQ(result->value.size(), 1u);
+        const std::vector<float> opacity = opacity_values(result->value);
+        ASSERT_EQ(opacity.size(), 1u);
+        EXPECT_TRUE(std::isfinite(opacity[0]));
+        EXPECT_FLOAT_EQ(opacity[0], -20.0f);
+        ASSERT_EQ(result->warnings.size(), 1u);
+        EXPECT_EQ(find_field<std::int64_t>(
+                      result->warnings.front().fields,
+                      "repaired_opacity_values"),
+                  1);
+        EXPECT_FALSE(find_field<std::int64_t>(
+            result->warnings.front().fields, "invalid_rows"));
+    }
+
+    TEST_F(PlyErrorTaxonomyTest, RepairsInfiniteOpacityWhenCompactingInvalidRows) {
+        const fs::path input = path("compacted_positive_infinite_opacity.ply");
+        std::string body;
+        append_gaussian_row(body, 1.0f, -2.0f,
+                            std::numeric_limits<float>::infinity(), 1.0f);
+        append_gaussian_row(body, std::numeric_limits<float>::quiet_NaN(), -2.0f,
+                            0.25f, 1.0f);
+        write_binary_file(input, make_binary_header(2, gaussian_properties_with_dc()), body);
+
+        const auto result = lfs::io::load_ply(input, cpu_splat_load_options());
+
+        ASSERT_TRUE(result.has_value()) << lfs::format_for_developer(result.error());
+        EXPECT_EQ(result->value.size(), 1u);
+        const std::vector<float> opacity = opacity_values(result->value);
+        ASSERT_EQ(opacity.size(), 1u);
+        EXPECT_TRUE(std::isfinite(opacity[0]));
+        EXPECT_FLOAT_EQ(opacity[0], 20.0f);
+
+        size_t discard_warnings = 0;
+        size_t repair_warnings = 0;
+        for (const auto& warning : result->warnings) {
+            if (find_field<std::int64_t>(warning.fields, "invalid_rows")) {
+                ++discard_warnings;
+                EXPECT_EQ(find_field<std::int64_t>(warning.fields, "invalid_rows"), 1);
+            }
+            if (find_field<std::int64_t>(
+                    warning.fields, "repaired_opacity_values")) {
+                ++repair_warnings;
+                EXPECT_EQ(find_field<std::int64_t>(
+                              warning.fields,
+                              "repaired_opacity_values"),
+                          1);
+            }
+        }
+        EXPECT_EQ(discard_warnings, 1u);
+        EXPECT_EQ(repair_warnings, 1u);
+    }
+
+    TEST_F(PlyErrorTaxonomyTest, RejectsNaNOpacity) {
+        const fs::path input = path("nan_opacity.ply");
+        std::string body;
+        append_gaussian_row(body, 1.0f, -2.0f,
+                            std::numeric_limits<float>::quiet_NaN(), 1.0f);
+        write_binary_file(input, make_binary_header(1, gaussian_properties_with_dc()), body);
+
+        const auto result = lfs::io::load_ply(input, cpu_splat_load_options());
+
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), lfs::ErrorCode::DataLoss);
+        EXPECT_EQ(find_error_field<std::int64_t>(result.error(), "invalid_rows"), 1);
+        EXPECT_EQ(find_error_field<std::int64_t>(result.error(), "non_finite_values"), 1);
+    }
+
+    TEST_F(PlyErrorTaxonomyTest, RejectsNonFiniteGaussianFieldsExceptOpacityInfinity) {
+        struct Case {
+            std::string_view filename;
+            std::array<float, 14> row;
+        };
+        const auto inf = std::numeric_limits<float>::infinity();
+        const std::array<Case, 4> cases{
+            Case{"non_finite_position.ply",
+                 {inf, 2.0f, 3.0f, -2.0f, -2.0f, -2.0f, 0.25f,
+                  1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}},
+            Case{"non_finite_scale.ply",
+                 {1.0f, 2.0f, 3.0f, -inf, -2.0f, -2.0f, 0.25f,
+                  1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}},
+            Case{"non_finite_rotation.ply",
+                 {1.0f, 2.0f, 3.0f, -2.0f, -2.0f, -2.0f, 0.25f,
+                  inf, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}},
+            Case{"non_finite_sh.ply",
+                 {1.0f, 2.0f, 3.0f, -2.0f, -2.0f, -2.0f, 0.25f,
+                  1.0f, 0.0f, 0.0f, 0.0f, inf, 0.0f, 0.0f}},
+        };
+
+        for (const auto& test_case : cases) {
+            SCOPED_TRACE(test_case.filename);
+            const fs::path input = path(test_case.filename);
+            std::string body;
+            append_row(body, test_case.row);
+            write_binary_file(input, make_binary_header(1, gaussian_properties_with_dc()), body);
+
+            const auto result = lfs::io::load_ply(input, cpu_splat_load_options());
+
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error().code(), lfs::ErrorCode::DataLoss);
+            EXPECT_EQ(find_error_field<std::int64_t>(result.error(), "invalid_rows"), 1);
+            EXPECT_EQ(find_error_field<std::int64_t>(result.error(), "non_finite_values"), 1);
+        }
+    }
+
+    TEST_F(PlyErrorTaxonomyTest, ExportImportOfRepairedOpacityRemainsFiniteAndOpaque) {
+        const fs::path input = path("export_import_positive_infinite_opacity_input.ply");
+        const fs::path exported = path("export_import_positive_infinite_opacity_output.ply");
+        std::string body;
+        append_gaussian_row(body, 1.0f, -2.0f,
+                            std::numeric_limits<float>::infinity(), 1.0f);
+        write_binary_file(input, make_binary_header(1, gaussian_properties_with_dc()), body);
+
+        auto loaded = lfs::io::load_ply(input, cpu_splat_load_options());
+        ASSERT_TRUE(loaded.has_value()) << lfs::format_for_developer(loaded.error());
+        const std::vector<float> repaired_opacity = opacity_values(loaded->value);
+        ASSERT_EQ(repaired_opacity.size(), 1u);
+        ASSERT_TRUE(std::isfinite(repaired_opacity[0]));
+
+        const auto saved = lfs::io::save_ply(
+            loaded->value, {.output_path = exported, .binary = true});
+        ASSERT_TRUE(saved.has_value()) << saved.error().format();
+
+        auto reloaded = lfs::io::load_ply(exported, cpu_splat_load_options());
+        ASSERT_TRUE(reloaded.has_value()) << lfs::format_for_developer(reloaded.error());
+        const std::vector<float> roundtrip_opacity = opacity_values(reloaded->value);
+        ASSERT_EQ(roundtrip_opacity.size(), 1u);
+        EXPECT_TRUE(std::isfinite(roundtrip_opacity[0]));
+        EXPECT_NEAR(sigmoid(roundtrip_opacity[0]), 1.0f, 1.0e-6f);
+        EXPECT_NEAR(sigmoid(roundtrip_opacity[0]), sigmoid(repaired_opacity[0]), 1.0e-7f);
     }
 
     TEST_F(PlyErrorTaxonomyTest, CancellationReturnsCancelled) {
@@ -591,3 +799,99 @@ namespace {
     }
 
 } // namespace
+
+TEST_F(PlyErrorTaxonomyTest, ExportRepairsInfiniteOpacityWithoutChangingSourceOrAllocatingVram) {
+    using namespace lfs::core;
+    const float inf = std::numeric_limits<float>::infinity();
+    const std::vector<float> original{inf, -inf, 16.85f, -30.0f};
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        for (const bool binary : {true, false}) {
+            PointCloud pc;
+            pc.means = Tensor::zeros({4, 3}, device);
+            pc.opacity = Tensor::from_vector(original, {4, 1}, device);
+            const auto output = path("infinite_export.ply");
+            const auto allocations_before = alloc_counter::snapshot();
+            const auto saved = lfs::io::save_ply(pc, {.output_path = output, .binary = binary});
+            ASSERT_TRUE(saved.has_value()) << saved.error().format();
+            EXPECT_EQ(alloc_counter::delta_since(allocations_before), 0u)
+                << "Opacity repair must not allocate VRAM, including transient driver allocations";
+            const auto unchanged = pc.opacity.cpu().to_vector();
+            EXPECT_EQ(unchanged, original);
+            // Inspect the serialized values, without relying on the importer's repair.
+            std::ifstream stream(output, std::ios::binary);
+            std::string line;
+            size_t columns = 0, opacity_column = 0;
+            while (std::getline(stream, line) && line != "end_header") {
+                if (line.starts_with("property ")) {
+                    if (line == "property float opacity")
+                        opacity_column = columns;
+                    ++columns;
+                }
+            }
+            ASSERT_GT(columns, opacity_column);
+            for (size_t row = 0; row < original.size(); ++row) {
+                float value = 0.0f;
+                for (size_t col = 0; col < columns; ++col) {
+                    if (binary)
+                        stream.read(reinterpret_cast<char*>(&value), sizeof(value));
+                    else
+                        stream >> value;
+                    ASSERT_TRUE(stream.good());
+                    if (col == opacity_column) {
+                        ASSERT_TRUE(std::isfinite(value));
+                        EXPECT_NEAR(value, row < 2 ? std::copysign(20.0f, original[row]) : original[row], 1e-5f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_F(PlyErrorTaxonomyTest, ExportStillRejectsNaNOpacityAndInfinitePositions) {
+    using namespace lfs::core;
+    for (const bool bad_opacity : {true, false}) {
+        PointCloud pc;
+        pc.means = Tensor::zeros({1, 3}, Device::CPU);
+        pc.opacity = Tensor::from_vector(std::vector<float>{std::numeric_limits<float>::infinity()}, {1, 1}, Device::CPU);
+        if (bad_opacity)
+            pc.opacity.ptr<float>()[0] = std::numeric_limits<float>::quiet_NaN();
+        else
+            pc.means.ptr<float>()[0] = std::numeric_limits<float>::infinity();
+        const auto output = path("invalid_export.ply");
+        const auto saved = lfs::io::save_ply(pc, {.output_path = output, .binary = true});
+        ASSERT_FALSE(saved.has_value());
+        EXPECT_NE(saved.error().format().find(bad_opacity ? "PointCloud.opacity" : "PointCloud.means"), std::string::npos);
+        EXPECT_FALSE(fs::exists(output));
+    }
+}
+
+TEST_F(PlyErrorTaxonomyTest, SplatExportRepairsOpacityAfterDeletedRowFiltering) {
+    using namespace lfs::core;
+    std::string body;
+    for (int i = 0; i < 4; ++i)
+        append_gaussian_row(body, float(i), -2.0f, 0.0f, 1.0f);
+    const auto input = path("splat_export_input.ply");
+    write_binary_file(input, make_binary_header(4, gaussian_properties_with_dc()), body);
+    auto loaded = lfs::io::load_ply(input, cpu_splat_load_options());
+    ASSERT_TRUE(loaded.has_value());
+    auto& splat = loaded->value;
+    const float inf = std::numeric_limits<float>::infinity();
+    const std::vector<float> original{inf, -inf, 16.85f, std::numeric_limits<float>::quiet_NaN()};
+    splat.opacity_raw() = Tensor::from_vector(original, {4, 1}, Device::CPU);
+    splat.deleted() = Tensor::from_vector(std::vector<bool>{false, false, false, true}, {4}, Device::CPU);
+    const auto output = path("splat_export_output.ply");
+    const auto saved = lfs::io::save_ply(splat, {.output_path = output, .binary = true});
+    ASSERT_TRUE(saved.has_value()) << saved.error().format();
+    auto roundtrip = lfs::io::load_ply(output, cpu_splat_load_options());
+    ASSERT_TRUE(roundtrip.has_value()) << lfs::format_for_developer(roundtrip.error());
+    const auto values = opacity_values(roundtrip->value);
+    ASSERT_EQ(values.size(), 3u);
+    EXPECT_NEAR(values[0], 20.0f, 1e-5f);
+    EXPECT_NEAR(values[1], -20.0f, 1e-5f);
+    EXPECT_NEAR(values[2], 16.85f, 1e-5f);
+    const auto unchanged = splat.opacity_raw().to_vector();
+    EXPECT_EQ(unchanged[0], inf);
+    EXPECT_EQ(unchanged[1], -inf);
+    EXPECT_FLOAT_EQ(unchanged[2], original[2]);
+    EXPECT_TRUE(std::isnan(unchanged[3]));
+}

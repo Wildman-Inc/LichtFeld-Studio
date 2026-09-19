@@ -3,6 +3,7 @@
 """Regression checks for VkSplat viewport output lifetime hazards."""
 
 from pathlib import Path
+import re
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -12,7 +13,20 @@ def _read(rel_path: str) -> str:
     return (PROJECT_ROOT / rel_path).read_text(encoding="utf-8")
 
 
-def test_vksplat_output_resize_waits_before_destroying_gui_sampled_images():
+def test_live_training_reserves_shared_scratch_before_render_frame():
+    source = _read("src/visualizer/rendering/vksplat_viewport_renderer.cpp")
+    render_start = source.index("VksplatViewportRenderer::render(")
+    render_body = source[render_start:]
+
+    # A timed install/grow reservation needs an idle window. Taking the render
+    # guard first makes the renderer itself an active frame and starves that
+    # reservation. Keep scratch setup ahead of the guard acquisition.
+    ensure_pos = render_body.index("ensureSharedScratchArena(context, required_shared_scratch)")
+    guard_pos = render_body.index("shared_arena_guard.emplace(&arena_handoff_token_)")
+    assert ensure_pos < guard_pos
+
+
+def test_vksplat_output_resize_retires_gui_sampled_images_into_pool():
     source = _read("src/visualizer/rendering/vksplat_viewport_renderer.cpp")
     function_start = source.index("VksplatViewportRenderer::ensureOutputImages")
     function_end = source.index(
@@ -21,13 +35,17 @@ def test_vksplat_output_resize_waits_before_destroying_gui_sampled_images():
     )
     body = source[function_start:function_end]
 
-    wait_pos = body.index("context.waitForSubmittedFrames()")
-    destroy_color_pos = body.index("context.destroyExternalImage(slot.image)")
-    destroy_depth_pos = body.index("context.destroyExternalImage(slot.depth_image)")
+    # Deferred pool retirement: no full graphics drain and no immediate destroy.
+    assert "waitForSubmittedFrames()" not in body
+    assert "destroyExternalImage" not in body
+    assert "const std::uint64_t producer = last_submitted_render_value_;" in body
+    assert "const std::uint64_t consumer = context.lastFrameSubmitSerial();" in body
+    assert "output_pool_.release(slot.color_pool_serial, producer, consumer)" in body
+    assert "output_pool_.release(slot.depth_pool_serial, producer, consumer)" in body
 
-    assert "replacing_existing_output" in body
-    assert wait_pos < destroy_color_pos
-    assert wait_pos < destroy_depth_pos
+    release_pos = body.index("output_pool_.release(")
+    acquire_pos = body.index("acquire_or_create")
+    assert release_pos < acquire_pos
 
 
 def test_vksplat_external_inputs_are_retained_and_timeline_ordered():
@@ -69,14 +87,21 @@ def test_vksplat_initialization_failure_rolls_back_all_provisional_resources():
     assert "VkSplat initialization rollback failed" in rollback_body
 
     setup_body = body[first_creation_pos:commit_pos]
-    assert "createExternalTimelineSemaphore(0, render_complete_external_)" in setup_body
+    assert re.search(
+        r"createExternalTimelineSemaphore\(0,\s*render_complete_external_,", setup_body
+    )
     assert "upload_timelines_[slot].initialize" in setup_body
     assert "overlay_upload_timelines_[slot].initialize" in setup_body
     assert "lod_engine_timeline_.initialize" in setup_body
     assert "selection_query_timeline_.initialize" in setup_body
 
     failure_positions = []
-    search_from = 0
+    # Terminal-device rejection owns no provisional resources. Every failure
+    # after initialization begins must still be covered by the rollback guard.
+    terminal_pos = body.index("context.rendererTerminalState()")
+    terminal_refusal_pos = body.index("return std::unexpected", terminal_pos)
+    assert terminal_pos < terminal_refusal_pos < provisional_pos
+    search_from = provisional_pos
     while True:
         failure_pos = body.find("return std::unexpected", search_from)
         if failure_pos < 0:
@@ -131,7 +156,7 @@ def test_appearance_optimizer_writes_are_bracketed_by_reader_handshake():
 
     for operation in (
         "ppisp_controller_pool_->optimizer_step",
-        "bilateral_grid_->optimizer_step",
+        "bilateral_grid_->step_image",
         "ppisp_->optimizer_step",
     ):
         operation_pos = body.index(operation)
@@ -154,16 +179,26 @@ def test_cuda_vulkan_image_handoff_is_ordered_in_both_directions():
     assert "std::optional<TimelinePoint> wait" in context_header
     assert "std::optional<TimelinePoint> signal" in context_header
 
-    prepare_start = service.index("void ViewportInteropService::prepareChannel")
-    prepare_end = service.index("void ViewportInteropService::prepareFrame", prepare_start)
+    prepare_start = service.index("void ViewportInteropService::prepareFrame")
+    prepare_end = service.index("void ViewportInteropService::recordFrameBarriers", prepare_start)
     prepare_body = service[prepare_start:prepare_end]
-    wait_pos = prepare_body.index("target.interop.wait(target.timeline_value")
-    copy_pos = prepare_body.index("target.interop.copyTensorToSurface", wait_pos)
-    signal_pos = prepare_body.index("target.interop.signal(signal_value", copy_pos)
-    acquire_pos = prepare_body.index(
-        "ImmediateTransitionOptions::waitOn", signal_pos
-    )
-    assert wait_pos < copy_pos < signal_pos < acquire_pos
+    release_pos = prepare_body.index("ImmediateTransitionOptions::signalAt")
+    submit_pos = prepare_body.index("context.transitionImageLayoutsImmediate", release_pos)
+    wait_pos = prepare_body.index("unit.interop.wait(unit.timeline_value", submit_pos)
+    copy_pos = prepare_body.index("unit.interop.copyTensorToSurface", wait_pos)
+    signal_pos = prepare_body.index("unit.interop.signal(signal_value", copy_pos)
+    retain_pos = prepare_body.index(".cuda_signal_value = signal_value", signal_pos)
+    assert release_pos < submit_pos < wait_pos < copy_pos < signal_pos < retain_pos
+
+    record_end = service.index("void ViewportInteropService::bindViewportParams", prepare_end)
+    record_body = service[prepare_end:record_end]
+    assert "barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL" in record_body
+    assert "barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL" in record_body
+    acquire_pos = record_body.index("context.addFrameTimelineWait")
+    assert "pending.cuda_signal_value" in record_body[acquire_pos:]
+    assert "VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT" in record_body[acquire_pos:]
+    publish_pos = record_body.index("publishFromTarget", acquire_pos)
+    assert acquire_pos < record_body.index("pending.unit->layout =", acquire_pos) < publish_pos
 
     assert "interop.wait(interop_timeline_value, upload_stream)" in ui_texture
     assert "interop.signal(signal_value, upload_stream)" in ui_texture
@@ -195,7 +230,7 @@ def test_vulkan_immediate_submit_reclaims_context_owned_work_asynchronously():
     active_frame_pos = transition_body.index("if (frame_active_)")
     drain_pos = transition_body.index("drainCompletedImmediateSubmits()")
     allocate_pos = transition_body.index("vkAllocateCommandBuffers")
-    submit_pos = transition_body.index("vkQueueSubmit")
+    submit_pos = transition_body.index("vk_queue_submit_synced")
     retain_pos = transition_body.index("pending_immediate_submits_.push_back", submit_pos)
     assert active_frame_pos < drain_pos < allocate_pos < submit_pos < retain_pos
     assert "kMaxPendingImmediateSubmits = 64" in transition_body
@@ -227,13 +262,14 @@ def test_cuda_surface_copy_is_stream_ordered_without_blocking_the_steady_path():
     assert "launchCudaVulkanCopyTensorToSurface" in copy_body
     assert "cudaStreamSynchronize" not in copy_body
 
-    prepare_start = service.index("void ViewportInteropService::prepareChannel")
-    prepare_end = service.index("void ViewportInteropService::prepareFrame", prepare_start)
+    prepare_start = service.index("void ViewportInteropService::prepareFrame")
+    prepare_end = service.index("void ViewportInteropService::recordFrameBarriers", prepare_start)
     prepare_body = service[prepare_start:prepare_end]
-    wait_pos = prepare_body.index("target.interop.wait")
-    copy_pos = prepare_body.index("target.interop.copyTensorToSurface", wait_pos)
-    signal_pos = prepare_body.index("target.interop.signal", copy_pos)
+    wait_pos = prepare_body.index("unit.interop.wait")
+    copy_pos = prepare_body.index("unit.interop.copyTensorToSurface", wait_pos)
+    signal_pos = prepare_body.index("unit.interop.signal", copy_pos)
     assert wait_pos < copy_pos < signal_pos
+    assert "cudaStreamSynchronize" not in prepare_body
 
 
 def test_scene_upload_uses_frame_slots_and_timeline_handoffs():
@@ -248,11 +284,17 @@ def test_scene_upload_uses_frame_slots_and_timeline_handoffs():
     assert "channel.targets.resize(context.framesInFlight())" in body
     cache_hit_pos = body.index("ViewportInteropAction::CacheHit")
     frame_wait_pos = body.index("context.waitForCurrentFrameSlot()")
-    copy_pos = body.index("target.interop.copyTensorToSurface")
-    assert cache_hit_pos < frame_wait_pos < copy_pos
-    assert "target.interop.wait" in body
-    assert "target.interop.signal" in body
+    enqueue_pos = body.index("pending_uploads_.push_back")
+    assert cache_hit_pos < frame_wait_pos < enqueue_pos
     assert "cudaStreamSynchronize" not in body
+
+    frame_end = service.index("void ViewportInteropService::recordFrameBarriers", prepare_end)
+    frame_body = service[prepare_end:frame_end]
+    prepare_pos = frame_body.index("prepareChannel(context, channels_->scene")
+    wait_pos = frame_body.index("unit.interop.wait")
+    copy_pos = frame_body.index("unit.interop.copyTensorToSurface")
+    signal_pos = frame_body.index("unit.interop.signal")
+    assert prepare_pos < wait_pos < copy_pos < signal_pos
 
     drain_start = scene.index("void SceneManager::drainGpuForTensorRelease()")
     drain_end = scene.index("bool SceneManager::resetToEmptyState", drain_start)
@@ -264,14 +306,34 @@ def test_scene_upload_uses_frame_slots_and_timeline_handoffs():
 
 def test_cuda_vulkan_external_images_drain_work_before_destroy():
     service = _read("src/visualizer/rendering/viewport_interop_service.cpp")
-    target_start = service.index("void destroy(VulkanContext& context)")
-    target_end = service.index("};", target_start)
-    target_body = service[target_start:target_end]
+    drain_start = service.index("void ViewportInteropService::drainInteropPool")
+    drain_end = service.index("void ViewportInteropService::releaseSlotTarget", drain_start)
+    drain_body = service[drain_start:drain_end]
 
-    idle_pos = target_body.index("context.waitForImmediateSubmits()")
-    interop_reset_pos = target_body.index("\n            interop.reset();")
-    image_destroy_pos = target_body.index("\n            context.destroyExternalImage(image);")
+    idle_pos = drain_body.index("context.waitForImmediateSubmits()")
+    interop_reset_pos = drain_body.index("unit.interop.reset();")
+    image_destroy_pos = drain_body.index("context.destroyExternalImage(unit.image);")
     assert idle_pos < interop_reset_pos < image_destroy_pos
+    # Pool reuse/destruction requires both compute production and GUI sampling
+    # to retire, not merely completion of the image-layout submission.
+    assert "context.getTimelineSemaphoreCounterValue(unit.semaphore.semaphore, counter)" in drain_body
+    assert "return counter >= value" in drain_body
+    assert "context.retiredFrameSubmitSerial()" in drain_body
+    assert "return serial <= retired_serial" in drain_body
+    assert "pool.drain(force, producer_pred, consumer_pred, destroy_fn)" in drain_body
+
+    release_end = service.index("void ViewportInteropService::setSceneImage", drain_end)
+    release_body = service[drain_end:release_end]
+    assert "target.unit->timeline_value" in release_body
+    assert "context.lastFrameSubmitSerial()" in release_body
+    assert "pool.release(target.pool_serial, producer, consumer)" in release_body
+    assert "destroyExternalImage" not in release_body
+
+    shutdown_start = service.index("void ViewportInteropService::shutdown(")
+    shutdown_body = service[shutdown_start:]
+    assert shutdown_body.index("upload_stream_.synchronize()") < shutdown_body.index(
+        "drainInteropPool(*teardown_context_, /*force=*/true)"
+    )
 
     ui_texture = _read("src/visualizer/gui/vulkan_ui_texture.cpp")
     destroy_start = ui_texture.index("void destroyImage()")
@@ -336,7 +398,7 @@ def test_vulkan_preview_render_view_uses_native_device_limits_not_16k_policy():
     assert "renderPreviewImageTiledWithState" in source
     assert "request.frame_view.intrinsics_override" in source
     assert "copyPreviewTileToOutput" not in source
-    assert "readOutputImageIntoCpuHwc" in source
+    assert "submitReadOutputImageIntoCpuHwcTicket" in source
     assert "lfs::core::Tensor::empty" in source
 
 
@@ -359,11 +421,26 @@ def test_vksplat_preview_export_releases_transient_resources():
     manager = _read("src/visualizer/rendering/rendering_manager_viewport.cpp")
 
     assert "releasePreviewResources" in header
-    assert "releaseOutputSlot(OutputSlot::Preview)" in source
+    assert "releaseOutputSlot(OutputSlot::Preview, /*evict=*/true)" in source
     assert "releasePrivateScratchBuffers()" in source
     assert "releaseSharedScratchArena()" in source
     assert "logVramBreakdownIfChanged(\"preview_release\")" in source
     assert "releasePreviewImageResources" in manager
+
+
+def test_vksplat_readbacks_use_consumer_watermark_not_full_drain():
+    source = _read("src/visualizer/rendering/vksplat_viewport_renderer.cpp")
+    header = _read("src/visualizer/window/vulkan_context.hpp")
+
+    # Definition + three image-readback call sites (depth image, color HWC, sample).
+    assert source.count("waitForOutputImageConsumers") >= 4
+
+    preview_start = source.index("VksplatViewportRenderer::readPreviewDepth")
+    preview_end = source.index("VksplatViewportRenderer::", preview_start + 1)
+    preview_body = source[preview_start:preview_end]
+    assert "waitForSubmittedFrames" not in preview_body
+
+    assert "waitForRetiredFrameSubmitSerial" in header
 
 
 def test_gaussian_video_export_uses_vulkan_preview_renderer():

@@ -3,7 +3,9 @@
 
 // Phase 7A: fake-clock bounded-wait matrix (spec §4.4) — GPU-free.
 
+#include "core/logger.hpp"
 #include "rendering/vulkan_wait.hpp"
+#include "window/vulkan_context.hpp"
 
 #include <gtest/gtest.h>
 
@@ -1028,4 +1030,101 @@ TEST(VulkanWaitBounded, Phase7CP3Mesh2SplatFingerprintQuarantine) {
     // Mapping table still says retain when wait is not Ready after submit.
     EXPECT_EQ(map_mesh2splat_resource_disposition(true, false),
               Mesh2SplatResourceAction::RetainFenceAndCb);
+}
+
+// ---------------------------------------------------------------------------
+// #1721: GUI-frame timeline wait accounting. GPU-free cursor used by
+// VulkanContext::addFrameTimelineWait. Same-value re-wait after a no-submit
+// frame is not an error; a later bump still queues.
+// ---------------------------------------------------------------------------
+
+TEST(FrameTimelineWaitCursor, SameValueAfterNoSubmitRequeues) {
+    lfs::rendering::FrameTimelineWaitCursor cursor;
+    EXPECT_EQ(cursor.note(2331), lfs::rendering::FrameTimelineWaitAction::Queue);
+    EXPECT_EQ(cursor.pending, 2331u);
+    EXPECT_EQ(cursor.committed, 0u);
+
+    cursor.submit_rejected();
+    EXPECT_EQ(cursor.pending, 0u);
+    EXPECT_EQ(cursor.committed, 0u);
+
+    // No-submit frame: the wait never reached the GPU, so the same value
+    // must be queued again rather than treated as a contract violation.
+    EXPECT_EQ(cursor.note(2331), lfs::rendering::FrameTimelineWaitAction::Queue);
+    EXPECT_EQ(cursor.pending, 2331u);
+}
+
+TEST(FrameTimelineWaitCursor, SameValueAfterSubmitIsAlreadySatisfied) {
+    lfs::rendering::FrameTimelineWaitCursor cursor;
+    EXPECT_EQ(cursor.note(2331), lfs::rendering::FrameTimelineWaitAction::Queue);
+    cursor.submit_accepted();
+    EXPECT_EQ(cursor.committed, 2331u);
+    EXPECT_EQ(cursor.pending, 0u);
+
+    EXPECT_EQ(cursor.note(2331), lfs::rendering::FrameTimelineWaitAction::AlreadySatisfied);
+    EXPECT_EQ(cursor.note(2300), lfs::rendering::FrameTimelineWaitAction::AlreadySatisfied);
+    EXPECT_EQ(cursor.pending, 0u);
+    EXPECT_EQ(cursor.committed, 2331u);
+}
+
+TEST(FrameTimelineWaitCursor, BumpAfterSubmitQueues) {
+    lfs::rendering::FrameTimelineWaitCursor cursor;
+    EXPECT_EQ(cursor.note(2331), lfs::rendering::FrameTimelineWaitAction::Queue);
+    cursor.submit_accepted();
+
+    EXPECT_EQ(cursor.note(2332), lfs::rendering::FrameTimelineWaitAction::Queue);
+    EXPECT_EQ(cursor.pending, 2332u);
+    EXPECT_EQ(cursor.committed, 2331u);
+    cursor.submit_accepted();
+    EXPECT_EQ(cursor.committed, 2332u);
+    EXPECT_EQ(cursor.pending, 0u);
+}
+
+TEST(FrameTimelineWaitCursor, WithinFrameDuplicateIsAlreadySatisfied) {
+    lfs::rendering::FrameTimelineWaitCursor cursor;
+    EXPECT_EQ(cursor.note(10), lfs::rendering::FrameTimelineWaitAction::Queue);
+    EXPECT_EQ(cursor.note(10), lfs::rendering::FrameTimelineWaitAction::AlreadySatisfied);
+    EXPECT_EQ(cursor.note(11), lfs::rendering::FrameTimelineWaitAction::Queue);
+    EXPECT_EQ(cursor.pending, 11u);
+    cursor.submit_accepted();
+    EXPECT_EQ(cursor.committed, 11u);
+}
+
+namespace lfs::vis {
+    struct VulkanContextTestAccess {
+        static void loseDevice(VulkanContext& context) {
+            (void)context.mapWaitOutcome(lfs::make_error({.code = ErrorCode::DeviceLost, .domain = ErrorDomain::Vulkan, .detail = "injected device loss", .detection = LFS_SOURCE_SITE_CURRENT()}), "test fence");
+        }
+        static void quarantine(VulkanContext& context) {
+            context.gpu_wait_quarantined_.store(true);
+        }
+    };
+} // namespace lfs::vis
+
+TEST(VulkanContextTerminalTest, LostOrQuarantinedDeviceStopsFramesAndFenceRetries) {
+    for (const bool lost : {true, false}) {
+        lfs::vis::VulkanContext context;
+        if (lost)
+            lfs::vis::VulkanContextTestAccess::loseDevice(context);
+        else
+            lfs::vis::VulkanContextTestAccess::quarantine(context);
+        const auto first_error = context.lastError();
+        size_t error_count = 0;
+        const auto token = lfs::core::Logger::get().add_log_handler(
+            [&](lfs::core::LogLevel level, const lfs::core::SourceSite&, std::string_view) {
+                if (level == lfs::core::LogLevel::Error || level == lfs::core::LogLevel::Warn)
+                    ++error_count;
+            });
+        for (int frame = 0; frame < 1000; ++frame) {
+            lfs::vis::VulkanContext::Frame output;
+            EXPECT_FALSE(context.beginFrame({}, output));
+            EXPECT_FALSE(context.endFrame());
+            EXPECT_FALSE(context.waitForSubmittedFrames());
+        }
+        lfs::core::Logger::get().remove_log_handler(token);
+        EXPECT_EQ(error_count, 0u);
+        EXPECT_EQ(context.lastError(), first_error);
+        EXPECT_EQ(context.rendererTerminalState(), lost ? lfs::vis::RendererTerminalState::DeviceLost
+                                                        : lfs::vis::RendererTerminalState::Quarantined);
+    }
 }

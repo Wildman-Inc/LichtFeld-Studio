@@ -9,6 +9,9 @@
 #include "hdr_tonemap.hpp"
 #include "nvcodec_image_loader.hpp"
 #include "video/color_convert.cuh"
+#if defined(USE_CUDA) && USE_CUDA
+#include "video/cuda_frame_handoff.hpp"
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -38,6 +41,7 @@ extern "C" {
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace lfs::io {
@@ -772,6 +776,8 @@ namespace lfs::io {
     class VideoFrameExtractor::Impl {
     public:
         bool extract(const Params& params, std::string& error) {
+            outcome_ = ExtractionOutcome::Failed;
+            error.clear();
             const auto extraction_started = std::chrono::steady_clock::now();
             AVFormatContext* fmt_ctx = nullptr;
             AVCodecContext* codec_ctx = nullptr;
@@ -789,6 +795,23 @@ namespace lfs::io {
             std::vector<uint8_t> rot_buf;
             std::unique_ptr<NvCodecImageLoader> nvcodec;
             bool using_hw_decode = false;
+
+            const auto cleanup = [&]() {
+                if (sws_ctx)
+                    sws_freeContext(sws_ctx);
+                av_frame_free(&frame);
+                av_frame_free(&sw_frame);
+                av_frame_free(&sparse_previous_frame);
+                av_packet_free(&packet);
+                avcodec_free_context(&codec_ctx);
+                av_buffer_unref(&hw_device_ctx);
+                avformat_close_input(&fmt_ctx);
+                delete[] cpu_contiguous_buffer;
+                cpu_contiguous_buffer = nullptr;
+                freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
+                freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
+                freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
+            };
 
             try {
                 const std::string video_path_utf8 = lfs::core::path_to_utf8(params.video_path);
@@ -907,52 +930,69 @@ namespace lfs::io {
                                                      : "CPU software");
                 }
 
-                codec_ctx = avcodec_alloc_context3(codec);
-                if (!codec_ctx) {
-                    error = "Failed to allocate codec context";
-                    if (hw_device_ctx)
-                        av_buffer_unref(&hw_device_ctx);
-                    avformat_close_input(&fmt_ctx);
-                    return false;
-                }
-
-                if (avcodec_parameters_to_context(codec_ctx, video_stream->codecpar) < 0) {
-                    error = "Failed to copy codec parameters";
-                    avcodec_free_context(&codec_ctx);
-                    if (hw_device_ctx)
-                        av_buffer_unref(&hw_device_ctx);
-                    avformat_close_input(&fmt_ctx);
-                    return false;
-                }
-
-                if (using_hw_decode) {
-                    codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-                    if (!codec_ctx->hw_device_ctx) {
-                        error = "Failed to retain CUDA video decoder context";
-                        avcodec_free_context(&codec_ctx);
-                        av_buffer_unref(&hw_device_ctx);
+                while (true) {
+                    codec_ctx = avcodec_alloc_context3(codec);
+                    if (!codec_ctx) {
+                        error = "Failed to allocate codec context";
+                        if (hw_device_ctx)
+                            av_buffer_unref(&hw_device_ctx);
                         avformat_close_input(&fmt_ctx);
                         return false;
                     }
-                    codec_ctx->get_format = get_hw_format;
-                } else {
-                    const unsigned int hardware_threads = std::max(1U, std::thread::hardware_concurrency());
-                    codec_ctx->thread_count = std::min(MAX_SW_DECODE_THREADS,
-                                                       static_cast<int>(hardware_threads));
-                    codec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-                    LOG_INFO("FFmpeg software decoder threads: {}", codec_ctx->thread_count);
-                }
+
+                    if (avcodec_parameters_to_context(codec_ctx, video_stream->codecpar) < 0) {
+                        error = "Failed to copy codec parameters";
+                        avcodec_free_context(&codec_ctx);
+                        if (hw_device_ctx)
+                            av_buffer_unref(&hw_device_ctx);
+                        avformat_close_input(&fmt_ctx);
+                        return false;
+                    }
+
+                    if (using_hw_decode) {
+                        codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+                        if (!codec_ctx->hw_device_ctx) {
+                            error = "Failed to retain CUDA video decoder context";
+                            avcodec_free_context(&codec_ctx);
+                            av_buffer_unref(&hw_device_ctx);
+                            avformat_close_input(&fmt_ctx);
+                            return false;
+                        }
+                        codec_ctx->get_format = get_hw_format;
+                    } else {
+                        const unsigned int hardware_threads = std::max(1U, std::thread::hardware_concurrency());
+                        codec_ctx->thread_count = std::min(MAX_SW_DECODE_THREADS,
+                                                           static_cast<int>(hardware_threads));
+                        codec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+                        LOG_INFO("FFmpeg software decoder threads: {}", codec_ctx->thread_count);
+                    }
 #ifdef AV_CODEC_EXPORT_DATA_DOVI_RPU
-                codec_ctx->export_side_data |= AV_CODEC_EXPORT_DATA_DOVI_RPU;
+                    codec_ctx->export_side_data |= AV_CODEC_EXPORT_DATA_DOVI_RPU;
 #endif
 
-                if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
-                    error = "Failed to open codec";
+                    if (avcodec_open2(codec_ctx, codec, nullptr) >= 0)
+                        break;
+
+                    if (!using_hw_decode) {
+                        error = "Failed to open codec";
+                        avcodec_free_context(&codec_ctx);
+                        if (hw_device_ctx)
+                            av_buffer_unref(&hw_device_ctx);
+                        avformat_close_input(&fmt_ctx);
+                        return false;
+                    }
+
+                    LOG_WARN("Failed to open NVDEC hardware decoder {}, falling back to CPU", hw_decoder_name);
                     avcodec_free_context(&codec_ctx);
-                    if (hw_device_ctx)
-                        av_buffer_unref(&hw_device_ctx);
-                    avformat_close_input(&fmt_ctx);
-                    return false;
+                    av_buffer_unref(&hw_device_ctx);
+                    using_hw_decode = false;
+                    codec = avcodec_find_decoder(codec_id);
+                    if (!codec) {
+                        error = "Unsupported codec";
+                        avformat_close_input(&fmt_ctx);
+                        return false;
+                    }
+                    LOG_INFO("Using CPU software decoder");
                 }
 
                 const int src_width = codec_ctx->width;
@@ -1169,7 +1209,7 @@ namespace lfs::io {
                             gpu_batch_buffer = nullptr;
                             jpeg_batch_size = 0;
                         }
-                    } else {
+                    } else if (memory_info_result == cudaSuccess) {
                         LOG_WARN(
                             "Insufficient CUDA memory headroom for JPEG batching; "
                             "falling back to CPU");
@@ -1330,6 +1370,7 @@ namespace lfs::io {
                     double sharpness_score;
                 };
                 std::vector<FrameSaveInfo> saved_frames;
+                std::unordered_set<std::filesystem::path> emitted_filenames;
 
                 const bool seek_timestamps_available =
                     std::isfinite(time_base) && time_base > 0.0 && std::isfinite(video_duration) &&
@@ -1397,6 +1438,29 @@ namespace lfs::io {
                     return params.output_dir / (formatFrameFilenameStem(params.filename_pattern, frame_num) + ext);
                 };
 
+                const auto source_frame_for_time = [&](const double frame_time) {
+                    return std::max(
+                        1, static_cast<int>(std::llround(frame_time * video_fps)) + 1);
+                };
+
+                auto reserve_output_filename = [&](const std::filesystem::path& filename,
+                                                   const int source_frame) {
+                    if (emitted_filenames.insert(filename).second)
+                        return true;
+                    LOG_WARN("Skipping duplicate source frame {} output: {}",
+                             source_frame, lfs::core::path_to_utf8(filename));
+                    return false;
+                };
+
+                auto finish_selected_frame = [&]() {
+                    saved_count++;
+
+                    if (params.progress_callback) {
+                        params.progress_callback(saved_count + skipped_count, estimated_total, skipped_count);
+                    }
+                    throw_if_cancelled();
+                };
+
                 auto should_extract_frame = [&](const double frame_time) {
                     bool should_extract = false;
                     if (params.mode == ExtractionMode::FPS) {
@@ -1421,8 +1485,13 @@ namespace lfs::io {
                         [](const CandidateFrame& a, const CandidateFrame& b) {
                             return a.score < b.score;
                         });
-                    std::filesystem::path fname = generate_filename(
-                        written_count + 1);
+                    std::filesystem::path fname = generate_filename(best->source_frame);
+                    if (!reserve_output_filename(fname, best->source_frame)) {
+                        finish_selected_frame();
+                        window_candidates.clear();
+                        window_skip_counter = 0;
+                        return;
+                    }
                     // Apply rotation to the best window frame before writing
                     int write_w = out_width;
                     int write_h = out_height;
@@ -1470,17 +1539,14 @@ namespace lfs::io {
                                                     best->score});
                         }
                     }
-                    ++saved_count;
-                    if (params.progress_callback)
-                        params.progress_callback(saved_count, estimated_total, skipped_count);
+                    finish_selected_frame();
                     window_candidates.clear();
                     window_skip_counter = 0;
-                    throw_if_cancelled();
                 };
 
                 auto process_frame_hw = [&](AVFrame* hw_frame) {
                     throw_if_cancelled();
-                    std::filesystem::path filename = generate_filename(saved_count + 1);
+                    std::filesystem::path filename = generate_filename(current_src_frame);
 
                     const AVPixelFormat hw_sw_format = hardwareFrameSoftwareFormat(hw_frame);
                     if (decoded_software_format == AV_PIX_FMT_NONE &&
@@ -1497,7 +1563,9 @@ namespace lfs::io {
                         logged_hw_format_fallback = true;
                     }
 
+#if defined(USE_CUDA) && USE_CUDA
                     if (use_full_gpu_pipeline) {
+                        video::CudaFrameHandoff frame_handoff(hw_frame);
                         const uint8_t* y_plane = hw_frame->data[0];
                         const uint8_t* uv_plane = hw_frame->data[1];
                         const int y_pitch = hw_frame->linesize[0];
@@ -1534,6 +1602,11 @@ namespace lfs::io {
                             }
                         }
 
+                        if (!reserve_output_filename(filename, current_src_frame)) {
+                            finish_selected_frame();
+                            return;
+                        }
+
                         const int rot = params.rotation;
                         int batch_w = out_width;
                         int batch_h = out_height;
@@ -1562,6 +1635,7 @@ namespace lfs::io {
                             cudaMemcpy(dst_ptr, batch_src, frame_size,
                                        cudaMemcpyDeviceToDevice),
                             "CUDA JPEG batch copy failed");
+                        frame_handoff.finish();
 
                         batch_gpu_ptrs.push_back(dst_ptr);
                         batch_filenames.push_back(filename);
@@ -1571,7 +1645,9 @@ namespace lfs::io {
                         if (batch_idx >= jpeg_batch_size) {
                             flush_jpeg_batch();
                         }
-                    } else {
+                    } else
+#endif
+                    {
                         av_frame_unref(sw_frame);
                         const int transfer_result =
                             av_hwframe_transfer_data(sw_frame, hw_frame, 0);
@@ -1617,6 +1693,11 @@ namespace lfs::io {
                             }
                         }
                         // --- End sharpness ---
+
+                        if (!reserve_output_filename(filename, current_src_frame)) {
+                            finish_selected_frame();
+                            return;
+                        }
 
                         // --- Rotation (hybrid HW path) ---
                         int hw_rot_w = out_width;
@@ -1732,6 +1813,12 @@ namespace lfs::io {
                     }
                     // --- End sharpness ---
 
+                    std::filesystem::path filename = generate_filename(current_src_frame);
+                    if (!reserve_output_filename(filename, current_src_frame)) {
+                        finish_selected_frame();
+                        return;
+                    }
+
                     // --- Rotation (SW path) ---
                     int sw_rot_w = out_width;
                     int sw_rot_h = out_height;
@@ -1766,8 +1853,6 @@ namespace lfs::io {
                                     static_cast<size_t>(out_width) * out_height * 3);
                     }
                     // --- End rotation ---
-
-                    std::filesystem::path filename = generate_filename(saved_count + 1);
 
                     if (gpu_encoding_enabled) {
                         if (batch_encode_w == 0) {
@@ -1804,12 +1889,7 @@ namespace lfs::io {
                         LOG_WARN("Failed to write extracted frame: {}", lfs::core::path_to_utf8(filename));
                     }
 
-                    saved_count++;
-
-                    if (params.progress_callback) {
-                        params.progress_callback(saved_count + skipped_count, estimated_total, skipped_count);
-                    }
-                    throw_if_cancelled();
+                    finish_selected_frame();
                 };
 
                 if (params.mode == ExtractionMode::FPS) {
@@ -1841,8 +1921,7 @@ namespace lfs::io {
                 const auto process_selected_frame = [&](AVFrame* const selected_frame,
                                                         const double frame_time) {
                     current_frame_time = frame_time;
-                    current_src_frame = std::max(
-                        1, static_cast<int>(std::llround(frame_time * video_fps)) + 1);
+                    current_src_frame = source_frame_for_time(frame_time);
                     if (using_hw_decode)
                         process_frame_hw(selected_frame);
                     else
@@ -1872,7 +1951,7 @@ namespace lfs::io {
                     }
 
                     current_frame_time = frame_time;
-                    current_src_frame = decoded_frame_count;
+                    current_src_frame = source_frame_for_time(frame_time);
                     if (params.sharpness.enabled && params.sharpness.window_mode) {
                         const int window_index = params.mode == ExtractionMode::FPS
                                                      ? static_cast<int>(std::floor(
@@ -2240,7 +2319,7 @@ namespace lfs::io {
 
                         const std::filesystem::path meta_path =
                             params.output_dir / "extraction_metadata.json";
-                        std::ofstream meta_file(meta_path);
+                        std::ofstream meta_file(meta_path, std::ios::binary);
                         if (meta_file) {
                             meta_file << root.dump(2);
                         }
@@ -2265,50 +2344,27 @@ namespace lfs::io {
                              cuda_upload_seconds, jpeg_encode_seconds, jpeg_write_seconds);
                 }
 
-                // Cleanup
-                if (sws_ctx)
-                    sws_freeContext(sws_ctx);
-                av_frame_free(&frame);
-                av_frame_free(&sw_frame);
-                av_frame_free(&sparse_previous_frame);
-                av_packet_free(&packet);
-                avcodec_free_context(&codec_ctx);
-                if (hw_device_ctx)
-                    av_buffer_unref(&hw_device_ctx);
-                avformat_close_input(&fmt_ctx);
-                delete[] cpu_contiguous_buffer;
-                freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
-                freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
-                freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
+                cleanup();
 
+                outcome_ = ExtractionOutcome::Completed;
                 return true;
 
+            } catch (const ExtractionCancelled& e) {
+                cleanup();
+                outcome_ = ExtractionOutcome::Cancelled;
+                error = e.what();
+                return false;
             } catch (const std::exception& e) {
-                if (sws_ctx)
-                    sws_freeContext(sws_ctx);
-                if (frame)
-                    av_frame_free(&frame);
-                if (sw_frame)
-                    av_frame_free(&sw_frame);
-                if (sparse_previous_frame)
-                    av_frame_free(&sparse_previous_frame);
-                if (packet)
-                    av_packet_free(&packet);
-                if (codec_ctx)
-                    avcodec_free_context(&codec_ctx);
-                if (hw_device_ctx)
-                    av_buffer_unref(&hw_device_ctx);
-                if (fmt_ctx)
-                    avformat_close_input(&fmt_ctx);
-                delete[] cpu_contiguous_buffer;
-                freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
-                freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
-                freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
-
+                cleanup();
                 error = e.what();
                 return false;
             }
         }
+
+        [[nodiscard]] ExtractionOutcome lastOutcome() const { return outcome_; }
+
+    private:
+        ExtractionOutcome outcome_ = ExtractionOutcome::Failed;
     };
 
     VideoFrameExtractor::VideoFrameExtractor() : impl_(new Impl()) {}
@@ -2316,6 +2372,10 @@ namespace lfs::io {
 
     bool VideoFrameExtractor::extract(const Params& params, std::string& error) {
         return impl_->extract(params, error);
+    }
+
+    ExtractionOutcome VideoFrameExtractor::lastOutcome() const {
+        return impl_->lastOutcome();
     }
 
 } // namespace lfs::io

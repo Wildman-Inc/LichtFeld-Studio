@@ -34,6 +34,17 @@ namespace {
         int begin_calls = 0;
         int reset_cb_calls = 0;
         VkResult first_submit_result = VK_ERROR_DEVICE_LOST;
+        VkResult query_result = VK_NOT_READY;
+        int query_calls = 0;
+        VkQueryResultFlags query_flags = 0;
+
+        static VKAPI_ATTR VkResult VKAPI_CALL query_results(VkDevice, VkQueryPool, uint32_t,
+                                                            uint32_t, size_t, void*, VkDeviceSize,
+                                                            VkQueryResultFlags flags) {
+            ++active()->query_calls;
+            active()->query_flags = flags;
+            return active()->query_result;
+        }
 
         static SubmitScript*& active() {
             static SubmitScript* ptr = nullptr;
@@ -103,6 +114,8 @@ namespace {
             disarm_for_destruction();
         }
 
+        void collect_timestamps() { collectTimestampResults(command_batch_slots_[0], 2); }
+
         void install_fake_handles() {
             device = fakeVkHandle<VkDevice>(0x1001);
             command_queue = fakeVkHandle<VkQueue>(0x1002);
@@ -123,6 +136,9 @@ namespace {
             commandBatchInProgress = false;
             last_timeline_signal_values_.clear();
             pending_timeline_waits_.clear();
+            buffer_retire_timeline_ = fakeVkHandle<VkSemaphore>(0x5001);
+            next_buffer_retire_value_ = 1;
+            retired_buffer_shells_.clear();
         }
 
         void disarm_for_destruction() {
@@ -137,6 +153,9 @@ namespace {
                 slot.command_buffer = VK_NULL_HANDLE;
                 slot.timestamp_query_pool = VK_NULL_HANDLE;
             }
+            retired_buffer_shells_.clear();
+            buffer_retire_timeline_ = VK_NULL_HANDLE;
+            next_buffer_retire_value_ = 1;
             command_buffer = VK_NULL_HANDLE;
             timestamp_query_pool = VK_NULL_HANDLE;
             fence = VK_NULL_HANDLE;
@@ -233,4 +252,24 @@ TEST(VkSplatFailedSubmitNoPublish, QW6_FailThenSuccessNoFalsePublication) {
     // false pre-submit publication; value_fail must still be absent.
     EXPECT_NE(pipeline.pending_signal_of_active(), VK_NULL_HANDLE);
     EXPECT_EQ(pipeline.pending_signal_value_of_active(), value_ok);
+}
+
+TEST(VksplatTimestampTest, MissingProfilingResultsNeverBlockOrFailRendering) {
+    SubmitScript script;
+    BindSubmit bind(script);
+    TestablePipeline pipeline;
+    pipeline.install_fake_handles();
+    auto dispatch = lfs::rendering::VulkanDispatch::real();
+    dispatch.get_query_pool_results = SubmitScript::query_results;
+    pipeline.setVulkanDispatch(dispatch);
+    EXPECT_NO_THROW(pipeline.collect_timestamps());
+    EXPECT_EQ(script.query_calls, 1);
+    EXPECT_EQ(script.query_flags & VK_QUERY_RESULT_WAIT_BIT, 0u);
+    script.query_result = VK_ERROR_DEVICE_LOST;
+    try {
+        pipeline.collect_timestamps();
+        FAIL() << "device loss must remain a typed error";
+    } catch (const lfs::Exception& error) {
+        EXPECT_EQ(error.error().code(), lfs::ErrorCode::DeviceLost);
+    }
 }

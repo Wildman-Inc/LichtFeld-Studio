@@ -22,6 +22,7 @@ namespace lfs::python {
             int iteration = 0;
             float psnr = 0.0f;
             float ssim = 0.0f;
+            std::optional<float> lpips;
         };
 
         std::mutex g_latest_eval_metrics_mutex;
@@ -63,21 +64,25 @@ namespace lfs::python {
             g_latest_eval_metrics = LatestEvaluationMetrics{
                 .iteration = e.iteration,
                 .psnr = e.psnr,
-                .ssim = e.ssim};
+                .ssim = e.ssim,
+                .lpips = e.lpips};
         });
 
         state::TrainingCompleted::when([](const auto& e) {
-            if (e.user_stopped)
-                return;
             if (!e.success)
                 return; // failures surface via the native ErrorBus bridge
+            if (e.suppress_notification)
+                return; // stop was part of New Project / app close / reset / trainer teardown on scene/dataset replacement — no modal (issue #1604, #1645)
 
             namespace Str = lichtfeld::Strings::Training::Button;
 
-            auto message = std::format(
-                "Training completed successfully.\n\n"
-                "{} iterations | loss {:.6f} | {}",
-                e.iteration, e.final_loss, formatDuration(e.elapsed_seconds));
+            auto message = e.user_stopped
+                               ? std::format("Training stopped by user at iteration {}.\n\n"
+                                             "Resume is available from the training panel. Save the project to keep this state.",
+                                             e.iteration)
+                               : std::format("Training completed successfully.\n\n"
+                                             "{} iterations | loss {:.6f} | {}",
+                                             e.iteration, e.final_loss, formatDuration(e.elapsed_seconds));
             std::optional<LatestEvaluationMetrics> eval_snapshot;
             {
                 std::lock_guard lock(g_latest_eval_metrics_mutex);
@@ -96,16 +101,26 @@ namespace lfs::python {
                         eval_snapshot->psnr,
                         eval_snapshot->ssim);
                 }
+                if (eval_snapshot->lpips)
+                    message += std::format(" | LPIPS {:.4f}", *eval_snapshot->lpips);
             }
 
-            const std::string edit_label = LOC(Str::SWITCH_EDIT_MODE);
-            PyModalRegistry::instance().show_confirm(
-                "Training Complete", message,
-                {edit_label, "OK"},
-                [edit_label](const std::string& clicked) {
-                    if (clicked == edit_label)
-                        cmd::SwitchToEditMode{}.emit();
-                });
+            if (e.user_stopped) {
+                // Stopped by user: OK only — Edit mode is nonsensical when scene may be clearing (issue #1604)
+                PyModalRegistry::instance().show_confirm(
+                    "Training Stopped", message,
+                    {"OK"},
+                    [](const std::string&) {});
+            } else {
+                const std::string edit_label = LOC(Str::SWITCH_EDIT_MODE);
+                PyModalRegistry::instance().show_confirm(
+                    "Training Complete", message,
+                    {edit_label, "OK"},
+                    [edit_label](const std::string& clicked) {
+                        if (clicked == edit_label)
+                            cmd::SwitchToEditMode{}.emit();
+                    });
+            }
         });
     }
 

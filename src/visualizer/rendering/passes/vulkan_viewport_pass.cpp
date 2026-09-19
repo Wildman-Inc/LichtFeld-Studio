@@ -7,6 +7,7 @@
 #include "config.h"
 #include "core/logger.hpp"
 #include "diagnostics/vram_profiler.hpp"
+#include "rendering/output_image_pool.hpp"
 #include "rendering/vulkan_wait.hpp"
 #include "viewport_pass_graph.hpp"
 #include "vulkan_environment_pass.hpp"
@@ -24,6 +25,7 @@
 #include "viewport/pivot.frag.spv.h"
 #include "viewport/pivot.vert.spv.h"
 #include "viewport/scene.frag.spv.h"
+#include "viewport/scene_spatial.frag.spv.h"
 #include "viewport/screen_quad.vert.spv.h"
 #include "viewport/shape_overlay.frag.spv.h"
 #include "viewport/shape_overlay.vert.spv.h"
@@ -99,13 +101,14 @@ namespace lfs::vis {
             std::int32_t grid_index = 0;
         };
 
-        struct OverlayPush {
-            glm::vec4 padding{0.0f};
-        };
-
         struct PivotPush {
             glm::vec4 center_size{0.0f};
             glm::vec4 color_opacity{0.26f, 0.59f, 0.98f, 1.0f};
+        };
+
+        struct ScenePush {
+            glm::vec2 uv_scale{1.0f, 1.0f};
+            glm::vec2 uv_clamp_max{1.0f, 1.0f};
         };
 
         struct TexturedOverlayPush {
@@ -115,23 +118,31 @@ namespace lfs::vis {
             glm::vec4 viewport_rect{0.0f, 0.0f, 0.0f, 0.0f};
             // x: depth_available, y: flip-y, z/w unused.
             glm::vec4 depth_params{0.0f, 0.0f, 0.0f, 0.0f};
+            // xy = uv_scale, zw = uv_clamp_max for padded splat depth.
+            glm::vec4 uv_region{1.0f, 1.0f, 1.0f, 1.0f};
         };
 
         struct ShapeOverlayPush {
             // x,y: viewport origin (framebuffer px). z,w: viewport size (framebuffer px).
             glm::vec4 viewport_rect{0.0f, 0.0f, 0.0f, 0.0f};
             // x: depth_available (1.0 = sample splat depth, 0.0 = skip fade),
-            // y: flip-y when sampling depth UV. z,w unused.
+            // y: flip-y when sampling depth UV. z,w unused (or thickness/projection).
             glm::vec4 params{0.0f, 0.0f, 0.0f, 0.0f};
+            // xy = uv_scale, zw = uv_clamp_max for padded splat depth.
+            glm::vec4 uv_region{1.0f, 1.0f, 1.0f, 1.0f};
         };
 
         struct FrustumPush {
             glm::vec4 viewport_rect{0.0f, 0.0f, 0.0f, 0.0f};
             glm::vec4 params{0.0f, 0.0f, 0.0f, 0.0f};
+            glm::vec4 uv_region{1.0f, 1.0f, 1.0f, 1.0f};
             glm::mat4 view{1.0f};
             glm::vec4 viewport_panel{0.0f, 0.0f, 0.0f, 0.0f};
             glm::vec4 projection{0.0f, 0.0f, 0.0f, 0.0f};
         };
+        // 144 bytes exceeds the 128-byte Vulkan minimum for maxPushConstantsSize.
+        // Acceptable only because CUDA requires NVIDIA hardware (reports 256).
+        static_assert(sizeof(FrustumPush) <= 256);
 
         constexpr std::uint32_t kFrustumVertexCount = 48;
         constexpr float kFrustumLineThickness = 1.5f;
@@ -208,6 +219,8 @@ namespace lfs::vis {
             DynamicBuffer ui_textured_overlay;
             DynamicBuffer grid_uniform;
             DynamicBuffer frustum_instances;
+            const VulkanViewportFrustumOverlayData* uploaded_frustum_overlay = nullptr;
+            std::uint64_t uploaded_frustum_overlay_generation = 0;
             VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
             VkDescriptorSet grid_descriptor_set = VK_NULL_HANDLE;
             VkDescriptorSet frustum_descriptor_set = VK_NULL_HANDLE;
@@ -241,6 +254,11 @@ namespace lfs::vis {
 
         VkPipelineLayout scene_pipeline_layout = VK_NULL_HANDLE;
         VkPipeline scene_pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout scene_spatial_pipeline_layout = VK_NULL_HANDLE;
+        VkPipeline scene_spatial_pipeline = VK_NULL_HANDLE;
+        bool scene_spatial_pipeline_failed = false;
+        SceneUpscalerSelection scene_upscaler_selection{};
+        std::optional<SceneUpscalerSelection> logged_scene_upscaler_selection;
         VkPipelineLayout vignette_pipeline_layout = VK_NULL_HANDLE;
         VkPipeline vignette_pipeline = VK_NULL_HANDLE;
         VkPipelineLayout grid_pipeline_layout = VK_NULL_HANDLE;
@@ -380,11 +398,11 @@ namespace lfs::vis {
                 [this](const VulkanViewportPassParams& p) {
                     const auto& frame = resourcesForFrame(p.frame_slot);
                     return frame.textured_overlay.count > 0 && textured_overlay_pipeline != VK_NULL_HANDLE &&
-                           frame.textured_overlay.buffer != VK_NULL_HANDLE && !p.textured_overlays.empty();
+                           frame.textured_overlay.buffer != VK_NULL_HANDLE && !texturedOverlays(p).empty();
                 },
                 [this](const ViewportRecordContext& c, const VulkanViewportPassParams& p) {
                     const auto& frame = resourcesForFrame(p.frame_slot);
-                    recordTexturedOverlayPass(c, p, p.textured_overlays, frame.textured_overlay,
+                    recordTexturedOverlayPass(c, p, texturedOverlays(p), frame.textured_overlay,
                                               c.world_depth_params_push);
                 });
             addGraphPass(
@@ -414,7 +432,7 @@ namespace lfs::vis {
                     return frame.frustum_instances.count > 0 && frustum_pipeline != VK_NULL_HANDLE &&
                            frame.frustum_descriptor_set != VK_NULL_HANDLE &&
                            frame.shape_overlay_descriptor_set != VK_NULL_HANDLE &&
-                           frame.frustum_instances.buffer != VK_NULL_HANDLE && !p.frustum_batches.empty();
+                           frame.frustum_instances.buffer != VK_NULL_HANDLE && !frustumBatches(p).empty();
                 },
                 [this](const ViewportRecordContext& c, const VulkanViewportPassParams& p) {
                     recordFrustumPass(c, p);
@@ -479,6 +497,27 @@ namespace lfs::vis {
                 [this](const ViewportRecordContext& c, const VulkanViewportPassParams& p) {
                     recordPostUiOverlayPass(c.cmd, p);
                 });
+        }
+
+        [[nodiscard]] const std::vector<VulkanViewportTexturedOverlay>& texturedOverlays(
+            const VulkanViewportPassParams& params) const {
+            return params.frustum_overlay_data
+                       ? params.frustum_overlay_data->textured_overlays
+                       : params.textured_overlays;
+        }
+
+        [[nodiscard]] const std::vector<VulkanViewportFrustumInstance>& frustumInstances(
+            const VulkanViewportPassParams& params) const {
+            return params.frustum_overlay_data
+                       ? params.frustum_overlay_data->frustum_instances
+                       : params.frustum_instances;
+        }
+
+        [[nodiscard]] const std::vector<VulkanViewportFrustumBatch>& frustumBatches(
+            const VulkanViewportPassParams& params) const {
+            return params.frustum_overlay_data
+                       ? params.frustum_overlay_data->frustum_batches
+                       : params.frustum_batches;
         }
 
         [[nodiscard]] bool createBuffer(const VkDeviceSize size,
@@ -997,11 +1036,11 @@ namespace lfs::vis {
                         __FILE__,
                         __LINE__);
                 } else {
-                    result = vkQueueSubmit(graphics_queue, 1, &submit, fence);
+                    result = lfs::rendering::vk_queue_submit_synced(graphics_queue, 1, &submit, fence);
                 }
                 if (error.empty() && result != VK_SUCCESS) {
                     error = formatVkCheckFailure(
-                        "vkQueueSubmit(graphics_queue, 1, &submit, fence)",
+                        "lfs::rendering::vk_queue_submit_synced(graphics_queue, 1, &submit, fence)",
                         result,
                         std::format("One-shot graphics submission failed (queue={:#x}, command_buffer={:#x}, command_buffer_count=1, wait_semaphore_count=0, signal_semaphore_count=0, fence={:#x})",
                                     vkHandleValue(graphics_queue),
@@ -1128,6 +1167,9 @@ namespace lfs::vis {
             context->setDebugObjectName(VK_OBJECT_TYPE_IMAGE,
                                         shape_overlay_dummy_depth_image,
                                         "viewport.shape_overlay.depth.dummy");
+            vmaSetAllocationName(allocator,
+                                 shape_overlay_dummy_depth_alloc,
+                                 "Viewport shape-overlay dummy depth");
             shape_overlay_dummy_depth_vram_label = "r32_float:1x1";
             lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
                 "vulkan.viewport.shape_overlay_dummy_depth",
@@ -1294,7 +1336,8 @@ namespace lfs::vis {
                                           PipelineVertexLayout vertex_layout,
                                           VkPipelineLayout& pipeline_layout,
                                           VkPipeline& pipeline,
-                                          VkDescriptorSetLayout extra_descriptor_layout = VK_NULL_HANDLE) {
+                                          VkDescriptorSetLayout extra_descriptor_layout = VK_NULL_HANDLE,
+                                          bool depth_test = false) {
             VkShaderModule vertex_module = lfs::vis::createShaderModule(device, vertex_spv, "Viewport");
             VkShaderModule fragment_module = lfs::vis::createShaderModule(device, fragment_spv, "Viewport");
             if (vertex_module == VK_NULL_HANDLE || fragment_module == VK_NULL_HANDLE) {
@@ -1417,7 +1460,10 @@ namespace lfs::vis {
 
             VkPipelineDepthStencilStateCreateInfo depth{};
             depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-            depth.depthTestEnable = VK_FALSE;
+            // World-space passes opt in so geometry drawn earlier in the frame occludes
+            // them. They never write depth: they are blended overlays, and occluding the
+            // overlays that follow them in the same phase is not wanted.
+            depth.depthTestEnable = depth_test ? VK_TRUE : VK_FALSE;
             depth.depthWriteEnable = VK_FALSE;
             depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
@@ -1552,15 +1598,19 @@ namespace lfs::vis {
             frustum_push.size = sizeof(FrustumPush);
             using namespace viewport_shaders;
 
+            VkPushConstantRange scene_push{};
+            scene_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            scene_push.offset = 0;
+            scene_push.size = sizeof(ScenePush);
             return createPipeline(kScreenQuadVertSpv, kSceneFragSpv, "scene",
-                                  scene_descriptor_layout, nullptr, true, PipelineVertexLayout::ScreenQuad,
+                                  scene_descriptor_layout, &scene_push, true, PipelineVertexLayout::ScreenQuad,
                                   scene_pipeline_layout, scene_pipeline) &&
                    createPipeline(kScreenQuadVertSpv, kVignetteFragSpv, "vignette",
                                   VK_NULL_HANDLE, &vignette_push, true, PipelineVertexLayout::ScreenQuad,
                                   vignette_pipeline_layout, vignette_pipeline) &&
                    createPipeline(kGridVertSpv, kGridFragSpv, "grid",
                                   grid_descriptor_layout, &grid_push, true, PipelineVertexLayout::PositionOnly,
-                                  grid_pipeline_layout, grid_pipeline) &&
+                                  grid_pipeline_layout, grid_pipeline, VK_NULL_HANDLE, /*depth_test=*/true) &&
                    createPipeline(kOverlayVertSpv, kOverlayFragSpv, "overlay",
                                   VK_NULL_HANDLE, nullptr, true, PipelineVertexLayout::ColorOverlay,
                                   overlay_pipeline_layout, overlay_pipeline) &&
@@ -1581,6 +1631,39 @@ namespace lfs::vis {
                                   PipelineVertexLayout::Procedural,
                                   frustum_pipeline_layout, frustum_pipeline,
                                   frustum_descriptor_layout);
+        }
+
+        [[nodiscard]] bool ensureSpatialScenePipeline() {
+            if (scene_spatial_pipeline != VK_NULL_HANDLE)
+                return true;
+            if (scene_spatial_pipeline_failed)
+                return false;
+            VkPushConstantRange scene_push{};
+            scene_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            scene_push.offset = 0;
+            scene_push.size = sizeof(ScenePush);
+            using namespace viewport_shaders;
+            if (createPipeline(kScreenQuadVertSpv,
+                               kSceneSpatialFragSpv,
+                               "scene_spatial",
+                               scene_descriptor_layout,
+                               &scene_push,
+                               true,
+                               PipelineVertexLayout::ScreenQuad,
+                               scene_spatial_pipeline_layout,
+                               scene_spatial_pipeline)) {
+                return true;
+            }
+            if (scene_spatial_pipeline != VK_NULL_HANDLE) {
+                vkDestroyPipeline(device, scene_spatial_pipeline, nullptr);
+                scene_spatial_pipeline = VK_NULL_HANDLE;
+            }
+            if (scene_spatial_pipeline_layout != VK_NULL_HANDLE) {
+                vkDestroyPipelineLayout(device, scene_spatial_pipeline_layout, nullptr);
+                scene_spatial_pipeline_layout = VK_NULL_HANDLE;
+            }
+            scene_spatial_pipeline_failed = true;
+            return false;
         }
 
         void updateQuadBuffer(const bool flip_y) {
@@ -1931,18 +2014,19 @@ namespace lfs::vis {
 
         void updateFrustumInstances(const VulkanViewportPassParams& params) {
             auto& frame = resourcesForFrame(params.frame_slot);
-            if (params.frustum_instances.empty()) {
+            const auto& instances = frustumInstances(params);
+            if (instances.empty()) {
                 frame.frustum_instances.count = 0;
                 return;
             }
-            if (!ensureFrustumInstanceBuffer(frame, params.frustum_instances.size())) {
+            if (!ensureFrustumInstanceBuffer(frame, instances.size())) {
                 return;
             }
             const VkDeviceSize bytes = static_cast<VkDeviceSize>(
-                sizeof(VulkanViewportFrustumInstance) * params.frustum_instances.size());
-            if (writeAllocation(frame.frustum_instances.allocation, params.frustum_instances.data(), bytes)) {
+                sizeof(VulkanViewportFrustumInstance) * instances.size());
+            if (writeAllocation(frame.frustum_instances.allocation, instances.data(), bytes)) {
                 frame.frustum_instances.count = static_cast<std::uint32_t>(
-                    std::min<std::size_t>(params.frustum_instances.size(), std::numeric_limits<std::uint32_t>::max()));
+                    std::min<std::size_t>(instances.size(), std::numeric_limits<std::uint32_t>::max()));
             }
         }
 
@@ -1952,14 +2036,29 @@ namespace lfs::vis {
         }
 
         void prepare(const VulkanViewportPassParams& params) {
+            if (params.scene_upscaler == SceneUpscalerBackend::Native) {
+                scene_spatial_pipeline_failed = false;
+            } else {
+                static_cast<void>(ensureSpatialScenePipeline());
+            }
             auto& frame = resourcesForFrame(params.frame_slot);
             updateQuadBuffer(params.scene_image_flip_y);
             updateGridUniforms(params);
-            updateFrustumInstances(params);
-            updateTexturedOverlayBuffer(params.textured_overlays,
-                                        frame.textured_overlay,
-                                        params.frame_slot,
-                                        "textured_overlay");
+            const auto* const frustum_overlay = params.frustum_overlay_data.get();
+            const bool frustum_overlay_unchanged =
+                frustum_overlay != nullptr &&
+                frame.uploaded_frustum_overlay == frustum_overlay &&
+                frame.uploaded_frustum_overlay_generation == frustum_overlay->generation;
+            if (!frustum_overlay_unchanged) {
+                updateFrustumInstances(params);
+                updateTexturedOverlayBuffer(texturedOverlays(params),
+                                            frame.textured_overlay,
+                                            params.frame_slot,
+                                            "textured_overlay");
+                frame.uploaded_frustum_overlay = frustum_overlay;
+                frame.uploaded_frustum_overlay_generation =
+                    frustum_overlay ? frustum_overlay->generation : 0;
+            }
             updateTexturedOverlayBuffer(params.ui_textured_overlays,
                                         frame.ui_textured_overlay,
                                         params.frame_slot,
@@ -1986,6 +2085,30 @@ namespace lfs::vis {
             environment_pass.prepare(params.environment, params.frame_slot);
             depth_blit_pass.prepare(params.depth_blit, params.frame_slot);
             split_view_pass.prepare(params.split_view, params.frame_slot);
+            const bool runtime_available = params.split_view.enabled
+                                               ? split_view_pass.available()
+                                               : scene_spatial_pipeline != VK_NULL_HANDLE;
+            scene_upscaler_selection = resolveSceneUpscalerSelection(
+                params.scene_upscaler, runtime_available);
+            auto& profiler = lfs::diagnostics::VramProfiler::instance();
+            profiler.setGauge("viewer.upscaler.requested",
+                              static_cast<double>(scene_upscaler_selection.requested));
+            profiler.setGauge("viewer.upscaler.effective",
+                              static_cast<double>(scene_upscaler_selection.effective));
+            profiler.setGauge("viewer.upscaler.fallback",
+                              scene_upscaler_selection.fellBack() ? 1.0 : 0.0);
+            profiler.setGauge("viewer.upscaler.runtime_ready", runtime_available ? 1.0 : 0.0);
+            if (!logged_scene_upscaler_selection ||
+                *logged_scene_upscaler_selection != scene_upscaler_selection) {
+                if (scene_upscaler_selection.fellBack()) {
+                    LOG_WARN("Scene reconstruction '{}' unavailable; using native presentation",
+                             sceneUpscalerBackendId(scene_upscaler_selection.requested));
+                } else {
+                    LOG_INFO("Scene reconstruction active: {}",
+                             sceneUpscalerBackendId(scene_upscaler_selection.effective));
+                }
+                logged_scene_upscaler_selection = scene_upscaler_selection;
+            }
         }
 
         void bindViewport(VkCommandBuffer command_buffer, const FramebufferRect& rect) const {
@@ -2163,6 +2286,19 @@ namespace lfs::vis {
                 // content_rect arrives panel-local; lift it into framebuffer
                 // coords so the shader's letterbox check matches gl_FragCoord.
                 VulkanSplitViewParams adjusted = params.split_view;
+                if (adjusted.coordinate_extent.x > 0 && adjusted.coordinate_extent.y > 0) {
+                    const float scale_x = static_cast<float>(rect.width) /
+                                          static_cast<float>(adjusted.coordinate_extent.x);
+                    const float scale_y = static_cast<float>(rect.height) /
+                                          static_cast<float>(adjusted.coordinate_extent.y);
+                    const int left = static_cast<int>(std::lround(adjusted.content_rect.x * scale_x));
+                    const int top = static_cast<int>(std::lround(adjusted.content_rect.y * scale_y));
+                    const int right = static_cast<int>(std::lround(
+                        (adjusted.content_rect.x + adjusted.content_rect.z) * scale_x));
+                    const int bottom = static_cast<int>(std::lround(
+                        (adjusted.content_rect.y + adjusted.content_rect.w) * scale_y));
+                    adjusted.content_rect = {left, top, std::max(right - left, 1), std::max(bottom - top, 1)};
+                }
                 adjusted.content_rect.x += rect.x;
                 adjusted.content_rect.y += rect.y;
                 const VkRect2D panel_rect{
@@ -2172,15 +2308,36 @@ namespace lfs::vis {
                 };
                 split_view_pass.record(command_buffer, panel_rect, adjusted, params.frame_slot);
             } else if (has_scene) {
-                vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, scene_pipeline);
+                const bool use_spatial =
+                    scene_upscaler_selection.effective == SceneUpscalerBackend::Spatial &&
+                    scene_spatial_pipeline != VK_NULL_HANDLE;
+                const VkPipeline selected_pipeline = use_spatial ? scene_spatial_pipeline : scene_pipeline;
+                const VkPipelineLayout selected_layout =
+                    use_spatial ? scene_spatial_pipeline_layout : scene_pipeline_layout;
+                vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selected_pipeline);
                 vkCmdBindDescriptorSets(command_buffer,
                                         VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        scene_pipeline_layout,
+                                        selected_layout,
                                         0,
                                         1,
                                         &frame.scene_descriptor_set,
                                         0,
                                         nullptr);
+                const glm::ivec2 valid = params.scene_image_size;
+                const glm::ivec2 alloc =
+                    params.scene_image_alloc_size.x > 0 && params.scene_image_alloc_size.y > 0
+                        ? params.scene_image_alloc_size
+                        : valid;
+                const ScenePush scene_push{
+                    .uv_scale = outputUvScale(valid, alloc),
+                    .uv_clamp_max = outputUvClampMax(valid, alloc),
+                };
+                vkCmdPushConstants(command_buffer,
+                                   selected_layout,
+                                   VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0,
+                                   sizeof(scene_push),
+                                   &scene_push);
                 vkCmdDraw(command_buffer, 6, 1, 0, 0);
             }
         }
@@ -2302,6 +2459,8 @@ namespace lfs::vis {
                 push.effects = overlay.effects;
                 push.viewport_rect = ctx.viewport_rect_push;
                 push.depth_params = depth_params;
+                push.uv_region = glm::vec4(params.depth_blit.uv_scale,
+                                           params.depth_blit.uv_clamp_max);
                 vkCmdBindDescriptorSets(command_buffer,
                                         VK_PIPELINE_BIND_POINT_GRAPHICS,
                                         textured_overlay_pipeline_layout,
@@ -2344,7 +2503,9 @@ namespace lfs::vis {
             auto& frame = resourcesForFrame(params.frame_slot);
             const ShapeOverlayPush world_shape_overlay_push{
                 .viewport_rect = ctx.viewport_rect_push,
-                .params = ctx.world_depth_params_push};
+                .params = ctx.world_depth_params_push,
+                .uv_region = glm::vec4(params.depth_blit.uv_scale,
+                                       params.depth_blit.uv_clamp_max)};
             recordShapeOverlays(ctx.cmd, frame.shape_overlay, frame, world_shape_overlay_push);
         }
 
@@ -2360,7 +2521,7 @@ namespace lfs::vis {
                 "Viewport frustum pass requires instances, pipeline, both descriptor sets, and an instance buffer (frame_slot={}, instance_count={}, batch_count={}, pipeline={:#x}, frustum_descriptor_set={:#x}, shape_descriptor_set={:#x}, instance_buffer={:#x})",
                 params.frame_slot,
                 frame.frustum_instances.count,
-                params.frustum_batches.size(),
+                frustumBatches(params).size(),
                 vkHandleValue(frustum_pipeline),
                 vkHandleValue(frame.frustum_descriptor_set),
                 vkHandleValue(frame.shape_overlay_descriptor_set),
@@ -2376,7 +2537,7 @@ namespace lfs::vis {
                                     sets.data(),
                                     0,
                                     nullptr);
-            for (const auto& batch : params.frustum_batches) {
+            for (const auto& batch : frustumBatches(params)) {
                 if (batch.instance_count == 0 ||
                     batch.first_instance + batch.instance_count > frame.frustum_instances.count) {
                     continue;
@@ -2397,6 +2558,8 @@ namespace lfs::vis {
                                         ctx.world_depth_params_push.y,
                                         kFrustumLineThickness,
                                         projection_mode);
+                push.uv_region = glm::vec4(params.depth_blit.uv_scale,
+                                           params.depth_blit.uv_clamp_max);
                 push.view = batch.view;
                 push.viewport_panel = glm::vec4(batch.viewport_pos, batch.viewport_size);
                 push.projection = glm::vec4(batch.render_size, batch.focal_x, batch.focal_y);
@@ -2544,9 +2707,19 @@ namespace lfs::vis {
 
         void reset() {
             if (device != VK_NULL_HANDLE) {
-                if (context != nullptr && !context->waitForSubmittedFrames()) {
-                    LOG_WARN("Vulkan viewport pass shutdown could not wait for submitted frames: {}",
-                             context->lastError());
+                if (context != nullptr) {
+                    if (!context->waitForSubmittedFrames()) {
+                        LOG_WARN("Vulkan viewport pass shutdown could not wait for submitted frames: {}",
+                                 context->lastError());
+                        if (!context->deviceWaitIdle()) {
+                            LOG_WARN("Vulkan viewport pass shutdown could not idle device: {}",
+                                     context->lastError());
+                        }
+                    }
+                    if (!context->waitForImmediateSubmits()) {
+                        LOG_WARN("Vulkan viewport pass shutdown could not drain immediate submits: {}",
+                                 context->lastError());
+                    }
                 }
                 scene_image_uploader.shutdown();
                 mesh_pass.shutdown();
@@ -2555,6 +2728,8 @@ namespace lfs::vis {
                 split_view_pass.shutdown();
                 if (scene_pipeline != VK_NULL_HANDLE)
                     vkDestroyPipeline(device, scene_pipeline, nullptr);
+                if (scene_spatial_pipeline != VK_NULL_HANDLE)
+                    vkDestroyPipeline(device, scene_spatial_pipeline, nullptr);
                 if (vignette_pipeline != VK_NULL_HANDLE)
                     vkDestroyPipeline(device, vignette_pipeline, nullptr);
                 if (grid_pipeline != VK_NULL_HANDLE)
@@ -2571,6 +2746,8 @@ namespace lfs::vis {
                     vkDestroyPipeline(device, frustum_pipeline, nullptr);
                 if (scene_pipeline_layout != VK_NULL_HANDLE)
                     vkDestroyPipelineLayout(device, scene_pipeline_layout, nullptr);
+                if (scene_spatial_pipeline_layout != VK_NULL_HANDLE)
+                    vkDestroyPipelineLayout(device, scene_spatial_pipeline_layout, nullptr);
                 if (vignette_pipeline_layout != VK_NULL_HANDLE)
                     vkDestroyPipelineLayout(device, vignette_pipeline_layout, nullptr);
                 if (grid_pipeline_layout != VK_NULL_HANDLE)
@@ -2658,6 +2835,10 @@ namespace lfs::vis {
         if (impl_) {
             impl_->record(command_buffer, framebuffer_extent, params);
         }
+    }
+
+    SceneUpscalerSelection VulkanViewportPass::sceneUpscalerSelection() const {
+        return impl_ ? impl_->scene_upscaler_selection : SceneUpscalerSelection{};
     }
 
     void VulkanViewportPass::shutdown() {

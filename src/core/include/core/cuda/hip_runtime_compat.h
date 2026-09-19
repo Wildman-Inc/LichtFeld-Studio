@@ -155,6 +155,12 @@ using cudaExternalSemaphoreHandleType = hipExternalSemaphoreHandleType;
 #ifndef cudaErrorNoDevice
 #define cudaErrorNoDevice hipErrorNoDevice
 #endif
+#ifndef cudaErrorInvalidResourceHandle
+#define cudaErrorInvalidResourceHandle hipErrorInvalidResourceHandle
+#endif
+#ifndef cudaErrorContextIsDestroyed
+#define cudaErrorContextIsDestroyed hipErrorContextIsDestroyed
+#endif
 
 #ifndef cudaMemcpyHostToDevice
 #define cudaMemcpyHostToHost hipMemcpyHostToHost
@@ -549,6 +555,9 @@ using CUdevice_attribute = hipDeviceAttribute_t;
 #ifndef CUDA_SUCCESS
 #define CUDA_SUCCESS cudaSuccess
 #endif
+#ifndef CUDA_ERROR_OUT_OF_MEMORY
+#define CUDA_ERROR_OUT_OF_MEMORY hipErrorOutOfMemory
+#endif
 
 #ifndef CU_MEM_ALLOCATION_TYPE_PINNED
 #define CU_MEM_ALLOCATION_TYPE_PINNED cudaMemAllocationTypePinned
@@ -660,6 +669,26 @@ using cudaGraphicsResource_t = hipGraphicsResource_t;
 #else
 #define LFS_CUDA_SYNC_MASK 0xffffffffu
 #endif
+#endif
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+namespace lfs::core::cuda {
+
+// CUDA rasterizers partition blocks into logical 32-lane warps even on wave64.
+// Keep ballot bits local to the caller's partition, matching width-32 shuffles.
+__device__ __forceinline__ unsigned int ballot32(const int predicate) {
+#if LFS_USE_HIP
+    const auto mask = __ballot_sync(LFS_CUDA_SYNC_MASK, predicate);
+    const unsigned int linear_thread =
+        threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+    const unsigned int partition_offset = (linear_thread % warpSize) & ~31u;
+    return static_cast<unsigned int>(mask >> partition_offset);
+#else
+    return __ballot_sync(LFS_CUDA_SYNC_MASK, predicate);
+#endif
+}
+
+} // namespace lfs::core::cuda
 #endif
 
 #include <cstdio>

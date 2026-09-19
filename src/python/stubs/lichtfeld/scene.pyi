@@ -108,7 +108,21 @@ class SplatData:
         """Set maximum SH degree"""
 
     def reserve_capacity(self, capacity: int) -> None:
-        """Reserve capacity for Gaussians (for densification)"""
+        """
+        Reserve capacity for Gaussians (for densification). Raises if the model is renderer-backed.
+        """
+
+class SceneSplatSnapshot:
+    @property
+    def transform(self) -> tuple: ...
+
+    @property
+    def sh_degree(self) -> int: ...
+
+    def splat_data(self) -> SplatData:
+        """
+        Materialize this owned node's local geometry. May run on an export worker.
+        """
 
 class NodeType(enum.Enum):
     SPLAT = 0
@@ -314,6 +328,10 @@ class SceneNode:
         """Unique node identifier"""
 
     @property
+    def uuid(self) -> str:
+        """Durable node UUID"""
+
+    @property
     def parent_id(self) -> int:
         """Parent node identifier (-1 for root)"""
 
@@ -324,6 +342,10 @@ class SceneNode:
     @property
     def type(self) -> NodeType:
         """Node type (SPLAT, GROUP, CAMERA, etc.)"""
+
+    @property
+    def local_transform(self) -> tuple:
+        """Local transform as 4x4 row-major tuple"""
 
     @property
     def world_transform(self) -> tuple:
@@ -530,6 +552,9 @@ class Scene:
     def get_node_by_id(self, id: int) -> SceneNode | None:
         """Find a node by its integer ID (None if not found)"""
 
+    def get_node_by_uuid(self, uuid: str) -> SceneNode | None:
+        """Find a node by its durable UUID (None if invalid or not found)"""
+
     def get_node(self, name: str) -> SceneNode | None:
         """Find a node by name (None if not found)"""
 
@@ -538,6 +563,11 @@ class Scene:
 
     def get_visible_nodes(self) -> list[SceneNode]:
         """Get all visible nodes in the scene"""
+
+    def snapshot_visible_splats(self) -> list[SceneSplatSnapshot]:
+        """
+        Copy visible splats and world transforms at a UI safe point. Returned data owns its storage and supports worker-side export after scene edits or deletion.
+        """
 
     def is_node_effectively_visible(self, id: int) -> bool:
         """Check if a node is visible considering parent visibility"""
@@ -703,7 +733,7 @@ class Scene:
         """Notify the renderer that scene data has changed"""
 
     def duplicate_node(self, name: str) -> str:
-        """Duplicate a node by name, returns new node ID"""
+        """Duplicate a node by name, returns the new node name"""
 
     def merge_group(self, group_name: str) -> str:
         """Merge all splats in a group into a single node, returns merged node ID"""
@@ -776,6 +806,10 @@ class Camera:
     @property
     def has_depth(self) -> bool:
         """Whether a depth map file exists"""
+
+    @property
+    def has_image(self) -> bool:
+        """Whether the bound dataset image file exists"""
 
     @property
     def uid(self) -> int:

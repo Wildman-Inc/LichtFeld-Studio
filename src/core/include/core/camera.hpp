@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <future>
 #include <string>
+#include <vector>
 
 namespace lfs::core {
 
@@ -156,6 +157,34 @@ namespace lfs::core {
         const std::filesystem::path& mask_path() const noexcept { return _mask_path; }
         const std::filesystem::path& depth_path() const noexcept { return _depth_path; }
         const std::filesystem::path& normal_path() const noexcept { return _normal_path; }
+        void set_normal_path(std::filesystem::path path);
+
+        // Sparse SfM observations for this image (COLMAP 2D points with a 3D id).
+        // Pixel coordinates are in the camera's native width/height at load
+        // (images_N scale already applied). World xyz is reconstruction space
+        // and follows Camera::translate.
+        struct SfmObservation {
+            float u = 0.0f;
+            float v = 0.0f;
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+        };
+
+        void set_sfm_observations(std::vector<SfmObservation> observations) {
+            _sfm_observations = std::move(observations);
+        }
+        [[nodiscard]] const std::vector<SfmObservation>& sfm_observations() const noexcept {
+            return _sfm_observations;
+        }
+
+        // Rewrites image/mask/depth/normal paths that live under old_root to the same
+        // relative location under new_root. Paths outside old_root are left unchanged.
+        // Sidecar caches and in-memory masks (set_mask_tensor) are not cleared: a
+        // dataset relocation keeps the same files, and injected masks do not originate
+        // from _mask_path.
+        void rebase_asset_paths(const std::filesystem::path& old_root,
+                                const std::filesystem::path& new_root);
         bool has_in_memory_mask() const noexcept { return _in_memory_mask_raw.is_valid(); }
         bool has_mask() const noexcept {
             return has_in_memory_mask() ||
@@ -169,6 +198,11 @@ namespace lfs::core {
         }
         bool has_alpha() const noexcept { return _has_alpha; }
         void set_has_alpha(bool v) noexcept { _has_alpha = v; }
+        // Set at dataset load when the bound image file is absent. Independent of
+        // scene-graph training_enabled (user disable). Dummy/test cameras keep the
+        // default true even if image_path does not exist.
+        bool has_image() const noexcept { return _has_image; }
+        void set_has_image(bool v) noexcept { _has_image = v; }
         CameraSplit split() const noexcept { return _split; }
         void set_split(const CameraSplit split) noexcept {
             assert((split == CameraSplit::Train || split == CameraSplit::Eval) && "Camera split must be Train or Eval");
@@ -184,6 +218,9 @@ namespace lfs::core {
         void translate(const Tensor& trans);
 
         void precompute_undistortion(float blank_pixels = 0.0f);
+        // Install parameters computed for an equivalent camera record without
+        // repeating the distortion solve or its device-to-host copies.
+        void adopt_undistortion(const UndistortParams& params) noexcept;
         bool is_undistort_precomputed() const noexcept { return _undistort_precomputed; }
         void prepare_undistortion(float blank_pixels = 0.0f);
         bool is_undistort_prepared() const noexcept { return _undistort_prepared; }
@@ -216,6 +253,7 @@ namespace lfs::core {
         std::filesystem::path _depth_path;
         std::filesystem::path _normal_path;
         bool _has_alpha = false;
+        bool _has_image = true;
         CameraSplit _split = CameraSplit::Train;
         int _camera_width = 0;
         int _camera_height = 0;
@@ -227,9 +265,17 @@ namespace lfs::core {
         Tensor _world_view_transform;
         Tensor _cam_position;
 
-        // Mask caching (processed mask stored on GPU)
+        // Mask caching (processed mask stored on GPU). Keyed on the processing
+        // arguments: a binarized 0.5 load must not poison a later SegmentAndIgnore
+        // keep-band load (or the reverse).
         Tensor _cached_mask;
         bool _mask_loaded = false;
+        int _cached_mask_resize_factor = 0;
+        int _cached_mask_max_width = 0;
+        bool _cached_mask_invert = false;
+        float _cached_mask_threshold = 0.5f;
+        bool _cached_mask_binarize = true;
+        bool _cached_mask_undistort_prepared = false;
         // Raw, pre-supplied in-memory mask (used by direct-scene plugins) —
         // takes precedence over _mask_path when set. Processed on first use.
         Tensor _in_memory_mask_raw;
@@ -250,6 +296,8 @@ namespace lfs::core {
 
         // CUDA stream for async operations
         cudaStream_t _stream = nullptr;
+
+        std::vector<SfmObservation> _sfm_observations;
     };
     inline float focal2fov(float focal, int pixels) {
         return 2.0f * std::atan(pixels / (2.0f * focal));

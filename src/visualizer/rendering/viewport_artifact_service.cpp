@@ -44,19 +44,6 @@ namespace lfs::vis {
         return gpu_frame_ && gpu_frame_->valid();
     }
 
-    bool ViewportArtifactService::hasViewportOutput() const {
-        return hasGpuFrame() || (captured_image_ && captured_image_->is_valid());
-    }
-
-    bool ViewportArtifactService::hasOutputArtifacts() const {
-        for (size_t i = 0; i < metadata_.depth_panel_count && i < metadata_.depth_panels.size(); ++i) {
-            if (metadata_.depth_panels[i].depth && metadata_.depth_panels[i].depth->is_valid()) {
-                return true;
-            }
-        }
-        return hasGpuFrame() || rendered_size_.x > 0 || rendered_size_.y > 0;
-    }
-
     std::shared_ptr<lfs::core::Tensor> ViewportArtifactService::getCapturedImageIfCurrent() const {
         if (captured_image_ && captured_artifact_generation_ == artifact_generation_) {
             return captured_image_;
@@ -238,10 +225,6 @@ namespace lfs::vis {
                 } else {
                     scaled_x = panel_local_x;
                 }
-
-                // Tensor-backed depth outputs use a bottom-left origin. Tools operate in
-                // window coordinates with a top-left origin, so flip Y before sampling.
-                scaled_y = (depth_height - 1) - scaled_y;
 
                 if (scaled_x >= 0 && scaled_x < depth_width && scaled_y >= 0 && scaled_y < depth_height) {
                     float d;

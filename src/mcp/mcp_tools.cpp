@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "mcp_tools.hpp"
-#include "mcp_training_context.hpp"
 
 #include "core/error.hpp"
 #include "core/error_envelope.hpp"
@@ -40,16 +39,6 @@ namespace lfs::mcp {
                 return "session";
             }
             return "unknown";
-        }
-
-        training::CommandTarget string_to_target(const std::string& s) {
-            if (s == "model")
-                return training::CommandTarget::Model;
-            if (s == "optimizer")
-                return training::CommandTarget::Optimizer;
-            if (s == "session")
-                return training::CommandTarget::Session;
-            return training::CommandTarget::Session;
         }
 
         json parameter_error_envelope(const lfs::ErrorCode code, const std::string& message,
@@ -135,6 +124,40 @@ namespace lfs::mcp {
         return inst;
     }
 
+    void ToolRegistry::set_lazy_initializer(std::function<void()> initializer) {
+        std::lock_guard lock(mutex_);
+        lazy_initializer_ = std::move(initializer);
+    }
+
+    void ToolRegistry::ensure_initialized() const {
+        std::call_once(initialization_once_, [this] {
+            std::function<void()> initializer;
+            {
+                std::lock_guard lock(mutex_);
+                initializer = lazy_initializer_;
+            }
+            if (initializer)
+                initializer();
+        });
+    }
+
+    void ResourceRegistry::set_lazy_initializer(std::function<void()> initializer) {
+        std::lock_guard lock(mutex_);
+        lazy_initializer_ = std::move(initializer);
+    }
+
+    void ResourceRegistry::ensure_initialized() const {
+        std::call_once(initialization_once_, [this] {
+            std::function<void()> initializer;
+            {
+                std::lock_guard lock(mutex_);
+                initializer = lazy_initializer_;
+            }
+            if (initializer)
+                initializer();
+        });
+    }
+
     void ToolRegistry::register_tool(McpTool tool, ToolHandler handler) {
         const std::string normalized_name = normalize_tool_name(tool.name);
         if (!is_valid_tool_name(normalized_name)) {
@@ -166,6 +189,7 @@ namespace lfs::mcp {
     }
 
     std::vector<McpTool> ToolRegistry::list_tools() const {
+        ensure_initialized();
         std::lock_guard lock(mutex_);
         std::vector<McpTool> result;
         result.reserve(tools_.size());
@@ -180,6 +204,7 @@ namespace lfs::mcp {
 
     json ToolRegistry::call_tool(const std::string& name, const json& arguments,
                                  lfs::OperationId operation_id) {
+        ensure_initialized();
         ToolHandler handler;
         std::vector<std::string> required;
         {
@@ -210,11 +235,6 @@ namespace lfs::mcp {
         resources_[uri] = RegisteredResource{std::move(resource), handler};
     }
 
-    void ResourceRegistry::unregister_resource(const std::string& uri) {
-        std::lock_guard lock(mutex_);
-        resources_.erase(uri);
-    }
-
     void ResourceRegistry::register_resource_prefix(std::string uri_prefix, ResourceHandler handler) {
         std::lock_guard lock(mutex_);
         const std::string prefix = uri_prefix;
@@ -227,6 +247,7 @@ namespace lfs::mcp {
     }
 
     std::vector<McpResource> ResourceRegistry::list_resources() const {
+        ensure_initialized();
         std::lock_guard lock(mutex_);
         std::vector<McpResource> result;
         result.reserve(resources_.size());
@@ -240,6 +261,7 @@ namespace lfs::mcp {
     }
 
     std::expected<std::vector<McpResourceContent>, std::string> ResourceRegistry::read_resource(const std::string& uri) const {
+        ensure_initialized();
         ResourceHandler handler;
         {
             std::lock_guard lock(mutex_);
@@ -469,14 +491,150 @@ namespace lfs::mcp {
                 }
 
                 auto snapshot = cc->snapshot();
+                const auto& project_capture =
+                    snapshot.project_snapshot.last;
                 return json{
                     {"iteration", snapshot.iteration},
                     {"max_iterations", snapshot.max_iterations},
+                    {"strategy", snapshot.strategy},
                     {"num_gaussians", snapshot.num_gaussians},
                     {"loss", snapshot.loss},
                     {"is_running", snapshot.is_running},
                     {"is_paused", snapshot.is_paused},
-                    {"is_refining", snapshot.is_refining}};
+                    {"is_refining", snapshot.is_refining},
+                    {"session_hydrated", snapshot.session_hydrated},
+                    {"project_snapshot",
+                     {
+                         {"completed",
+                          snapshot.project_snapshot
+                              .completed_snapshots},
+                         {"path",
+                          snapshot.project_snapshot_path},
+                         {"writer_in_flight",
+                          snapshot
+                              .project_snapshot_writer_in_flight},
+                         {"writer_error",
+                          snapshot
+                              .project_snapshot_writer_error},
+                         {"snapshot_uuid",
+                          project_capture.snapshot_uuid
+                              .to_string()},
+                         {"iteration",
+                          project_capture.iteration},
+                         {"checkpoint_bytes",
+                          project_capture.checkpoint_bytes},
+                         {"device_snapshot_bytes",
+                          project_capture.device_snapshot_bytes},
+                         {"pinned_peak_bytes",
+                          project_capture.pinned_peak_bytes},
+                         {"host_staging_bytes",
+                          project_capture.host_staging_bytes},
+                         {"host_rss_delta_bytes",
+                          project_capture.host_rss_delta_bytes},
+                         {"host_memory_available_bytes",
+                          project_capture
+                              .host_memory_available_bytes},
+                         {"host_memory_required_bytes",
+                          project_capture
+                              .host_memory_required_bytes},
+                         {"host_memory_preflight_passed",
+                          project_capture
+                              .host_memory_preflight_passed},
+                         {"host_ram_within_gate",
+                          project_capture
+                              .host_ram_within_gate},
+                         {"pause_ms",
+                          project_capture.pause_ms},
+                         {"pause_p95_ms",
+                          snapshot.project_snapshot
+                              .pause_p95_ms},
+                         {"pause_p95_n",
+                          snapshot.project_snapshot
+                              .p95_n},
+                         {"service_initialization_ms",
+                          project_capture
+                              .service_initialization_ms},
+                         {"prepare_stall_ms",
+                          project_capture
+                              .prepare_stall_ms},
+                         {"preparation_ms",
+                          project_capture
+                              .preparation_ms},
+                         {"cold_path_ms",
+                          project_capture.cold_path_ms},
+                         {"cold_first_snapshot",
+                          project_capture
+                              .cold_first_snapshot},
+                         {"safe_point_entry_ms",
+                          project_capture
+                              .safe_point_entry_ms},
+                         {"stream_sync_ms",
+                          project_capture.stream_sync_ms},
+                         {"cpu_state_ms",
+                          project_capture
+                              .additional_cpu_state_ms},
+                         {"scng_ms",
+                          project_capture.scng_ms},
+                         {"selm_ms",
+                          project_capture.selm_ms},
+                         {"prms_ms",
+                          project_capture.prms_ms},
+                         {"serialize_and_issue_ms",
+                          project_capture
+                              .serialize_and_issue_ms},
+                         {"last_d2h_wait_ms",
+                          project_capture
+                              .last_d2h_wait_ms},
+                         {"final_drain_ms",
+                          project_capture.final_drain_ms},
+                         {"measured_pinned_d2h_bytes_per_second",
+                          project_capture
+                              .measured_pinned_d2h_bytes_per_second},
+                         {"rig_gate_ms",
+                          project_capture.rig_gate_ms},
+                         {"pause_within_rig_gate",
+                          project_capture
+                              .pause_within_rig_gate},
+                         {"cold_path_within_rig_gate",
+                          project_capture
+                              .cold_path_within_rig_gate},
+                         {"consistency_proven",
+                          project_capture
+                              .consistency_proven},
+                         {"pre_snapshot_step_mean_ms",
+                          snapshot
+                              .project_snapshot_pre_step_mean_ms},
+                         {"pre_snapshot_step_first_iteration",
+                          snapshot
+                              .project_snapshot_pre_step_first_iteration},
+                         {"pre_snapshot_step_last_iteration",
+                          snapshot
+                              .project_snapshot_pre_step_last_iteration},
+                         {"pre_snapshot_step_samples",
+                          snapshot
+                              .project_snapshot_pre_step_samples},
+                         {"post_resume_step_mean_ms",
+                          snapshot
+                              .project_snapshot_post_step_mean_ms},
+                         {"post_resume_step_first_iteration",
+                          snapshot
+                              .project_snapshot_post_step_first_iteration},
+                         {"post_resume_step_last_iteration",
+                          snapshot
+                              .project_snapshot_post_step_last_iteration},
+                         {"post_resume_step_samples",
+                          snapshot
+                              .project_snapshot_post_step_samples},
+                         {"step_regression_percent",
+                          snapshot
+                              .project_snapshot_step_regression_percent},
+                         {"step_regression_gate_evaluated",
+                          snapshot
+                              .project_snapshot_step_regression_gate_evaluated},
+                         {"step_regression_within_gate",
+                          snapshot
+                              .project_snapshot_step_regression_within_gate},
+                     }}};
             });
 
         registry.register_tool(
@@ -632,12 +790,6 @@ namespace lfs::mcp {
                         .mime_type = "application/json",
                         .content = content.dump(2)}};
             });
-    }
-
-    void register_builtin_tools() {
-        register_core_tools();
-        register_core_resources();
-        register_scene_tools();
     }
 
 } // namespace lfs::mcp

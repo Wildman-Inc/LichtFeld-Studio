@@ -40,6 +40,12 @@ namespace lfs::io {
         Custom
     };
 
+    enum class ExtractionOutcome {
+        Completed,
+        Cancelled,
+        Failed,
+    };
+
     enum class SharpnessAlgorithm {
         LAPLACIAN, // Laplacian variance — fast, blur detection
         TENENGRAD, // Sobel energy — directional blur detection
@@ -82,7 +88,7 @@ namespace lfs::io {
             int custom_height = 0;
 
             // Output naming
-            std::string filename_pattern = "frame_%d"; // %d = frame number
+            std::string filename_pattern = "frame_%d"; // %d = 1-based source video frame number
             bool generate_metadata = false;
             int rotation = 0; // 0, 90, 180, 270
             bool convert_hdr_to_sdr = false;
@@ -98,6 +104,7 @@ namespace lfs::io {
                                                  int source_height, double stream_time_base,
                                                  ValidatedLayout& layout, std::string& error);
         bool extract(const Params& params, std::string& error);
+        [[nodiscard]] ExtractionOutcome lastOutcome() const;
 
     private:
         class Impl;

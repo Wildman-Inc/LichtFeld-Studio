@@ -4,7 +4,7 @@ How a frame goes from CUDA tensors to pixels on screen.
 
 ## Scope
 
-The CUDA terminology and timeline-semaphore flow below describe the upstream LichtFeld Studio backend. LichtFeld Studio for ROCm can use the same external-memory Vulkan interop design through the HIP compatibility layer. When HIP cannot use external timeline semaphores, scene-image publication uses the synchronization path described below if external-memory image interop succeeded. Otherwise, it uses CPU/Vulkan staging.
+The CUDA terminology and timeline-semaphore flow below describe the upstream LichtFeld Studio backend. LichtFeld Studio for ROCm uses the same external-memory Vulkan interop design through the HIP compatibility layer. The viewer requires the selected HIP device and driver to support external memory and timeline semaphore interop; scene-image publication also requires image/surface support.
 
 ## Flow
 
@@ -16,9 +16,9 @@ trainer (CUDA)            VulkanContext               viewport pass            R
      │                         │                           │                       │                        │
      │       VksplatViewportRenderer (per frame_slot)      │                       │                        │
      │                         │                           │                       │                        │
-     │  ring_inputs[slot] ◄────┤  packDeviceInputs +       │                       │                        │
-     │  CUDA → VkBuffer        │  cudaMemcpyAsync +        │                       │                        │
-     │  (external memory)      │  timeline signal          │                       │                        │
+     │  ring_inputs[slot] ◄────┤  prepareInputs /           │                       │                        │
+     │  CUDA → VkBuffer        │  cudaMemcpyAsync +         │                       │                        │
+     │  (external memory)      │  timeline signal/wait      │                       │                        │
      │                         │                           │                       │                        │
      │                         │  Vulkan rasterizer pipeline (12 dispatches)        │                        │
      │                         │  → output_image_ (VkImage, R8G8B8A8_UNORM,        │                        │
@@ -47,15 +47,13 @@ Per-frame timeline:
 
 1. CPU side at frame start: `vkWaitForFences(in_flight_[currentFrameSlot()])` — guarantees the prior use of slot N is done before reuse
 2. CUDA work for this frame is enqueued (Vulkan→CUDA wait happens implicitly via the CPU-side fence wait — when the CPU reaches this point, slot N's prior Vulkan reads are done, so CUDA can safely overwrite the slot)
-3. After CUDA's `cudaMemcpyAsync` packs the inputs, CUDA signals a per-ring-slot **timeline semaphore** (Vulkan-exportable, imported into CUDA) on the same stream. The Vulkan submit registers `addFrameTimelineWait(timeline, value)` so the compute submit blocks on that signal at `VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT`. **No CPU stall** — the prior `cudaStreamSynchronize` is gone (see `vksplat_viewport_renderer.cpp::uploadInputs`).
+3. After CUDA's `cudaMemcpyAsync` packs the inputs, CUDA signals a per-ring-slot **timeline semaphore** (Vulkan-exportable, imported into CUDA) on the same stream. The Vulkan submit registers `addFrameTimelineWait(timeline, value)` so the compute submit blocks on that signal at `VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT`. **No CPU stall** — CUDA→Vulkan handoff is a timeline wait on the ring submit (see `vksplat_viewport_renderer.cpp::prepareInputs`).
 4. Vulkan submit consumes the slot's CUDA-imported buffers, signals `in_flight_[slot]` on completion
 5. `vkQueuePresentKHR` blocks on the render-finished semaphore
 
-### ROCm/HIP scene-image paths
+### ROCm/HIP interop
 
-For LichtFeld Studio for ROCm, `cudaTimelineInteropUnavailableReason()` routes scene-image publication to an external-memory ring of at least three slots when the compute device cannot use external timeline semaphore interop but the image was imported successfully. Vulkan layout submissions return fence-backed `ImmediateSubmitTicket`s and are polled with `vkGetFenceStatus`; surface copies record and poll `cudaEvent*`. In HIP builds, the compatibility layer maps those event types and calls to `hipEvent*`. Normal publication avoids a per-frame CPU wait, while reset or teardown may synchronize an outstanding event before destroying the interop resources.
-
-If no external scene image is available, `VulkanSceneImageUploader` packs the tensor into mapped host-visible memory and submits `vkCmdCopyBufferToImage`. The external-memory ring is therefore a synchronization fallback for one successful interop path, not the only fallback. Individual VkSplat transfers may also synchronize when external timeline semaphore interop is unavailable.
+The compatibility layer maps CUDA runtime operations to HIP. `CudaTimelineSemaphore` imports the Vulkan timeline semaphore and orders compute writes before Vulkan reads. `cudaVulkanImageInteropSupported()` checks HIP image/surface support before importing a scene image. Unsupported interop fails with a diagnostic; the current viewer does not provide a CPU-staging or event-polling fallback.
 
 Three rings to be aware of, all keyed by `currentFrameSlot() % framesInFlight()`:
 
@@ -63,7 +61,7 @@ Three rings to be aware of, all keyed by `currentFrameSlot() % framesInFlight()`
 |---|---|---|
 | Vulkan command pool / cmd buffer / semaphores / fence | `VulkanContext` | `vulkan_context.{cpp,hpp}` |
 | Per-frame viewport-pass resources (overlay buffers, descriptors) | `VulkanViewportPass::FrameResources` | `vulkan_viewport_pass.cpp` |
-| CUDA-imported splat input buffers (xyz/rot/scales+opacs/sh) | `VksplatViewportRenderer::cuda_inputs_` | `vksplat_viewport_renderer.{cpp,hpp}` |
+| CUDA-imported splat input buffers (xyz/rot/scales+opacs/sh) | `VksplatViewportRenderer ring uploaded storages` | `vksplat_viewport_renderer.{cpp,hpp}` |
 
 Rule of thumb: anything written by CUDA and read by Vulkan within a frame must be ring-buffered to the same depth as `framesInFlight()`, or the cross-API ordering breaks under multi-frame-in-flight.
 
@@ -76,18 +74,16 @@ Rule of thumb: anything written by CUDA and read by Vulkan within a frame must b
 - Vulkan 1.3 mandatory features: `synchronization2`, `dynamicRendering`
 - Vulkan 1.2 mandatory features: `timelineSemaphore`, `bufferDeviceAddress`
 
-The Studio currently still requires the Vulkan external-memory device extensions during initialization. That device requirement is separate from scene-image publication: if the compute backend cannot supply an imported scene image, the viewport uploader can use CPU/Vulkan staging.
+Vulkan extension support alone does not establish compute interop support. CUDA/HIP must also import the external resources successfully. Scene-image publication requires an imported external image.
 
-After init, `VulkanContext` exposes opportunistic feature flags via `has*()` accessors:
+After init, `VulkanContext` probes opportunistic features. Some remain as public `has*()` accessors; others are log/PFN-only internal state after deadcode cleanup:
 
-- `hasDescriptorIndexing()` — Vulkan 1.2 core; `descriptorIndexing` + `runtimeDescriptorArray` etc.
-- `hasPushDescriptor()` — `VK_KHR_push_descriptor`
-- `hasShaderObject()` — `VK_EXT_shader_object`
-- `hasExtendedDynamicState3()` — `VK_EXT_extended_dynamic_state3`
-- `hasCooperativeMatrix()` — `VK_KHR_cooperative_matrix`
-- `hasHostImageCopy()` — `VK_EXT_host_image_copy`
+- `hasHostImageCopy()` — `VK_EXT_host_image_copy` (public accessor)
+- Push descriptor — `VK_KHR_push_descriptor` (internal `has_push_descriptor_` + PFN; public getter removed)
+- Float16 storage — feature-chain enable only; runtime probe is `VulkanGSRenderer::supportsFloat16Storage()`
+- Descriptor indexing / shader object / extended dynamic state / cooperative matrix — enablement paths as available on the device
 
-Each gates a Phase 3/4 modernization path. All six are present on current NVIDIA desktop drivers.
+Live code gates on PFNs / feature enablement rather than unused public capability getters.
 
 ## Device-identity check
 
@@ -118,7 +114,7 @@ External images created via `VulkanContext::createExternalImage` must be registe
 | Splat input packer (CPU + GPU) | `src/visualizer/rendering/vksplat_input_packer.{cpp,hpp}` |
 | Per-frame ring + plug-in for vksplat | `src/visualizer/rendering/vksplat_viewport_renderer.{cpp,hpp}` |
 | Viewport pass (scene compose + overlays) | `src/visualizer/rendering/passes/vulkan_viewport_pass.cpp` |
-| Scene-image upload (external interop or CPU/Vulkan staging) | `src/visualizer/rendering/passes/vulkan_scene_image_uploader.cpp` |
+| Scene-image binding (external interop) | `src/visualizer/rendering/passes/vulkan_scene_image_uploader.cpp` |
 | RmlUi vk backend (project-vendored from RmlUi 6.2) | `src/visualizer/gui/rmlui/rmlui_vk_backend.cpp` |
 
 ## Adding a new render pass
@@ -127,12 +123,10 @@ External images created via `VulkanContext::createExternalImage` must be registe
 2. If the pass writes to a new external image, allocate via `VulkanContext::createExternalImage()` and register with `context.imageBarriers().registerImage(...)` immediately.
 3. Wherever you change image layouts, call `context.imageBarriers().transitionImage(cmd, image, aspect, new_layout)` — never call `vkCmdPipelineBarrier`/`vkCmdPipelineBarrier2` inline for image transitions.
 4. For buffer barriers within a pass, use `vkCmdPipelineBarrier2` with `VkBufferMemoryBarrier2` and explicit stage/access masks; the tracker doesn't manage buffers.
-5. If the pass adds CUDA/HIP work, ring-buffer any cross-API state to `framesInFlight()` depth — see `VksplatViewportRenderer::cuda_inputs_` for the pattern.
+5. If the pass adds CUDA/HIP work, ring-buffer any cross-API state to `framesInFlight()` depth — see `VksplatViewportRenderer::ring_uploaded_` for the pattern.
 
-## Interop and staging behavior
+## Interop requirements
 
-The old global interop opt-out controls remain removed: there is no `--no-interop` CLI flag, `LFS_NO_VK_CUDA_INTEROP` environment variable, or `LFS_VULKAN_NO_INTEROP_FALLBACK` build option. Scene-image publication nevertheless has an explicit staging path when an external compute image is unavailable.
-
-The ROCm/HIP asynchronous ring described above is a synchronization fallback over external memory. CPU/Vulkan staging is a separate data-transfer fallback for systems where an external compute image cannot be used.
+The old global interop opt-out controls remain removed: there is no `--no-interop` CLI flag, `LFS_NO_VK_CUDA_INTEROP` environment variable, or `LFS_VULKAN_NO_INTEROP_FALLBACK` build option. Both scene-image publication and VkSplat inputs require working external interop.
 
 vulkan no longer carries its standalone Python-module init path (own `VkInstance`/`VkPhysicalDevice`/`VkDevice` creation): `initializeExternal` is the only entry point and the visualizer always supplies the Vulkan + VMA handles.

@@ -3,12 +3,14 @@
  * SPDX-License-Identifier: MIT */
 
 #include "gui/rmlui/rmlui_vk_backend.hpp"
+#include "core/error.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gui/rmlui/vulkan/rmlui_shaders_spv.hpp"
 #include "internal/resource_paths.hpp"
+#include "io/project_container.hpp"
 #include "python/python_runtime.hpp"
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/FileInterface.h>
@@ -16,6 +18,7 @@
 #include <RmlUi/Core/Math.h>
 #include <RmlUi/Core/Profiling.h>
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -24,13 +27,13 @@
 #include <format>
 #include <limits>
 #include <optional>
-#include <semaphore>
 #include <stb_image.h>
 #include <string.h>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 
 // AlignUp(314, 256) = 512
 template <typename T>
@@ -81,6 +84,7 @@ namespace {
     struct PreviewTextureRequest {
         std::filesystem::path path;
         int max_size = 0;
+        bool embedded_project_preview = false;
     };
 
     bool IsPreviewTextureSource(std::string_view source) {
@@ -202,6 +206,8 @@ namespace {
                 const std::string_view value = part.substr(eq + 1);
                 if (key == "path") {
                     request.path = lfs::core::utf8_to_path(PercentDecode(value));
+                } else if (key == "kind") {
+                    request.embedded_project_preview = value == "licht";
                 } else if (key == "thumb") {
                     thumb_size = ParseIntParam(value);
                 } else if (key == "pmw") {
@@ -275,6 +281,7 @@ RenderInterface_VK::RenderInterface_VK() : m_is_transform_enabled{false},
                                            m_p_sampler_linear{},
                                            m_p_sampler_nearest{},
                                            m_scissor{},
+                                           m_scissor_requested{},
                                            m_scissor_original{},
                                            m_viewport{},
                                            m_p_queue_graphics{},
@@ -294,7 +301,9 @@ RenderInterface_VK::RenderInterface_VK() : m_is_transform_enabled{false},
     m_rml_transform = Rml::Matrix4f::Identity();
 }
 
-RenderInterface_VK::~RenderInterface_VK() {}
+RenderInterface_VK::~RenderInterface_VK() {
+    StopPreviewWorkerPool();
+}
 
 std::string RenderInterface_VK::MakeExternalTextureSource(VkImageView image_view, VkSampler sampler,
                                                           int width, int height) {
@@ -323,6 +332,25 @@ void RenderInterface_VK::SetTextureDebugName(const Rml::TextureHandle texture_ha
     (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE_VIEW,
                                   (uint64_t)texture->m_p_vk_image_view,
                                   view_name.c_str());
+}
+
+RenderInterface_VK::VmaStatistics RenderInterface_VK::QueryVmaStatistics() const {
+    VmaStatistics result{};
+    if (m_p_allocator == VK_NULL_HANDLE || m_p_physical_device == VK_NULL_HANDLE)
+        return result;
+
+    VkPhysicalDeviceMemoryProperties memory_properties{};
+    vkGetPhysicalDeviceMemoryProperties(m_p_physical_device, &memory_properties);
+
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(m_p_allocator, budgets.data());
+    for (std::uint32_t i = 0; i < memory_properties.memoryHeapCount; ++i) {
+        if ((memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0)
+            continue;
+        result.block_bytes += budgets[i].statistics.blockBytes;
+        result.allocation_bytes += budgets[i].statistics.allocationBytes;
+    }
+    return result;
 }
 
 Rml::CompiledGeometryHandle RenderInterface_VK::CompileGeometry(Rml::Span<const Rml::Vertex> vertices, Rml::Span<const int> indices) {
@@ -482,13 +510,27 @@ void RenderInterface_VK::EnableScissorRegion(bool enable) {
     if (m_is_use_scissor_specified == false) {
         m_is_transformed_scissor_enabled = false;
         m_is_apply_to_regular_geometry_stencil = m_is_clip_mask_enabled;
-        m_scissor = ContextClipScissor();
+        m_scissor = ClampToCacheCaptureArea(ContextClipScissor());
         vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
     }
 }
 
 void RenderInterface_VK::SetScissorRegion(Rml::Rectanglei region) {
     if (m_is_use_scissor_specified) {
+        const float left_f = static_cast<float>(region.Left()) + m_context_offset.x;
+        const float top_f = static_cast<float>(region.Top()) + m_context_offset.y;
+        const float right_f = left_f + static_cast<float>(region.Width());
+        const float bottom_f = top_f + static_cast<float>(region.Height());
+        const int requested_left = static_cast<int>(std::floor(left_f));
+        const int requested_top = static_cast<int>(std::floor(top_f));
+        const int requested_right = static_cast<int>(std::ceil(right_f));
+        const int requested_bottom = static_cast<int>(std::ceil(bottom_f));
+        m_scissor_requested.offset = {requested_left, requested_top};
+        m_scissor_requested.extent = {
+            static_cast<uint32_t>(std::max(0, requested_right - requested_left)),
+            static_cast<uint32_t>(std::max(0, requested_bottom - requested_top)),
+        };
+
         if (m_is_transform_enabled) {
             Rml::Vertex vertices[4];
 
@@ -500,7 +542,7 @@ void RenderInterface_VK::SetScissorRegion(Rml::Rectanglei region) {
             int indices[6] = {0, 2, 1, 0, 3, 2};
 
             m_is_use_stencil_pipeline = true;
-            m_scissor = ContextClipScissor();
+            m_scissor = ClampToCacheCaptureArea(ContextClipScissor());
             vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
 
 #ifdef RMLUI_VK_DEBUG
@@ -527,8 +569,10 @@ void RenderInterface_VK::SetScissorRegion(Rml::Rectanglei region) {
 
             VkClearRect clear_rect = {};
             clear_rect.layerCount = 1;
-            clear_rect.rect.extent.width = m_width;
-            clear_rect.rect.extent.height = m_height;
+            clear_rect.rect = ClampToCacheCaptureArea(VkRect2D{
+                {0, 0},
+                {static_cast<uint32_t>(m_width), static_cast<uint32_t>(m_height)},
+            });
 
             vkCmdClearAttachments(m_p_current_command_buffer, 1, &clear_attachment, 1, &clear_rect);
 
@@ -541,25 +585,21 @@ void RenderInterface_VK::SetScissorRegion(Rml::Rectanglei region) {
 
             m_is_transformed_scissor_enabled = true;
             m_is_apply_to_regular_geometry_stencil = true;
-            m_scissor = ContextClipScissor();
+            m_scissor = ClampToCacheCaptureArea(ContextClipScissor());
             vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
         } else {
             m_is_transformed_scissor_enabled = false;
             m_is_apply_to_regular_geometry_stencil = m_is_clip_mask_enabled;
             // Enclose the translated rect; fractional panel offsets otherwise clip text edges.
-            const float left_f = static_cast<float>(region.Left()) + m_context_offset.x;
-            const float top_f = static_cast<float>(region.Top()) + m_context_offset.y;
-            const float right_f = left_f + static_cast<float>(region.Width());
-            const float bottom_f = top_f + static_cast<float>(region.Height());
-            const int left = Rml::Math::Clamp(static_cast<int>(std::floor(left_f)), 0, m_width);
-            const int top = Rml::Math::Clamp(static_cast<int>(std::floor(top_f)), 0, m_height);
-            const int right = Rml::Math::Clamp(static_cast<int>(std::ceil(right_f)), 0, m_width);
-            const int bottom = Rml::Math::Clamp(static_cast<int>(std::ceil(bottom_f)), 0, m_height);
+            const int left = Rml::Math::Clamp(requested_left, 0, m_width);
+            const int top = Rml::Math::Clamp(requested_top, 0, m_height);
+            const int right = Rml::Math::Clamp(requested_right, 0, m_width);
+            const int bottom = Rml::Math::Clamp(requested_bottom, 0, m_height);
             m_scissor.offset.x = left;
             m_scissor.offset.y = top;
             m_scissor.extent.width = static_cast<uint32_t>(std::max(0, right - left));
             m_scissor.extent.height = static_cast<uint32_t>(std::max(0, bottom - top));
-            m_scissor = IntersectContextClip(m_scissor);
+            m_scissor = ClampToCacheCaptureArea(IntersectContextClip(m_scissor));
 
 #ifdef RMLUI_VK_DEBUG
             VkDebugUtilsLabelEXT info{};
@@ -598,8 +638,10 @@ void RenderInterface_VK::RenderToClipMask(Rml::ClipMaskOperation operation, Rml:
 
     VkClearRect clear_rect = {};
     clear_rect.layerCount = 1;
-    clear_rect.rect.extent.width = m_width;
-    clear_rect.rect.extent.height = m_height;
+    clear_rect.rect = ClampToCacheCaptureArea(VkRect2D{
+        {0, 0},
+        {static_cast<uint32_t>(m_width), static_cast<uint32_t>(m_height)},
+    });
 
     // Match RmlUi's legacy compatibility behavior for intersect until the Vulkan renderer has
     // stencil increment/decrement pipelines for true nested clip-mask intersections.
@@ -666,7 +708,7 @@ void RenderInterface_VK::CompositeLayers(Rml::LayerHandle source, Rml::LayerHand
     }
 
     EndActiveRendering();
-    TransitionImageLayout(source_layer->m_color.m_p_vk_image, VK_IMAGE_ASPECT_COLOR_BIT, source_layer->m_color_layout,
+    TransitionImageLayout(source_layer->m_color.m_p_vk_image, source_layer->m_color.m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, source_layer->m_color_layout,
                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     source_layer->m_color_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
@@ -705,120 +747,190 @@ Rml::TextureHandle RenderInterface_VK::SaveLayerAsTexture() {
     if (m_p_current_command_buffer == nullptr || m_render_layer_stack_size <= 0)
         return {};
 
+    const render_layer_t* source_layer = GetRenderLayer(static_cast<Rml::LayerHandle>(m_render_layer_stack_size));
+    if (!source_layer || source_layer->width <= 0 || source_layer->height <= 0)
+        return {};
+
+    const VkRect2D declared_bounds = m_is_use_scissor_specified
+                                         ? m_scissor_requested
+                                         : VkRect2D{{0, 0}, {static_cast<uint32_t>(source_layer->width), static_cast<uint32_t>(source_layer->height)}};
+    return SaveLayerRegionAsTexture(declared_bounds, {});
+}
+
+Rml::TextureHandle RenderInterface_VK::SaveLayerRegionAsTexture(const VkRect2D region,
+                                                                const Rml::TextureHandle reuse_texture) {
+    if (m_p_current_command_buffer == nullptr || m_render_layer_stack_size <= 0)
+        return {};
+
     render_layer_t* source_layer = GetRenderLayer(static_cast<Rml::LayerHandle>(m_render_layer_stack_size));
     if (!source_layer)
         return {};
     if (source_layer->width <= 0 || source_layer->height <= 0)
         return {};
 
-    VkRect2D bounds = m_is_use_scissor_specified ? m_scissor : ContextClipScissor();
-    bounds = IntersectContextClip(bounds);
-    bounds.offset.x = Rml::Math::Clamp(bounds.offset.x, 0, source_layer->width);
-    bounds.offset.y = Rml::Math::Clamp(bounds.offset.y, 0, source_layer->height);
-    if (bounds.offset.x + static_cast<int>(bounds.extent.width) > source_layer->width)
-        bounds.extent.width = static_cast<uint32_t>(source_layer->width - bounds.offset.x);
-    if (bounds.offset.y + static_cast<int>(bounds.extent.height) > source_layer->height)
-        bounds.extent.height = static_cast<uint32_t>(source_layer->height - bounds.offset.y);
-    if (bounds.extent.width == 0 || bounds.extent.height == 0)
+    VkRect2D declared_bounds = region;
+    const int declared_left = Rml::Math::Clamp(declared_bounds.offset.x, 0, source_layer->width);
+    const int declared_top = Rml::Math::Clamp(declared_bounds.offset.y, 0, source_layer->height);
+    const int declared_right = Rml::Math::Clamp(
+        declared_bounds.offset.x + static_cast<int>(declared_bounds.extent.width), 0, source_layer->width);
+    const int declared_bottom = Rml::Math::Clamp(
+        declared_bounds.offset.y + static_cast<int>(declared_bounds.extent.height), 0, source_layer->height);
+    declared_bounds.offset = {declared_left, declared_top};
+    declared_bounds.extent = {
+        static_cast<uint32_t>(std::max(0, declared_right - declared_left)),
+        static_cast<uint32_t>(std::max(0, declared_bottom - declared_top)),
+    };
+    if (declared_bounds.extent.width == 0 || declared_bounds.extent.height == 0)
         return {};
 
     EndActiveRendering();
 
-    auto* texture = new texture_data_t{};
-    const VkFormat format = m_swapchain_format.format;
-    const VkExtent3D extent{bounds.extent.width, bounds.extent.height, 1};
+    VkRect2D capture_bounds = IntersectContextClip(declared_bounds);
+    capture_bounds = ClampToCacheCaptureArea(capture_bounds);
+    const bool capture_covers_declared =
+        capture_bounds.offset.x == declared_bounds.offset.x &&
+        capture_bounds.offset.y == declared_bounds.offset.y &&
+        capture_bounds.extent.width == declared_bounds.extent.width &&
+        capture_bounds.extent.height == declared_bounds.extent.height;
 
-    VkImageCreateInfo image_info{};
-    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    image_info.imageType = VK_IMAGE_TYPE_2D;
-    image_info.format = format;
-    image_info.extent = extent;
-    image_info.mipLevels = 1;
-    image_info.arrayLayers = 1;
-    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
-    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const int declared_w = static_cast<int>(declared_bounds.extent.width);
+    const int declared_h = static_cast<int>(declared_bounds.extent.height);
+    const VkExtent3D extent{declared_bounds.extent.width, declared_bounds.extent.height, 1};
 
-    VmaAllocationCreateInfo allocation_info{};
-    allocation_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-
-    VmaAllocationInfo allocation_stats{};
-    VkResult status = vmaCreateImage(m_p_allocator,
-                                     &image_info,
-                                     &allocation_info,
-                                     &texture->m_p_vk_image,
-                                     &texture->m_p_vma_allocation,
-                                     &allocation_stats);
-    RMLUI_VK_ASSERTMSG(status == VK_SUCCESS, "failed to create saved RmlUi layer texture");
-    if (status != VK_SUCCESS) {
-        delete texture;
-        return {};
+    texture_data_t* texture = nullptr;
+    bool reusing = false;
+    if (reuse_texture != 0) {
+        auto* candidate = reinterpret_cast<texture_data_t*>(reuse_texture);
+        if (candidate && candidate->m_p_vk_image != VK_NULL_HANDLE && candidate->m_p_vk_image_view != VK_NULL_HANDLE &&
+            candidate->m_width == declared_w && candidate->m_height == declared_h) {
+            texture = candidate;
+            reusing = true;
+        }
     }
-    (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE,
-                                  (uint64_t)texture->m_p_vk_image,
-                                  "rmlui.saved-layer.image");
-    texture->m_vram_scope = "vulkan.rmlui.saved_layer_texture";
-    texture->m_vram_label = TextureVramLabel("saved_layer",
-                                             "clip",
-                                             static_cast<int>(bounds.extent.width),
-                                             static_cast<int>(bounds.extent.height),
-                                             texture);
-    texture->m_vram_allocation_size = allocation_stats.size;
-    RecordRmlUiVram(texture->m_vram_scope, texture->m_vram_label, texture->m_vram_allocation_size);
 
-    VkImageViewCreateInfo view_info{};
-    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_info.image = texture->m_p_vk_image;
-    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = format;
-    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view_info.subresourceRange.baseMipLevel = 0;
-    view_info.subresourceRange.levelCount = 1;
-    view_info.subresourceRange.baseArrayLayer = 0;
-    view_info.subresourceRange.layerCount = 1;
-    status = vkCreateImageView(m_p_device, &view_info, nullptr, &texture->m_p_vk_image_view);
-    RMLUI_VK_ASSERTMSG(status == VK_SUCCESS, "failed to create saved RmlUi layer texture view");
-    if (status != VK_SUCCESS) {
-        if (!texture->m_vram_scope.empty() && !texture->m_vram_label.empty())
-            RecordRmlUiVram(texture->m_vram_scope, texture->m_vram_label, 0);
-        vmaDestroyImage(m_p_allocator, texture->m_p_vk_image, texture->m_p_vma_allocation);
-        delete texture;
-        return {};
+    if (!reusing) {
+        texture = new texture_data_t{};
+        const VkFormat format = m_swapchain_format.format;
+
+        VkImageCreateInfo image_info{};
+        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = format;
+        image_info.extent = extent;
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo allocation_info{};
+        allocation_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+        VmaAllocationInfo allocation_stats{};
+        VkResult status = vmaCreateImage(m_p_allocator,
+                                         &image_info,
+                                         &allocation_info,
+                                         &texture->m_p_vk_image,
+                                         &texture->m_p_vma_allocation,
+                                         &allocation_stats);
+        RMLUI_VK_ASSERTMSG(status == VK_SUCCESS, "failed to create saved RmlUi layer texture");
+        if (status != VK_SUCCESS) {
+            delete texture;
+            return {};
+        }
+        (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE,
+                                      (uint64_t)texture->m_p_vk_image,
+                                      "rmlui.saved-layer.image");
+        vmaSetAllocationName(m_p_allocator,
+                             texture->m_p_vma_allocation,
+                             "RmlUi saved layer texture");
+        texture->m_barrier_generation = ++m_image_barrier_generation;
+        texture->m_width = declared_w;
+        texture->m_height = declared_h;
+        texture->m_vram_scope = "vulkan.rmlui.saved_layer_texture";
+        texture->m_vram_label = TextureVramLabel("saved_layer",
+                                                 "clip",
+                                                 declared_w,
+                                                 declared_h,
+                                                 texture);
+        texture->m_vram_allocation_size = allocation_stats.size;
+        RecordRmlUiVram(texture->m_vram_scope, texture->m_vram_label, texture->m_vram_allocation_size);
+
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = texture->m_p_vk_image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = format;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view_info.subresourceRange.baseMipLevel = 0;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.baseArrayLayer = 0;
+        view_info.subresourceRange.layerCount = 1;
+        status = vkCreateImageView(m_p_device, &view_info, nullptr, &texture->m_p_vk_image_view);
+        RMLUI_VK_ASSERTMSG(status == VK_SUCCESS, "failed to create saved RmlUi layer texture view");
+        if (status != VK_SUCCESS) {
+            if (!texture->m_vram_scope.empty() && !texture->m_vram_label.empty())
+                RecordRmlUiVram(texture->m_vram_scope, texture->m_vram_label, 0);
+            vmaDestroyImage(m_p_allocator, texture->m_p_vk_image, texture->m_p_vma_allocation);
+            delete texture;
+            return {};
+        }
+        (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE_VIEW,
+                                      (uint64_t)texture->m_p_vk_image_view,
+                                      "rmlui.saved-layer.view");
+        texture->m_p_vk_sampler = m_p_sampler_linear;
     }
-    (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE_VIEW,
-                                  (uint64_t)texture->m_p_vk_image_view,
-                                  "rmlui.saved-layer.view");
-    texture->m_p_vk_sampler = m_p_sampler_linear;
 
-    TransitionImageLayout(source_layer->m_color.m_p_vk_image, VK_IMAGE_ASPECT_COLOR_BIT, source_layer->m_color_layout,
-                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    source_layer->m_color_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    if (capture_bounds.extent.width > 0 && capture_bounds.extent.height > 0) {
+        TransitionImageLayout(source_layer->m_color.m_p_vk_image, source_layer->m_color.m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, source_layer->m_color_layout,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        source_layer->m_color_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
 
-    TransitionImageLayout(texture->m_p_vk_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    // Fresh images: UNDEFINED → TRANSFER_DST (discard). Reused cache textures were last in
+    // SHADER_READ_ONLY after composite sampling; WAR against those fragment reads on this queue.
+    const VkImageLayout dst_old_layout =
+        reusing ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    TransitionImageLayout(texture->m_p_vk_image, texture->m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, dst_old_layout,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-    VkImageCopy copy_region{};
-    copy_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy_region.srcSubresource.mipLevel = 0;
-    copy_region.srcSubresource.baseArrayLayer = 0;
-    copy_region.srcSubresource.layerCount = 1;
-    copy_region.srcOffset = {bounds.offset.x, bounds.offset.y, 0};
-    copy_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy_region.dstSubresource.mipLevel = 0;
-    copy_region.dstSubresource.baseArrayLayer = 0;
-    copy_region.dstSubresource.layerCount = 1;
-    copy_region.dstOffset = {0, 0, 0};
-    copy_region.extent = extent;
+    if (!capture_covers_declared) {
+        VkClearColorValue clear_color{};
+        VkImageSubresourceRange clear_range{};
+        clear_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clear_range.levelCount = 1;
+        clear_range.layerCount = 1;
+        vkCmdClearColorImage(m_p_current_command_buffer, texture->m_p_vk_image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_color, 1, &clear_range);
+    }
 
-    vkCmdCopyImage(m_p_current_command_buffer, source_layer->m_color.m_p_vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   texture->m_p_vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+    if (capture_bounds.extent.width > 0 && capture_bounds.extent.height > 0) {
+        VkImageCopy copy_region{};
+        copy_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy_region.srcSubresource.mipLevel = 0;
+        copy_region.srcSubresource.baseArrayLayer = 0;
+        copy_region.srcSubresource.layerCount = 1;
+        copy_region.srcOffset = {capture_bounds.offset.x, capture_bounds.offset.y, 0};
+        copy_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy_region.dstSubresource.mipLevel = 0;
+        copy_region.dstSubresource.baseArrayLayer = 0;
+        copy_region.dstSubresource.layerCount = 1;
+        copy_region.dstOffset = {capture_bounds.offset.x - declared_bounds.offset.x,
+                                 capture_bounds.offset.y - declared_bounds.offset.y, 0};
+        copy_region.extent = {capture_bounds.extent.width, capture_bounds.extent.height, 1};
 
-    TransitionImageLayout(texture->m_p_vk_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        vkCmdCopyImage(m_p_current_command_buffer, source_layer->m_color.m_p_vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       texture->m_p_vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+    }
+
+    TransitionImageLayout(texture->m_p_vk_image, texture->m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     BeginLayerRendering(static_cast<Rml::LayerHandle>(m_render_layer_stack_size), false);
 
-    RegisterLiveTexture(texture);
+    if (!reusing)
+        RegisterLiveTexture(texture);
     return reinterpret_cast<Rml::TextureHandle>(texture);
 }
 
@@ -923,7 +1035,7 @@ Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimens
         try {
             const auto path = lfs::vis::getAssetPath(asset_name);
             if (std::filesystem::exists(path))
-                return load_with_stbi(path.string());
+                return load_with_stbi(lfs::core::path_to_utf8(path));
         } catch (...) {
         }
         return 0;
@@ -1047,55 +1159,166 @@ Rml::TextureHandle RenderInterface_VK::LoadAsyncPreviewTexture(Rml::Vector2i& te
     m_async_preview_textures.push_back(state);
 
     try {
-        std::thread([state, path = request->path, max_size = request->max_size]() mutable {
-            auto result = DecodePreviewTexture(std::move(path), max_size);
-            {
-                std::lock_guard lock(state->mutex);
-                state->result = std::move(result);
-            }
-            state->ready.store(true, std::memory_order_release);
-            lfs::python::request_redraw();
-        }).detach();
+        EnsurePreviewWorkerPool();
+        EnqueuePreviewWork(preview_work_t{
+            state, request->path, request->max_size, request->embedded_project_preview});
     } catch (const std::exception& e) {
-        LOG_WARN("Failed to start async preview texture worker for '{}': {}", lfs::core::path_to_utf8(request->path), e.what());
+        LOG_WARN("Failed to queue async preview texture worker for '{}': {}",
+                 lfs::core::path_to_utf8(request->path), e.what());
         DropAsyncPreviewTexture(texture);
     }
 
     return handle;
 }
 
-RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewTexture(std::filesystem::path path, const int max_size) {
-    static std::counting_semaphore<4> decode_slots(4);
-    struct DecodeSlotGuard {
-        std::counting_semaphore<4>& slots;
-        explicit DecodeSlotGuard(std::counting_semaphore<4>& s) : slots(s) { slots.acquire(); }
-        ~DecodeSlotGuard() { slots.release(); }
-    };
+void RenderInterface_VK::EnsurePreviewWorkerPool() {
+    std::lock_guard lock(m_preview_queue_mutex);
+    if (!m_preview_workers.empty())
+        return;
+    m_preview_workers_stopping = false;
+    constexpr std::size_t kWorkerCount = 3;
+    for (std::size_t i = 0; i < kWorkerCount; ++i) {
+        m_preview_workers.emplace_back([this] {
+            for (;;) {
+                preview_work_t work;
+                {
+                    std::unique_lock queue_lock(m_preview_queue_mutex);
+                    m_preview_queue_cv.wait(queue_lock, [this] {
+                        return m_preview_workers_stopping || !m_preview_queue.empty();
+                    });
+                    if (m_preview_workers_stopping && m_preview_queue.empty())
+                        return;
+                    work = std::move(m_preview_queue.front());
+                    m_preview_queue.pop_front();
+                }
+                if (!work.state || work.state->cancelled.load(std::memory_order_acquire))
+                    continue;
+                auto result = DecodePreviewTexture(
+                    std::move(work.path), work.max_size, work.embedded_project_preview);
+                if (work.state->cancelled.load(std::memory_order_acquire))
+                    continue;
+                {
+                    std::lock_guard result_lock(work.state->mutex);
+                    work.state->result = std::move(result);
+                }
+                work.state->ready.store(true, std::memory_order_release);
+                lfs::python::request_redraw();
+            }
+        });
+    }
+}
 
-    DecodeSlotGuard guard(decode_slots);
+void RenderInterface_VK::EnqueuePreviewWork(preview_work_t work) {
+    {
+        std::lock_guard lock(m_preview_queue_mutex);
+        if (m_preview_workers_stopping)
+            throw std::runtime_error("preview worker pool is stopping");
+        m_preview_queue.emplace_back(std::move(work));
+    }
+    m_preview_queue_cv.notify_one();
+}
 
+void RenderInterface_VK::StopPreviewWorkerPool() noexcept {
+    {
+        std::lock_guard lock(m_preview_queue_mutex);
+        m_preview_workers_stopping = true;
+        m_preview_queue.clear();
+    }
+    m_preview_queue_cv.notify_all();
+    for (auto& worker : m_preview_workers) {
+        if (worker.joinable())
+            worker.join();
+    }
+    m_preview_workers.clear();
+}
+
+RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewTexture(
+    std::filesystem::path path,
+    const int max_size,
+    const bool embedded_project_preview) {
     async_preview_result_t result;
     unsigned char* data = nullptr;
     try {
-        auto [pixels, width, height, channels] = lfs::core::load_image(path, -1, max_size);
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        unsigned char* pixels = nullptr;
+        if (embedded_project_preview) {
+            auto reader = lfs::io::project::ProjectReader::open(path);
+            if (!reader) {
+                LOG_WARN("Failed to inspect embedded project preview '{}': {}",
+                         lfs::core::path_to_utf8(path),
+                         lfs::format_for_developer(reader.error()));
+                return result;
+            }
+            auto preview = reader->read_preview();
+            if (!preview) {
+                LOG_WARN("Failed to read embedded project preview '{}': {}",
+                         lfs::core::path_to_utf8(path),
+                         lfs::format_for_developer(preview.error()));
+                return result;
+            }
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(preview->data());
+            std::tie(pixels, width, height, channels) =
+                lfs::core::load_image_from_memory(bytes, preview->size());
+        } else {
+            std::tie(pixels, width, height, channels) =
+                lfs::core::load_image_thumbnail(path, max_size);
+        }
         data = pixels;
         if (pixels && width > 0 && height > 0 && channels > 0) {
-            const std::size_t pixel_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-            result.pixels.resize(pixel_count * 4u);
-            for (std::size_t i = 0; i < pixel_count; ++i) {
-                const unsigned char* src = pixels + i * static_cast<std::size_t>(channels);
-                const unsigned char r = src[0];
-                const unsigned char g = channels > 1 ? src[1] : r;
-                const unsigned char b = channels > 2 ? src[2] : r;
-                const unsigned char a = channels > 3 ? src[3] : 255;
-                Rml::byte* dst = result.pixels.data() + i * 4u;
-                dst[0] = static_cast<Rml::byte>((static_cast<unsigned int>(r) * a + 127u) / 255u);
-                dst[1] = static_cast<Rml::byte>((static_cast<unsigned int>(g) * a + 127u) / 255u);
-                dst[2] = static_cast<Rml::byte>((static_cast<unsigned int>(b) * a + 127u) / 255u);
-                dst[3] = static_cast<Rml::byte>(a);
+            int output_width = width;
+            int output_height = height;
+            if (embedded_project_preview && max_size > 0 &&
+                std::max(width, height) > max_size) {
+                const double scale = static_cast<double>(max_size) /
+                                     static_cast<double>(std::max(width, height));
+                output_width = std::max(1, static_cast<int>(std::lround(width * scale)));
+                output_height = std::max(1, static_cast<int>(std::lround(height * scale)));
             }
-            result.width = width;
-            result.height = height;
+            const std::size_t pixel_count =
+                static_cast<std::size_t>(output_width) *
+                static_cast<std::size_t>(output_height);
+            result.pixels.resize(pixel_count * 4u);
+            const auto sample = [&](const double x, const double y, const int channel) {
+                const double sx = std::clamp(x, 0.0, static_cast<double>(width - 1));
+                const double sy = std::clamp(y, 0.0, static_cast<double>(height - 1));
+                const int x0 = static_cast<int>(sx);
+                const int y0 = static_cast<int>(sy);
+                const int x1 = std::min(width - 1, x0 + 1);
+                const int y1 = std::min(height - 1, y0 + 1);
+                const double fx = sx - x0;
+                const double fy = sy - y0;
+                const auto at = [&](const int px, const int py) {
+                    return static_cast<double>(pixels[(static_cast<std::size_t>(py) * width + px) * channels + channel]);
+                };
+                return (at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx) * (1.0 - fy) +
+                       (at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx) * fy;
+            };
+            for (int y = 0; y < output_height; ++y) {
+                for (int x = 0; x < output_width; ++x) {
+                    const double source_x = (x + 0.5) * width / output_width - 0.5;
+                    const double source_y = (y + 0.5) * height / output_height - 0.5;
+                    const unsigned char r = static_cast<unsigned char>(std::lround(sample(source_x, source_y, 0)));
+                    const unsigned char g = static_cast<unsigned char>(std::lround(sample(source_x, source_y, channels > 1 ? 1 : 0)));
+                    const unsigned char b = static_cast<unsigned char>(std::lround(sample(source_x, source_y, channels > 2 ? 2 : 0)));
+                    const unsigned char a = channels > 3 ? static_cast<unsigned char>(std::lround(sample(source_x, source_y, 3))) : 255;
+                    Rml::byte* dst = result.pixels.data() +
+                                     (static_cast<std::size_t>(y) *
+                                          static_cast<std::size_t>(output_width) +
+                                      static_cast<std::size_t>(x)) *
+                                         4u;
+                    dst[0] = static_cast<Rml::byte>(
+                        (static_cast<unsigned int>(r) * a + 127u) / 255u);
+                    dst[1] = static_cast<Rml::byte>(
+                        (static_cast<unsigned int>(g) * a + 127u) / 255u);
+                    dst[2] = static_cast<Rml::byte>(
+                        (static_cast<unsigned int>(b) * a + 127u) / 255u);
+                    dst[3] = static_cast<Rml::byte>(a);
+                }
+            }
+            result.width = output_width;
+            result.height = output_height;
         }
     } catch (const std::exception& e) {
         LOG_WARN("Failed to decode preview texture '{}': {}", lfs::core::path_to_utf8(path), e.what());
@@ -1118,6 +1341,7 @@ void RenderInterface_VK::DropAsyncPreviewTexture(texture_data_t* texture) {
     m_async_preview_textures.erase(std::remove_if(m_async_preview_textures.begin(), m_async_preview_textures.end(),
                                                   [texture](const std::shared_ptr<async_preview_state_t>& state) {
                                                       if (state && state->texture == texture) {
+                                                          state->cancelled.store(true, std::memory_order_release);
                                                           state->texture = nullptr;
                                                           return true;
                                                       }
@@ -1258,6 +1482,7 @@ Rml::TextureHandle RenderInterface_VK::CreateTexture(Rml::Span<const Rml::byte> 
 
     p_texture->m_p_vk_image = p_image;
     p_texture->m_p_vma_allocation = p_allocation;
+    p_texture->m_barrier_generation = ++m_image_barrier_generation;
     const std::string image_debug_name = std::format("rmlui.texture.image[{}]", name);
     (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE,
                                   (uint64_t)p_texture->m_p_vk_image,
@@ -1289,9 +1514,7 @@ Rml::TextureHandle RenderInterface_VK::CreateTexture(Rml::Span<const Rml::byte> 
         return {};
     };
 
-#ifdef RMLUI_VK_DEBUG
     vmaSetAllocationName(m_p_allocator, p_allocation, name.c_str());
-#endif
 
     if (use_host_image_copy) {
         VkHostImageLayoutTransitionInfoEXT to_sampled{};
@@ -1351,8 +1574,9 @@ Rml::TextureHandle RenderInterface_VK::CreateTexture(Rml::Span<const Rml::byte> 
 
         const bool uploaded = m_upload_manager.UploadToGPU([p_image, extent_image, cpu_buffer](VkCommandBuffer p_cmd) {
             lfs::vis::VulkanImageBarrierTracker upload_barriers;
-            upload_barriers.registerImage(p_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-            upload_barriers.transitionImage(p_cmd, p_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            constexpr std::uint64_t kUploadGeneration = 1;
+            upload_barriers.registerImage(p_image, kUploadGeneration, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+            upload_barriers.transitionImage(p_cmd, p_image, kUploadGeneration, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
             VkBufferImageCopy region = {};
             region.bufferOffset = 0;
@@ -1367,7 +1591,7 @@ Rml::TextureHandle RenderInterface_VK::CreateTexture(Rml::Span<const Rml::byte> 
 
             vkCmdCopyBufferToImage(p_cmd, cpu_buffer.m_p_vk_buffer, p_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-            upload_barriers.transitionImage(p_cmd, p_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            upload_barriers.transitionImage(p_cmd, p_image, kUploadGeneration, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         });
 
         DestroyResource_StagingBuffer(cpu_buffer);
@@ -1426,12 +1650,41 @@ void RenderInterface_VK::SetContextOffset(float offset_x, float offset_y) {
     ApplyTransformState();
 }
 
+void RenderInterface_VK::BeginCacheCapture(const int x, const int y, const int width, const int height) {
+    if (width <= 0 || height <= 0) {
+        EndCacheCapture();
+        return;
+    }
+
+    const int left = Rml::Math::Clamp(x, 0, m_width);
+    const int top = Rml::Math::Clamp(y, 0, m_height);
+    const int right = Rml::Math::Clamp(x + width, 0, m_width);
+    const int bottom = Rml::Math::Clamp(y + height, 0, m_height);
+    if (right <= left || bottom <= top) {
+        EndCacheCapture();
+        return;
+    }
+
+    m_cache_capture_active = true;
+    m_cache_capture_render_area.offset.x = left;
+    m_cache_capture_render_area.offset.y = top;
+    m_cache_capture_render_area.extent.width = static_cast<uint32_t>(right - left);
+    m_cache_capture_render_area.extent.height = static_cast<uint32_t>(bottom - top);
+}
+
+void RenderInterface_VK::EndCacheCapture() {
+    m_cache_capture_active = false;
+    m_cache_capture_render_area = {};
+}
+
 void RenderInterface_VK::SetContextClipRect(float x1, float y1, float x2, float y2) {
     if (x2 <= x1 || y2 <= y1) {
         m_context_clip_enabled = true;
         m_context_clip_scissor = {};
-        if (m_p_current_command_buffer)
-            vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_context_clip_scissor);
+        if (m_p_current_command_buffer) {
+            VkRect2D empty = ClampToCacheCaptureArea(m_context_clip_scissor);
+            vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &empty);
+        }
         return;
     }
 
@@ -1445,8 +1698,10 @@ void RenderInterface_VK::SetContextClipRect(float x1, float y1, float x2, float 
     m_context_clip_scissor.offset.y = top;
     m_context_clip_scissor.extent.width = static_cast<uint32_t>(std::max(0, right - left));
     m_context_clip_scissor.extent.height = static_cast<uint32_t>(std::max(0, bottom - top));
-    if (m_p_current_command_buffer)
-        vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_context_clip_scissor);
+    if (m_p_current_command_buffer) {
+        VkRect2D scissor = ClampToCacheCaptureArea(m_context_clip_scissor);
+        vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &scissor);
+    }
 }
 
 void RenderInterface_VK::ApplyTransformState() {
@@ -1502,6 +1757,203 @@ void RenderInterface_VK::RenderTextureQuad(Rml::TextureHandle texture, const flo
     m_context_offset = context_offset;
 }
 
+bool RenderInterface_VK::RenderFrostedGlass(
+    const Rml::Span<const FrostedGlassRegion> regions) {
+    if (!m_external_context || !m_p_current_command_buffer ||
+        !m_external_swapchain_image || regions.size() == 0 ||
+        m_active_render_target != active_render_target_t::Swapchain ||
+        !EnsureFrostedGlassBackdrop()) {
+        return false;
+    }
+
+    auto& backdrop = m_frosted_glass_backdrop;
+    EndActiveRendering();
+
+    TransitionImageLayout(m_external_swapchain_image,
+                          m_external_swapchain_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          m_external_swapchain_layout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    m_external_swapchain_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    TransitionImageLayout(backdrop.primary.m_p_vk_image,
+                          backdrop.primary.m_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          backdrop.primary_layout,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    backdrop.primary_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+    const auto blit = [this](const VkImage source,
+                             const VkImageLayout source_layout,
+                             const int source_width,
+                             const int source_height,
+                             const VkImage destination,
+                             const VkImageLayout destination_layout,
+                             const int destination_width,
+                             const int destination_height) {
+        VkImageBlit image_blit{};
+        image_blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        image_blit.srcSubresource.mipLevel = 0;
+        image_blit.srcSubresource.baseArrayLayer = 0;
+        image_blit.srcSubresource.layerCount = 1;
+        image_blit.srcOffsets[1] = {source_width, source_height, 1};
+        image_blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        image_blit.dstSubresource.mipLevel = 0;
+        image_blit.dstSubresource.baseArrayLayer = 0;
+        image_blit.dstSubresource.layerCount = 1;
+        image_blit.dstOffsets[1] = {destination_width, destination_height, 1};
+        vkCmdBlitImage(m_p_current_command_buffer,
+                       source, source_layout,
+                       destination, destination_layout,
+                       1, &image_blit, VK_FILTER_LINEAR);
+    };
+
+    blit(m_external_swapchain_image,
+         m_external_swapchain_layout,
+         m_width, m_height,
+         backdrop.primary.m_p_vk_image,
+         backdrop.primary_layout,
+         backdrop.primary_width, backdrop.primary_height);
+
+    TransitionImageLayout(backdrop.primary.m_p_vk_image,
+                          backdrop.primary.m_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          backdrop.primary_layout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    backdrop.primary_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    TransitionImageLayout(backdrop.secondary.m_p_vk_image,
+                          backdrop.secondary.m_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          backdrop.secondary_layout,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    backdrop.secondary_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    blit(backdrop.primary.m_p_vk_image,
+         backdrop.primary_layout,
+         backdrop.primary_width, backdrop.primary_height,
+         backdrop.secondary.m_p_vk_image,
+         backdrop.secondary_layout,
+         backdrop.secondary_width, backdrop.secondary_height);
+
+    TransitionImageLayout(backdrop.secondary.m_p_vk_image,
+                          backdrop.secondary.m_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          backdrop.secondary_layout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    backdrop.secondary_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    TransitionImageLayout(backdrop.primary.m_p_vk_image,
+                          backdrop.primary.m_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          backdrop.primary_layout,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    backdrop.primary_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    blit(backdrop.secondary.m_p_vk_image,
+         backdrop.secondary_layout,
+         backdrop.secondary_width, backdrop.secondary_height,
+         backdrop.primary.m_p_vk_image,
+         backdrop.primary_layout,
+         backdrop.primary_width, backdrop.primary_height);
+
+    TransitionImageLayout(backdrop.primary.m_p_vk_image,
+                          backdrop.primary.m_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          backdrop.primary_layout,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    backdrop.primary_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    TransitionImageLayout(m_external_swapchain_image,
+                          m_external_swapchain_barrier_generation,
+                          VK_IMAGE_ASPECT_COLOR_BIT,
+                          m_external_swapchain_layout,
+                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    m_external_swapchain_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    BeginSwapchainRendering(VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD);
+    ResetContextRenderState();
+
+    const auto draw_backdrop = [this, &backdrop](const float x1,
+                                                 const float y1,
+                                                 const float x2,
+                                                 const float y2) {
+        if (x2 <= x1 || y2 <= y1)
+            return;
+        SetContextClipRect(x1, y1, x2, y2);
+        RenderFrostedGlassQuad(backdrop.primary);
+    };
+
+    for (const FrostedGlassRegion& region : regions) {
+        const float left = std::clamp(region.x, 0.0f, static_cast<float>(m_width));
+        const float top = std::clamp(region.y, 0.0f, static_cast<float>(m_height));
+        const float right = std::clamp(region.x + region.width,
+                                       0.0f, static_cast<float>(m_width));
+        const float bottom = std::clamp(region.y + region.height,
+                                        0.0f, static_cast<float>(m_height));
+        const float radius = std::clamp(region.radius,
+                                        0.0f,
+                                        0.5f * std::min(right - left, bottom - top));
+        if (radius < 1.0f) {
+            draw_backdrop(left, top, right, bottom);
+            continue;
+        }
+        // Two intersecting rectangles approximate the rounded clip; the exact
+        // anti-aliased radius and themed border are drawn by RmlUi above it.
+        draw_backdrop(left + radius, top, right - radius, bottom);
+        draw_backdrop(left, top + radius, right, bottom - radius);
+    }
+    ResetContextRenderState();
+    return true;
+}
+
+void RenderInterface_VK::RenderFrostedGlassQuad(texture_data_t& texture) {
+    if (!m_p_current_command_buffer || !texture.m_p_vk_image_view ||
+        m_width <= 0 || m_height <= 0) {
+        return;
+    }
+
+    // Slightly enlarge the sampled backdrop. The tiny refraction is visible on
+    // high-contrast scene edges without introducing a second shader pipeline.
+    constexpr float REFRACTION_INSET = 1.25f;
+    if (!m_frosted_glass_quad_geometry ||
+        m_frosted_glass_quad_width != m_width ||
+        m_frosted_glass_quad_height != m_height) {
+        if (m_frosted_glass_quad_geometry)
+            ReleaseGeometry(m_frosted_glass_quad_geometry);
+
+        const float x = -REFRACTION_INSET;
+        const float y = -REFRACTION_INSET;
+        const float width = static_cast<float>(m_width) + 2.0f * REFRACTION_INSET;
+        const float height = static_cast<float>(m_height) + 2.0f * REFRACTION_INSET;
+        Rml::Vertex vertices[4];
+        vertices[0].position = {x, y};
+        vertices[0].tex_coord = {0.0f, 0.0f};
+        vertices[1].position = {x + width, y};
+        vertices[1].tex_coord = {1.0f, 0.0f};
+        vertices[2].position = {x + width, y + height};
+        vertices[2].tex_coord = {1.0f, 1.0f};
+        vertices[3].position = {x, y + height};
+        vertices[3].tex_coord = {0.0f, 1.0f};
+        for (Rml::Vertex& vertex : vertices)
+            vertex.colour = Rml::ColourbPremultiplied(255, 255, 255, 255);
+        static constexpr int indices[6] = {0, 1, 2, 0, 2, 3};
+        m_frosted_glass_quad_geometry = CompileGeometry({vertices, 4}, {indices, 6});
+        m_frosted_glass_quad_width = m_width;
+        m_frosted_glass_quad_height = m_height;
+    }
+
+    const bool transform_enabled = m_is_transform_enabled;
+    const shader_vertex_user_data_t user_data = m_user_data_for_vertex_shader;
+    const Rml::Matrix4f rml_transform = m_rml_transform;
+    const Rml::Matrix4f context_transform = m_context_transform;
+    const Rml::Vector2f context_offset = m_context_offset;
+    SetTransform(nullptr);
+    if (m_frosted_glass_quad_geometry) {
+        RenderGeometry(m_frosted_glass_quad_geometry,
+                       {}, reinterpret_cast<Rml::TextureHandle>(&texture));
+    }
+    m_is_transform_enabled = transform_enabled;
+    m_user_data_for_vertex_shader = user_data;
+    m_rml_transform = rml_transform;
+    m_context_transform = context_transform;
+    m_context_offset = context_offset;
+}
+
 VkRect2D RenderInterface_VK::ContextClipScissor() const noexcept {
     return m_context_clip_enabled ? m_context_clip_scissor : m_scissor_original;
 }
@@ -1522,6 +1974,26 @@ VkRect2D RenderInterface_VK::IntersectContextClip(VkRect2D scissor) const noexce
     scissor.extent.width = static_cast<uint32_t>(std::max(0, right - left));
     scissor.extent.height = static_cast<uint32_t>(std::max(0, bottom - top));
     return scissor;
+}
+
+VkRect2D RenderInterface_VK::ClampToCacheCaptureArea(VkRect2D rect) const noexcept {
+    if (!m_cache_capture_active)
+        return rect;
+
+    const int left = std::max(rect.offset.x, m_cache_capture_render_area.offset.x);
+    const int top = std::max(rect.offset.y, m_cache_capture_render_area.offset.y);
+    const int right = std::min(rect.offset.x + static_cast<int>(rect.extent.width),
+                               m_cache_capture_render_area.offset.x +
+                                   static_cast<int>(m_cache_capture_render_area.extent.width));
+    const int bottom = std::min(rect.offset.y + static_cast<int>(rect.extent.height),
+                                m_cache_capture_render_area.offset.y +
+                                    static_cast<int>(m_cache_capture_render_area.extent.height));
+
+    rect.offset.x = left;
+    rect.offset.y = top;
+    rect.extent.width = static_cast<uint32_t>(std::max(0, right - left));
+    rect.extent.height = static_cast<uint32_t>(std::max(0, bottom - top));
+    return rect;
 }
 
 bool RenderInterface_VK::InitializeExternal(const ExternalContext& context) {
@@ -1562,6 +2034,19 @@ bool RenderInterface_VK::InitializeExternal(const ExternalContext& context) {
     m_width = static_cast<int>(context.extent.width);
     m_height = static_cast<int>(context.extent.height);
 
+    VkFormatProperties color_format_properties{};
+    vkGetPhysicalDeviceFormatProperties(m_p_physical_device,
+                                        m_swapchain_format.format,
+                                        &color_format_properties);
+    constexpr VkFormatFeatureFlags required_blit_features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_DST_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    m_frosted_glass_blit_supported =
+        (color_format_properties.optimalTilingFeatures & required_blit_features) ==
+        required_blit_features;
+
     VkPhysicalDeviceProperties physical_device_properties = {};
     vkGetPhysicalDeviceProperties(m_p_physical_device, &physical_device_properties);
 
@@ -1586,7 +2071,9 @@ void RenderInterface_VK::ShutdownExternal() {
     if (m_p_device)
         vkDeviceWaitIdle(m_p_device);
 
+    StopPreviewWorkerPool();
     m_async_preview_textures.clear();
+    DestroyFrostedGlassBackdrop(false);
     DestroyRenderLayers();
     Destroy_Pipelines();
     Destroy_Resources();
@@ -1602,6 +2089,7 @@ void RenderInterface_VK::ShutdownExternal() {
     m_external_swapchain_image_view = VK_NULL_HANDLE;
     m_external_depth_stencil_image_view = VK_NULL_HANDLE;
     m_external_swapchain_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    m_frosted_glass_blit_supported = false;
     m_external_context = false;
 }
 
@@ -1633,6 +2121,7 @@ void RenderInterface_VK::BeginExternalFrame(const VkCommandBuffer command_buffer
     m_external_swapchain_image_view = swapchain_image_view;
     m_external_depth_stencil_image_view = depth_stencil_image_view;
     m_external_swapchain_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    m_external_swapchain_barrier_generation = ++m_image_barrier_generation;
     vkCmdSetViewport(m_p_current_command_buffer, 0, 1, &m_viewport);
     vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor_original);
     vkCmdSetStencilReference(m_p_current_command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
@@ -1647,6 +2136,7 @@ void RenderInterface_VK::BeginExternalFrame(const VkCommandBuffer command_buffer
     SetContextOffset(0.0f, 0.0f);
     SetTransform(nullptr);
     m_context_clip_enabled = false;
+    EndCacheCapture();
 }
 
 void RenderInterface_VK::EndExternalFrame() {
@@ -1662,6 +2152,7 @@ void RenderInterface_VK::EndExternalFrame() {
     m_external_swapchain_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     m_active_render_target = active_render_target_t::None;
     m_p_current_command_buffer = nullptr;
+    EndCacheCapture();
 }
 
 void RenderInterface_VK::ResetContextRenderState() {
@@ -1676,8 +2167,11 @@ void RenderInterface_VK::ResetContextRenderState() {
     SetContextOffset(0.0f, 0.0f);
     SetTransform(nullptr);
     m_context_clip_enabled = false;
+    // Do not clear cache-capture mode here: manager may call Reset between
+    // BeginCacheCapture and PushLayer/Render.
     vkCmdSetViewport(m_p_current_command_buffer, 0, 1, &m_viewport);
-    vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor_original);
+    VkRect2D scissor = ClampToCacheCaptureArea(m_scissor_original);
+    vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &scissor);
     vkCmdSetStencilReference(m_p_current_command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
 }
 
@@ -2140,6 +2634,9 @@ RenderInterface_VK::buffer_data_t RenderInterface_VK::CreateResource_StagingBuff
 
     VkResult status = vmaCreateBuffer(m_p_allocator, &info, &info_allocation, &p_buffer, &p_allocation, &info_stats);
     RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vmaCreateBuffer");
+    if (status == VkResult::VK_SUCCESS && p_allocation != VK_NULL_HANDLE) {
+        vmaSetAllocationName(m_p_allocator, p_allocation, "RmlUi staging buffer");
+    }
 
 #ifdef RMLUI_VK_DEBUG
     Rml::Log::Message(Rml::Log::LT_DEBUG, "Allocated buffer [%s]", FormatByteSize(info_stats.size).c_str());
@@ -2211,6 +2708,10 @@ void RenderInterface_VK::FreeAllTransientShaderAllocations() noexcept {
 }
 
 void RenderInterface_VK::Destroy_Geometries() noexcept {
+    if (m_frosted_glass_quad_geometry) {
+        ReleaseGeometry(m_frosted_glass_quad_geometry);
+        m_frosted_glass_quad_geometry = {};
+    }
     if (m_texture_quad_geometry) {
         ReleaseGeometry(m_texture_quad_geometry);
         m_texture_quad_geometry = {};
@@ -2231,7 +2732,7 @@ void RenderInterface_VK::Destroy_Texture(const texture_data_t& texture) noexcept
     if (texture.m_p_vma_allocation) {
         if (!texture.m_vram_scope.empty() && !texture.m_vram_label.empty())
             RecordRmlUiVram(texture.m_vram_scope, texture.m_vram_label, 0);
-        m_image_barriers.forgetImage(texture.m_p_vk_image);
+        m_image_barriers.forgetImage(texture.m_p_vk_image, texture.m_barrier_generation);
         if (texture.m_p_vk_image_view)
             vkDestroyImageView(m_p_device, texture.m_p_vk_image_view, nullptr);
         vmaDestroyImage(m_p_allocator, texture.m_p_vk_image, texture.m_p_vma_allocation);
@@ -2265,6 +2766,138 @@ VkImageAspectFlags RenderInterface_VK::DepthStencilAspectMask() const noexcept {
     case VK_FORMAT_D32_SFLOAT_S8_UINT: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     default: return VK_IMAGE_ASPECT_DEPTH_BIT;
     }
+}
+
+bool RenderInterface_VK::CreateFrostedGlassTexture(texture_data_t& texture,
+                                                   const int width,
+                                                   const int height,
+                                                   const std::string_view label) {
+    if (!m_p_allocator || width <= 0 || height <= 0)
+        return false;
+
+    VkImageCreateInfo image_info{};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = m_swapchain_format.format;
+    image_info.extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocation_info{};
+    allocation_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    VmaAllocationInfo allocation_stats{};
+    const VkResult image_status = vmaCreateImage(m_p_allocator,
+                                                 &image_info,
+                                                 &allocation_info,
+                                                 &texture.m_p_vk_image,
+                                                 &texture.m_p_vma_allocation,
+                                                 &allocation_stats);
+    if (image_status != VK_SUCCESS) {
+        Rml::Log::Message(Rml::Log::LT_WARNING,
+                          "[Vulkan] Failed to allocate frosted glass texture '%.*s' (%d).",
+                          static_cast<int>(label.size()), label.data(), static_cast<int>(image_status));
+        texture = {};
+        return false;
+    }
+
+    texture.m_width = width;
+    texture.m_height = height;
+    texture.m_p_vk_sampler = m_p_sampler_linear;
+    texture.m_barrier_generation = ++m_image_barrier_generation;
+    texture.m_vram_scope = "vulkan.rmlui.frosted_glass";
+    texture.m_vram_label = TextureVramLabel("backdrop", label, width, height, &texture);
+    texture.m_vram_allocation_size = allocation_stats.size;
+    RecordRmlUiVram(texture.m_vram_scope, texture.m_vram_label,
+                    texture.m_vram_allocation_size);
+
+    const std::string image_name = std::format("rmlui.frosted_glass.{}.image", label);
+    (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE,
+                                  (uint64_t)texture.m_p_vk_image,
+                                  image_name.c_str());
+    vmaSetAllocationName(m_p_allocator, texture.m_p_vma_allocation, image_name.c_str());
+
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = texture.m_p_vk_image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = m_swapchain_format.format;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.baseMipLevel = 0;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.baseArrayLayer = 0;
+    view_info.subresourceRange.layerCount = 1;
+    const VkResult view_status = vkCreateImageView(m_p_device,
+                                                   &view_info,
+                                                   nullptr,
+                                                   &texture.m_p_vk_image_view);
+    if (view_status != VK_SUCCESS) {
+        Rml::Log::Message(Rml::Log::LT_WARNING,
+                          "[Vulkan] Failed to create frosted glass texture view '%.*s' (%d).",
+                          static_cast<int>(label.size()), label.data(), static_cast<int>(view_status));
+        Destroy_Texture(texture);
+        texture = {};
+        return false;
+    }
+    const std::string view_name = std::format("rmlui.frosted_glass.{}.view", label);
+    (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE_VIEW,
+                                  (uint64_t)texture.m_p_vk_image_view,
+                                  view_name.c_str());
+    return true;
+}
+
+void RenderInterface_VK::DestroyFrostedGlassBackdrop(const bool deferred) noexcept {
+    const auto release = [this, deferred](texture_data_t& texture) {
+        if (!texture.m_p_vk_image)
+            return;
+        if (deferred)
+            QueueTextureForDeferredDeletion(new texture_data_t(texture));
+        else
+            Destroy_Texture(texture);
+        texture = {};
+    };
+    release(m_frosted_glass_backdrop.primary);
+    release(m_frosted_glass_backdrop.secondary);
+    m_frosted_glass_backdrop = {};
+}
+
+bool RenderInterface_VK::EnsureFrostedGlassBackdrop() {
+    if (!m_frosted_glass_blit_supported || m_width <= 0 || m_height <= 0)
+        return false;
+
+    const int primary_width = std::max(1, m_width / 4);
+    const int primary_height = std::max(1, m_height / 4);
+    const int secondary_width = std::max(1, m_width / 8);
+    const int secondary_height = std::max(1, m_height / 8);
+    const bool size_matches =
+        m_frosted_glass_backdrop.primary.m_p_vk_image &&
+        m_frosted_glass_backdrop.secondary.m_p_vk_image &&
+        m_frosted_glass_backdrop.primary_width == primary_width &&
+        m_frosted_glass_backdrop.primary_height == primary_height &&
+        m_frosted_glass_backdrop.secondary_width == secondary_width &&
+        m_frosted_glass_backdrop.secondary_height == secondary_height;
+    if (size_matches)
+        return true;
+
+    DestroyFrostedGlassBackdrop(true);
+    if (!CreateFrostedGlassTexture(m_frosted_glass_backdrop.primary,
+                                   primary_width, primary_height, "primary") ||
+        !CreateFrostedGlassTexture(m_frosted_glass_backdrop.secondary,
+                                   secondary_width, secondary_height, "secondary")) {
+        DestroyFrostedGlassBackdrop(true);
+        m_frosted_glass_blit_supported = false;
+        return false;
+    }
+    m_frosted_glass_backdrop.primary_width = primary_width;
+    m_frosted_glass_backdrop.primary_height = primary_height;
+    m_frosted_glass_backdrop.secondary_width = secondary_width;
+    m_frosted_glass_backdrop.secondary_height = secondary_height;
+    return true;
 }
 
 void RenderInterface_VK::EnsureRenderLayer(Rml::LayerHandle layer_handle) {
@@ -2316,6 +2949,9 @@ void RenderInterface_VK::EnsureRenderLayer(Rml::LayerHandle layer_handle) {
     (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE,
                                   (uint64_t)layer.m_color.m_p_vk_image,
                                   color_image_name.c_str());
+    vmaSetAllocationName(m_p_allocator,
+                         layer.m_color.m_p_vma_allocation,
+                         color_image_name.c_str());
     layer.m_color.m_vram_scope = "vulkan.rmlui.render_layer";
     layer.m_color.m_vram_label = TextureVramLabel("layer_color", "rmlui", m_width, m_height, &layer.m_color);
     layer.m_color.m_vram_allocation_size = color_allocation_stats.size;
@@ -2341,6 +2977,7 @@ void RenderInterface_VK::EnsureRenderLayer(Rml::LayerHandle layer_handle) {
                                   color_view_name.c_str());
     layer.m_color.m_p_vk_sampler = m_p_sampler_linear;
     layer.m_color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    layer.m_color.m_barrier_generation = ++m_image_barrier_generation;
 
     VkImageCreateInfo depth_info{};
     depth_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -2362,6 +2999,9 @@ void RenderInterface_VK::EnsureRenderLayer(Rml::LayerHandle layer_handle) {
     (void)m_debug_name_writer.set(VK_OBJECT_TYPE_IMAGE,
                                   (uint64_t)layer.m_depth_stencil.m_p_vk_image,
                                   depth_image_name.c_str());
+    vmaSetAllocationName(m_p_allocator,
+                         layer.m_depth_stencil.m_p_vma_allocation,
+                         depth_image_name.c_str());
     layer.m_depth_stencil.m_vram_scope = "vulkan.rmlui.render_layer";
     layer.m_depth_stencil.m_vram_label = TextureVramLabel("layer_depth", "rmlui", m_width, m_height, &layer.m_depth_stencil);
     layer.m_depth_stencil.m_vram_allocation_size = depth_allocation_stats.size;
@@ -2386,6 +3026,7 @@ void RenderInterface_VK::EnsureRenderLayer(Rml::LayerHandle layer_handle) {
                                   (uint64_t)layer.m_depth_stencil.m_p_vk_image_view,
                                   depth_view_name.c_str());
     layer.m_depth_stencil_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    layer.m_depth_stencil.m_barrier_generation = ++m_image_barrier_generation;
     layer.width = m_width;
     layer.height = m_height;
 }
@@ -2404,12 +3045,12 @@ const RenderInterface_VK::render_layer_t* RenderInterface_VK::GetRenderLayer(Rml
     return index < m_render_layers.size() ? &m_render_layers[index] : nullptr;
 }
 
-void RenderInterface_VK::TransitionImageLayout(VkImage image, VkImageAspectFlags aspect_mask, VkImageLayout old_layout, VkImageLayout new_layout) {
+void RenderInterface_VK::TransitionImageLayout(VkImage image, std::uint64_t generation, VkImageAspectFlags aspect_mask, VkImageLayout old_layout, VkImageLayout new_layout) {
     if (!m_p_current_command_buffer || !image || old_layout == new_layout)
         return;
 
-    m_image_barriers.registerImage(image, aspect_mask, old_layout);
-    m_image_barriers.transitionImage(m_p_current_command_buffer, image, aspect_mask, new_layout);
+    m_image_barriers.registerImage(image, generation, aspect_mask, old_layout);
+    m_image_barriers.transitionImage(m_p_current_command_buffer, image, generation, aspect_mask, new_layout);
 }
 
 void RenderInterface_VK::ResetDynamicRenderState() {
@@ -2417,7 +3058,7 @@ void RenderInterface_VK::ResetDynamicRenderState() {
         return;
     vkCmdSetViewport(m_p_current_command_buffer, 0, 1, &m_viewport);
     VkRect2D scissor = (m_is_use_scissor_specified && !m_is_transformed_scissor_enabled) ? m_scissor : ContextClipScissor();
-    scissor = IntersectContextClip(scissor);
+    scissor = ClampToCacheCaptureArea(IntersectContextClip(scissor));
     vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &scissor);
     vkCmdSetStencilReference(m_p_current_command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
 }
@@ -2431,10 +3072,10 @@ void RenderInterface_VK::BeginLayerRendering(Rml::LayerHandle layer_handle, bool
     if (layer->width <= 0 || layer->height <= 0)
         return;
 
-    TransitionImageLayout(layer->m_color.m_p_vk_image, VK_IMAGE_ASPECT_COLOR_BIT, layer->m_color_layout,
+    TransitionImageLayout(layer->m_color.m_p_vk_image, layer->m_color.m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, layer->m_color_layout,
                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     layer->m_color_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    TransitionImageLayout(layer->m_depth_stencil.m_p_vk_image, DepthStencilAspectMask(), layer->m_depth_stencil_layout,
+    TransitionImageLayout(layer->m_depth_stencil.m_p_vk_image, layer->m_depth_stencil.m_barrier_generation, DepthStencilAspectMask(), layer->m_depth_stencil_layout,
                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     layer->m_depth_stencil_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
@@ -2459,11 +3100,24 @@ void RenderInterface_VK::BeginLayerRendering(Rml::LayerHandle layer_handle, bool
     depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depth_attachment.clearValue = depth_clear;
 
+    // Full-layer default; during cache capture, restrict renderArea so loadOp CLEAR
+    // only touches the panel region (scissors are clamped to the same rect).
+    VkRect2D render_area{};
+    render_area.offset = {0, 0};
+    render_area.extent = {static_cast<uint32_t>(layer->width), static_cast<uint32_t>(layer->height)};
+    if (m_cache_capture_active) {
+        render_area = ClampToCacheCaptureArea(render_area);
+        // Empty capture area would make begin-rendering illegal; fall back to full layer.
+        if (render_area.extent.width == 0 || render_area.extent.height == 0) {
+            render_area.offset = {0, 0};
+            render_area.extent = {static_cast<uint32_t>(layer->width),
+                                  static_cast<uint32_t>(layer->height)};
+        }
+    }
+
     VkRenderingInfo rendering_info{};
     rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering_info.renderArea.offset = {0, 0};
-    rendering_info.renderArea.extent = {static_cast<uint32_t>(layer->width),
-                                        static_cast<uint32_t>(layer->height)};
+    rendering_info.renderArea = render_area;
     rendering_info.layerCount = 1;
     rendering_info.colorAttachmentCount = 1;
     rendering_info.pColorAttachments = &color_attachment;
@@ -2487,6 +3141,7 @@ void RenderInterface_VK::BeginSwapchainRendering(VkAttachmentLoadOp color_load_o
         depth_view = m_external_depth_stencil_image_view;
         if (m_external_swapchain_image != VK_NULL_HANDLE && m_external_swapchain_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
             TransitionImageLayout(m_external_swapchain_image,
+                                  m_external_swapchain_barrier_generation,
                                   VK_IMAGE_ASPECT_COLOR_BIT,
                                   m_external_swapchain_layout,
                                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -2556,10 +3211,10 @@ bool RenderInterface_VK::CopySwapchainToLayer(Rml::LayerHandle destination) {
 
     EndActiveRendering();
 
-    TransitionImageLayout(m_external_swapchain_image, VK_IMAGE_ASPECT_COLOR_BIT, m_external_swapchain_layout,
+    TransitionImageLayout(m_external_swapchain_image, m_external_swapchain_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, m_external_swapchain_layout,
                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     m_external_swapchain_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    TransitionImageLayout(destination_layer->m_color.m_p_vk_image, VK_IMAGE_ASPECT_COLOR_BIT, destination_layer->m_color_layout,
+    TransitionImageLayout(destination_layer->m_color.m_p_vk_image, destination_layer->m_color.m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, destination_layer->m_color_layout,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     destination_layer->m_color_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 
@@ -2576,10 +3231,10 @@ bool RenderInterface_VK::CopySwapchainToLayer(Rml::LayerHandle destination) {
     vkCmdCopyImage(m_p_current_command_buffer, m_external_swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    destination_layer->m_color.m_p_vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
 
-    TransitionImageLayout(m_external_swapchain_image, VK_IMAGE_ASPECT_COLOR_BIT, m_external_swapchain_layout,
+    TransitionImageLayout(m_external_swapchain_image, m_external_swapchain_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, m_external_swapchain_layout,
                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     m_external_swapchain_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    TransitionImageLayout(destination_layer->m_color.m_p_vk_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    TransitionImageLayout(destination_layer->m_color.m_p_vk_image, destination_layer->m_color.m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     destination_layer->m_color_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
@@ -2698,6 +3353,14 @@ void RenderInterface_VK::MemoryPool::Initialize(VkDeviceSize byte_size, VkDevice
     auto status = vmaCreateBuffer(m_p_vk_allocator, &info, &info_alloc, &m_p_buffer, &m_p_buffer_alloc, &info_stats);
 
     RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vmaCreateBuffer");
+    if (status == VkResult::VK_SUCCESS && m_p_buffer_alloc != VK_NULL_HANDLE) {
+        vmaSetAllocationName(m_p_vk_allocator,
+                             m_p_buffer_alloc,
+                             "RmlUi geometry memory pool");
+        RecordRmlUiVram("vulkan.rmlui.geometry_pool",
+                        "vertex_index_uniform",
+                        info_stats.size);
+    }
 
     VmaVirtualBlockCreateInfo info_virtual_block = {};
     info_virtual_block.size = m_memory_total_size;
@@ -2726,6 +3389,7 @@ void RenderInterface_VK::MemoryPool::Shutdown() noexcept {
 
     vmaUnmapMemory(m_p_vk_allocator, m_p_buffer_alloc);
     vmaDestroyVirtualBlock(m_p_block);
+    RecordRmlUiVram("vulkan.rmlui.geometry_pool", "vertex_index_uniform", 0);
     vmaDestroyBuffer(m_p_vk_allocator, m_p_buffer, m_p_buffer_alloc);
 }
 

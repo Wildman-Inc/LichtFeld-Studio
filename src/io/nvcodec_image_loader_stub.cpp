@@ -43,22 +43,13 @@ namespace lfs::io {
         throw_disabled();
     }
 
-    std::vector<lfs::core::Tensor> NvCodecImageLoader::load_images_batch_gpu(
-        const std::vector<std::filesystem::path>&,
-        int,
-        int) {
-        throw_disabled();
-    }
-
-    std::vector<lfs::core::Tensor> NvCodecImageLoader::batch_decode_from_memory(
-        const std::vector<std::vector<uint8_t>>&,
-        void*) {
-        throw_disabled();
-    }
-
-    std::vector<lfs::core::Tensor> NvCodecImageLoader::batch_decode_from_spans(
+    std::vector<lfs::core::Tensor> NvCodecImageLoader::decode_jpeg_batch_from_spans(
         const std::vector<std::pair<const uint8_t*, size_t>>&,
-        void*) {
+        void*,
+        bool,
+        bool,
+        std::vector<lfs::core::Tensor*>*,
+        std::vector<lfs::core::Tensor*>*) {
         throw_disabled();
     }
 
@@ -79,6 +70,7 @@ namespace lfs::io {
     std::vector<uint8_t> NvCodecImageLoader::encode_grayscale_to_jpeg2k(
         const lfs::core::Tensor&,
         void*,
+        bool,
         bool) {
         throw_disabled();
     }
@@ -86,6 +78,7 @@ namespace lfs::io {
     lfs::core::Tensor NvCodecImageLoader::decode_jpeg2k_16bit_from_memory_gpu(
         const std::vector<uint8_t>&,
         void*,
+        bool,
         bool) {
         throw_disabled();
     }

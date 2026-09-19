@@ -4,6 +4,7 @@
 #include "internal/cuda_stream_context.hpp"
 #include "core/cuda_error.hpp"
 #include "internal/cuda_event_pool.hpp"
+#include "internal/stream_lifetime.hpp"
 #include "internal/tensor_impl.hpp"
 
 #include <format>
@@ -17,10 +18,15 @@ namespace lfs::core {
     }
 
     void setCurrentCUDAStream(cudaStream_t stream) {
+        if (stream) {
+            unretire_stream(stream);
+        }
         tl_current_stream = stream;
     }
 
     void waitForCUDAStream(cudaStream_t execution_stream, cudaStream_t dependency_stream) {
+        unretire_stream(execution_stream);
+        unretire_stream(dependency_stream);
         if (dependency_stream == nullptr || dependency_stream == execution_stream) {
             return;
         }
@@ -62,6 +68,18 @@ namespace lfs::core {
                                 static_cast<void*>(execution_stream)));
             }
         }
+    }
+
+    cudaError_t memcpy_ordered(void* const dst, const void* const src, const size_t bytes,
+                               const cudaMemcpyKind kind, const cudaStream_t stream) {
+        if (stream != nullptr && kind == cudaMemcpyDeviceToHost) {
+            bridgeStreams(stream, nullptr);
+        }
+        const cudaError_t status = cudaMemcpy(dst, src, bytes, kind);
+        if (status == cudaSuccess && stream != nullptr && kind == cudaMemcpyHostToDevice) {
+            bridgeStreams(nullptr, stream);
+        }
+        return status;
     }
 
     cudaStream_t prepare_inputs_for_stream(

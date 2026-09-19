@@ -60,7 +60,10 @@ namespace lfs::vis::gui {
         bool wantsInput() const { return wants_input_; }
         bool wantsKeyboard() const { return wants_keyboard_; }
         bool needsAnimationFrame() const;
+        [[nodiscard]] std::string animationDemandDescription() const;
         CursorRequest getCursorRequest() const;
+        [[nodiscard]] float tabStripScroll() const { return tab_scroll_left_; }
+        void setTabStripScroll(float value);
 
         std::function<void(const std::string&)> on_tab_changed;
         std::function<void(const std::string&)> on_tab_closed;
@@ -105,6 +108,8 @@ namespace lfs::vis::gui {
 
         bool resize_dragging_ = false;
         bool last_over_resize_handle_ = false;
+        Rml::Element* last_blurred_focus_ = nullptr;
+        Rml::Element* last_hover_element_ = nullptr;
 
         CursorRequest cursor_request_{};
         float prev_mouse_x_ = 0;

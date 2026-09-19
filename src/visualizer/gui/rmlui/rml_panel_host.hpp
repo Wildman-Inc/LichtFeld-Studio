@@ -10,6 +10,8 @@
 #include "gui/rmlui/rmlui_manager.hpp"
 #include <core/export.hpp>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -62,6 +64,7 @@ namespace lfs::vis::gui {
         void markContentDirty() {
             content_dirty_ = true;
             direct_cache_dirty_ = true;
+            content_height_rearm_count_ = 0;
         }
         void setForeground(bool fg) { foreground_ = fg; }
         void setFloating(bool floating);
@@ -72,6 +75,13 @@ namespace lfs::vis::gui {
         bool needsAnimationFrame() const {
             return render_needed_ || content_dirty_ || animation_active_ || tooltip_.revealDue();
         }
+        [[nodiscard]] bool needsImmediateAnimationFrame() const {
+            return content_height_settling_;
+        }
+        [[nodiscard]] std::string animationDemandDescription() const;
+        // Finite RmlUi scheduled update delay (seconds) when > 0; nullopt for
+        // continuous demand (0, use needsAnimationFrame) or idle (infinity).
+        [[nodiscard]] std::optional<double> nextScheduledUpdateDelay() const;
 
         Rml::ElementDocument* getDocument() { return document_; }
         Rml::Context* getContext() { return rml_context_; }
@@ -88,6 +98,7 @@ namespace lfs::vis::gui {
         bool forwardInput(float panel_x, float panel_y);
         bool syncThemeProperties();
         bool loadDocument();
+        void syncLocalizedContent();
         void cacheContentElements();
         float computeScrollHeightCap() const;
         float computeContentHeight() const;
@@ -133,6 +144,11 @@ namespace lfs::vis::gui {
 
         bool render_needed_ = true;
         bool animation_active_ = false;
+        double next_update_delay_ = std::numeric_limits<double>::infinity();
+        int content_height_rearm_count_ = 0;
+        bool content_height_rearm_warned_ = false;
+        bool content_height_settling_ = false;
+        std::uint64_t localized_language_generation_ = std::numeric_limits<std::uint64_t>::max();
         bool direct_cache_dirty_ = true;
         CachedVulkanContextRender direct_cache_;
         int last_fbo_w_ = 0;
@@ -143,6 +159,7 @@ namespace lfs::vis::gui {
         int last_layout_padding_ = -1;
         int last_forwarded_mx_ = -1;
         int last_forwarded_my_ = -1;
+        int last_forwarded_mods_ = 0;
         bool last_hovered_ = false;
         Rml::Element* manual_dropdown_hover_ = nullptr;
         bool manual_dropdown_mouse_captured_ = false;

@@ -18,6 +18,7 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 [![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/TbxJST2BbC)
 [![Website](https://img.shields.io/badge/Website-LichtFeld%20Studio-blue)](https://lichtfeld.io)
 [![X](https://img.shields.io/badge/X-Follow-111111?logo=x&logoColor=white)](https://twitter.com/janusch_patas)
+[![YouTube](https://img.shields.io/badge/YouTube-Subscribe-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/@lichtfeldstudio)
 [![Papers](https://img.shields.io/badge/Papers-Awesome%203DGS-orange)](https://mrnerf.github.io/awesome-3D-gaussian-splatting/)
 
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-Support-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/MrNeRF)
@@ -26,7 +27,7 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 
 [**Fork Release Page**](https://github.com/Wildman-Inc/LichtFeld-Studio/releases) •
 [**Source Repository**](https://github.com/Wildman-Inc/LichtFeld-Studio) •
-[**Windows ROCm / Arc Builds**](docs/docs/installation/building/windows-rocm.md) •
+[**Windows ROCm Builds**](docs/docs/installation/building/windows-rocm.md) •
 [**Linux ROCm / CDNA Builds**](docs/docs/installation/building/linux-rocm.md) •
 [**Plugin System**](docs/plugin-system.md) •
 [**MCP Guide**](docs/docs/development/mcp/index.md) •
@@ -35,6 +36,7 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 
 <img src="docs/viewer_demo.gif" alt="LichtFeld Studio viewer" width="85%"/>
 
+[**See It in Action**](#see-it-in-action) •
 [**Why LichtFeld**](#why-lichtfeld-studio) •
 [**Who It Is For**](#who-it-is-for) •
 [**Capabilities**](#capabilities) •
@@ -43,6 +45,18 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 [**Community**](#community) •
 [**Contributing**](#contributing) •
 [**License**](#license)
+
+</div>
+
+## See It in Action
+
+<div align="center">
+
+<a href="https://www.youtube.com/watch?v=i-04z4_eqiU">
+  <img src="https://img.youtube.com/vi/i-04z4_eqiU/maxresdefault.jpg" alt="LichtFeld Studio — Everything it can do today" width="85%">
+</a>
+
+[**▶ Watch on YouTube — Everything LichtFeld Studio can do today**](https://www.youtube.com/watch?v=i-04z4_eqiU)
 
 </div>
 
@@ -73,7 +87,7 @@ The upstream CUDA product defines the complete LichtFeld Studio capability set b
 - **Extensibility**: use the Python plugin system for custom panels, operators, tools, and dependencies
 - **Automation surface**: integrate LichtFeld Studio with local tools, scripts, and agents through MCP resources and tools
 - **Research-ready features**: MCMC optimization, bilateral grid appearance modeling, 3DGUT support for distorted camera models, and timelapse generation
-- **Native performance**: modern C++23 with CUDA 12.8+ upstream, Windows ROCm/HIP 7.14 in this fork, Linux ROCm/HIP source builds with configurable CDNA targets, and Vulkan visualization
+- **Native performance**: modern C++23 with CUDA 12.8+ upstream, Windows ROCm 10.x in this fork, Linux ROCm/HIP source builds with configurable CDNA targets, and Vulkan visualization
 
 Fork-specific Windows build and validation details are documented in [LichtFeld Studio for ROCm builds](docs/docs/installation/building/windows-rocm.md). Linux ROCm and CDNA source-build instructions are documented separately in [Linux ROCm and CDNA builds](docs/docs/installation/building/linux-rocm.md).
 
@@ -89,13 +103,13 @@ LichtFeld Studio is free and open source. The links below support the upstream L
 
 Upstream Windows binaries are available through the LichtFeld Portal. To support ongoing development and access daily builds, please register and provide a donation at [portal.lichtfeld.io](https://portal.lichtfeld.io/). Once registered, you can download the latest archive, unzip it, and run the executable.
 
-For fork-specific source builds, see the [Windows ROCm and Arc build guide](docs/docs/installation/building/windows-rocm.md) or [Linux ROCm and CDNA build guide](docs/docs/installation/building/linux-rocm.md) in the [fork repository](https://github.com/Wildman-Inc/LichtFeld-Studio). General upstream CUDA build notes remain in the [upstream Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) and [docs/README.md](docs/README.md).
+For fork-specific source builds, see the [Windows ROCm build guide](docs/docs/installation/building/windows-rocm.md) or [Linux ROCm and CDNA build guide](docs/docs/installation/building/linux-rocm.md) in the [fork repository](https://github.com/Wildman-Inc/LichtFeld-Studio). General upstream CUDA build notes remain in the [upstream Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/) and [source build guide](docs/building_and_distribution.md).
 
 Current project notes:
 
 - Windows is the primary prebuilt distribution target today
 - Upstream Studio builds target NVIDIA GPUs with CUDA 12.8+
-- LichtFeld Studio for ROCm (`STUDIO+HIP`) was validated on Radeon 8060S (`gfx1151`) with HIP `7.14.60850`
+- Windows ROCm 10.1 was validated on Radeon 8060S (`gfx1151`): GUI training and editing, a 40-step `truck` run with GUT, PPISP, and Sparsity, and portable ZIP execution. See the [verification matrix](docs/docs/installation/building/windows-rocm.md#verification-status) for runtime coverage.
 - Linux ROCm source builds accept native and explicit CDNA targets. CI builds CMake HIP-language wave-reduction, VkSplat input, and bit-exact LOD/RAD targets for `gfx90a`, `gfx942`, and `gfx950` through the same architecture and target helpers used by the application; complete application runtime and training still require validation on physical Linux CDNA systems
 
 ## Docs
@@ -115,6 +129,7 @@ Current project notes:
 - [Discord](https://discord.gg/TbxJST2BbC) for support, discussion, and showcase posts
 - [Website](https://mrnerf.com) for project updates and related work
 - [Twitter / X](https://twitter.com/janusch_patas) for announcements
+- [YouTube](https://www.youtube.com/@lichtfeldstudio) for video tours and feature demos
 
 ## Contributing
 
@@ -124,7 +139,7 @@ Getting started:
 
 - Check issues labeled `good first issue`
 - Join the [Discord](https://discord.gg/TbxJST2BbC) if you want to discuss implementation details before opening a larger change
-- Install the pre-commit hook with `cp tools/pre-commit .git/hooks/`
+- Follow the [source build guide](docs/building_and_distribution.md) for toolchain setup, the pre-commit hook, and test commands
 
 ## Corporate Sponsors
 

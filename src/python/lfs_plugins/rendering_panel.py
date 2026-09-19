@@ -85,7 +85,7 @@ BOOL_PROPS = [
 
 SLIDER_PROPS = [
     "axes_size", "grid_opacity", "camera_frustum_scale", "voxel_size",
-    "focal_length_mm", "render_scale", "environment_exposure", "environment_rotation_degrees",
+    "focal_length_mm", "render_scale", "color_exposure", "environment_exposure", "environment_rotation_degrees",
     "mesh_wireframe_width", "mesh_light_intensity", "mesh_ambient",
     "ppisp_exposure", "ppisp_vignette_strength", "ppisp_gamma_multiplier",
     "ppisp_gamma_red", "ppisp_gamma_green", "ppisp_gamma_blue",
@@ -101,6 +101,7 @@ SCRUB_FIELD_DEFS = {
     "voxel_size": ScrubFieldSpec(0.001, 0.1, 0.001, "%.3f"),
     "focal_length_mm": ScrubFieldSpec(10.0, 200.0, 0.1, "%.1f"),
     "render_scale": ScrubFieldSpec(0.25, 1.0, 0.01, "%.2f"),
+    "color_exposure": ScrubFieldSpec(0.1, 8.0, 0.01, "%.2f"),
     "environment_exposure": ScrubFieldSpec(-6.0, 6.0, 0.01, "%.2f"),
     "environment_rotation_degrees": ScrubFieldSpec(-180.0, 180.0, 0.1, "%.1f"),
     "mesh_wireframe_width": ScrubFieldSpec(0.5, 5.0, 0.01, "%.2f"),
@@ -137,7 +138,7 @@ SCRUB_FIELD_DEFS = {
 }
 
 SELECT_PROPS = [
-    "grid_plane", "sh_degree", "raster_backend", "camera_metrics_mode", "mesh_shadow_resolution",
+    "grid_plane", "sh_degree", "raster_backend", "camera_metrics_mode", "mesh_shadow_resolution", "color_tonemapping",
 ]
 RASTER_BACKENDS = {"3dgs", "3dgut"}
 
@@ -191,6 +192,12 @@ LOCALE_KEY = {
     "grid_opacity": "main_panel.grid_opacity",
     "focal_length_mm": "main_panel.focal_length",
     "render_scale": "main_panel.render_scale",
+    "environment_mode": "main_panel.environment",
+    "environment_map_path": "main_panel.environment_map_path",
+    "color_exposure": "main_panel.color_exposure",
+    "color_tonemapping": "main_panel.color_tonemapping",
+    "environment_exposure": "main_panel.environment_exposure",
+    "environment_rotation_degrees": "main_panel.environment_rotation",
     "camera_metrics_mode": "main_panel.camera_metrics",
     "sh_degree": "main_panel.sh_degree",
     "grid_plane": "main_panel.plane",
@@ -249,7 +256,7 @@ def _entry_label(text: str) -> str:
     text = str(text).strip()
     if not text:
         return ":"
-    return text if text.endswith(":") else f"{text}:"
+    return text if text.endswith((":", "：")) else f"{text}:"
 
 
 def _normalize_raster_backend(value):
@@ -268,19 +275,28 @@ def _color_channel_field(prop_id, suffix):
     return f"{prop_id}_{suffix}"
 
 
+RENDERING_INITIALLY_COLLAPSED = {
+    "lod",
+    "selection",
+    "mesh",
+    "post_process",
+    "ppisp_crf",
+}
+
+
 class RenderingPanel(Panel):
     id = "lfs.rendering"
     label = "Rendering"
     space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 10
     template = "rmlui/rendering.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
+    height_mode = lf.ui.PanelHeightMode.FILL
     update_policy = "dirty"
 
     def __init__(self):
         self._handle = None
         self._color_edit_prop = None
-        self._collapsed = {"lod", "selection", "mesh", "post_process", "ppisp_crf"}
+        self._collapsed = set(RENDERING_INITIALLY_COLLAPSED)
         self._popup_el = None
         self._doc = None
         self._picker_click_handled = False
@@ -310,6 +326,18 @@ class RenderingPanel(Panel):
             self._set_scrub_value,
         )
         self._reactive_binding = PanelStateBinding()
+
+    def capture_chrome(self):
+        return {"collapsed": sorted(self._collapsed)}
+
+    def apply_chrome(self, payload):
+        self._collapsed = set(RENDERING_INITIALLY_COLLAPSED)
+        if isinstance(payload, dict):
+            collapsed = payload.get("collapsed")
+            if isinstance(collapsed, (list, tuple)):
+                self._collapsed = {str(name) for name in collapsed}
+        if self._handle:
+            self._handle.dirty_all()
 
     def _sync_panel_label(self):
         label = tr("window.rendering")
@@ -448,8 +476,6 @@ class RenderingPanel(Panel):
                     lambda: str(getattr(s(), "ppisp_mode", "")),
                     lambda v: self._set_ppisp_mode(v))
 
-        model.bind_func("environment_enabled",
-                        lambda: s() is not None and getattr(s(), "environment_mode", "") == "EQUIRECTANGULAR")
         model.bind_func("mesh_wireframe_supported", _mesh_wireframe_supported)
         model.bind_func("mesh_wide_lines_supported", _mesh_wide_lines_supported)
 
@@ -533,22 +559,20 @@ class RenderingPanel(Panel):
         model.bind_func("ppisp_auto",
                          lambda: s() is not None and getattr(s(), "ppisp_mode", "") != "MANUAL")
 
-        model.bind_func("label_panel_title",
-                         lambda: lf.ui.tr("rendering") or "Rendering")
         model.bind_func("label_hdr_viewport",
-                         lambda: "Viewport")
+                         lambda: _tr_fallback("rendering_panel.section_viewport", "Viewport"))
         model.bind_func("label_hdr_camera",
-                         lambda: "Camera & Projection")
+                         lambda: _tr_fallback("rendering_panel.section_camera", "Camera & Projection"))
         model.bind_func("label_hdr_lod",
                          lambda: _tr_fallback("rendering_panel.section_lod", "LOD"))
         model.bind_func("label_hdr_simplify",
                          lambda: _tr_fallback("rendering_panel.section_simplify", "Splat Simplify"))
         model.bind_func("label_hdr_selection",
-                         lambda: "Selection & Overlays")
+                         lambda: _tr_fallback("rendering_panel.section_selection", "Selection & Overlays"))
         model.bind_func("label_hdr_mesh",
                          lambda: lf.ui.tr("main_panel.mesh") or "Mesh")
         model.bind_func("label_hdr_post_process",
-                         lambda: "Post Processing")
+                         lambda: _tr_fallback("rendering_panel.section_post_process", "Post Processing"))
         model.bind_func("label_environment_map_browse",
                          lambda: lf.ui.tr("common.browse") or "Browse...")
         model.bind_func("label_simplify_source",

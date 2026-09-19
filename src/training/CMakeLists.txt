@@ -8,9 +8,6 @@ add_subdirectory(rasterization/fastgs)
 # Add LibTorch-free gsplat backend
 add_subdirectory(rasterization/gsplat)
 
-# Add igs+ edge-compute rasterizer
-add_subdirectory(rasterization/edge_compute)
-
 # LibTorch-free CUDA kernels
 set(LFS_TRAINING_KERNEL_SOURCES
     kernels/loss_tensor_contract.cpp
@@ -27,12 +24,14 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/mcmc_kernels.cu
     kernels/mrnf_kernels.cu
     kernels/densification_kernels.cu
+    kernels/morton_reorder_kernels.cu
     kernels/grad_alpha.cu
     kernels/depth_loss.cu
     kernels/normal_loss.cu
     kernels/normal_consistency_loss.cu
     kernels/roi_weight_map.cu
     kernels/image_kernels.cu
+    kernels/mask_preprocess.cu
     components/sparsity_optimizer_kernels.cu
 )
 
@@ -49,6 +48,7 @@ target_link_libraries(lfs_training_kernels
     PUBLIC
         lfs_core         # For lfs::core::Tensor (tensor merged into lfs_core)
         ${GPU_RUNTIME_LIBRARY}
+        lfs_core_cuda    # q16 encode/decode kernels
 )
 
 if(USE_CUDA)
@@ -85,6 +85,10 @@ add_subdirectory(depth_anchor)
 # Optimizer sources
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
+    sh_value_codec.cpp
+    sh_value_storage.cpp
+    morton_reorder.cpp
+    live_model_mutation_guard.cpp
     optimizer/scheduler.cpp
     losses/regularization.cpp
     losses/photometric_loss.cpp
@@ -96,7 +100,7 @@ set(TRAINING_NEW_SOURCES
     strategies/improved_gs_plus.cpp
     rasterization/fast_rasterizer.cpp
     rasterization/gsplat_rasterizer.cpp
-    rasterization/edge_rasterizer.cpp
+    components/config_serialization.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
     components/ppisp_controller.cu
@@ -104,11 +108,17 @@ set(TRAINING_NEW_SOURCES
     components/ppisp_file.cpp
     components/sparsity_optimizer.cpp
     control/command_api.cpp
+    metrics/eval_mask.cpp
     metrics/metrics.cpp
         checkpoint.cpp
+        project_snapshot_chapters.cpp
+        training_snapshot_service.cpp
         progress.cpp
         training_cropbox_mask.cpp
         trainer.cpp
+        normal_auto_generate.cpp
+        vram_ledger.cpp
+        perf_bench.cpp
     training_setup.cpp
 )
 
@@ -127,8 +137,6 @@ target_include_directories(lfs_training
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/rasterization/include  # For rasterization_api.h
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/optimizer/include
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/utils
-	${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/rasterization/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/utils
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization  # For gsplat headers
 )
 # indicators.hpp is an implementation detail of progress.cpp.
@@ -144,11 +152,11 @@ target_link_libraries(lfs_training
         lfs_io                  # For CacheLoader, exporter, pipelined loader
         lfs_event_bridge        # Shared event bridge for cross-module singletons
         lfs_training_kernels    # LibTorch-free SSIM kernels
-        fastlfs_backend         # For adam_step_raw CUDA kernel (LibTorch-free)
+        fastlfs_backend         # LibTorch-free FastGS rasterization and optimizer kernels
         gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
-	edge_compute_backend    # For igs+ edge score rasterization
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
+        lfs_preprocessing       # MoGe-2 normal auto-generate
         lfs_python_utils
 )
 

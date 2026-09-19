@@ -8,6 +8,7 @@
 #include "core/error_reporter.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "gui/error_event_bridge.hpp"
+#include "gui/error_surface_types.hpp"
 #include "gui/string_keys.hpp"
 
 #include <format>
@@ -41,7 +42,8 @@ namespace lfs::vis::gui {
         [[nodiscard]] bool isOutOfMemory(const lfs::Error& error) noexcept {
             const lfs::ErrorDomain domain = error.domain();
             return error.code() == lfs::ErrorCode::ResourceExhausted &&
-                   (domain == lfs::ErrorDomain::Training || domain == lfs::ErrorDomain::IO);
+                   domain == lfs::ErrorDomain::Training &&
+                   !isHostMemoryExhaustion(error);
         }
 
         [[nodiscard]] const char* titleKeyFor(const lfs::Error& error) {
@@ -78,13 +80,32 @@ namespace lfs::vis::gui {
             case lfs::ErrorDomain::Python:
                 return Keys::PLUGINS_DISABLED;
             case lfs::ErrorDomain::App:
-                return op == error_op::kLoadConfig ? Keys::CONFIG_INVALID : Keys::FILE_OPEN_FAILED;
+                if (op == error_op::kLoadConfig) {
+                    return Keys::CONFIG_INVALID;
+                }
+                if (op == error_op::kSave || op == error_op::kCompact) {
+                    return Keys::SAVE_FAILED;
+                }
+                if (op == error_op::kExport) {
+                    return error.severity() == lfs::Severity::Warning ? Keys::EXPORT_WARNING
+                                                                      : Keys::EXPORT_FAILED;
+                }
+                if (op == error_op::kNewProject || op == error_op::kProjectSettings) {
+                    return Keys::GENERIC;
+                }
+                return Keys::FILE_OPEN_FAILED;
             case lfs::ErrorDomain::IO:
+                if (error.severity() == lfs::Severity::Warning) {
+                    return Keys::GENERIC;
+                }
                 if (op == error_op::kLoadDataset) {
                     return Keys::DATASET_LOAD_FAILED;
                 }
-                if (op == error_op::kSave) {
+                if (op == error_op::kSave || op == error_op::kCompact) {
                     return Keys::SAVE_FAILED;
+                }
+                if (op == error_op::kOpenProject) {
+                    return Keys::FILE_OPEN_FAILED;
                 }
                 if (op == error_op::kExportVideo) {
                     return Keys::VIDEO_EXPORT_FAILED;

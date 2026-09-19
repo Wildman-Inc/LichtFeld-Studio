@@ -17,7 +17,6 @@ param(
 
     [switch]$SkipVerification,
     [switch]$SkipVcpkg,
-    [switch]$SkipLibTorch,
     [switch]$Package,
     [switch]$Clean,
     [switch]$Help
@@ -32,10 +31,9 @@ Usage: .\build_lichtfeld.ps1 [options]
 This script automatically:
   1. Verifies build prerequisites for the selected GPU backend
   2. Sets up vcpkg in the parent directory
-  3. Downloads CUDA LibTorch (Debug & Release) for CUDA builds
-  4. Initializes git submodules
-  5. Configures and builds LichtFeld Studio
-  6. Optionally creates a portable ZIP package and SHA-256 checksum
+  3. Initializes git submodules
+  4. Configures and builds LichtFeld Studio
+  5. Optionally creates a portable ZIP package and SHA-256 checksum
 
 Options:
   -Configuration <Debug|Release>  Build configuration (default: Release)
@@ -44,7 +42,6 @@ Options:
   -AmdgpuArch <arch[;arch...]>     AMDGPU target(s), for example gfx1151 or gfx90a;gfx942
   -SkipVerification               Skip environment verification
   -SkipVcpkg                      Skip vcpkg setup
-  -SkipLibTorch                   Skip CUDA LibTorch download
   -Package                        Create a portable ZIP package (Release only)
   -Clean                          Clean build directory before building
   -Help                           Show this help message
@@ -56,7 +53,6 @@ Examples:
   .\build_lichtfeld.ps1 -GpuBackend HIP -AmdgpuArch gfx942
   .\build_lichtfeld.ps1 -Package                   Build and package Release
   .\build_lichtfeld.ps1 -Clean                     Clean and rebuild
-  .\build_lichtfeld.ps1 -SkipLibTorch              Skip LibTorch download (if already present)
 
 Notes:
   - Package builds require Configuration Release and enable BUILD_PORTABLE.
@@ -101,37 +97,63 @@ function Test-Command {
     return $false
 }
 
+function Find-ROCmClang {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    foreach ($RelativePath in @('lib\llvm\bin', 'llvm\bin', 'bin')) {
+        $CompilerDirectory = Join-Path $Root $RelativePath
+        $CxxCompiler = Join-Path $CompilerDirectory 'clang++.exe'
+        $CCompiler = Join-Path $CompilerDirectory 'clang.exe'
+        if ((Test-Path -LiteralPath $CxxCompiler -PathType Leaf) -and
+            (Test-Path -LiteralPath $CCompiler -PathType Leaf)) {
+            return $CxxCompiler
+        }
+    }
+    return $null
+}
+
 function Find-ROCmRoot {
     $Candidates = @()
-    if ($RocmPath -ne "") { $Candidates += $RocmPath }
+    $ExplicitRoot = $RocmPath
     foreach ($EnvName in @("LFS_ROCM_PATH", "ROCM_PATH", "HIP_PATH")) {
         $Value = [Environment]::GetEnvironmentVariable($EnvName)
-        if ($Value -ne "") { $Candidates += $Value }
+        if (-not $ExplicitRoot -and $Value) { $ExplicitRoot = $Value }
+    }
+    if ($ExplicitRoot) {
+        $HipHeader = Join-Path $ExplicitRoot 'include\hip\hip_runtime.h'
+        $HipLib = Join-Path $ExplicitRoot 'lib\amdhip64.lib'
+        if ((Find-ROCmClang $ExplicitRoot) -and
+            ((Test-Path -LiteralPath $HipHeader) -or (Test-Path -LiteralPath $HipLib))) {
+            return (Resolve-Path -LiteralPath $ExplicitRoot).Path
+        }
+        throw "The selected ROCm/HIP SDK is incomplete: $ExplicitRoot"
     }
 
     if (Test-Command "python") {
         try {
             $PythonRoot = python -c "import importlib.util, pathlib; spec = importlib.util.find_spec('_rocm_sdk_core'); print(pathlib.Path(spec.origin).resolve().parent if spec and spec.origin else '')" 2>$null
-            if ($PythonRoot -ne "") { $Candidates += $PythonRoot }
+            if ($PythonRoot) { $Candidates += $PythonRoot }
         } catch {
         }
     }
 
-    $Candidates += @(
-        "C:\Program Files\AMD\ROCm\7.14.0",
-        "C:\Program Files\AMD\ROCm\7.14",
-        "C:\Program Files\AMD\ROCm\7.2.2",
-        "C:\Program Files\AMD\ROCm\7.2.1",
-        "C:\Program Files\AMD\ROCm\7.2",
-        "C:\Program Files\AMD\ROCm\7.1"
-    )
+    $InstalledRoots = Get-ChildItem -LiteralPath 'C:\Program Files\AMD\ROCm' `
+        -Directory -ErrorAction SilentlyContinue |
+        Sort-Object -Descending -Property @{
+            Expression = {
+                $SdkVersion = [version]'0.0'
+                [void][version]::TryParse($_.Name, [ref]$SdkVersion)
+                $SdkVersion
+            }
+        }
+    $Candidates += @($InstalledRoots | ForEach-Object FullName)
 
     foreach ($Candidate in $Candidates | Select-Object -Unique) {
-        if ($Candidate -eq "") { continue }
-        $Clang = Join-Path $Candidate "lib\llvm\bin\clang++.exe"
+        if (-not $Candidate) { continue }
+        $Clang = Find-ROCmClang $Candidate
         $HipHeader = Join-Path $Candidate "include\hip\hip_runtime.h"
         $HipLib = Join-Path $Candidate "lib\amdhip64.lib"
-        if ((Test-Path $Clang) -and ((Test-Path $HipHeader) -or (Test-Path $HipLib))) {
+        if ($Clang -and ((Test-Path $HipHeader) -or (Test-Path $HipLib))) {
             return (Resolve-Path $Candidate).Path
         }
     }
@@ -182,91 +204,6 @@ function Remove-PackageOutputs {
             throw "Could not remove the previous package output: $Path"
         }
     }
-}
-
-function Get-PackageRuntimeManifestEntries {
-    param([Parameter(Mandatory = $true)][string]$ManifestPath)
-
-    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-        throw "Required runtime manifest was not generated: $ManifestPath"
-    }
-
-    $Entries = @(Get-Content -LiteralPath $ManifestPath |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -ne '' })
-    if ($Entries.Count -eq 0) {
-        throw "Runtime manifest is empty: $ManifestPath"
-    }
-
-    $UniqueEntries = [System.Collections.Generic.HashSet[string]]::new(
-        [System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($Entry in $Entries) {
-        if ([System.IO.Path]::GetFileName($Entry) -ne $Entry -or
-            $Entry.IndexOfAny([char[]]'\\/') -ge 0 -or
-            -not $UniqueEntries.Add($Entry)) {
-            throw "Runtime manifest contains an invalid or duplicate file name '$Entry': $ManifestPath"
-        }
-    }
-    return $Entries
-}
-
-function Get-PackageRuntimeLicenseManifestEntries {
-    param([Parameter(Mandatory = $true)][string]$ManifestPath)
-
-    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-        throw "Required runtime license manifest was not generated: $ManifestPath"
-    }
-
-    $Lines = @(Get-Content -LiteralPath $ManifestPath |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -ne '' })
-    if ($Lines.Count -eq 0) {
-        throw "Runtime license manifest is empty: $ManifestPath"
-    }
-
-    $RuntimeNames = [System.Collections.Generic.HashSet[string]]::new(
-        [System.StringComparer]::OrdinalIgnoreCase)
-    $Entries = foreach ($Line in $Lines) {
-        $SeparatorIndex = $Line.IndexOf('|')
-        if ($SeparatorIndex -le 0 -or
-            $SeparatorIndex -eq ($Line.Length - 1) -or
-            $Line.IndexOf('|', $SeparatorIndex + 1) -ge 0) {
-            throw "Runtime license manifest contains an invalid entry '$Line': $ManifestPath"
-        }
-
-        $RuntimeName = $Line.Substring(0, $SeparatorIndex).Trim()
-        $LicensePathList = $Line.Substring($SeparatorIndex + 1).Trim()
-        if ([System.IO.Path]::GetFileName($RuntimeName) -ne $RuntimeName -or
-            $RuntimeName.IndexOfAny([char[]]'\\/') -ge 0 -or
-            -not $RuntimeNames.Add($RuntimeName)) {
-            throw "Runtime license manifest contains an invalid or duplicate runtime '$RuntimeName': $ManifestPath"
-        }
-        $LicensePaths = @($LicensePathList.Split(',') |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -ne '' })
-        $UniqueLicensePaths = [System.Collections.Generic.HashSet[string]]::new(
-            [System.StringComparer]::OrdinalIgnoreCase)
-        if ($LicensePaths.Count -eq 0) {
-            throw "Runtime license manifest contains no licenses for '$RuntimeName': $ManifestPath"
-        }
-        foreach ($LicensePath in $LicensePaths) {
-            if (-not $UniqueLicensePaths.Add($LicensePath) -or
-                $LicensePath.Contains('\') -or
-                -not $LicensePath.StartsWith('licenses/ROCm/',
-                    [System.StringComparison]::OrdinalIgnoreCase) -or
-                $LicensePath.EndsWith('/') -or
-                $LicensePath -match '(^|/)[.][.]?(/|$)') {
-                throw "Runtime license manifest contains an invalid or duplicate license path '$LicensePath': $ManifestPath"
-            }
-        }
-
-        [pscustomobject]@{
-            RuntimeName = $RuntimeName
-            LicensePaths = $LicensePaths
-            Line = "$RuntimeName|$($LicensePaths -join ',')"
-        }
-    }
-    return @($Entries)
 }
 
 function Get-PackageSha256ManifestEntries {
@@ -390,10 +327,7 @@ function Test-PackageArchiveContract {
     param(
         [Parameter(Mandatory = $true)][string]$ArchivePath,
         [Parameter(Mandatory = $true)][string]$Backend,
-        [string]$RuntimeManifestPath = '',
-        [string]$RuntimeLicenseManifestPath = '',
-        [string]$RuntimeSha256ManifestPath = '',
-        [string]$LicenseSha256ManifestPath = ''
+        [string]$ArtifactManifestPath = ''
     )
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -401,259 +335,61 @@ function Test-PackageArchiveContract {
     try {
         $EntryNames = @($Archive.Entries |
             Where-Object { -not $_.FullName.EndsWith('/') } |
-                ForEach-Object { $_.FullName.Replace('\', '/') })
+            ForEach-Object { $_.FullName.Replace('\', '/') })
         $Entries = [System.Collections.Generic.HashSet[string]]::new(
             [System.StringComparer]::OrdinalIgnoreCase)
         foreach ($EntryName in $EntryNames) {
-            if (-not $Entries.Add($EntryName)) {
-                throw "Package ZIP contains a duplicate entry: $EntryName"
+            if ($EntryName.StartsWith('/') -or $EntryName.Contains(':') -or
+                $EntryName -match '(^|/)[.][.]?(/|$)' -or
+                -not $Entries.Add($EntryName)) {
+                throw "Package ZIP contains an unsafe or duplicate entry: $EntryName"
             }
         }
         Assert-ZipRuntimePolicy $EntryNames
-        $RuntimeDirectory = 'bin/'
-        foreach ($RuntimePattern in @('^(?i:msvcp140).*?[.]dll$',
-                '^(?i:vcruntime140).*?[.]dll$')) {
-            $LocatedRuntimePattern = '^' + [regex]::Escape($RuntimeDirectory) +
-                $RuntimePattern.Substring(1)
-            if (-not ($EntryNames -match $LocatedRuntimePattern)) {
+        foreach ($RuntimePattern in @('^bin/(?i:msvcp140).*?[.]dll$',
+                '^bin/(?i:vcruntime140).*?[.]dll$')) {
+            if (-not ($EntryNames -match $RuntimePattern)) {
                 throw "Package ZIP is missing a required MSVC runtime matching '$RuntimePattern'."
             }
         }
-
         Assert-ZipEntry $Entries 'bin/LichtFeld-Studio.exe' 'Studio executable'
         Assert-ZipEntry $Entries 'LICENSE' 'Studio license'
         Assert-ZipEntry $Entries 'licenses/THIRD_PARTY_LICENSES.md' 'Studio third-party license notice'
 
         if ($Backend -eq 'HIP') {
-            Assert-ZipNoticeDirectory $EntryNames 'licenses/ROCm/runtime' 'a ROCm redistribution notice'
-        }
-
-        if ($Backend -eq 'HIP' -and -not $RuntimeManifestPath) {
-            throw 'HIP packages require a ROCm runtime manifest.'
-        }
-        if ($Backend -eq 'HIP' -and -not $RuntimeLicenseManifestPath) {
-            throw 'HIP packages require a ROCm runtime license manifest.'
-        }
-        if ($Backend -eq 'HIP' -and
-            (-not $RuntimeSha256ManifestPath -or -not $LicenseSha256ManifestPath)) {
-            throw 'HIP packages require ROCm runtime and license SHA-256 manifests.'
-        }
-        if ($RuntimeManifestPath) {
-            $RuntimeManifestEntries = @(Get-PackageRuntimeManifestEntries $RuntimeManifestPath)
-            foreach ($RuntimeEntry in $RuntimeManifestEntries) {
-                Assert-ZipEntry $Entries "bin/$RuntimeEntry" "required $Backend runtime '$RuntimeEntry'"
+            if (-not $ArtifactManifestPath) {
+                throw 'HIP packages require a selected-SDK artifact manifest.'
             }
-            if ($Backend -eq 'HIP') {
-                $PackagedRocmRuntimes = @($EntryNames |
-                    Where-Object { $_ -match '^bin/[^/]+[.]dll$' } |
-                    ForEach-Object { [System.IO.Path]::GetFileName($_).ToLowerInvariant() } |
-                    Where-Object { $_ -match '^(?:amd_comgr|amdhip.*|hip.*|roc.*)[.]dll$' } |
-                    Sort-Object -Unique)
-                $ExpectedRocmRuntimes = @($RuntimeManifestEntries |
-                    ForEach-Object { $_.ToLowerInvariant() } |
-                    Sort-Object -Unique)
-                $RuntimeDifference = @(Compare-Object $ExpectedRocmRuntimes $PackagedRocmRuntimes)
-                if ($RuntimeDifference) {
-                    throw "ROCm runtime manifest does not match the package: $($RuntimeDifference -join ', ')"
+            Assert-ZipNoticeDirectory $EntryNames 'licenses/ROCm/runtime' 'available ROCm SDK notices'
+            $Artifacts = @(Get-PackageSha256ManifestEntries $ArtifactManifestPath)
+            foreach ($Artifact in $Artifacts) {
+                if ($Artifact.Key.Contains('\') -or $Artifact.Key.Contains(':') -or
+                    $Artifact.Key -match '(^|/)[.][.]?(/|$)' -or
+                    $Artifact.Key -notmatch '^(bin/[^/]+[.]dll|[.]kpack/[^/]+[.]kpack|licenses/ROCm/.+)$') {
+                    throw "ROCm artifact manifest has an invalid package path '$($Artifact.Key)'."
                 }
-
-                $LicenseManifestEntries = @(
-                    Get-PackageRuntimeLicenseManifestEntries $RuntimeLicenseManifestPath)
-                $MappedRocmRuntimes = @($LicenseManifestEntries |
-                    ForEach-Object { $_.RuntimeName.ToLowerInvariant() } |
-                    Sort-Object -Unique)
-                $LicenseCoverageDifference = @(
-                    Compare-Object $ExpectedRocmRuntimes $MappedRocmRuntimes)
-                if ($LicenseCoverageDifference) {
-                    throw "ROCm runtime license mappings do not cover the runtime manifest exactly: $($LicenseCoverageDifference -join ', ')"
+                $ActualHash = Get-ZipEntrySha256 $Archive $Artifact.Key
+                if ($ActualHash -cne $Artifact.Hash) {
+                    throw "Selected ROCm SDK artifact SHA-256 mismatch: $($Artifact.Key)"
                 }
-
-                $PackagedLicenseManifestPath = 'licenses/ROCm/runtime-license-manifest.txt'
-                Assert-ZipEntry $Entries $PackagedLicenseManifestPath `
-                    'ROCm runtime license manifest'
-                foreach ($LicenseEntry in $LicenseManifestEntries) {
-                    foreach ($LicensePath in $LicenseEntry.LicensePaths) {
-                        Assert-ZipEntry $Entries $LicensePath `
-                            "license for ROCm runtime '$($LicenseEntry.RuntimeName)'"
-                    }
-                }
-
-                $ProvenanceManifestPath =
-                    'licenses/ROCm/provenance/therock_manifest.json'
-                Assert-ZipEntry $Entries $ProvenanceManifestPath `
-                    'ROCm SDK provenance manifest'
-
-                $PackagedLicenseManifestEntry = $Archive.Entries |
-                    Where-Object { $_.FullName.Replace('\', '/').Equals(
-                            $PackagedLicenseManifestPath,
-                            [System.StringComparison]::OrdinalIgnoreCase) } |
-                    Select-Object -First 1
-                $Reader = [System.IO.StreamReader]::new(
-                    $PackagedLicenseManifestEntry.Open())
-                try {
-                    $PackagedLicenseManifestLines = @($Reader.ReadToEnd() -split '\r?\n' |
-                        ForEach-Object { $_.Trim() } |
-                        Where-Object { $_ -ne '' })
-                } finally {
-                    $Reader.Dispose()
-                }
-                $ExpectedLicenseManifestLines = @(
-                    $LicenseManifestEntries | ForEach-Object { $_.Line })
-                if (($ExpectedLicenseManifestLines -join "`n") -cne
-                    ($PackagedLicenseManifestLines -join "`n")) {
-                    throw 'Packaged ROCm runtime license manifest differs from the generated contract.'
-                }
-
-                $RuntimeSha256Entries = @(
-                    Get-PackageSha256ManifestEntries $RuntimeSha256ManifestPath)
-                $AuditedRuntimeSha256Lines = @(Get-Content -LiteralPath (
-                        Join-Path $PSScriptRoot 'licenses\ROCm\audited-runtime-sha256.txt') |
-                    ForEach-Object { $_.Trim() } |
-                    Where-Object { $_ -ne '' })
-                $GeneratedRuntimeSha256Lines = @(
-                    $RuntimeSha256Entries | ForEach-Object { $_.Line })
-                if (($GeneratedRuntimeSha256Lines -join "`n") -cne
-                    ($AuditedRuntimeSha256Lines -join "`n")) {
-                    throw 'Generated ROCm runtime hashes differ from the audited 7.14 manifest.'
-                }
-                $RuntimeSha256Keys = @($RuntimeSha256Entries |
-                    ForEach-Object { $_.Key.ToLowerInvariant() } |
-                    Sort-Object -Unique)
-                $RuntimeSha256Difference = @(
-                    Compare-Object $ExpectedRocmRuntimes $RuntimeSha256Keys)
-                if ($RuntimeSha256Difference) {
-                    throw "ROCm runtime SHA-256 mappings do not cover the runtime manifest exactly: $($RuntimeSha256Difference -join ', ')"
-                }
-
-                $ExpectedLicensePaths = @($LicenseManifestEntries |
-                    ForEach-Object { $_.LicensePaths } |
-                    ForEach-Object { $_.ToLowerInvariant() } |
-                    Sort-Object -Unique)
-                $LicenseSha256Entries = @(
-                    Get-PackageSha256ManifestEntries $LicenseSha256ManifestPath)
-                $AuditedLicenseSha256Lines = @(Get-Content -LiteralPath (
-                        Join-Path $PSScriptRoot 'licenses\ROCm\audited-license-sha256.txt') |
-                    ForEach-Object { $_.Trim() } |
-                    Where-Object { $_ -ne '' })
-                $GeneratedLicenseSha256Lines = @(
-                    $LicenseSha256Entries | ForEach-Object { $_.Line })
-                if (($GeneratedLicenseSha256Lines -join "`n") -cne
-                    ($AuditedLicenseSha256Lines -join "`n")) {
-                    throw 'Generated ROCm license hashes differ from the audited manifest.'
-                }
-                $LicenseSha256Keys = @($LicenseSha256Entries |
-                    ForEach-Object { $_.Key.ToLowerInvariant() } |
-                    Sort-Object -Unique)
-                $LicenseSha256Difference = @(
-                    Compare-Object $ExpectedLicensePaths $LicenseSha256Keys)
-                if ($LicenseSha256Difference) {
-                    throw "ROCm license SHA-256 mappings do not cover the license contract exactly: $($LicenseSha256Difference -join ', ')"
-                }
-
-                $IntegrityManifests = @(
-                    [pscustomobject]@{
-                        PackagePath = 'licenses/ROCm/runtime-sha256-manifest.txt'
-                        Entries = $RuntimeSha256Entries
-                    },
-                    [pscustomobject]@{
-                        PackagePath = 'licenses/ROCm/license-sha256-manifest.txt'
-                        Entries = $LicenseSha256Entries
-                    })
-                foreach ($IntegrityManifest in $IntegrityManifests) {
-                    Assert-ZipEntry $Entries $IntegrityManifest.PackagePath `
-                        'ROCm SHA-256 integrity manifest'
-                    $PackagedIntegrityEntry = $Archive.Entries |
-                        Where-Object { $_.FullName.Replace('\', '/').Equals(
-                                $IntegrityManifest.PackagePath,
-                                [System.StringComparison]::OrdinalIgnoreCase) } |
-                        Select-Object -First 1
-                    $Reader = [System.IO.StreamReader]::new(
-                        $PackagedIntegrityEntry.Open())
-                    try {
-                        $PackagedIntegrityLines = @($Reader.ReadToEnd() -split '\r?\n' |
-                            ForEach-Object { $_.Trim() } |
-                            Where-Object { $_ -ne '' })
-                    } finally {
-                        $Reader.Dispose()
-                    }
-                    $ExpectedIntegrityLines = @(
-                        $IntegrityManifest.Entries | ForEach-Object { $_.Line })
-                    if (($ExpectedIntegrityLines -join "`n") -cne
-                        ($PackagedIntegrityLines -join "`n")) {
-                        throw "Packaged integrity manifest differs from the generated contract: $($IntegrityManifest.PackagePath)"
-                    }
-                }
-
-                foreach ($RuntimeSha256Entry in $RuntimeSha256Entries) {
-                    if ([System.IO.Path]::GetFileName($RuntimeSha256Entry.Key) -ne
-                        $RuntimeSha256Entry.Key) {
-                        throw "ROCm runtime SHA-256 manifest has an invalid runtime path '$($RuntimeSha256Entry.Key)'."
-                    }
-                    $ActualHash = Get-ZipEntrySha256 $Archive `
-                        "bin/$($RuntimeSha256Entry.Key)"
-                    if ($ActualHash -cne $RuntimeSha256Entry.Hash) {
-                        throw "ROCm runtime SHA-256 mismatch: $($RuntimeSha256Entry.Key)"
-                    }
-                }
-                foreach ($LicenseSha256Entry in $LicenseSha256Entries) {
-                    if (-not $LicenseSha256Entry.Key.StartsWith(
-                            'licenses/ROCm/',
-                            [System.StringComparison]::OrdinalIgnoreCase)) {
-                        throw "ROCm license SHA-256 manifest has an invalid path '$($LicenseSha256Entry.Key)'."
-                    }
-                    $ActualHash = Get-ZipEntrySha256 $Archive $LicenseSha256Entry.Key
-                    if ($ActualHash -cne $LicenseSha256Entry.Hash) {
-                        throw "ROCm license SHA-256 mismatch: $($LicenseSha256Entry.Key)"
-                    }
-                }
-
-                $ProvenanceEntry = $Archive.Entries |
-                    Where-Object { $_.FullName.Replace('\', '/').Equals(
-                            $ProvenanceManifestPath,
-                            [System.StringComparison]::OrdinalIgnoreCase) } |
-                    Select-Object -First 1
-                $Reader = [System.IO.StreamReader]::new($ProvenanceEntry.Open())
-                try {
-                    $Provenance = $Reader.ReadToEnd() | ConvertFrom-Json
-                } finally {
-                    $Reader.Dispose()
-                }
-                $ExpectedTheRockCommit =
-                    '6d7f1714045261f62747f297f2f9e5f9c6d6b465'
-                if ($Provenance.the_rock_commit -cne $ExpectedTheRockCommit) {
-                    throw 'Packaged ROCm SDK provenance is not the audited TheRock build.'
-                }
-                $RequiredSubmodules = @{
-                    'llvm-project' = '5c9bfa94a37c59923dee3c55942566db7904b659'
-                    'rocm-libraries' = '46653de70f6d71031bed76e15525edd331318a99'
-                    'rocm-systems' = 'b8c378ef2c7220a68122d13b81dab5addd61e016'
-                }
-                foreach ($RequiredSubmodule in $RequiredSubmodules.GetEnumerator()) {
-                    $Submodule = $Provenance.submodules |
-                        Where-Object { $_.submodule_name -eq $RequiredSubmodule.Key } |
-                        Select-Object -First 1
-                    if (-not $Submodule -or
-                        $Submodule.pin_sha -cne $RequiredSubmodule.Value) {
-                        throw "Packaged ROCm SDK provenance does not match audited '$($RequiredSubmodule.Key)'."
-                    }
-                }
-                $SdkVersionPath =
-                    'licenses/ROCm/provenance/rocm-sdk-version.txt'
-                Assert-ZipEntry $Entries $SdkVersionPath 'ROCm SDK version'
-                $SdkVersionEntry = $Archive.Entries |
-                    Where-Object { $_.FullName.Replace('\', '/').Equals(
-                            $SdkVersionPath,
-                            [System.StringComparison]::OrdinalIgnoreCase) } |
-                    Select-Object -First 1
-                $Reader = [System.IO.StreamReader]::new($SdkVersionEntry.Open())
-                try {
-                    $SdkVersion = $Reader.ReadToEnd().Trim()
-                } finally {
-                    $Reader.Dispose()
-                }
-                if ($SdkVersion -cne '7.14.0') {
-                    throw "Packaged ROCm SDK version is not audited: '$SdkVersion'."
-                }
+            }
+            $ManifestEntry = 'licenses/ROCm/artifact-sha256-manifest.txt'
+            $ManifestHash = (Get-FileHash -LiteralPath $ArtifactManifestPath -Algorithm SHA256).Hash
+            if ((Get-ZipEntrySha256 $Archive $ManifestEntry) -cne $ManifestHash) {
+                throw 'Packaged ROCm artifact manifest differs from the configured SDK inputs.'
+            }
+            # Reject extra runtimes/assets or stale notices from an older SDK.
+            $ExpectedArtifacts = @($Artifacts | ForEach-Object { $_.Key.ToLowerInvariant() } |
+                Sort-Object -Unique)
+            $ActualArtifacts = @($EntryNames | Where-Object {
+                $_.ToLowerInvariant() -in $ExpectedArtifacts -or
+                $_ -match '^bin/(?:amd_comgr|amdhip.*|hip.*|roc.*)[.]dll$' -or
+                $_ -match '^[.]kpack/' -or
+                ($_.StartsWith('licenses/ROCm/', [System.StringComparison]::OrdinalIgnoreCase) -and
+                    $_ -ne $ManifestEntry)
+            } | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
+            if (Compare-Object $ExpectedArtifacts $ActualArtifacts) {
+                throw 'ROCm package artifacts do not match the selected SDK manifest.'
             }
         }
     } finally {
@@ -1087,95 +823,6 @@ function Setup-Vcpkg {
 }
 
 # ============================================================================
-# LibTorch Download
-# ============================================================================
-
-function Setup-LibTorch {
-    Write-Host "================================================================" -ForegroundColor Cyan
-    Write-Host "Setting Up LibTorch" -ForegroundColor Cyan
-    Write-Host "================================================================" -ForegroundColor Cyan
-    Write-Host ""
-
-    $ExternalDir = Join-Path $ProjectRoot "external"
-    $DebugDir = Join-Path $ExternalDir "debug"
-    $ReleaseDir = Join-Path $ExternalDir "release"
-    $DebugLibTorch = Join-Path $DebugDir "libtorch"
-    $ReleaseLibTorch = Join-Path $ReleaseDir "libtorch"
-
-    # Create directories
-    if (-not (Test-Path $ExternalDir)) {
-        New-Item -ItemType Directory -Path $ExternalDir | Out-Null
-        Write-Host "Created: external/" -ForegroundColor Gray
-    }
-    if (-not (Test-Path $DebugDir)) {
-        New-Item -ItemType Directory -Path $DebugDir | Out-Null
-        Write-Host "Created: external/debug/" -ForegroundColor Gray
-    }
-    if (-not (Test-Path $ReleaseDir)) {
-        New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
-        Write-Host "Created: external/release/" -ForegroundColor Gray
-    }
-
-    # Download Debug LibTorch if missing
-    if (-not (Test-Path $DebugLibTorch)) {
-        Write-Host ""
-        Write-Host "Downloading LibTorch (Debug)..." -ForegroundColor Yellow
-        Write-Host "This is a large download (~3.2 GB). Please wait..." -ForegroundColor Gray
-
-        $DebugZip = Join-Path $ProjectRoot "libtorch-debug.zip"
-        $DebugUrl = "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-debug-2.7.0%2Bcu128.zip"
-
-        try {
-            curl.exe -L -o "$DebugZip" "$DebugUrl" --progress-bar
-            if ($LASTEXITCODE -ne 0) { throw "Download failed" }
-
-            Write-Host "Extracting LibTorch (Debug)..." -ForegroundColor Yellow
-            tar -xf "$DebugZip" -C "$DebugDir"
-            if ($LASTEXITCODE -ne 0) { throw "Extraction failed" }
-
-            Remove-Item $DebugZip -Force
-            Write-Host "LibTorch (Debug) installed successfully!" -ForegroundColor Green
-        } catch {
-            Write-Host "ERROR: Failed to download/extract Debug LibTorch: $_" -ForegroundColor Red
-            if (Test-Path $DebugZip) { Remove-Item $DebugZip -Force }
-            exit 1
-        }
-    } else {
-        Write-Host "LibTorch (Debug) already exists. Skipping download." -ForegroundColor Green
-    }
-
-    # Download Release LibTorch if missing
-    if (-not (Test-Path $ReleaseLibTorch)) {
-        Write-Host ""
-        Write-Host "Downloading LibTorch (Release)..." -ForegroundColor Yellow
-        Write-Host "This is a large download (~3.2 GB). Please wait..." -ForegroundColor Gray
-
-        $ReleaseZip = Join-Path $ProjectRoot "libtorch-release.zip"
-        $ReleaseUrl = "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.7.0%2Bcu128.zip"
-
-        try {
-            curl.exe -L -o "$ReleaseZip" "$ReleaseUrl" --progress-bar
-            if ($LASTEXITCODE -ne 0) { throw "Download failed" }
-
-            Write-Host "Extracting LibTorch (Release)..." -ForegroundColor Yellow
-            tar -xf "$ReleaseZip" -C "$ReleaseDir"
-            if ($LASTEXITCODE -ne 0) { throw "Extraction failed" }
-
-            Remove-Item $ReleaseZip -Force
-            Write-Host "LibTorch (Release) installed successfully!" -ForegroundColor Green
-        } catch {
-            Write-Host "ERROR: Failed to download/extract Release LibTorch: $_" -ForegroundColor Red
-            if (Test-Path $ReleaseZip) { Remove-Item $ReleaseZip -Force }
-            exit 1
-        }
-    } else {
-        Write-Host "LibTorch (Release) already exists. Skipping download." -ForegroundColor Green
-    }
-
-    Write-Host ""
-}
-
-# ============================================================================
 # Copy DLLs to Output Directory
 # ============================================================================
 
@@ -1260,7 +907,7 @@ function Build-LichtFeldStudio {
         }
         $BuildDir = Join-Path $ProjectRoot $BuildDirName
         $VcpkgToolchain = Join-Path $VcpkgPath "scripts\buildsystems\vcpkg.cmake"
-        $Generator = if ($GpuBackend -eq 'HIP') { "Ninja" } else { "Visual Studio 17 2022" }
+        $Generator = if ($GpuBackend -eq 'HIP') { "Ninja Multi-Config" } else { "Visual Studio 17 2022" }
         $ResolvedRocm = $null
         if ($GpuBackend -eq 'HIP') {
             $ResolvedRocm = Find-ROCmRoot
@@ -1270,7 +917,7 @@ function Build-LichtFeldStudio {
                 exit 1
             }
         }
-        if ($Generator -eq 'Ninja' -and -not (Test-Command "ninja")) {
+        if ($Generator -like 'Ninja*' -and -not (Test-Command "ninja")) {
             Write-Host "ERROR: Ninja is required for $GpuBackend builds." -ForegroundColor Red
             Write-Host "Install Ninja and ensure ninja.exe is available on PATH." -ForegroundColor Yellow
             exit 1
@@ -1283,39 +930,6 @@ function Build-LichtFeldStudio {
             Write-Host ""
             Write-Host "Please run without -SkipVcpkg to set up vcpkg first." -ForegroundColor Yellow
             exit 1
-        }
-
-        if ($GpuBackend -eq 'CUDA') {
-            # Verify CUDA LibTorch exists for the selected configuration.
-            $LibTorchDebugPath = Join-Path $ProjectRoot "external\debug\libtorch"
-            $LibTorchReleasePath = Join-Path $ProjectRoot "external\release\libtorch"
-            $LibTorchPath = if ($Configuration -eq 'Debug') {
-                $LibTorchDebugPath
-            } else {
-                $LibTorchReleasePath
-            }
-
-            if (-not (Test-Path $LibTorchPath)) {
-                Write-Host "ERROR: LibTorch ($Configuration) not found!" -ForegroundColor Red
-                Write-Host "Expected: $LibTorchPath" -ForegroundColor Gray
-                Write-Host ""
-                Write-Host "Please run without -SkipLibTorch to download LibTorch first." -ForegroundColor Yellow
-                exit 1
-            }
-
-            # Visual Studio is multi-config, so keep both configurations available.
-            if (-not (Test-Path $LibTorchDebugPath)) {
-                Write-Host "WARNING: LibTorch Debug not found (multi-config generator requires both)" -ForegroundColor Yellow
-                Write-Host "Expected: $LibTorchDebugPath" -ForegroundColor Gray
-                Write-Host "Debug builds may fail. Run without -SkipLibTorch to download both." -ForegroundColor Yellow
-                Write-Host ""
-            }
-            if (-not (Test-Path $LibTorchReleasePath)) {
-                Write-Host "WARNING: LibTorch Release not found (multi-config generator requires both)" -ForegroundColor Yellow
-                Write-Host "Expected: $LibTorchReleasePath" -ForegroundColor Gray
-                Write-Host "Release builds may fail. Run without -SkipLibTorch to download both." -ForegroundColor Yellow
-                Write-Host ""
-            }
         }
 
         # Clean if requested
@@ -1360,13 +974,17 @@ function Build-LichtFeldStudio {
         }
         if ($Generator -like "Visual Studio*") {
             $CMakeArgs += @("-A", "x64")
-        } else {
+        } elseif ($Generator -ne 'Ninja Multi-Config') {
             $CMakeArgs += "-DCMAKE_BUILD_TYPE=$Configuration"
         }
 
         if ($GpuBackend -eq 'HIP') {
-            $HipCxxCompiler = Join-Path $ResolvedRocm 'lib\llvm\bin\clang++.exe'
-            $HipCCompiler = Join-Path $ResolvedRocm 'lib\llvm\bin\clang.exe'
+            $HipCxxCompiler = Find-ROCmClang $ResolvedRocm
+            $HipCCompiler = if ($HipCxxCompiler) {
+                Join-Path (Split-Path -Parent $HipCxxCompiler) 'clang.exe'
+            } else {
+                ''
+            }
             if (-not (Test-Path -LiteralPath $HipCxxCompiler -PathType Leaf) -or
                 -not (Test-Path -LiteralPath $HipCCompiler -PathType Leaf)) {
                 Write-Host "ERROR: ROCm/HIP Clang compiler pair was not found." -ForegroundColor Red
@@ -1385,7 +1003,9 @@ function Build-LichtFeldStudio {
                 $CMakeCacheContent = Get-Content -LiteralPath $CMakeCachePath -Raw
                 $CachedCxxCompiler = Get-CMakeCacheValue $CMakeCacheContent 'CMAKE_CXX_COMPILER'
                 $CachedCCompiler = Get-CMakeCacheValue $CMakeCacheContent 'CMAKE_C_COMPILER'
+                $CachedGenerator = Get-CMakeCacheValue $CMakeCacheContent 'CMAKE_GENERATOR'
                 $RequiresFreshConfigure =
+                    $CachedGenerator -ne $Generator -or
                     -not $CachedCxxCompiler -or
                     -not $CachedCCompiler -or
                     -not (Test-EquivalentPath $CachedCxxCompiler $HipCxxCompiler) -or
@@ -1408,19 +1028,6 @@ function Build-LichtFeldStudio {
                     Write-Host "Refreshing CMake cache after ROCm/HIP toolchain change." -ForegroundColor Yellow
                     $CMakeArgs = @('--fresh') + $CMakeArgs
                 }
-            }
-        }
-
-        if ($GpuBackend -eq 'CUDA') {
-            # Add LibTorch path for CUDA CMake builds when present.
-            $TorchConfigPath = if ($Configuration -eq 'Debug') {
-                Join-Path $ProjectRoot "external\debug\libtorch\share\cmake\Torch"
-            } else {
-                Join-Path $ProjectRoot "external\release\libtorch\share\cmake\Torch"
-            }
-
-            if (Test-Path $TorchConfigPath) {
-                $CMakeArgs += "-DTorch_DIR=$TorchConfigPath"
             }
         }
 
@@ -1470,7 +1077,7 @@ function Build-LichtFeldStudio {
 
         Copy-RequiredDLLs -BuildDir $BuildDir -Config $Configuration
 
-        $ExecutablePath = if ($Generator -like "Visual Studio*") {
+        $ExecutablePath = if ($Generator -like "Visual Studio*" -or $Generator -eq 'Ninja Multi-Config') {
             Join-Path (Join-Path $BuildDir $Configuration) "LichtFeld-Studio.exe"
         } else {
             Join-Path $BuildDir "LichtFeld-Studio.exe"
@@ -1534,23 +1141,8 @@ function Build-LichtFeldStudio {
 
             $PackageArchivePath = Join-Path $BuildDir "$PackageBaseName.zip"
             $PackageChecksumPath = "$PackageArchivePath.sha256"
-            $RuntimeManifestPath = if ($GpuBackend -eq 'HIP') {
-                Join-Path $BuildDir 'rocm-runtime-manifest.txt'
-            } else {
-                ''
-            }
-            $RuntimeLicenseManifestPath = if ($GpuBackend -eq 'HIP') {
-                Join-Path $BuildDir 'rocm-runtime-license-manifest.txt'
-            } else {
-                ''
-            }
-            $RuntimeSha256ManifestPath = if ($GpuBackend -eq 'HIP') {
-                Join-Path $BuildDir 'rocm-runtime-sha256-manifest.txt'
-            } else {
-                ''
-            }
-            $LicenseSha256ManifestPath = if ($GpuBackend -eq 'HIP') {
-                Join-Path $BuildDir 'rocm-license-sha256-manifest.txt'
+            $ArtifactManifestPath = if ($GpuBackend -eq 'HIP') {
+                Join-Path $BuildDir 'rocm-artifact-sha256-manifest.txt'
             } else {
                 ''
             }
@@ -1585,9 +1177,7 @@ function Build-LichtFeldStudio {
             $PackageArchivePath = (Resolve-Path -LiteralPath $PackageArchivePath).Path
             $PackageChecksumPath = (Resolve-Path -LiteralPath $PackageChecksumPath).Path
             Test-PackageChecksum $PackageArchivePath $PackageChecksumPath
-            Test-PackageArchiveContract $PackageArchivePath $GpuBackend `
-                $RuntimeManifestPath $RuntimeLicenseManifestPath `
-                $RuntimeSha256ManifestPath $LicenseSha256ManifestPath
+            Test-PackageArchiveContract $PackageArchivePath $GpuBackend $ArtifactManifestPath
         }
 
         Write-Host ""
@@ -1676,18 +1266,7 @@ if (-not $SkipVcpkg) {
     Write-Host ""
 }
 
-# Phase 4: LibTorch Download
-if ($GpuBackend -eq 'CUDA' -and -not $SkipLibTorch) {
-    Setup-LibTorch
-} elseif ($GpuBackend -eq 'HIP') {
-    Write-Host "Skipping CUDA LibTorch setup for $GpuBackend backend" -ForegroundColor Yellow
-    Write-Host ""
-} else {
-    Write-Host "Skipping LibTorch setup (-SkipLibTorch)" -ForegroundColor Yellow
-    Write-Host ""
-}
-
-# Phase 5: Build
+# Phase 4: Build
 Build-LichtFeldStudio
 
 Write-Host ""

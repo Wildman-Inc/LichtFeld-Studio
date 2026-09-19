@@ -7,7 +7,7 @@ WindowsROCm.cmake
 
 Helpers for locating the Windows ROCm/HIP SDK and the ROCm Python wheel layout.
 The Windows packages have used several root names and compiler layouts across
-7.1 and 7.2.x, so keep probing in one place instead of hard-coding a single SDK.
+ROCm 7.x and 10.x. Keep each selected SDK's headers and runtime together.
 ]=============================================================================]
 
 function(lfs_windows_rocm_collect_roots out_var)
@@ -20,7 +20,7 @@ function(lfs_windows_rocm_collect_roots out_var)
         endif()
     endforeach()
 
-    foreach(_env_var HIP_PATH ROCM_PATH HIP_PATH_722 HIP_PATH_721 HIP_PATH_72 HIP_PATH_71 HIP_PATH_70 HIP_PATH_64 HIP_PATH_62)
+    foreach(_env_var LFS_ROCM_PATH ROCM_PATH HIP_PATH HIP_PATH_722 HIP_PATH_721 HIP_PATH_72 HIP_PATH_71 HIP_PATH_70 HIP_PATH_64 HIP_PATH_62)
         if(DEFINED ENV{${_env_var}} AND NOT "$ENV{${_env_var}}" STREQUAL "")
             list(APPEND _priority_roots "$ENV{${_env_var}}")
         endif()
@@ -38,13 +38,6 @@ function(lfs_windows_rocm_collect_roots out_var)
             list(APPEND _priority_roots "${_python_rocm_root}")
         endif()
     endif()
-
-    list(APPEND _discovered_roots
-        "C:/Program Files/AMD/ROCm/7.2.2"
-        "C:/Program Files/AMD/ROCm/7.2.1"
-        "C:/Program Files/AMD/ROCm/7.2"
-        "C:/Program Files/AMD/ROCm/7.1"
-    )
 
     file(GLOB _program_files_roots LIST_DIRECTORIES true "C:/Program Files/AMD/ROCm/*")
     if(_program_files_roots)
@@ -72,6 +65,7 @@ function(lfs_windows_rocm_root_is_usable root out_var)
         if(EXISTS "${root}/include/hip/hip_runtime.h"
            OR EXISTS "${root}/lib/amdhip64.lib"
            OR EXISTS "${root}/bin/amdhip64.dll"
+           OR EXISTS "${root}/bin/amdhip64_7.dll"
            OR EXISTS "${root}/bin/hipInfo.exe"
            OR EXISTS "${root}/bin/hipinfo.exe")
             set(_usable TRUE)
@@ -81,6 +75,29 @@ function(lfs_windows_rocm_root_is_usable root out_var)
 endfunction()
 
 function(lfs_windows_rocm_find_root out_var)
+    # An explicit SDK must not silently fall back to another Python environment.
+    foreach(_var LFS_ROCM_PATH ROCM_PATH HIP_PATH)
+        if(DEFINED ${_var} AND NOT "${${_var}}" STREQUAL "")
+            file(TO_CMAKE_PATH "${${_var}}" _explicit_root)
+            lfs_windows_rocm_root_is_usable("${_explicit_root}" _usable)
+            if(NOT _usable)
+                message(FATAL_ERROR "${_var} does not contain a ROCm/HIP SDK: ${_explicit_root}")
+            endif()
+            set(${out_var} "${_explicit_root}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    foreach(_env_var LFS_ROCM_PATH ROCM_PATH HIP_PATH)
+        if(DEFINED ENV{${_env_var}} AND NOT "$ENV{${_env_var}}" STREQUAL "")
+            file(TO_CMAKE_PATH "$ENV{${_env_var}}" _explicit_root)
+            lfs_windows_rocm_root_is_usable("${_explicit_root}" _usable)
+            if(NOT _usable)
+                message(FATAL_ERROR "${_env_var} does not contain a ROCm/HIP SDK: ${_explicit_root}")
+            endif()
+            set(${out_var} "${_explicit_root}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
     lfs_windows_rocm_collect_roots(_roots)
     set(_found "")
     foreach(_root IN LISTS _roots)
@@ -108,28 +125,8 @@ function(lfs_windows_rocm_find_devel_root root out_var)
         endif()
     endforeach()
 
-    find_program(_lfs_python_for_rocm_devel NAMES python python3)
-    if(_lfs_python_for_rocm_devel)
-        execute_process(
-            COMMAND "${_lfs_python_for_rocm_devel}" -c "import pathlib; from rocm_sdk._devel import get_devel_root; print(pathlib.Path(get_devel_root()).resolve())"
-            OUTPUT_VARIABLE _python_rocm_devel_root
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(_python_rocm_devel_root)
-            list(APPEND _candidates "${_python_rocm_devel_root}")
-        endif()
-        execute_process(
-            COMMAND "${_lfs_python_for_rocm_devel}" -c "import importlib.util, pathlib; spec = importlib.util.find_spec('_rocm_sdk_devel'); print(pathlib.Path(spec.origin).resolve().parent if spec and spec.origin else '')"
-            OUTPUT_VARIABLE _python_rocm_devel_root
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(_python_rocm_devel_root)
-            list(APPEND _candidates "${_python_rocm_devel_root}")
-        endif()
-    endif()
-
+    # Resolve relative to the chosen core, not `python` on PATH (which may be a
+    # different environment, or vcpkg's Python after project() runs).
     if(root)
         get_filename_component(_root_parent "${root}" DIRECTORY)
         list(APPEND _candidates
@@ -173,9 +170,21 @@ function(lfs_windows_rocm_find_runtime_dirs root out_var)
     if(root)
         get_filename_component(_root_parent "${root}" DIRECTORY)
         list(APPEND _candidates "${root}/bin")
-        file(GLOB _wheel_runtime_bins LIST_DIRECTORIES true
-            "${_root_parent}/_rocm_sdk_libraries_*/bin"
-            "${_root_parent}/rocm_sdk_libraries_*/bin")
+        # ROCm 10.x uses one multi-architecture libraries wheel. Old per-device
+        # wheels can remain installed after upgrading; do not mix their DLLs.
+        set(_wheel_runtime_bins "")
+        foreach(_libraries_root _rocm_sdk_libraries rocm_sdk_libraries)
+            set(_runtime_bin "${_root_parent}/${_libraries_root}/bin")
+            file(GLOB _runtime_dlls "${_runtime_bin}/*.dll")
+            if(_runtime_dlls)
+                list(APPEND _wheel_runtime_bins "${_runtime_bin}")
+            endif()
+        endforeach()
+        if(NOT _wheel_runtime_bins)
+            file(GLOB _wheel_runtime_bins LIST_DIRECTORIES true
+                "${_root_parent}/_rocm_sdk_libraries_*/bin"
+                "${_root_parent}/rocm_sdk_libraries_*/bin")
+        endif()
         if(_wheel_runtime_bins)
             list(APPEND _candidates ${_wheel_runtime_bins})
         endif()
@@ -198,6 +207,72 @@ function(lfs_windows_rocm_find_runtime_dirs root out_var)
     set(${out_var} "${_runtime_dirs}" PARENT_SCOPE)
 endfunction()
 
+function(lfs_windows_rocm_collect_runtime_files root out_var)
+    lfs_windows_rocm_find_runtime_dirs("${root}" _runtime_dirs)
+    lfs_windows_rocm_find_clang("${root}" _clang)
+    get_filename_component(_compiler_dir "${_clang}" DIRECTORY)
+    set(_readobj "${_compiler_dir}/llvm-readobj.exe")
+    if(NOT EXISTS "${_readobj}")
+        message(FATAL_ERROR "ROCm runtime dependency inspection requires ${_readobj}")
+    endif()
+
+    # Include the runtime compiler because HIP loads it dynamically. Follow PE
+    # imports for everything else, limited to the selected SDK's directories.
+    set(_pending "")
+    set(_seed_names "")
+    foreach(_dir IN LISTS _runtime_dirs)
+        file(GLOB _seeds
+            "${_dir}/amdhip64*.dll" "${_dir}/hiprtc*.dll"
+            "${_dir}/hiprand.dll" "${_dir}/rocrand.dll")
+        foreach(_seed IN LISTS _seeds)
+            get_filename_component(_name "${_seed}" NAME)
+            string(TOLOWER "${_name}" _name)
+            if(NOT _name IN_LIST _seed_names)
+                list(APPEND _seed_names "${_name}")
+                list(APPEND _pending "${_seed}")
+            endif()
+        endforeach()
+    endforeach()
+    if(NOT _seed_names MATCHES "amdhip64.*[.]dll")
+        message(FATAL_ERROR "No HIP runtime DLL found in ${_runtime_dirs}")
+    endif()
+
+    set(_files "")
+    while(_pending)
+        list(POP_FRONT _pending _dll)
+        if(_dll IN_LIST _files)
+            continue()
+        endif()
+        list(APPEND _files "${_dll}")
+        execute_process(COMMAND "${_readobj}" --coff-imports "${_dll}"
+            RESULT_VARIABLE _result OUTPUT_VARIABLE _imports ERROR_VARIABLE _error)
+        if(NOT _result EQUAL 0)
+            message(FATAL_ERROR "Cannot inspect ROCm runtime ${_dll}: ${_error}")
+        endif()
+        string(REGEX MATCHALL "Name: [^\r\n]+[.][dD][lL][lL]" _import_names "${_imports}")
+        foreach(_import IN LISTS _import_names)
+            string(REGEX REPLACE "^Name: " "" _name "${_import}")
+            # NO_CACHE controls storage, not lookup: mask an inherited/cache
+            # value so every import is resolved within this SDK's directories.
+            set(_dependency "_dependency-NOTFOUND")
+            find_file(_dependency NAMES "${_name}" PATHS ${_runtime_dirs}
+                NO_DEFAULT_PATH NO_CACHE)
+            if(_dependency)
+                list(APPEND _pending "${_dependency}")
+            else()
+                string(TOLOWER "${_name}" _lower_name)
+                if(_lower_name MATCHES "^(amdhip|amd_comgr|hip|roc)")
+                    message(FATAL_ERROR
+                        "${_dll} requires ${_name}, missing from the selected ROCm SDK")
+                endif()
+                # Windows and MSVC runtime DLLs are supplied by the OS and the
+                # existing application runtime staging, not by another ROCm SDK.
+            endif()
+        endforeach()
+    endwhile()
+    set(${out_var} "${_files}" PARENT_SCOPE)
+endfunction()
+
 function(lfs_windows_rocm_find_clang root out_var)
     set(_clang "")
     foreach(_candidate
@@ -212,6 +287,144 @@ function(lfs_windows_rocm_find_clang root out_var)
         endif()
     endforeach()
     set(${out_var} "${_clang}" PARENT_SCOPE)
+endfunction()
+
+function(lfs_windows_rocm_collect_runtime_kpacks root architectures runtime_files out_var)
+    lfs_windows_rocm_find_clang("${root}" _clang)
+    get_filename_component(_compiler_dir "${_clang}" DIRECTORY)
+    set(_kpacks "")
+    foreach(_dll IN LISTS runtime_files)
+        # PE section names are limited to eight characters. TheRock puts the
+        # external device-code paths in the .kpackrf section on Windows.
+        execute_process(
+            COMMAND "${_compiler_dir}/llvm-readobj.exe" --string-dump=.kpackrf "${_dll}"
+            RESULT_VARIABLE _result OUTPUT_VARIABLE _metadata ERROR_VARIABLE _error)
+        if(NOT _result EQUAL 0)
+            message(FATAL_ERROR "Cannot inspect ROCm device assets for ${_dll}: ${_error}")
+        endif()
+        string(REGEX MATCHALL "[.][.]/[.]kpack/[A-Za-z0-9_@.-]+[.]kpack" _patterns "${_metadata}")
+        list(REMOVE_DUPLICATES _patterns)
+        get_filename_component(_dll_dir "${_dll}" DIRECTORY)
+        foreach(_pattern IN LISTS _patterns)
+            if(_pattern MATCHES "@GFXARCH@")
+                if(NOT architectures)
+                    message(FATAL_ERROR "Select HIP_ARCHITECTURES to stage ROCm device assets")
+                endif()
+                set(_asset_architectures "${architectures}")
+            else()
+                set(_asset_architectures "all")
+            endif()
+            foreach(_arch IN LISTS _asset_architectures)
+                string(REGEX REPLACE ":.*$" "" _arch "${_arch}")
+                string(REPLACE "@GFXARCH@" "${_arch}" _relative_path "${_pattern}")
+                get_filename_component(_asset "${_dll_dir}/${_relative_path}" ABSOLUTE)
+                if(NOT EXISTS "${_asset}")
+                    message(FATAL_ERROR
+                        "Missing ROCm device archive ${_asset}. Install the matching "
+                        "rocm-sdk-device-${_arch} wheel and run python -m rocm_sdk init.")
+                endif()
+                list(APPEND _kpacks "${_asset}")
+            endforeach()
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES _kpacks)
+    set(${out_var} "${_kpacks}" PARENT_SCOPE)
+endfunction()
+
+# Record the selected SDK inputs, including non-DLL device archives. This is an
+# integrity contract for a local package, not a redistribution-license audit.
+function(lfs_windows_rocm_install_artifacts root runtime_files kpacks)
+    set(_sources ${runtime_files} ${kpacks})
+    set(_destinations)
+    foreach(_source IN LISTS runtime_files)
+        get_filename_component(_name "${_source}" NAME)
+        list(APPEND _destinations "${CMAKE_INSTALL_BINDIR}/${_name}")
+    endforeach()
+    foreach(_source IN LISTS kpacks)
+        get_filename_component(_name "${_source}" NAME)
+        list(APPEND _destinations ".kpack/${_name}")
+    endforeach()
+    file(GLOB_RECURSE _notices LIST_DIRECTORIES false "${root}/share/doc/*")
+    foreach(_source IN LISTS _notices)
+        file(RELATIVE_PATH _relative "${root}/share/doc" "${_source}")
+        list(APPEND _sources "${_source}")
+        list(APPEND _destinations "licenses/ROCm/runtime/${_relative}")
+    endforeach()
+    foreach(_provenance IN ITEMS "share/therock/therock_manifest.json" ".info/version")
+        if(EXISTS "${root}/${_provenance}")
+            get_filename_component(_name "${_provenance}" NAME)
+            if(_name STREQUAL "version")
+                set(_name "rocm-sdk-version.txt")
+            endif()
+            list(APPEND _sources "${root}/${_provenance}")
+            list(APPEND _destinations "licenses/ROCm/provenance/${_name}")
+        endif()
+    endforeach()
+    set(_manifest "")
+    foreach(_source _destination IN ZIP_LISTS _sources _destinations)
+        file(SHA256 "${_source}" _sha256)
+        string(APPEND _manifest "${_destination}|${_sha256}\n")
+        get_filename_component(_directory "${_destination}" DIRECTORY)
+        get_filename_component(_name "${_destination}" NAME)
+        install(FILES "${_source}" DESTINATION "${_directory}" RENAME "${_name}" COMPONENT runtime)
+    endforeach()
+    set(_manifest_file "${CMAKE_BINARY_DIR}/rocm-artifact-sha256-manifest.txt")
+    file(CONFIGURE OUTPUT "${_manifest_file}" CONTENT "${_manifest}" @ONLY)
+    install(FILES "${_manifest_file}" DESTINATION licenses/ROCm
+        RENAME artifact-sha256-manifest.txt COMPONENT runtime)
+endfunction()
+
+# clang++ uses the MSVC ABI without setting CMake's MSVC frontend flag, so
+# InstallRequiredSystemLibraries does not discover the Visual C++ CRT for it.
+function(lfs_windows_rocm_find_msvc_runtime out_var)
+    set(_redist_roots)
+    if(NOT "$ENV{VCToolsRedistDir}" STREQUAL "")
+        file(TO_CMAKE_PATH "$ENV{VCToolsRedistDir}" _explicit_redist)
+        list(APPEND _redist_roots "${_explicit_redist}")
+    endif()
+    foreach(_include IN LISTS CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES)
+        file(TO_CMAKE_PATH "${_include}" _include)
+        if(_include MATCHES "^(.*)/[Vv][Cc]/[Tt]ools/[Mm][Ss][Vv][Cc]/([0-9.]+)/include(/.*)?$")
+            set(_vs_root "${CMAKE_MATCH_1}")
+            file(GLOB _compiler_redists LIST_DIRECTORIES true "${_vs_root}/VC/Redist/MSVC/[0-9]*")
+            list(SORT _compiler_redists COMPARE NATURAL ORDER DESCENDING)
+            list(APPEND _redist_roots ${_compiler_redists})
+        endif()
+    endforeach()
+    # Sort installed fallbacks by runtime version, not VS directory name (2022
+    # sorts after 18 even though VS 18 may carry the newer runtime).
+    file(TO_CMAKE_PATH "$ENV{ProgramFiles}" _program_files)
+    file(GLOB _installed_redists LIST_DIRECTORIES true
+        "${_program_files}/Microsoft Visual Studio/*/*/VC/Redist/MSVC/[0-9]*")
+    set(_versioned_redists)
+    foreach(_redist IN LISTS _installed_redists)
+        get_filename_component(_version "${_redist}" NAME)
+        list(APPEND _versioned_redists "${_version}|${_redist}")
+    endforeach()
+    list(SORT _versioned_redists COMPARE NATURAL ORDER DESCENDING)
+    foreach(_entry IN LISTS _versioned_redists)
+        string(REGEX REPLACE "^[^|]+[|]" "" _redist "${_entry}")
+        list(APPEND _redist_roots "${_redist}")
+    endforeach()
+    list(REMOVE_DUPLICATES _redist_roots)
+    foreach(_redist IN LISTS _redist_roots)
+        file(GLOB _crt_dirs LIST_DIRECTORIES true "${_redist}/x64/Microsoft.VC*.CRT")
+        list(SORT _crt_dirs COMPARE NATURAL ORDER DESCENDING)
+        foreach(_crt_dir IN LISTS _crt_dirs)
+            if(EXISTS "${_crt_dir}/msvcp140.dll" AND EXISTS "${_crt_dir}/vcruntime140.dll")
+                file(GLOB _runtimes LIST_DIRECTORIES false
+                    "${_crt_dir}/msvcp140*.dll" "${_crt_dir}/vcruntime140*.dll"
+                    "${_crt_dir}/concrt140.dll" "${_crt_dir}/vccorlib140.dll")
+                list(FILTER _runtimes EXCLUDE REGEX "140d([_.]|[.]dll$)")
+                message(STATUS "MSVC distributable runtime: ${_crt_dir}")
+                set(${out_var} "${_runtimes}" PARENT_SCOPE)
+                return()
+            endif()
+        endforeach()
+    endforeach()
+    message(FATAL_ERROR
+        "MSVC x64 redistributable CRT was not found. Install Visual Studio C++ tools "
+        "or set VCToolsRedistDir to its VC/Redist/MSVC/<version> directory.")
 endfunction()
 
 function(lfs_windows_find_sdk_tool tool_name out_var)

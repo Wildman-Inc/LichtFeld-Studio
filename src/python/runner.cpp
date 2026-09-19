@@ -57,6 +57,7 @@ namespace lfs::python {
     static std::atomic<bool> g_builtin_ui_ready{false};
     static std::atomic<bool> g_builtin_ui_deferred_logged{false};
     static std::atomic<bool> g_python_bridge_failed{false};
+    static std::atomic<bool> g_user_plugin_loading_enabled{true};
     static std::mutex g_python_bridge_failure_mutex;
     static std::optional<lfs::Error> g_python_bridge_failure_error;
 
@@ -67,6 +68,11 @@ namespace lfs::python {
     static std::atomic<bool> g_py_init_failure_reported{false}; // one INFO line + one toast
     static std::atomic<bool> g_py_real_init_succeeded{false};   // real once-lambda reached Ready
     static std::atomic<bool> g_force_py_init_failure{false};    // test-only latch override
+
+    [[nodiscard]] bool user_plugin_loading_enabled() noexcept {
+        return g_user_plugin_loading_enabled.load(std::memory_order_acquire) &&
+               !lfs::core::environment::flag("LFS_SAFE_MODE", false);
+    }
 
     enum class PluginPreloadState : std::uint8_t {
         NotStarted,
@@ -97,6 +103,7 @@ namespace lfs::python {
     };
 
     static PluginAutoloadCoordinator g_plugin_preload;
+    static std::atomic<void (*)()> g_plugin_preload_completion_hook{nullptr};
 
     // Python C extension for capturing output
     static PyObject* capture_write(PyObject* self, PyObject* args) {
@@ -313,6 +320,9 @@ _add_dll_dirs()
             publish_plugin_preload_status();
         }
 
+        // SIGTERM/SIGINT are reasserted after preload becomes terminal:
+        // GUI via MainLoop::installInterruptHandlers; headless via
+        // set_plugin_preload_completion_hook (HeadlessRunCoordinator).
         void finish_plugin_preload(const PluginPreloadState terminal_state,
                                    std::string detail,
                                    const bool mark_loaded) {
@@ -330,6 +340,10 @@ _add_dll_dirs()
             }
             publish_plugin_preload_status();
             g_plugin_preload.cv.notify_all();
+            if (const auto hook = g_plugin_preload_completion_hook.load(
+                    std::memory_order_acquire)) {
+                hook();
+            }
         }
 
         bool prepend_sys_path_once(PyObject* const sys_path,
@@ -1310,7 +1324,24 @@ _add_dll_dirs()
         ensure_builtin_ui_ready_locked();
     }
 
+    void set_plugin_preload_completion_hook(void (*hook)()) {
+        g_plugin_preload_completion_hook.store(hook, std::memory_order_release);
+    }
+
+    void set_user_plugin_loading_enabled(const bool enabled) noexcept {
+        g_user_plugin_loading_enabled.store(enabled, std::memory_order_release);
+#ifdef _WIN32
+        (void)_putenv_s("LFS_SAFE_MODE", enabled ? "0" : "1");
+#else
+        (void)setenv("LFS_SAFE_MODE", enabled ? "0" : "1", 1);
+#endif
+    }
+
     bool ensure_plugins_loaded(const bool wait_for_completion) {
+        if (!user_plugin_loading_enabled()) {
+            LOG_INFO("User plugin loading is disabled for this process");
+            return false;
+        }
         if (!ensure_initialized()) {
             return false;
         }
@@ -1360,6 +1391,10 @@ _add_dll_dirs()
     }
 
     void preload_user_plugins_async() {
+        if (!user_plugin_loading_enabled()) {
+            LOG_INFO("Skipping user plugin preload because safe mode is active");
+            return;
+        }
         if (!lfs::core::environment::flag("LFS_PLUGIN_AUTOLOAD", true))
             return;
 
@@ -1484,8 +1519,9 @@ _add_dll_dirs()
         // destructor decrements Python reference counts
         lfs::training::ControlBoundary::instance().clear_all();
 
-        // Clear frame callback if set
+        // Clear animation callbacks if set
         clear_frame_callback();
+        clear_scene_time_callback();
 
         // Clear Python UI registries that hold nb::object references
         // These singletons would otherwise destroy nb::objects during
@@ -1495,10 +1531,6 @@ _add_dll_dirs()
         PyGC_Collect();
 
         // Skip Py_FinalizeEx() - nanobind static destructors need Python alive
-    }
-
-    bool was_python_used() {
-        return get_main_thread_state() != nullptr || Py_IsInitialized();
     }
 
     void install_output_redirect() {
@@ -1567,7 +1599,11 @@ sys.stderr = _repl_out
 import lichtfeld as lf
 _repl_locals = {{"lf": lf, "__name__": "__console__", "__doc__": None}}
 
-_histfile = os.path.join(os.path.expanduser("~"), ".lichtfeld", "repl_history")
+_histroot = os.environ.get(
+    "LFS_RESOLVED_DATA_DIR",
+    os.path.join(os.path.expanduser("~"), ".lichtfeld"),
+)
+_histfile = os.path.join(_histroot, "repl_history")
 os.makedirs(os.path.dirname(_histfile), exist_ok=True)
 
 _used_ptpython = False
@@ -2108,6 +2144,41 @@ def _lfs_format_code(code):
                 cb(dt);
             } catch (const std::exception& e) {
                 LOG_ERROR("Frame callback error: {}", e.what());
+            }
+        }
+    }
+
+    // Scene-time callback for deterministic animations
+    static std::function<void(float)> g_scene_time_callback;
+    static std::mutex g_scene_time_mutex;
+
+    void set_scene_time_callback(std::function<void(float)> callback) {
+        std::lock_guard lock(g_scene_time_mutex);
+        g_scene_time_callback = std::move(callback);
+    }
+
+    void clear_scene_time_callback() {
+        std::lock_guard lock(g_scene_time_mutex);
+        g_scene_time_callback = nullptr;
+    }
+
+    bool has_scene_time_callback() {
+        std::lock_guard lock(g_scene_time_mutex);
+        return g_scene_time_callback != nullptr;
+    }
+
+    void tick_scene_time_callback(float clip_time) {
+        std::function<void(float)> cb;
+        {
+            std::lock_guard lock(g_scene_time_mutex);
+            cb = g_scene_time_callback;
+        }
+        if (cb) {
+            const GilAcquire gil;
+            try {
+                cb(clip_time);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Scene-time callback error: {}", e.what());
             }
         }
     }

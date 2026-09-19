@@ -52,15 +52,22 @@ namespace lfs::vis {
         }
 
         struct SplitPush {
-            float split[4];       // x = position, y = left_flip_y, z = right_flip_y, w = pad
-            float rect[4];        // x, y, w, h
-            float panel_norm[4];  // left_start, left_end, right_start, right_end
-            float panel_flags[4]; // left_normalize, right_normalize, pad, pad
-            float background[4];  // rgb + pad
-            float divider[4];     // bar_half_w, handle_half_w, handle_half_h, corner_radius
-            float grip[4];        // spacing, half_w, half_l, line_count
+            float split[4];               // x = position, y = left_flip_y, z = right_flip_y, w = pad
+            float rect[4];                // x, y, w, h
+            float panel_norm[4];          // left_start, left_end, right_start, right_end
+            float panel_flags[4];         // left_normalize, right_normalize, left_filter, right_filter
+            float background[4];          // rgb + pad
+            float divider[4];             // bar_half_w, handle_half_w, handle_half_h, corner_radius
+            float grip[4];                // spacing, half_w, half_l, line_count
+            float left_uv_scale_clamp[4]; // xy scale, zw clamp
+            float right_uv_scale_clamp[4];
+            float left_texcoord_scale_offset[4];
+            float right_texcoord_scale_offset[4];
         };
-        static_assert(sizeof(SplitPush) == 7 * 16);
+        // 176 bytes exceeds the 128-byte Vulkan minimum for maxPushConstantsSize.
+        // Acceptable only because CUDA requires NVIDIA hardware (reports 256).
+        static_assert(sizeof(SplitPush) == 11 * 16);
+        static_assert(sizeof(SplitPush) <= 256);
 
         // Convert a CHW float [0,1] tensor (CUDA or CPU) into a tightly packed RGBA8
         // buffer at `dst`. TBB-parallel over rows. Caller owns the destination memory
@@ -813,6 +820,9 @@ namespace lfs::vis {
                                          side,
                                          w,
                                          h);
+            vmaSetAllocationName(allocator, p.alloc,
+                                 side[0] == 'l' ? "Split-view left panel image"
+                                                : "Split-view right panel image");
             p.image_vram_label = std::format("{}:{}x{}", side, w, h);
             lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
                 "vulkan.split_view.panel_image",
@@ -1016,8 +1026,8 @@ namespace lfs::vis {
             si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             si.commandBufferCount = 1;
             si.pCommandBuffers = &panel.cmd;
-            if (si.commandBufferCount != 1 || si.pCommandBuffers == nullptr ||
-                si.pCommandBuffers[0] == VK_NULL_HANDLE || panel.fence == VK_NULL_HANDLE ||
+            // panel.cmd address is never null; validate the handles themselves.
+            if (panel.cmd == VK_NULL_HANDLE || panel.fence == VK_NULL_HANDLE ||
                 graphics_queue == VK_NULL_HANDLE) {
                 return logVkFailure(std::format(
                     "Split-view panel submit requires a non-null queue, one command buffer, and a non-null fence (side={}, queue={:#x}, command_buffer_count={}, command_buffer_array={:#x}, command_buffer={:#x}, fence={:#x}) ({}:{})",
@@ -1025,12 +1035,12 @@ namespace lfs::vis {
                     vkHandleValue(graphics_queue),
                     si.commandBufferCount,
                     reinterpret_cast<std::uintptr_t>(si.pCommandBuffers),
-                    si.pCommandBuffers != nullptr ? vkHandleValue(si.pCommandBuffers[0]) : 0,
+                    vkHandleValue(panel.cmd),
                     vkHandleValue(panel.fence),
                     __FILE__,
                     __LINE__));
             }
-            result = vkQueueSubmit(graphics_queue, 1, &si, panel.fence);
+            result = lfs::rendering::vk_queue_submit_synced(graphics_queue, 1, &si, panel.fence);
             if (result != VK_SUCCESS) {
                 return replacePanelFenceSignaled(panel, "vkQueueSubmit", result);
             }
@@ -1158,7 +1168,6 @@ namespace lfs::vis {
             push.split[0] = std::clamp(params.split_position, 0.0f, 1.0f);
             push.split[1] = params.left.flip_y ? 1.0f : 0.0f;
             push.split[2] = params.right.flip_y ? 1.0f : 0.0f;
-            push.split[3] = 0.0f;
 
             const float rect_x = static_cast<float>(params.content_rect.x);
             const float rect_y = static_cast<float>(params.content_rect.y);
@@ -1176,6 +1185,8 @@ namespace lfs::vis {
 
             push.panel_flags[0] = params.left.normalize_x_to_panel ? 1.0f : 0.0f;
             push.panel_flags[1] = params.right.normalize_x_to_panel ? 1.0f : 0.0f;
+            push.panel_flags[2] = params.left.spatial_filter ? 1.0f : 0.0f;
+            push.panel_flags[3] = params.right.spatial_filter ? 1.0f : 0.0f;
 
             push.background[0] = params.background.r;
             push.background[1] = params.background.g;
@@ -1193,6 +1204,23 @@ namespace lfs::vis {
             push.grip[2] = 12.0f * 0.5f; // grip half-length
             push.grip[3] = 2.0f;         // line count (kGripLineCount)
 
+            push.left_uv_scale_clamp[0] = params.left.uv_scale.x;
+            push.left_uv_scale_clamp[1] = params.left.uv_scale.y;
+            push.left_uv_scale_clamp[2] = params.left.uv_clamp_max.x;
+            push.left_uv_scale_clamp[3] = params.left.uv_clamp_max.y;
+            push.right_uv_scale_clamp[0] = params.right.uv_scale.x;
+            push.right_uv_scale_clamp[1] = params.right.uv_scale.y;
+            push.right_uv_scale_clamp[2] = params.right.uv_clamp_max.x;
+            push.right_uv_scale_clamp[3] = params.right.uv_clamp_max.y;
+            push.left_texcoord_scale_offset[0] = params.left.texcoord_scale.x;
+            push.left_texcoord_scale_offset[1] = params.left.texcoord_scale.y;
+            push.left_texcoord_scale_offset[2] = params.left.texcoord_offset.x;
+            push.left_texcoord_scale_offset[3] = params.left.texcoord_offset.y;
+            push.right_texcoord_scale_offset[0] = params.right.texcoord_scale.x;
+            push.right_texcoord_scale_offset[1] = params.right.texcoord_scale.y;
+            push.right_texcoord_scale_offset[2] = params.right.texcoord_offset.x;
+            push.right_texcoord_scale_offset[3] = params.right.texcoord_offset.y;
+
             vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(push), &push);
             vkCmdDraw(cb, 6, 1, 0, 0);
@@ -1204,6 +1232,8 @@ namespace lfs::vis {
                    descriptor.left_view != VK_NULL_HANDLE &&
                    descriptor.right_view != VK_NULL_HANDLE;
         }
+
+        [[nodiscard]] bool available() const { return pipeline != VK_NULL_HANDLE; }
     };
 
     VulkanSplitViewPass::VulkanSplitViewPass() = default;
@@ -1240,6 +1270,10 @@ namespace lfs::vis {
 
     bool VulkanSplitViewPass::ready(const std::size_t frame_slot) const {
         return impl_ && impl_->ready(frame_slot);
+    }
+
+    bool VulkanSplitViewPass::available() const {
+        return impl_ && impl_->available();
     }
 
 } // namespace lfs::vis

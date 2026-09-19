@@ -20,6 +20,7 @@ namespace lfs::vis {
     enum class TrainingState : uint8_t {
         Idle,     // No dataset loaded, no trainer
         Ready,    // Dataset loaded, trainer initialized, can start
+        Starting, // Training initialization is running off-thread
         Running,  // Training thread active
         Paused,   // Training paused, can resume or stop
         Stopping, // Stop requested, waiting for thread
@@ -37,7 +38,6 @@ namespace lfs::vis {
         Reset,
         ClearScene,
         DeleteTrainingNode,
-        SaveCheckpoint,
         COUNT
     };
 
@@ -60,7 +60,7 @@ namespace lfs::vis {
         // State queries
         [[nodiscard]] TrainingState getState() const { return state_.load(std::memory_order_acquire); }
         [[nodiscard]] bool isInState(TrainingState state) const { return getState() == state; }
-        [[nodiscard]] bool isActive() const; // Running or Paused
+        [[nodiscard]] bool isActive() const; // Starting, Running, or Paused
         [[nodiscard]] FinishReason getFinishReason() const;
 
         // Action permission checks - call BEFORE attempting action
@@ -93,27 +93,29 @@ namespace lfs::vis {
         StateChangeCallback on_state_change_;
 
         // Transition table: [from][to] = allowed
-        static constexpr size_t STATE_COUNT = 6;
+        static constexpr size_t STATE_COUNT = 7;
         static constexpr std::array<std::array<bool, STATE_COUNT>, STATE_COUNT> TRANSITIONS = {{
-            // To:    Idle   Ready  Running Paused Stopping Finished
-            /* Idle */ {false, true, false, true, false, false}, // Paused: checkpoint load
-            /* Ready */ {true, false, true, false, false, false},
-            /* Running */ {false, false, false, true, true, false},
-            /* Paused */ {false, true, true, false, true, false},
-            /* Stopping */ {true, false, false, false, false, true},
-            /* Finished */ {true, true, false, false, false, false},
+            // To:    Idle   Ready  Starting Running Paused Stopping Finished
+            /* Idle */ {false, true, false, false, true, false, true}, // Paused/Finished: project CKPT
+            /* Ready */ {true, false, true, false, false, false, false},
+            /* Starting */ {true, false, false, true, false, true, true},
+            /* Running */ {false, false, false, false, true, true, false},
+            /* Paused */ {false, true, false, true, false, true, true}, // Finished: completed restore
+            /* Stopping */ {true, false, false, false, false, false, true},
+            /* Finished */ {true, true, false, false, false, false, false},
         }};
 
         // Action permission table: [state][action] = allowed
         static constexpr size_t ACTION_COUNT = static_cast<size_t>(TrainingAction::COUNT);
         static constexpr std::array<std::array<bool, ACTION_COUNT>, STATE_COUNT> PERMISSIONS = {{
-            //              Load   LoadCk Start  Pause  Resume Stop   Reset  Clear  DelNode SaveCk
-            /* Idle */ {true, true, false, false, false, false, false, true, true, false},
-            /* Ready */ {true, true, true, false, false, false, true, true, true, false},
-            /* Running */ {false, false, false, true, false, true, false, false, false, true},
-            /* Paused */ {true, true, false, false, true, true, true, true, false, true},
-            /* Stopping */ {false, false, false, false, false, false, false, false, false, false},
-            /* Finished */ {true, true, false, false, false, false, true, true, false, false},
+            //              Load   LoadCk Start  Pause  Resume Stop   Reset  Clear  DelNode
+            /* Idle */ {true, true, false, false, false, false, false, true, true},
+            /* Ready */ {true, true, true, false, false, false, true, true, true},
+            /* Starting */ {false, false, false, true, false, true, false, false, false},
+            /* Running */ {false, false, false, true, false, true, false, false, false},
+            /* Paused */ {true, true, false, false, true, true, true, true, false},
+            /* Stopping */ {false, false, false, false, false, false, false, false, false},
+            /* Finished */ {true, true, false, false, false, false, true, true, false},
         }};
     };
 

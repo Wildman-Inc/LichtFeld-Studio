@@ -8,12 +8,14 @@
 #include "core/cuda/memory_arena.hpp"
 #include "core/splat_data.hpp"
 #include "gsplat/Common.h"
+#include "gsplat/TileBatch.h"
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/render_output.hpp"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <expected>
 #include <string>
+#include <vector>
 
 namespace lfs::training {
 
@@ -29,8 +31,8 @@ namespace lfs::training {
     // Forward pass context - holds raw pointers needed for backward (arena allocated)
     struct GsplatRasterizeContext {
         // Raw pointers to arena-allocated intermediate buffers
-        float* render_colors_ptr = nullptr;  // [C, H, W, channels]
-        float* render_alphas_ptr = nullptr;  // [C, H, W, 1]
+        float* render_colors_ptr = nullptr;  // [C, channels, H, W]
+        float* render_alphas_ptr = nullptr;  // [C, 1, H, W]
         int32_t* radii_ptr = nullptr;        // [C, N, 2]
         float* means2d_ptr = nullptr;        // [C, N, 2]
         float* depths_ptr = nullptr;         // [C, N]
@@ -40,10 +42,15 @@ namespace lfs::training {
         int32_t* last_ids_ptr = nullptr;     // [C, H, W]
         float* compensations_ptr = nullptr;  // [C, N] or nullptr
 
-        // Internally allocated by gsplat (must cudaFree in backward)
+        // Borrowed from the gsplat TLS VMM intersection cache (do NOT free).
+        // Valid from forward through backward on this thread; released by the
+        // cache release hook or at thread shutdown.
         int64_t* isect_ids_ptr = nullptr;
         int32_t* flatten_ids_ptr = nullptr;
-        int32_t n_isects = 0;
+        int64_t n_isects = 0;
+        std::vector<gsplat_lfs::TileBatch> batches;
+        int32_t* tiles_per_gauss_ptr = nullptr;
+        int32_t n_sort = 0;
 
         // Saved input tensors (references, not copies)
         lfs::core::Tensor means;     // [N, 3]
@@ -126,7 +133,9 @@ namespace lfs::training {
         const lfs::core::Tensor& grad_alpha,
         lfs::core::SplatData& gaussian_model,
         AdamOptimizer& optimizer,
-        const lfs::core::Tensor& pixel_error_map = {});
+        const lfs::core::Tensor& pixel_error_map = {},
+        const lfs::core::Tensor& edge_weight_map = {},
+        lfs::core::Tensor edge_score_out = {});
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;
@@ -146,27 +155,11 @@ namespace lfs::training {
         if (!result) {
             throw std::runtime_error(result.error());
         }
-        // Free internally allocated buffers since backward won't be called.
-        // Stream-ordered so the arena chain stays intact (a streamless
-        // end_frame would force a device sync on the calling — often UI —
-        // thread every inference render).
+        // Isect/flatten ids are owned by the TLS VMM cache, not this context.
+        // Stream-ordered arena end_frame keeps the frame chain intact (a
+        // streamless end_frame would force a device sync on the calling — often
+        // UI — thread every inference render).
         const cudaStream_t stream = result->second.stream;
-#if CUDART_VERSION >= 11020
-        if (result->second.isect_ids_ptr != nullptr) {
-            cudaFreeAsync(result->second.isect_ids_ptr, stream);
-        }
-        if (result->second.flatten_ids_ptr != nullptr) {
-            cudaFreeAsync(result->second.flatten_ids_ptr, stream);
-        }
-#else
-        if (result->second.isect_ids_ptr != nullptr) {
-            cudaFree(result->second.isect_ids_ptr);
-        }
-        if (result->second.flatten_ids_ptr != nullptr) {
-            cudaFree(result->second.flatten_ids_ptr);
-        }
-#endif
-        // Release arena frame since no backward will be called
         auto& arena = core::GlobalArenaManager::instance().get_arena();
         arena.end_frame(result->second.frame_id, stream);
         return result->first;

@@ -3,7 +3,6 @@
 ## Requirements
 
 - CUDA Toolkit 12.8+
-- cuDNN 9 for CUDA 12 (CI installs cuDNN 9.5.0 only when the runner image does not already provide it)
 - CMake 3.30+
 - vcpkg (`VCPKG_ROOT` environment variable set)
 - GCC 14+ (Linux) or Visual Studio 2022 v17.10+ (Windows)
@@ -19,16 +18,17 @@ selectable in Visual Studio IDE projects; the vcpkg port itself does not use
 MSBuild. The rest of LichtFeld Studio continues to use the configured Visual
 Studio/MSVC toolchain.
 
-On Windows, set `CUDNN_ROOT_DIR` to the cuDNN version root so the build can copy
-the CUDA-versioned cuDNN runtime DLLs next to the executable and into portable
-installs:
+## Contributor Setup
 
-```bat
-set CUDNN_ROOT_DIR=C:\Program Files\NVIDIA\CUDNN\v9.24
+Install the repository's pre-commit hook after cloning:
+
+```bash
+cp tools/pre-commit .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
 ```
 
-For unusual layouts, pass `-DLFS_CUDNN_BIN_DIR=...` directly to the cuDNN DLL
-directory, for example `...\bin\<cuda-version>\x64`.
+The hook applies `clang-format` to staged C, C++, and CUDA source files outside
+`external/` before each commit.
 
 ## Linux Prerequisites
 
@@ -42,8 +42,12 @@ sudo apt install \
   git curl unzip cmake gcc-14 g++-14 ccache ninja-build zip tar pkg-config python3 python3-dev \
   libxinerama-dev libxcursor-dev xorg-dev libglu1-mesa-dev \
   libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev libibus-1.0-dev libdbus-1-dev \
-  libsystemd-dev nasm autoconf autoconf-archive automake libtool
+  libsystemd-dev libgtk-3-dev nasm autoconf autoconf-archive automake libtool
 ```
+
+`libgtk-3-dev` is required because `nativefiledialog-extended` is built from source on Linux
+against its GTK backend rather than taken from vcpkg; see `cmake/SetupNativeFileDialog.cmake`.
+Without it configure fails with `pkg-config could not locate `gtk+-3.0``.
 
 The configure step now fails early if neither a usable X11 stack nor a usable Wayland stack is present.
 If you intentionally want a headless or experimental build, pass `-DLFS_ENFORCE_LINUX_GUI_BACKENDS=OFF`.
@@ -59,9 +63,38 @@ cmake -B build
 cmake --build build -j 16
 ./build/LichtFeld-Studio --help
 
-# Example training run
+# Example training run (writes /path/to/output/project.licht; add --headless and --export ply for a CLI-only splat export)
 ./build/LichtFeld-Studio -d /path/to/data -o /path/to/output
 ```
+
+#### Release-only dependencies (optional)
+
+Native x64 Windows and Linux builds can use these presets to build only the
+Release variants of vcpkg dependencies, including host tools:
+
+| Platform | Release application | Optimized application with debug information |
+| --- | --- | --- |
+| Windows x64 | `windows-release` | `windows-relwithdebinfo` |
+| Linux x64 | `linux-release` | `linux-relwithdebinfo` |
+
+For example, from an initialized Windows x64 MSVC/CUDA development shell:
+
+```sh
+cmake --preset windows-release
+cmake --build --preset windows-release
+```
+
+Each preset uses its own build directory. Release and RelWithDebInfo on the
+same platform share the dependency recipe and can reuse compatible binary
+cache entries; the first Release-only install may rebuild packages. The
+standard `build` and `debug` presets remain available, with tests opt-in.
+
+See the [developer build guide](docs/development/build.md#release-only-dependency-profiles)
+for all commands, cache behavior and dependency-symbol coverage. To keep an
+existing `cmake --build build ...` command, follow the
+[existing Ninja directory migration](docs/development/build.md#keeping-an-existing-ninja-build-directory),
+including `-B build` and `-DBUILD_TESTS=ON` when building `lichtfeld_tests`.
+The [test prerequisites](#tests) still apply.
 
 ### 2. Portable Build (Distribution)
 
@@ -74,9 +107,95 @@ cmake --install build --prefix ./dist
 
 ./dist/bin/run_lichtfeld.sh --help
 
-# Example training run
+# Example training run (writes /path/to/output/project.licht)
 ./dist/bin/run_lichtfeld.sh -d /path/to/data -o /path/to/output
 ```
+
+## Tests
+
+The tensor comparison tests validate the built-in tensor library against LibTorch as an
+oracle, so a LibTorch SDK is required to configure the test build. It is not needed for the
+application itself, which is LibTorch-free.
+
+Download the LibTorch C++ SDK matching your CUDA version from
+[pytorch.org](https://pytorch.org/get-started/locally/) (select **LibTorch** as the package
+and **C++/Java** as the language) and unpack it so `TorchConfig.cmake` resolves:
+
+| Platform | Expected location |
+|---|---|
+| Linux | `external/libtorch/` |
+| Windows (Release) | `external/release/libtorch/` |
+| Windows (Debug) | `external/debug/libtorch/` |
+
+```bash
+# Linux, from the repository root
+curl -L -o libtorch.zip "<libtorch-download-url>"
+unzip -q libtorch.zip -d external/
+```
+
+Configuring without it fails at `find_package(Torch REQUIRED)`. Some LibTorch builds link
+CUDA libraries they do not ship; if the test binaries then fail to start with a missing
+shared library, install the named library or use a build that bundles its CUDA dependencies.
+
+Tests are a separate opt-in build:
+
+```bash
+cmake -S . -B build/tests -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON
+cmake --build build/tests \
+  --target lichtfeld_tests tensor_hardening_tests \
+  -j6
+```
+
+Run the CTest label that matches the subsystem and cost of the change:
+
+| Label | Use it for |
+|---|---|
+| `fast` | Default developer loop: core unit tests, fast Python tests, focused GPU contracts, and some real-data loader checks |
+| `slow` | Dataset loaders, training, interop, and other multi-second integration paths |
+| `nightly` | Stress, large-tensor, real-data, and optional-codec coverage |
+| `hardening` | Isolated tensor hardening and crash-prone oracle tests |
+| `discovery` | Discovery fuzzing and parameter sweeps |
+| `gpu` | All registered tests that require GPU execution |
+
+For example:
+
+```bash
+ctest --test-dir build/tests --output-on-failure -L fast
+ctest --test-dir build/tests --output-on-failure -L slow
+ctest --test-dir build/tests --output-on-failure -L nightly
+```
+
+### Localization contracts
+
+The localization contracts are a small, headless validation suite. They validate
+locale key and placeholder parity, one-key-per-line JSON formatting, literal
+translation-key references, RML directives, count-sensitive plural-form rules,
+the hardcoded-UI-text audit, and localized cached UI state. They do not build
+or execute the GUI, LibTorch, or CUDA test targets. The contributor guide
+documents the locale conventions and language-specific grammar policy.
+
+Register the contracts in an existing build directory:
+
+```bash
+cmake -S . -B build -DBUILD_LOCALIZATION_TESTS=ON
+cmake --build build --target test_localization_contracts
+```
+
+The custom target runs the single CTest entry named `LocalizationContracts`.
+It can also be invoked directly after configuration:
+
+```bash
+ctest --test-dir build/tests --output-on-failure -R LocalizationContracts
+```
+
+The repository intentionally ignores `data/`, but several fast, slow, nightly,
+and GPU tests read real files from `data/bicycle` or `data/garden`. Populate
+those paths with compatible real datasets before running the affected tiers.
+Synthetic placeholder input is not a substitute: loader, training, image-codec,
+and checkpoint tests assert the expected images, masks, COLMAP files, or point
+cloud exist on disk.
 
 ## What's the Difference?
 
@@ -108,20 +227,17 @@ dist/
 | `BUILD_CUDA_PTX_ONLY` | OFF | PTX-only build (auto-enabled by PORTABLE) |
 | `BUILD_CUDA_MIN_SM` | 75 | Minimum GPU (75=Turing, 80=Ampere, 89=Ada) |
 | `BUILD_TESTS` | OFF | Build test suite |
+| `BUILD_LOCALIZATION_TESTS` | OFF | Register headless localization contract tests |
 | `LFS_ENFORCE_LINUX_GUI_BACKENDS` | ON | Linux only. Fail configure if SDL3 would be built without both X11 and Wayland |
-
-ONNX Runtime is consumed as a pinned prebuilt GPU SDK on x64 Windows and Linux
-instead of being built by vcpkg. The default SDK is controlled by
-`LFS_ONNXRUNTIME_VERSION`; set `LFS_ONNXRUNTIME_ROOT` to an unpacked ONNX Runtime
-SDK to use a local or custom build. Set `LFS_ONNXRUNTIME_USE_PREBUILT=OFF` to
-fall back to a package-provided `onnxruntime` CMake config.
+| `LFS_CUDA_COMPILER_CACHE` | *(empty)* | Compiler cache for CUDA only. Empty follows the auto-detected launcher; `OFF` disables CUDA caching; or name/path of a launcher such as `ccache`. Needed where nvcc cannot be wrapped by sccache |
 
 ## Preprocess Model Downloads
 
 The `preprocess` subcommand downloads the default MoGe-2 ONNX model on first
-use when `--model` is not provided. The cached model and every downloaded
-temporary file are SHA-256 verified on Windows and Linux before ONNX Runtime can
-load them. A hash mismatch deletes the untrusted temporary file, rejects the
+use when `--model` is not provided, then converts it once to a sibling `.lfw`
+weight file for the in-tree native runtime. The cached model and every
+downloaded temporary file are SHA-256 verified on Windows and Linux before
+use. A hash mismatch deletes the untrusted temporary file, rejects the
 cached model, and exits with an error. Use `preprocess --download-only` to
 preload and verify the cache, or `--no-download` to require an already verified
 cache entry.

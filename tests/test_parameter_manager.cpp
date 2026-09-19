@@ -5,6 +5,7 @@
 
 #include "core/parameter_manager.hpp"
 #include "core/parameters.hpp"
+#include "io/project_chapters.hpp"
 
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -20,6 +21,48 @@ namespace {
         EXPECT_EQ(manager.getActiveParams().strategy, "mrnf");
         EXPECT_EQ(lfs::core::param::OptimizationParameters{}.strategy, "mrnf");
         EXPECT_EQ(lfs::core::param::OptimizationParameters::mcmc_defaults().strategy, "mcmc");
+    }
+
+    TEST(ParameterManagerTest, SessionCopyTracksExplicitSourcesAndResetBaseline) {
+        lfs::vis::ParameterManager manager;
+        const auto load_result = manager.ensureLoaded();
+        ASSERT_TRUE(load_result.has_value()) << load_result.error();
+
+        const auto factory_defaults = lfs::core::param::OptimizationParameters::mrnf_defaults();
+        const auto initial_session = manager.copySessionParams();
+        EXPECT_EQ(initial_session.strategy, factory_defaults.strategy);
+        EXPECT_FLOAT_EQ(initial_session.opacity_lr, factory_defaults.opacity_lr);
+        EXPECT_EQ(initial_session.max_cap, factory_defaults.max_cap);
+
+        lfs::core::param::TrainingParameters cli_params;
+        cli_params.optimization = factory_defaults;
+        cli_params.optimization.opacity_lr = 0.123f;
+        cli_params.optimization.max_cap = 1'234'567;
+        manager.setSessionDefaults(cli_params);
+
+        const auto cli_session = manager.copySessionParams();
+        EXPECT_FLOAT_EQ(cli_session.opacity_lr, 0.123f);
+        EXPECT_EQ(cli_session.max_cap, 1'234'567);
+
+        manager.modifyActiveParams([](auto& params) {
+            params.opacity_lr = 0.75f;
+            params.max_cap = 42;
+        });
+        manager.resetToDefaults("mrnf");
+        const auto reset_current = manager.copyActiveParams();
+        EXPECT_FLOAT_EQ(reset_current.opacity_lr, 0.123f);
+        EXPECT_EQ(reset_current.max_cap, 1'234'567);
+
+        lfs::core::param::TrainingParameters checkpoint_params;
+        checkpoint_params.optimization = lfs::core::param::OptimizationParameters::igs_plus_defaults();
+        checkpoint_params.optimization.opacity_lr = 0.321f;
+        checkpoint_params.optimization.max_cap = 765'432;
+        manager.importTrainingParams(checkpoint_params);
+
+        const auto checkpoint_session = manager.copySessionParams();
+        EXPECT_EQ(checkpoint_session.strategy, "igs+");
+        EXPECT_FLOAT_EQ(checkpoint_session.opacity_lr, 0.321f);
+        EXPECT_EQ(checkpoint_session.max_cap, 765'432);
     }
 
     TEST(ParameterManagerTest, ImportTrainingParamsRestoresResolvedCheckpointState) {
@@ -50,7 +93,6 @@ namespace {
         checkpoint_params.dataset.max_width = 1536;
         checkpoint_params.dataset.test_every = 4;
         checkpoint_params.dataset.loading_params.use_cpu_memory = false;
-        checkpoint_params.dataset.loading_params.use_fs_cache = false;
         checkpoint_params.dataset.invert_masks = true;
         checkpoint_params.dataset.mask_threshold = 0.75f;
 
@@ -77,7 +119,6 @@ namespace {
         EXPECT_EQ(dataset.max_width, 1536);
         EXPECT_EQ(dataset.test_every, 4);
         EXPECT_FALSE(dataset.loading_params.use_cpu_memory);
-        EXPECT_FALSE(dataset.loading_params.use_fs_cache);
         EXPECT_TRUE(dataset.invert_masks);
         EXPECT_FLOAT_EQ(dataset.mask_threshold, 0.75f);
 
@@ -176,6 +217,39 @@ namespace {
         EXPECT_EQ(params.resolved_ppisp_controller_activation_step(params.resolved_total_iterations()), 20'000);
     }
 
+    TEST(ParameterManagerTest,
+         PendingProjectRestoreChangesOnlyRoleQualifiedManagerState) {
+        lfs::vis::ParameterManager source;
+        ASSERT_TRUE(source.ensureLoaded());
+        auto captured = source.capturePendingProjectState();
+        ASSERT_TRUE(captured) << captured.error().user_message();
+        captured->active_strategy = "igs+";
+        captured->mcmc_current.iterations = 101;
+        captured->mrnf_current.iterations = 202;
+        captured->igs_current.iterations = 303;
+        captured->dataset.images = "images_project";
+        captured->dataset.centralize_dataset = "pointcloud";
+
+        lfs::vis::ParameterManager target;
+        ASSERT_TRUE(target.ensureLoaded());
+        target.markDirty();
+        auto restored = target.restorePendingProjectState(*captured);
+        ASSERT_TRUE(restored) << restored.error().user_message();
+        EXPECT_EQ(target.getActiveStrategy(), "igs+");
+        EXPECT_EQ(target.getCurrentParams("mcmc").iterations, 101u);
+        EXPECT_EQ(target.getCurrentParams("mrnf").iterations, 202u);
+        EXPECT_EQ(target.getCurrentParams("igs+").iterations, 303u);
+        EXPECT_EQ(target.getDatasetConfig().images, "images_project");
+        EXPECT_FALSE(target.consumeDirty());
+
+        auto invalid = *captured;
+        invalid.mcmc_current =
+            lfs::core::param::OptimizationParameters::mrnf_defaults();
+        auto rejected = target.restorePendingProjectState(invalid);
+        EXPECT_FALSE(rejected);
+        EXPECT_EQ(target.getCurrentParams("mcmc").iterations, 101u);
+    }
+
     TEST(ParameterValidationTest, RejectsCrashProneIterationAndNumericValues) {
         lfs::core::param::OptimizationParameters params;
         EXPECT_TRUE(params.validate().empty());
@@ -191,6 +265,11 @@ namespace {
         params = {};
         params.sh_degree_interval = 0;
         EXPECT_NE(params.validate().find("sh_degree_interval"), std::string::npos);
+        params = {};
+        params.morton_reorder_interval = 0;
+        EXPECT_TRUE(params.validate().empty());
+        params.morton_reorder_interval = 5000;
+        EXPECT_TRUE(params.validate().empty());
         params = {};
         params.start_refine = 10;
         params.stop_refine = 9;

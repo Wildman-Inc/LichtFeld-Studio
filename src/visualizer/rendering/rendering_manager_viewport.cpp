@@ -11,6 +11,7 @@
 #include "scene/scene_render_state.hpp"
 #include "training/trainer.hpp"
 #include "training/training_manager.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include "vksplat_viewport_renderer.hpp"
 #include <algorithm>
 #include <cmath>
@@ -805,6 +806,10 @@ namespace lfs::vis {
                                          std::nullopt,
                                          request.orthographic_override,
                                          request.ortho_scale_override);
+        if (last_vulkan_context_ &&
+            last_vulkan_context_->rendererTerminalState() != RendererTerminalState::Running) {
+            return std::unexpected("renderer is unavailable after a GPU failure; restart LichtFeld Studio");
+        }
         releasePreviewImageResources();
 
         lfs::core::Tensor image;
@@ -939,6 +944,9 @@ namespace lfs::vis {
         if (!last_vulkan_context_) {
             return std::unexpected("no Vulkan context is available");
         }
+        if (last_vulkan_context_->rendererTerminalState() != RendererTerminalState::Running) {
+            return std::unexpected("renderer is unavailable after a GPU failure; restart LichtFeld Studio");
+        }
         if (!hasRenderableGaussians(&model)) {
             return std::unexpected("no renderable Gaussian model is available");
         }
@@ -1061,6 +1069,12 @@ namespace lfs::vis {
         }
 
         int band_height_limit = tile_height_limit;
+        // #1574 1-deep export pipelining: submit ticket for band N, render band N+1,
+        // then wait ticket N (memcpy on deliver), submit N+1, ... At most one outstanding
+        // export ticket. With the 3-deep OutputSlotRing + cell pin, Preview reuse of the
+        // sourced ring cell blocks until that ticket retires — so a second outstanding
+        // export ticket is unnecessary for source-image safety.
+        std::optional<std::uint64_t> outstanding_export_ticket;
         for (int tile_y = 0; tile_y < height;) {
             int tile_height = std::min(band_height_limit, height - tile_y);
             const auto intrinsics = previewTileIntrinsics(
@@ -1094,6 +1108,9 @@ namespace lfs::vis {
                               tile_y,
                               tile_height,
                               rendered.error());
+                    if (outstanding_export_ticket) {
+                        (void)vksplat_viewport_renderer_->waitReadbackTicket(*outstanding_export_ticket);
+                    }
                     return {};
                 }
                 tile_height = std::max(kMinPreviewSubdivisionHeight, tile_height / 2);
@@ -1102,20 +1119,39 @@ namespace lfs::vis {
                          tile_y,
                          tile_height);
             }
-            auto copied = vksplat_viewport_renderer_->readOutputImageIntoCpuHwc(
+            // After render of band N: wait prior band's copy (if any), then submit band N.
+            if (outstanding_export_ticket) {
+                auto waited = vksplat_viewport_renderer_->waitReadbackTicket(*outstanding_export_ticket);
+                if (!waited) {
+                    LOG_TRACE("Gaussian preview tiled prior-band readback failed at tile y={}: {}",
+                              tile_y,
+                              waited.error());
+                    return {};
+                }
+                outstanding_export_ticket.reset();
+            }
+            auto ticket = vksplat_viewport_renderer_->submitReadOutputImageIntoCpuHwcTicket(
                 *last_vulkan_context_,
                 VksplatViewportRenderer::OutputSlot::Preview,
                 output,
                 0,
                 tile_y);
-            if (!copied) {
-                LOG_TRACE("Gaussian preview tiled readback failed at tile y={} height={}: {}",
+            if (!ticket) {
+                LOG_TRACE("Gaussian preview tiled readback submit failed at tile y={} height={}: {}",
                           tile_y,
                           tile_height,
-                          copied.error());
+                          ticket.error());
                 return {};
             }
+            outstanding_export_ticket = *ticket;
             tile_y += tile_height;
+        }
+        if (outstanding_export_ticket) {
+            auto waited = vksplat_viewport_renderer_->waitReadbackTicket(*outstanding_export_ticket);
+            if (!waited) {
+                LOG_TRACE("Gaussian preview tiled final-band readback failed: {}", waited.error());
+                return {};
+            }
         }
 
         return std::make_shared<lfs::core::Tensor>(std::move(output));
@@ -1178,8 +1214,38 @@ namespace lfs::vis {
         }
 
         auto render_lock = acquireLiveModelRenderLock(request.scene_manager);
-        auto scene_state = request.scene_manager->buildRenderState();
-        const auto* const model = scene_state.combined_model;
+        const auto settings = getSettings();
+        SceneRenderState scene_state;
+        const lfs::core::SplatData* model = nullptr;
+        if (splitViewUsesPLYComparison(settings.split_view_mode)) {
+            scene_state = request.scene_manager->buildRenderState({.metadata_only = true});
+            const auto& scene = request.scene_manager->getScene();
+            const auto sample = resolvePlyComparisonDepthSample(
+                scene,
+                settings.split_view_offset,
+                request.panel.value_or(SplitViewPanelId::Left));
+            if (sample.uses_owned_node_model && sample.node && hasRenderableGaussians(sample.model)) {
+                scopeSceneRenderStateToVisibleSplatNode(
+                    scene_state,
+                    scene,
+                    *sample.node,
+                    sample.visible_index,
+                    scene_coords::nodeVisualizerWorldTransform(scene, sample.node->id));
+                model = sample.model;
+            } else if (hasRenderableGaussians(sample.model)) {
+                scene_state.combined_model = sample.model;
+                scene_state.transform_indices = scene.peekTransformIndices();
+                scene_state.node_visibility_mask.assign(scene_state.model_transforms.size(), false);
+                if (sample.visible_index >= 0 &&
+                    static_cast<size_t>(sample.visible_index) < scene_state.node_visibility_mask.size()) {
+                    scene_state.node_visibility_mask[static_cast<size_t>(sample.visible_index)] = true;
+                }
+                model = sample.model;
+            }
+        } else {
+            scene_state = request.scene_manager->buildRenderState();
+            model = scene_state.combined_model;
+        }
         if (!hasRenderableGaussians(model)) {
             return -1.0f;
         }
@@ -1212,68 +1278,6 @@ namespace lfs::vis {
         }
 
         return sampleDepthTensorAt(**depth, request.pixel).value_or(-1.0f);
-    }
-
-    float RenderingManager::renderDepthAtPixelForNodeMask(const SceneManager* const scene_manager,
-                                                          const Viewport& viewport,
-                                                          const glm::ivec2& render_size,
-                                                          const int x,
-                                                          const int y,
-                                                          const std::vector<bool>& node_visibility_mask) {
-        if (!scene_manager || render_size.x <= 0 || render_size.y <= 0 ||
-            x < 0 || x >= render_size.x || y < 0 || y >= render_size.y ||
-            node_visibility_mask.empty() ||
-            !std::any_of(node_visibility_mask.begin(), node_visibility_mask.end(), [](const bool enabled) {
-                return enabled;
-            })) {
-            return -1.0f;
-        }
-        auto render_lock = acquireLiveModelRenderLock(scene_manager);
-        auto scene_state = scene_manager->buildRenderState();
-        const auto* const model = scene_state.combined_model;
-        if (!hasRenderableGaussians(model)) {
-            return -1.0f;
-        }
-
-        FrameContext frame_ctx{
-            .viewport = viewport,
-            .scene_manager = const_cast<SceneManager*>(scene_manager),
-            .model = model,
-            .scene_state = std::move(scene_state),
-            .settings = settings_,
-            .render_size = render_size,
-            .viewport_pos = {0, 0},
-            .cursor_preview = {},
-            .gizmo = {},
-            .view_panels = {},
-        };
-
-        lfs::rendering::FrameMetadata metadata{};
-        if (settings_.point_cloud_mode) {
-            auto* const engine = getRenderingEngine();
-            if (!engine) {
-                return -1.0f;
-            }
-            auto request = buildPointCloudRenderRequest(
-                frame_ctx,
-                render_size,
-                frame_ctx.scene_state.model_transforms);
-            request.scene.node_visibility_mask = node_visibility_mask;
-            auto result = engine->renderPointCloudImage(*model, request);
-            if (!result) {
-                LOG_DEBUG("Masked point-cloud depth render failed: {}", result.error());
-                return -1.0f;
-            }
-            metadata = std::move(result->metadata);
-        } else {
-            LOG_TRACE("Masked Gaussian depth render skipped: no Vulkan masked-depth path is available");
-            return -1.0f;
-        }
-        render_lock.reset();
-
-        ViewportArtifactService artifacts;
-        artifacts.updateFromImageOutput({}, metadata, render_size, true);
-        return artifacts.sampleLinearDepthAt(x, y, render_size, std::nullopt);
     }
 
 } // namespace lfs::vis

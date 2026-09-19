@@ -3,7 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/video_export_utils.hpp"
+#include "core/event_bridge/localization_manager.hpp"
+#include "gui/string_keys.hpp"
 #include "io/loader.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "rendering/vulkan_external_tensor.hpp"
 #include "scene/scene_manager.hpp"
 #include "training/training_manager.hpp"
@@ -13,28 +16,6 @@
 namespace lfs::vis::gui {
 
     namespace {
-
-        std::unique_ptr<lfs::core::SplatData> cloneSplatData(const lfs::core::SplatData& src) {
-            auto cloned = std::make_unique<lfs::core::SplatData>(
-                src.get_max_sh_degree(),
-                src.means_raw().clone(),
-                src.sh0_raw().clone(),
-                src.shN_raw().is_valid() ? src.shN_raw().clone() : lfs::core::Tensor{},
-                src.scaling_raw().clone(),
-                src.rotation_raw().clone(),
-                src.opacity_raw().clone(),
-                src.get_scene_scale(),
-                lfs::core::SplatData::ShNLayout::Swizzled);
-            cloned->set_active_sh_degree(src.get_active_sh_degree());
-            cloned->set_max_sh_degree(src.get_max_sh_degree());
-            if (src.has_deleted_mask()) {
-                cloned->deleted() = src.deleted().clone();
-            }
-            if (src._densification_info.is_valid()) {
-                cloned->_densification_info = src._densification_info.clone();
-            }
-            return cloned;
-        }
 
         std::shared_ptr<lfs::core::PointCloud> clonePointCloud(const lfs::core::PointCloud& src) {
             auto cloned = std::make_shared<lfs::core::PointCloud>();
@@ -95,15 +76,16 @@ namespace lfs::vis::gui {
 
         if (const auto* const model = scene_manager.getModelForRendering();
             model && model->size() > 0) {
-            snapshot.combined_model = std::shared_ptr<lfs::core::SplatData>(cloneSplatData(*model).release());
+            snapshot.combined_model = std::make_shared<lfs::core::SplatData>(model->clone());
             if (auto allocator = lfs::vis::makeViewerSplatTensorAllocator()) {
                 if (auto migrated = lfs::io::migrateSplatTensorsToAllocator(*snapshot.combined_model, allocator);
                     !migrated) {
-                    return std::unexpected("Failed to prepare splat tensors for video export: " +
+                    return std::unexpected(std::string(LOC(lichtfeld::Strings::Runtime::VIDEO_SPLAT_PREPARATION_FAILED)) +
                                            migrated.error().format());
                 }
             }
             snapshot.model_transforms = render_state.model_transforms;
+            snapshot.node_active_sh_degrees = render_state.node_active_sh_degrees;
             snapshot.transform_indices = cloneOptionalTensor(render_state.transform_indices);
             snapshot.selection_mask = cloneOptionalTensor(render_state.selection_mask);
             snapshot.selected_node_mask = render_state.selected_node_mask;
@@ -119,6 +101,7 @@ namespace lfs::vis::gui {
                 continue;
             snapshot.meshes.push_back(VideoExportMeshSnapshot{
                 .mesh = cloneMeshData(*vm.mesh),
+                .node_id = vm.node_id,
                 .transform = vm.transform,
                 .is_selected = vm.is_selected,
             });
@@ -171,10 +154,21 @@ namespace lfs::vis::gui {
         }
 
         if (!snapshot.hasRenderableContent()) {
-            return std::unexpected("No renderable content to export");
+            return std::unexpected(std::string(LOC(lichtfeld::Strings::Runtime::VIDEO_NO_RENDERABLE_CONTENT)));
         }
 
         return snapshot;
+    }
+
+    void refreshVideoExportMeshTransforms(
+        VideoExportSceneSnapshot& snapshot,
+        const lfs::core::Scene& scene) {
+        for (auto& mesh : snapshot.meshes) {
+            if (mesh.node_id == lfs::core::NULL_NODE || !scene.getNodeById(mesh.node_id))
+                continue;
+            mesh.transform = rendering::dataWorldTransformToVisualizerWorld(
+                scene.getWorldTransform(mesh.node_id));
+        }
     }
 
     std::expected<lfs::io::video::VideoExportOptions, std::string> validateVideoExportOptions(

@@ -335,7 +335,13 @@ namespace lfs::rendering {
         constexpr cudaExternalMemoryHandleType kCudaExternalMemoryHandleType =
             cudaExternalMemoryHandleTypeOpaqueWin32;
         constexpr cudaExternalSemaphoreHandleType kCudaExternalSemaphoreHandleType =
+#if defined(USE_HIP) && USE_HIP
+            // D3D12-created shared fences work on Windows HIP even when its
+            // opaque Vulkan timeline-semaphore capability is reported as zero.
+            hipExternalSemaphoreHandleTypeD3D12Fence;
+#else
             cudaExternalSemaphoreHandleTypeTimelineSemaphoreWin32;
+#endif
 #else
         constexpr cudaExternalMemoryHandleType kCudaExternalMemoryHandleType =
             cudaExternalMemoryHandleTypeOpaqueFd;
@@ -439,12 +445,18 @@ namespace lfs::rendering {
             const int width = imageWidth(tensor, layout);
             const int height = imageHeight(tensor, layout);
             const int channels = imageChannels(tensor, layout);
-            if (width != static_cast<int>(extent.width) || height != static_cast<int>(extent.height)) {
-                error = std::format("CUDA/Vulkan image copy size mismatch: tensor {}x{}, target {}x{}",
-                                    width,
-                                    height,
-                                    extent.width,
-                                    extent.height);
+            // Bucketed interop surfaces may be larger than the tensor (top-left valid region).
+            if (width <= 0 || height <= 0 ||
+                !cudaVulkanTensorFitsImport(static_cast<std::uint32_t>(width),
+                                            static_cast<std::uint32_t>(height),
+                                            extent.width,
+                                            extent.height)) {
+                error = std::format(
+                    "CUDA/Vulkan image copy size mismatch: tensor {}x{} must fit in target {}x{}",
+                    width,
+                    height,
+                    extent.width,
+                    extent.height);
                 return false;
             }
             if (channels != 1 && channels != 3 && channels != 4) {
@@ -490,7 +502,9 @@ namespace lfs::rendering {
             CudaVulkanTensorLayout layout,
             CudaVulkanTensorElementType element_type,
             bool flip_y,
-            const cudaStream_t stream);
+            const cudaStream_t stream,
+            void* linear_buffer,
+            std::uint32_t destination_width);
         [[nodiscard]] cudaError_t launchCudaVulkanCopyTensorToSurfaceR32f(
             cudaSurfaceObject_t surface,
             const float* source,
@@ -499,15 +513,10 @@ namespace lfs::rendering {
             int channels,
             CudaVulkanTensorLayout layout,
             bool flip_y,
-            const cudaStream_t stream);
+            const cudaStream_t stream,
+            void* linear_buffer,
+            std::uint32_t destination_width);
     } // namespace detail
-
-    CudaVulkanInterop::CudaVulkanInterop(CudaVulkanExternalImageImport image,
-                                         CudaVulkanExternalSemaphoreImport semaphore) {
-        if (!init(std::move(image), std::move(semaphore))) {
-            throw std::runtime_error(last_error_);
-        }
-    }
 
     CudaVulkanInterop::~CudaVulkanInterop() {
         reset();
@@ -524,6 +533,7 @@ namespace lfs::rendering {
 
         reset();
         cuda_mem_ = std::exchange(other.cuda_mem_, nullptr);
+        cuda_buffer_ = std::exchange(other.cuda_buffer_, nullptr);
         cuda_mip_ = std::exchange(other.cuda_mip_, nullptr);
         cuda_array_ = std::exchange(other.cuda_array_, nullptr);
         surface_ = std::exchange(other.surface_, cudaSurfaceObject_t{});
@@ -543,6 +553,8 @@ namespace lfs::rendering {
                                  CudaVulkanExternalSemaphoreImport semaphore) {
         reset();
         last_error_.clear();
+        NativeHandleOwner memory_handle(image.memory_handle);
+        NativeHandleOwner semaphore_handle(semaphore.semaphore_handle);
 
         if (auto err = verifyCudaMatchesVulkanDevice(); err) {
             return setFailure(last_error_, *err);
@@ -603,6 +615,7 @@ namespace lfs::rendering {
         if (status != cudaSuccess) {
             return setCudaFailure(last_error_, "cudaGetDevice", status);
         }
+#if !defined(_WIN32) || !defined(USE_HIP) || !USE_HIP
         int timeline_interop_supported = 0;
         status = cudaDeviceGetAttribute(&timeline_interop_supported,
                                         cudaDevAttrTimelineSemaphoreInteropSupported,
@@ -619,11 +632,10 @@ namespace lfs::rendering {
                                                cuda_device,
                                                timeline_interop_supported));
         }
+#endif
 
-        NativeHandleOwner memory_handle(image.memory_handle);
-        NativeHandleOwner semaphore_handle(semaphore.semaphore_handle);
 
-        if (!cudaVulkanImageInteropSupported()) {
+        if (!image.linear_buffer && !cudaVulkanImageInteropSupported()) {
             return setFailure(
                 last_error_,
                 "HIP device does not support image/surface operations required for Vulkan image interop");
@@ -650,39 +662,50 @@ namespace lfs::rendering {
         memory_handle.release();
 #endif
 
-        cudaExternalMemoryMipmappedArrayDesc array_desc{};
-        array_desc.offset = 0;
-        array_desc.formatDesc = channelDescForFormat(image.format);
-        array_desc.extent = make_cudaExtent(image.extent.width, image.extent.height, 0);
-        array_desc.flags = cudaArraySurfaceLoadStore;
-        array_desc.numLevels = 1;
+        if (image.linear_buffer) {
+            cudaExternalMemoryBufferDesc buffer_desc{};
+            buffer_desc.size = cuda_visible_size;
+            status = cudaExternalMemoryGetMappedBuffer(&cuda_buffer_, cuda_mem_, &buffer_desc);
+            if (status != cudaSuccess) {
+                reset();
+                return setCudaFailure(last_error_, "cudaExternalMemoryGetMappedBuffer", status);
+            }
+        } else {
+            cudaExternalMemoryMipmappedArrayDesc array_desc{};
+            array_desc.offset = 0;
+            array_desc.formatDesc = channelDescForFormat(image.format);
+            array_desc.extent = make_cudaExtent(image.extent.width, image.extent.height, 0);
+            array_desc.flags = cudaArraySurfaceLoadStore;
+            array_desc.numLevels = 1;
 
-        const auto map_mipmapped_array = externalMemoryGetMappedMipmappedArrayFunction();
-        if (map_mipmapped_array == nullptr) {
-            reset();
-            return setFailure(
-                last_error_,
-                "CUDA/HIP runtime does not export external-memory mipmapped-array mapping");
-        }
-        status = map_mipmapped_array(&cuda_mip_, cuda_mem_, &array_desc);
-        if (status != cudaSuccess) {
-            reset();
-            return setCudaFailure(last_error_, "cudaExternalMemoryGetMappedMipmappedArray", status);
-        }
+            const auto map_mipmapped_array = externalMemoryGetMappedMipmappedArrayFunction();
+            if (map_mipmapped_array == nullptr) {
+                reset();
+                return setFailure(
+                    last_error_,
+                    "CUDA/HIP runtime does not export external-memory mipmapped-array mapping");
+            }
+            status = map_mipmapped_array(&cuda_mip_, cuda_mem_, &array_desc);
+            if (status != cudaSuccess) {
+                reset();
+                return setCudaFailure(last_error_, "cudaExternalMemoryGetMappedMipmappedArray", status);
+            }
 
-        status = cudaGetMipmappedArrayLevel(&cuda_array_, cuda_mip_, 0);
-        if (status != cudaSuccess) {
-            reset();
-            return setCudaFailure(last_error_, "cudaGetMipmappedArrayLevel", status);
-        }
+            status = cudaGetMipmappedArrayLevel(&cuda_array_, cuda_mip_, 0);
+            if (status != cudaSuccess) {
+                reset();
+                return setCudaFailure(last_error_, "cudaGetMipmappedArrayLevel", status);
+            }
 
-        cudaResourceDesc resource_desc{};
-        resource_desc.resType = cudaResourceTypeArray;
-        resource_desc.res.array.array = cuda_array_;
-        status = cudaCreateSurfaceObject(&surface_, &resource_desc);
-        if (status != cudaSuccess) {
-            reset();
-            return setCudaFailure(last_error_, "cudaCreateSurfaceObject", status);
+            cudaResourceDesc resource_desc{};
+            resource_desc.resType = cudaResourceTypeArray;
+            resource_desc.res.array.array = cuda_array_;
+            status = cudaCreateSurfaceObject(&surface_, &resource_desc);
+            if (status != cudaSuccess) {
+                reset();
+                return setCudaFailure(last_error_, "cudaCreateSurfaceObject", status);
+            }
+
         }
 
         // cudaExternalSemaphoreHandleDesc has no initialValue field, so CUDA cannot validate or
@@ -728,6 +751,10 @@ namespace lfs::rendering {
             surface_ = cudaSurfaceObject_t{};
         }
         cuda_array_ = nullptr;
+        if (cuda_buffer_ != nullptr) {
+            cudaFree(cuda_buffer_);
+            cuda_buffer_ = nullptr;
+        }
         if (cuda_mip_ != nullptr) {
             cudaFreeMipmappedArray(cuda_mip_);
             cuda_mip_ = nullptr;
@@ -750,9 +777,9 @@ namespace lfs::rendering {
 
     bool CudaVulkanInterop::valid() const {
         return cuda_mem_ != nullptr &&
-               cuda_mip_ != nullptr &&
-               cuda_array_ != nullptr &&
-               surface_ != cudaSurfaceObject_t{} &&
+               (cuda_buffer_ != nullptr ||
+                (cuda_mip_ != nullptr && cuda_array_ != nullptr &&
+                 surface_ != cudaSurfaceObject_t{})) &&
                cuda_timeline_ != nullptr &&
                extent_.width > 0 &&
                extent_.height > 0;
@@ -804,6 +831,10 @@ namespace lfs::rendering {
         }
 
         upload_source_.sync_to_stream(stream);
+        // Kernels iterate the TENSOR extent and write the top-left subrect of the surface.
+        // Padding pixels are never written (display UV clamp excludes them).
+        const std::uint32_t copy_width = static_cast<std::uint32_t>(prepared.width);
+        const std::uint32_t copy_height = static_cast<std::uint32_t>(prepared.height);
         cudaError_t status = cudaSuccess;
         if (format_ == CudaVulkanImageFormat::R32Sfloat) {
             if (prepared.element_type != detail::CudaVulkanTensorElementType::Float32) {
@@ -818,23 +849,27 @@ namespace lfs::rendering {
             status = detail::launchCudaVulkanCopyTensorToSurfaceR32f(
                 surface_,
                 static_cast<const float*>(data),
-                extent_.width,
-                extent_.height,
+                copy_width,
+                copy_height,
                 prepared.channels,
                 prepared.layout,
                 flip_y,
-                stream);
+                stream,
+                cuda_buffer_,
+                extent_.width);
         } else {
             status = detail::launchCudaVulkanCopyTensorToSurface(
                 surface_,
                 data,
-                extent_.width,
-                extent_.height,
+                copy_width,
+                copy_height,
                 prepared.channels,
                 prepared.layout,
                 prepared.element_type,
                 flip_y,
-                stream);
+                stream,
+                cuda_buffer_,
+                extent_.width);
         }
         return setCudaFailure(last_error_, "copy tensor to CUDA surface", status);
     }
@@ -940,6 +975,7 @@ namespace lfs::rendering {
     bool CudaTimelineSemaphore::init(CudaVulkanExternalSemaphoreImport semaphore) {
         reset();
         last_error_.clear();
+        NativeHandleOwner semaphore_handle(semaphore.semaphore_handle);
 
         if (auto err = verifyCudaMatchesVulkanDevice(); err) {
             return setFailure(last_error_, *err);
@@ -951,7 +987,6 @@ namespace lfs::rendering {
                                                semaphore.initial_value));
         }
 
-        NativeHandleOwner semaphore_handle(semaphore.semaphore_handle);
         // cudaExternalSemaphoreHandleDesc has no initialValue field, so CUDA cannot validate or
         // communicate a non-zero Vulkan initial value during import.
         if (semaphore.initial_value != 0) {
@@ -1063,189 +1098,6 @@ namespace lfs::rendering {
         }
         last_waited_ = value;
         return true;
-    }
-
-    // ===== CudaVulkanBufferInterop ===============================================
-
-    CudaVulkanBufferInterop::CudaVulkanBufferInterop(CudaVulkanExternalBufferImport buffer) {
-        if (!init(std::move(buffer))) {
-            throw std::runtime_error(last_error_);
-        }
-    }
-
-    CudaVulkanBufferInterop::~CudaVulkanBufferInterop() {
-        reset();
-    }
-
-    CudaVulkanBufferInterop::CudaVulkanBufferInterop(CudaVulkanBufferInterop&& other) noexcept {
-        *this = std::move(other);
-    }
-
-    CudaVulkanBufferInterop& CudaVulkanBufferInterop::operator=(CudaVulkanBufferInterop&& other) noexcept {
-        if (this == &other) {
-            return *this;
-        }
-        reset();
-        cuda_mem_ = std::exchange(other.cuda_mem_, nullptr);
-        device_ptr_ = std::exchange(other.device_ptr_, nullptr);
-        allocation_size_ = std::exchange(other.allocation_size_, 0);
-        size_ = std::exchange(other.size_, 0);
-        upload_source_ = std::move(other.upload_source_);
-        last_error_ = std::move(other.last_error_);
-        return *this;
-    }
-
-    bool CudaVulkanBufferInterop::init(CudaVulkanExternalBufferImport buffer) {
-        reset();
-        last_error_.clear();
-
-        if (auto err = verifyCudaMatchesVulkanDevice(); err) {
-            return setFailure(last_error_, *err);
-        }
-        if (!nativeHandleValid(buffer.memory_handle)) {
-            return setFailure(last_error_, std::format(
-                                               "CUDA/Vulkan external buffer import requires a valid memory handle (memory_handle={}, allocation_size={}, cuda_visible_size={}, dedicated={})",
-                                               nativeHandleString(buffer.memory_handle),
-                                               buffer.allocation_size,
-                                               buffer.size,
-                                               buffer.dedicated_allocation));
-        }
-        if (buffer.allocation_size == 0 || buffer.size == 0 || buffer.size > buffer.allocation_size) {
-            return setFailure(last_error_, std::format(
-                                               "CUDA/Vulkan external buffer import requires a non-zero CUDA-visible size within the Vulkan allocation (vulkan_allocation_size={}, cuda_visible_size={}, memory_handle={}, dedicated={})",
-                                               buffer.allocation_size,
-                                               buffer.size,
-                                               nativeHandleString(buffer.memory_handle),
-                                               buffer.dedicated_allocation));
-        }
-
-        NativeHandleOwner memory_handle(buffer.memory_handle);
-
-        cudaExternalMemoryHandleDesc memory_desc{};
-        memory_desc.type = kCudaExternalMemoryHandleType;
-        memory_desc.size = buffer.allocation_size;
-        if (buffer.dedicated_allocation) {
-            memory_desc.flags = cudaExternalMemoryDedicated;
-        }
-#ifdef _WIN32
-        memory_desc.handle.win32.handle = memory_handle.get();
-#else
-        memory_desc.handle.fd = memory_handle.get();
-#endif
-
-        cudaError_t status = cudaImportExternalMemory(&cuda_mem_, &memory_desc);
-        if (status != cudaSuccess) {
-            reset();
-            return setCudaFailure(last_error_, "cudaImportExternalMemory(buffer)", status);
-        }
-#ifndef _WIN32
-        memory_handle.release();
-#endif
-
-        cudaExternalMemoryBufferDesc buffer_desc{};
-        buffer_desc.offset = 0;
-        buffer_desc.size = buffer.size;
-        status = cudaExternalMemoryGetMappedBuffer(&device_ptr_, cuda_mem_, &buffer_desc);
-        if (status != cudaSuccess) {
-            reset();
-            return setCudaFailure(last_error_, "cudaExternalMemoryGetMappedBuffer", status);
-        }
-
-        allocation_size_ = buffer.allocation_size;
-        size_ = buffer.size;
-        return true;
-    }
-
-    void CudaVulkanBufferInterop::reset() {
-        upload_source_ = {};
-        if (device_ptr_ != nullptr) {
-            cudaFree(device_ptr_);
-            device_ptr_ = nullptr;
-        }
-        if (cuda_mem_ != nullptr) {
-            cudaDestroyExternalMemory(cuda_mem_);
-            cuda_mem_ = nullptr;
-        }
-        allocation_size_ = 0;
-        size_ = 0;
-    }
-
-    bool CudaVulkanBufferInterop::valid() const {
-        return cuda_mem_ != nullptr && device_ptr_ != nullptr && size_ > 0;
-    }
-
-    bool CudaVulkanBufferInterop::copyFromTensor(const lfs::core::Tensor& tensor,
-                                                 const std::size_t byte_count,
-                                                 const cudaStream_t stream) const {
-        return copyFromTensor(tensor, byte_count, 0, stream);
-    }
-
-    bool CudaVulkanBufferInterop::copyFromTensor(const lfs::core::Tensor& tensor,
-                                                 const std::size_t byte_count,
-                                                 const std::size_t dst_offset,
-                                                 const cudaStream_t stream) const {
-        last_error_.clear();
-        if (!valid()) {
-            return setFailure(last_error_, std::format(
-                                               "CUDA/Vulkan buffer copy requires a complete imported buffer (cuda_memory={:#x}, device_pointer={:#x}, cuda_visible_size={}, vulkan_allocation_size={}, requested_bytes={}, dst_offset={})",
-                                               reinterpret_cast<std::uintptr_t>(cuda_mem_),
-                                               reinterpret_cast<std::uintptr_t>(device_ptr_),
-                                               size_,
-                                               allocation_size_,
-                                               byte_count,
-                                               dst_offset));
-        }
-        if (stream == nullptr) {
-            return setFailure(last_error_, std::format(
-                                               "CUDA/Vulkan buffer copy requires an explicit non-default stream (stream={:#x}, requested_bytes={}, dst_offset={}, cuda_visible_size={}, vulkan_allocation_size={})",
-                                               reinterpret_cast<std::uintptr_t>(stream),
-                                               byte_count,
-                                               dst_offset,
-                                               size_,
-                                               allocation_size_));
-        }
-        if (byte_count == 0 || dst_offset > size_ || byte_count > size_ - dst_offset) {
-            return setFailure(last_error_, std::format(
-                                               "CUDA/Vulkan buffer copy range exceeds the CUDA-visible import (dst_offset={}, requested_bytes={}, range_end={}, cuda_visible_size={}, vulkan_allocation_size={})",
-                                               dst_offset,
-                                               byte_count,
-                                               dst_offset <= std::numeric_limits<std::size_t>::max() - byte_count
-                                                   ? dst_offset + byte_count
-                                                   : std::numeric_limits<std::size_t>::max(),
-                                               size_,
-                                               allocation_size_));
-        }
-        if (!tensor.is_valid() || tensor.data_ptr() == nullptr) {
-            return setFailure(last_error_, std::format(
-                                               "CUDA/Vulkan buffer copy requires valid tensor storage (tensor_valid={}, tensor_pointer={:#x}, tensor_bytes={}, requested_bytes={}, dst_offset={})",
-                                               tensor.is_valid(),
-                                               reinterpret_cast<std::uintptr_t>(tensor.data_ptr()),
-                                               tensor.is_valid() ? tensor.bytes() : 0,
-                                               byte_count,
-                                               dst_offset));
-        }
-
-        upload_source_ = tensor;
-        if (upload_source_.device() != lfs::core::Device::CUDA) {
-            upload_source_ = upload_source_.to(lfs::core::Device::CUDA, stream);
-        }
-        if (!upload_source_.is_contiguous()) {
-            upload_source_ = upload_source_.contiguous();
-        }
-        if (byte_count > upload_source_.bytes()) {
-            return setFailure(
-                last_error_,
-                std::format("CUDA/Vulkan buffer copy requested {} bytes from {} byte tensor",
-                            byte_count,
-                            upload_source_.bytes()));
-        }
-
-        upload_source_.sync_to_stream(stream);
-        auto* const dst = static_cast<std::uint8_t*>(device_ptr_) + dst_offset;
-        const cudaError_t status = cudaMemcpyAsync(
-            dst, upload_source_.data_ptr(), byte_count, cudaMemcpyDeviceToDevice, stream);
-        return setCudaFailure(
-            last_error_, "cudaMemcpyAsync(CUDA tensor -> Vulkan buffer)", status);
     }
 
 } // namespace lfs::rendering

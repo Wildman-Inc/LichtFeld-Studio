@@ -14,6 +14,7 @@
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
 #include "gui/string_keys.hpp"
 #include "internal/resource_paths.hpp"
+#include "preferences.hpp"
 #include "theme/theme.hpp"
 #include "visualizer/app_store.hpp"
 
@@ -70,8 +71,10 @@ namespace lfs::vis::gui {
                 return;
 
             const auto& lang = available[idx];
-            if (loc.setLanguage(lang))
+            if (loc.setLanguage(lang)) {
+                lfs::vis::saveLanguagePreference(lang);
                 lfs::vis::publish_language_generation();
+            }
             if (mgr_ && (lang == "ja" || lang == "ko" || lang == "zh"))
                 mgr_->ensureCjkFontsLoaded();
         }
@@ -85,7 +88,9 @@ namespace lfs::vis::gui {
         ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
 #else
         std::string cmd = "xdg-open \"" + std::string(url) + "\" &";
-        std::system(cmd.c_str());
+        if (const int status = std::system(cmd.c_str()); status != 0) {
+            LOG_WARN("StartupOverlay: xdg-open failed for '{}': status {}", url, status);
+        }
 #endif
     }
 
@@ -116,8 +121,8 @@ namespace lfs::vis::gui {
         updateLocalizedText();
 
         link_listener_ = new LinkClickListener();
-        for (const char* id : {"link-discord", "link-x", "link-donate", "link-core11",
-                               "link-volinga"}) {
+        for (const char* id : {"link-discord", "link-x", "link-youtube", "link-donate",
+                               "link-core11", "link-volinga"}) {
             auto* el = document_->GetElementById(id);
             if (el)
                 el->AddEventListener(Rml::EventId::Click, link_listener_);
@@ -183,8 +188,8 @@ namespace lfs::vis::gui {
 
         if (!link_listener_)
             link_listener_ = new LinkClickListener();
-        for (const char* id : {"link-discord", "link-x", "link-donate", "link-core11",
-                               "link-volinga"}) {
+        for (const char* id : {"link-discord", "link-x", "link-youtube", "link-donate",
+                               "link-core11", "link-volinga"}) {
             auto* el = document_->GetElementById(id);
             if (el)
                 el->AddEventListener(Rml::EventId::Click, link_listener_);
@@ -200,6 +205,11 @@ namespace lfs::vis::gui {
     }
 
     void StartupOverlay::dismiss() {
+        if (lfs::vis::loadLanguagePreference().empty()) {
+            const auto& language = lfs::event::LocalizationManager::getInstance().getCurrentLanguage();
+            if (!language.empty())
+                lfs::vis::saveLanguagePreference(language);
+        }
         visible_ = false;
         input_ = nullptr;
         last_mouse_valid_ = false;
@@ -313,6 +323,9 @@ namespace lfs::vis::gui {
             return;
 
         auto& loc = lfs::event::LocalizationManager::getInstance();
+        if (auto* row = document_->GetElementById("lang-row")) {
+            row->SetProperty("display", lfs::vis::loadLanguagePreference().empty() ? "flex" : "none");
+        }
         const auto langs = loc.getAvailableLanguages();
         const auto names = loc.getAvailableLanguageNames();
         const auto& current = loc.getCurrentLanguage();
@@ -543,6 +556,18 @@ namespace lfs::vis::gui {
                local_x < offset.x + width && local_y < offset.y + height;
     }
 
+    bool StartupOverlay::isLinkHit(const float local_x, const float local_y) const {
+        if (!rml_context_ || !document_)
+            return false;
+
+        for (auto* el = rml_context_->GetElementAtPoint(Rml::Vector2f(local_x, local_y)); el;
+             el = el->GetParentNode()) {
+            if (!el->GetAttribute("data-url", Rml::String("")).empty())
+                return true;
+        }
+        return false;
+    }
+
     void StartupOverlay::ensureLanguageDropdownFontsLoaded() {
         if (language_dropdown_fonts_requested_ || !rml_manager_)
             return;
@@ -567,10 +592,30 @@ namespace lfs::vis::gui {
 
         const bool hovered = local_x >= 0 && local_y >= 0 &&
                              local_x < overlay_w && local_y < overlay_h;
+        const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
+                                      input.key_alt, input.key_super);
+        bool replayed_button_events = false;
+        for (const auto& event : input.mouse_button_events) {
+            if (event.button >= 3)
+                continue;
+            const float event_x = event.x - overlay_x;
+            const float event_y = event.y - overlay_y;
+            if (event_x < 0.0f || event_y < 0.0f ||
+                event_x >= overlay_w || event_y >= overlay_h)
+                continue;
+            if (event.down && isLanguageSelectHit(event_x, event_y))
+                ensureLanguageDropdownFontsLoaded();
+            rml_context_->ProcessMouseMove(static_cast<int>(event_x),
+                                           static_cast<int>(event_y), mods);
+            if (event.down)
+                rml_context_->ProcessMouseButtonDown(event.button, mods);
+            else
+                rml_context_->ProcessMouseButtonUp(event.button, mods);
+            replayed_button_events = true;
+            result.event_forwarded = true;
+        }
 
         if (hovered) {
-            const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
-                                          input.key_alt, input.key_super);
             const bool opening_language_select =
                 input.mouse_clicked[0] && isLanguageSelectHit(local_x, local_y);
             if (isLanguageSelectOpen() || opening_language_select)
@@ -579,17 +624,18 @@ namespace lfs::vis::gui {
                                            static_cast<int>(local_y), mods);
             result.event_forwarded = true;
 
-            if (input.mouse_clicked[0]) {
+            if (!replayed_button_events && input.mouse_clicked[0]) {
                 rml_context_->ProcessMouseButtonDown(0, mods);
                 result.event_forwarded = true;
             }
-            if (input.mouse_released[0]) {
+            if (!replayed_button_events && input.mouse_released[0]) {
                 rml_context_->ProcessMouseButtonUp(0, mods);
                 result.event_forwarded = true;
             }
 
             if (input.mouse_wheel != 0.0f) {
-                rml_context_->ProcessMouseWheel(Rml::Vector2f(0.0f, -input.mouse_wheel), mods);
+                rml_context_->ProcessMouseWheel(
+                    Rml::Vector2f(-input.mouse_wheel_x, -input.mouse_wheel), mods);
                 result.event_forwarded = true;
             }
         }
@@ -704,13 +750,22 @@ namespace lfs::vis::gui {
         if (input_ && hasInputActivity(*input_) &&
             (plugin_load_complete || rml_select_open ||
              isLanguageSelectHit(input_->mouse_x - viewport.pos.x,
-                                 input_->mouse_y - viewport.pos.y))) {
+                                 input_->mouse_y - viewport.pos.y) ||
+             isLinkHit(input_->mouse_x - viewport.pos.x,
+                       input_->mouse_y - viewport.pos.y))) {
             const auto input_result = forwardInput(*input_, viewport.pos.x, viewport.pos.y,
                                                    viewport.size.x, viewport.size.y);
             escape_consumed = input_result.escape_consumed;
             refresh_cache = refresh_cache || input_result.event_forwarded;
             input_event_forwarded = input_result.event_forwarded;
             rml_select_open = rml_select_open || isLanguageSelectOpen();
+        }
+        const auto language_generation_after_input = app_store().language_generation.get();
+        if (language_generation_after_input != last_language_generation_) {
+            updateLocalizedText();
+            last_language_generation_ = language_generation_after_input;
+            has_language_generation_ = true;
+            refresh_cache = true;
         }
         if (input_event_forwarded || (refresh_cache && !updated_this_frame))
             rml_context_->Update();
@@ -744,13 +799,15 @@ namespace lfs::vis::gui {
         ++shown_frames_;
 
         bool clicked_language_select = false;
+        bool clicked_link = false;
         if (input_) {
             const float local_x = input_->mouse_x - viewport.pos.x;
             const float local_y = input_->mouse_y - viewport.pos.y;
             clicked_language_select = input_->mouse_clicked[0] && isLanguageSelectHit(local_x, local_y);
+            clicked_link = input_->mouse_clicked[0] && isLinkHit(local_x, local_y);
         }
 
-        if (shown_frames_ > 2 && !rml_select_open && !clicked_language_select &&
+        if (shown_frames_ > 2 && !rml_select_open && !clicked_language_select && !clicked_link &&
             !drag_hovering && input_) {
             const bool mouse_clicked =
                 input_->mouse_clicked[0] || input_->mouse_clicked[1] || input_->mouse_clicked[2];
@@ -762,10 +819,10 @@ namespace lfs::vis::gui {
 
             if (key_action) {
                 LOG_DEBUG("StartupOverlay: dismissed by key action");
-                visible_ = false;
+                dismiss();
             } else if (mouse_clicked) {
                 LOG_DEBUG("StartupOverlay: dismissed by mouse click");
-                visible_ = false;
+                dismiss();
             }
         }
     }

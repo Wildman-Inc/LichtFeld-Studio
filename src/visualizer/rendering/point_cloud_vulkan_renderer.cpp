@@ -101,6 +101,22 @@ namespace lfs::vis {
             VkBufferUsageFlags usage = 0;
             std::string vram_scope;
             std::string vram_label;
+
+            ManagedBuffer() = default;
+            ManagedBuffer(const ManagedBuffer&) = delete;
+            ManagedBuffer& operator=(const ManagedBuffer&) = delete;
+            ManagedBuffer(ManagedBuffer&& other) noexcept { *this = std::move(other); }
+            ManagedBuffer& operator=(ManagedBuffer&& other) noexcept {
+                if (this != &other) {
+                    buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+                    allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+                    size = std::exchange(other.size, 0);
+                    usage = std::exchange(other.usage, 0);
+                    vram_scope = std::move(other.vram_scope);
+                    vram_label = std::move(other.vram_label);
+                }
+                return *this;
+            }
         };
 
         void destroyBuffer(VmaAllocator allocator, ManagedBuffer& buf) {
@@ -152,6 +168,7 @@ namespace lfs::vis {
             out.vram_label = vram_label.empty()
                                  ? std::format("buffer.{}B", static_cast<std::size_t>(bi.size))
                                  : std::string(vram_label);
+            vmaSetAllocationName(allocator, out.allocation, out.vram_label.c_str());
             lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
                 out.vram_scope,
                 out.vram_label,
@@ -166,6 +183,12 @@ namespace lfs::vis {
             VmaAllocationInfo allocation_info{};
             std::string vram_scope;
             std::string vram_label;
+
+            ScopedStagingBuffer() = default;
+            ScopedStagingBuffer(const ScopedStagingBuffer&) = delete;
+            ScopedStagingBuffer& operator=(const ScopedStagingBuffer&) = delete;
+            ScopedStagingBuffer(ScopedStagingBuffer&&) = delete;
+            ScopedStagingBuffer& operator=(ScopedStagingBuffer&&) = delete;
 
             ~ScopedStagingBuffer() {
                 if (allocator != VK_NULL_HANDLE && buffer != VK_NULL_HANDLE) {
@@ -459,7 +482,10 @@ namespace lfs::vis {
             glm::ivec2 size{0, 0};
             VkImageLayout color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            // Content identity (bumped after successful submit). Not a tracker key.
             std::uint64_t generation = 0;
+            // Resource identity for VulkanImageBarrierTracker (#1478).
+            std::uint64_t image_generation = 0;
         };
         std::array<OutputSlotResources, kSlotCount> slots{};
 
@@ -1016,6 +1042,7 @@ namespace lfs::vis {
                                          "point_cloud.output[{}].color",
                                          slot_index);
             slot.color_vram_label = std::format("color.slot{}:{}x{}", slot_index, size.x, size.y);
+            vmaSetAllocationName(allocator, slot.color_alloc, "Point-cloud color target");
             lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
                 "vulkan.point_cloud.output_image",
                 slot.color_vram_label,
@@ -1074,6 +1101,7 @@ namespace lfs::vis {
                                          "point_cloud.output[{}].depth",
                                          slot_index);
             slot.depth_vram_label = std::format("depth.slot{}:{}x{}", slot_index, size.x, size.y);
+            vmaSetAllocationName(allocator, slot.depth_alloc, "Point-cloud depth target");
             lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
                 "vulkan.point_cloud.output_image",
                 slot.depth_vram_label,
@@ -1105,17 +1133,19 @@ namespace lfs::vis {
                                          "point_cloud.output[{}].depth.view",
                                          slot_index);
 
+            ++slot.image_generation;
             context->imageBarriers().registerImage(slot.color_image,
+                                                   slot.image_generation,
                                                    VK_IMAGE_ASPECT_COLOR_BIT,
                                                    VK_IMAGE_LAYOUT_UNDEFINED);
             context->imageBarriers().registerImage(slot.depth_image,
+                                                   slot.image_generation,
                                                    VK_IMAGE_ASPECT_DEPTH_BIT,
                                                    VK_IMAGE_LAYOUT_UNDEFINED);
 
             slot.size = size;
             slot.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             slot.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-            ++slot.generation;
             return {};
         }
 
@@ -1127,7 +1157,7 @@ namespace lfs::vis {
                         slot.color_vram_label,
                         0);
                 }
-                context->imageBarriers().forgetImage(slot.color_image);
+                context->imageBarriers().forgetImage(slot.color_image, slot.image_generation);
                 if (slot.color_view != VK_NULL_HANDLE) {
                     vkDestroyImageView(device, slot.color_view, nullptr);
                 }
@@ -1140,7 +1170,7 @@ namespace lfs::vis {
                         slot.depth_vram_label,
                         0);
                 }
-                context->imageBarriers().forgetImage(slot.depth_image);
+                context->imageBarriers().forgetImage(slot.depth_image, slot.image_generation);
                 if (slot.depth_view != VK_NULL_HANDLE) {
                     vkDestroyImageView(device, slot.depth_view, nullptr);
                 }
@@ -1152,6 +1182,18 @@ namespace lfs::vis {
         void destroy() {
             if (device == VK_NULL_HANDLE) {
                 return;
+            }
+            // Viewport scene descriptors sample these output views. Retire that
+            // compositor work before vkDestroyImageView (VUID-01026).
+            if (context != nullptr) {
+                if (!context->waitForSubmittedFrames()) {
+                    LOG_WARN("Point-cloud renderer teardown could not wait for submitted frames: {}",
+                             context->lastError());
+                    if (!context->deviceWaitIdle()) {
+                        LOG_WARN("Point-cloud renderer teardown could not idle device: {}",
+                                 context->lastError());
+                    }
+                }
             }
             // C3: bounded teardown drain. Non-Ready retains fence + command pool
             // (AMB-4 / AMB-C5 — quarantine never authorizes free of in-flight work).
@@ -1701,9 +1743,11 @@ namespace lfs::vis {
 
             // Transition output images for rendering.
             context->imageBarriers().transitionImage(command_buffer, slot.color_image,
+                                                     slot.image_generation,
                                                      VK_IMAGE_ASPECT_COLOR_BIT,
                                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             context->imageBarriers().transitionImage(command_buffer, slot.depth_image,
+                                                     slot.image_generation,
                                                      VK_IMAGE_ASPECT_DEPTH_BIT,
                                                      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
 
@@ -1785,9 +1829,11 @@ namespace lfs::vis {
 
             // Transition both outputs to SHADER_READ_ONLY for downstream sampling.
             context->imageBarriers().transitionImage(command_buffer, slot.color_image,
+                                                     slot.image_generation,
                                                      VK_IMAGE_ASPECT_COLOR_BIT,
                                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             context->imageBarriers().transitionImage(command_buffer, slot.depth_image,
+                                                     slot.image_generation,
                                                      VK_IMAGE_ASPECT_DEPTH_BIT,
                                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
@@ -1795,9 +1841,11 @@ namespace lfs::vis {
             const VkImageLayout previous_depth_layout = slot.depth_layout;
             const auto restore_tracked_layouts = [&]() {
                 context->imageBarriers().registerImage(slot.color_image,
+                                                       slot.image_generation,
                                                        VK_IMAGE_ASPECT_COLOR_BIT,
                                                        previous_color_layout);
                 context->imageBarriers().registerImage(slot.depth_image,
+                                                       slot.image_generation,
                                                        VK_IMAGE_ASPECT_DEPTH_BIT,
                                                        previous_depth_layout);
             };
@@ -1877,7 +1925,7 @@ namespace lfs::vis {
                                                 VK_ERROR_INITIALIZATION_FAILED);
                 return std::unexpected<std::string>(error);
             }
-            r = vkQueueSubmit(submit_queue, 1, &si, fence);
+            r = lfs::rendering::vk_queue_submit_synced(submit_queue, 1, &si, fence);
             if (r != VK_SUCCESS) {
                 restore_tracked_layouts();
                 rejectSubmissionAndMaybeReplace("vkQueueSubmit", r);
@@ -2039,6 +2087,7 @@ namespace lfs::vis {
                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             ctx.imageBarriers().transitionImage(command_buffer,
                                                 slot.color_image,
+                                                slot.image_generation,
                                                 VK_IMAGE_ASPECT_COLOR_BIT,
                                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
@@ -2058,6 +2107,7 @@ namespace lfs::vis {
 
             ctx.imageBarriers().transitionImage(command_buffer,
                                                 slot.color_image,
+                                                slot.image_generation,
                                                 VK_IMAGE_ASPECT_COLOR_BIT,
                                                 restore_layout);
             slot.color_layout = restore_layout;
@@ -2131,10 +2181,10 @@ namespace lfs::vis {
                                                 VK_ERROR_INITIALIZATION_FAILED);
                 return std::unexpected<std::string>(error);
             }
-            r = vkQueueSubmit(submit_queue, 1, &submit_info, fence);
+            r = lfs::rendering::vk_queue_submit_synced(submit_queue, 1, &submit_info, fence);
             if (r != VK_SUCCESS) {
-                rejectSubmissionAndMaybeReplace("vkQueueSubmit(point-cloud readback)", r);
-                return std::unexpected<std::string>(vkError("vkQueueSubmit(point-cloud readback)", r));
+                rejectSubmissionAndMaybeReplace("lfs::rendering::vk_queue_submit_synced(point-cloud readback)", r);
+                return std::unexpected<std::string>(vkError("lfs::rendering::vk_queue_submit_synced(point-cloud readback)", r));
             }
             {
                 using lfs::rendering::apply_submission_transition;

@@ -14,23 +14,33 @@
 #include "core/parameters.hpp"
 #include "core/tensor.hpp"
 #include "dataset.hpp"
+#include "io/project_recovery.hpp"
 #include "kernels/depth_loss.hpp"
 #include "lfs/kernels/ssim.cuh"
+#include "lfs/training/refine_scratch.hpp"
+#include "losses/mask_loss.hpp"
 #include "losses/photometric_loss.hpp"
 #include "metrics/metrics.hpp"
 #include "optimizer/scheduler.hpp"
 #include "progress.hpp"
+#include "project_snapshot_chapters.hpp"
 #include "strategies/istrategy.hpp"
+#include "training_snapshot_service.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <functional>
+#include <istream>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stop_token>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -38,9 +48,44 @@ namespace lfs::core {
     class Scene;
 }
 
+namespace lfs::vis {
+    class VisualizerImplResetTest_TrainingSnapshotCleanupTerminalizesProjectWrite_Test;
+    class VisualizerImplResetTest_TrainingSnapshotPrepareFailureTerminalizesProjectWrite_Test;
+    class VisualizerImplResetTest_TrainingSnapshotSupersedeTerminalizesOldAndCompletesNew_Test;
+    class VisualizerImplResetTest_CloseSaveRoutesTrainingSnapshotToLiveDocument_Test;
+    class VisualizerImplResetTest_TrainerOwnedSaveTargetsLiveDocumentPath_Test;
+    class VisualizerImplResetTest_StartConflictSeesDiskCheckpointAfterTrainerReplacement_Test;
+    class VisualizerImplResetTest_SaveAsRoutesThroughFinishedTrainer_Test;
+    class VisualizerImplResetTest_SaveWhilePausedTrainingRoutesThroughLiveTrainer_Test;
+    class VisualizerImplResetTest_SaveWhilePausedNoWorkerTrainerCompletes_Test;
+    class VisualizerImplResetTest_SaveWhileStoppingStillBlocksUntilSnapshotPublished_Test;
+    class VisualizerImplResetTest_SaveWhileTrainerWriterInFlightQueuesUntilCompletion_Test;
+    class VisualizerImplResetTest_TemporaryPauseRequestIsObservedAtNextSafePoint_Test;
+    class VisualizerImplResetTest_SaveAsWhilePausedTrainingRoutesThroughLiveTrainer_Test;
+    class VisualizerImplResetTest_SaveAsRoutesThroughFailedTerminalSnapshotAftermath_Test;
+    class VisualizerImplResetTest_InfoSurvivesFailedTerminalSnapshotAftermath_Test;
+    class VisualizerImplResetTest_AdoptCompletedTrainingSnapshotSkipsOpenWhenCountersEqual_Test;
+    class VisualizerImplResetTest_AdoptedStepBoundaryPublishRebasesAutosaveBase_Test;
+    class VisualizerImplResetTest_LightAutosaveRebasesWhenSnapshotCountersMissNewMaster_Test;
+    class VisualizerImplResetTest_ExplicitSaveAfterUnadoptedTrainerAppendUsesCurrentHead_Test;
+    class VisualizerImplResetTest_ExplicitSaveAfterTrainerRewriteUsesCurrentHead_Test;
+    class VisualizerImplResetTest_UntitledTrainerRewriteAdoptThenSaveAsUsesCurrentHead_Test;
+    class VisualizerImplResetTest_EditModeSaveRetainsUnboundCheckpointHistory_Test;
+    class VisualizerImplResetTest_UntitledTrainingSnapshotAdoptionRegistersProjectInMru_Test;
+    class VisualizerImplResetTest_SaveAsAfterAutoCreatedTrainingKeepsOriginalAndCheckpoint_Test;
+    class VisualizerImplResetTest_CompletedAutoCreatedTrainingSavesRealMasterOnClose_Test;
+    class VisualizerImplResetTest_SaveAsAfterUntitledTrainingRoutesThroughFinishedTrainer_Test;
+} // namespace lfs::vis
+
+namespace lfs::vis::project {
+    class ProjectLifecycle;
+}
+
 namespace lfs::training {
     class AdamOptimizer;
+    struct TrainerBilateralGridTestAccess;
     struct TrainerRetryTestAccess;
+    struct TrainerCropboxMaskTestAccess;
     struct PPISPFileMetadata;
 
     struct PPISPViewportOverrides {
@@ -98,11 +143,52 @@ namespace lfs::training {
             bool used_mask = false;
         };
 
-        // Legacy constructor - takes ownership of strategy and shares datasets
-        Trainer(std::shared_ptr<CameraDataset> dataset,
-                std::unique_ptr<IStrategy> strategy,
-                std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>> provided_splits);
+        struct CameraMetricsInputCacheEntry {
+            int camera_uid = -1;
+            std::filesystem::path image_path;
+            std::filesystem::path mask_path;
+            GTLoadConfigSnapshot gt_config{};
+            int mask_mode = 0;
+            bool use_alpha_as_mask = false;
+            bool invert_masks = false;
+            float mask_threshold = 0.0f;
+            bool undistort_prepared = false;
+            lfs::core::Tensor gt_image;
+            lfs::core::Tensor mask;
+            std::uint64_t last_used = 0;
+        };
 
+        struct ProjectSnapshotRuntimeMetrics {
+            TrainingSnapshotServiceMetrics capture;
+            std::filesystem::path last_path;
+            std::string last_writer_error;
+            double pre_snapshot_step_mean_ms = 0.0;
+            double post_resume_step_mean_ms = 0.0;
+            double post_resume_step_regression_percent = 0.0;
+            int pre_snapshot_step_first_iteration = 0;
+            int pre_snapshot_step_last_iteration = 0;
+            std::size_t pre_snapshot_step_samples = 0;
+            int post_resume_step_first_iteration = 0;
+            int post_resume_step_last_iteration = 0;
+            std::size_t post_resume_step_samples = 0;
+            bool step_regression_gate_evaluated = false;
+            bool step_regression_within_gate = false;
+            bool writer_in_flight = false;
+            bool request_pending = false;
+            std::uint64_t
+                last_completed_request_id = 0;
+            std::uint64_t
+                last_failed_request_id = 0;
+            std::uint64_t
+                last_autosave_sequence = 0;
+            bool last_completed_was_autosave =
+                false;
+        };
+
+        enum class ProjectSnapshotWriteKind {
+            Explicit,
+            Autosave,
+        };
         /**
          * @brief Constructor - takes Scene reference (Scene owns all data)
          *
@@ -136,13 +222,40 @@ namespace lfs::training {
         // Control methods for GUI interaction
         void request_pause() { pause_requested_ = true; }
         void request_resume() { pause_requested_ = false; }
-        void request_save() { save_requested_ = true; }
+        [[nodiscard]] std::uint64_t
+        request_project_save(
+            std::filesystem::path path = {},
+            std::vector<std::byte> preview_png = {},
+            std::optional<ProjectSnapshotDocumentContext>
+                document_context = std::nullopt);
+        // Queue helper used by request-machinery tests. Production training
+        // autosave is light-only (ProjectLifecycle::startAutosave) and must
+        // never reach GPU checkpoint capture; consume/prepare fail closed.
+        [[nodiscard]] std::uint64_t
+        request_project_autosave(
+            std::filesystem::path master_path,
+            lfs::core::Uuid
+                base_explicit_commit_uuid,
+            std::uint64_t autosave_sequence,
+            std::optional<
+                ProjectSnapshotDocumentContext>
+                document_context =
+                    std::nullopt);
+        void cancel_project_snapshot_request(
+            std::uint64_t request_id,
+            const lfs::Error& reason);
+        void set_recovery_session(
+            lfs::io::project::RecoverySession session) {
+            recovery_session_.emplace(
+                std::move(session));
+        }
         void request_stop() { stop_requested_ = true; }
 
         bool is_paused() const { return is_paused_.load(); }
         bool is_running() const { return is_running_.load(); }
         bool is_training_complete() const { return training_complete_.load(); }
         bool has_stopped() const { return stop_requested_.load(); }
+        bool is_saving_model() const { return saving_model_.load(std::memory_order_acquire); }
 
         // Set Python script paths to execute once before training; scripts register per-iteration callbacks.
         void set_python_scripts(std::vector<std::filesystem::path> scripts) {
@@ -156,6 +269,7 @@ namespace lfs::training {
         float get_current_loss() const { return current_loss_.load(); }
         bool fillCameraLossColors(const std::vector<std::shared_ptr<const lfs::core::Camera>>& cameras,
                                   std::vector<std::array<float, 3>>& colors) const;
+        [[nodiscard]] std::uint64_t cameraLossColorGeneration() const;
 
         // just for viewer to get model
         const IStrategy& get_strategy() const { return *strategy_; }
@@ -197,9 +311,34 @@ namespace lfs::training {
             return params_;
         }
         void setParams(const lfs::core::param::TrainingParameters& params);
+        void set_lpips_weights_path(std::optional<std::filesystem::path> path);
         void setSplatTensorAllocator(lfs::core::SplatTensorAllocator allocator) {
             splat_tensor_allocator_ = std::move(allocator);
         }
+
+        /// densify re-encodes pad-dropped q16 into the live
+        /// exportable block. TrainerManager installs begin/end that drop the
+        /// Vulkan import for the exclusive densify window and re-import after
+        /// commit — same exclusion principle as growExportableForDensify.
+        /// Headless leaves both empty (no-op).
+        void setExportableDensifyBarrier(std::function<bool()> begin,
+                                         std::function<bool()> end) {
+            exportable_densify_barrier_begin_ = std::move(begin);
+            exportable_densify_barrier_end_ = std::move(end);
+        }
+
+        enum class ExportableDensifyBarrierBegin {
+            NotInstalled,
+            Acquired,
+            Failed,
+        };
+
+        /// Begin densify-window Vulkan exclusion. Headless callers proceed on
+        /// NotInstalled; Failed means the mutation must be aborted.
+        [[nodiscard]] ExportableDensifyBarrierBegin beginExportableDensifyBarrier();
+        /// Release one nesting level. A failed outermost callback is logged and
+        /// stops training because the post-mutation device state is not known safe.
+        [[nodiscard]] bool endExportableDensifyBarrier();
 
         void setOnIterationStart(std::function<void()> cb) { on_iteration_start_ = std::move(cb); }
 
@@ -224,7 +363,12 @@ namespace lfs::training {
         /// Check if PPISP is enabled, initialized, and ready for rendering
         bool hasPPISP() const {
             const auto params = getParams();
-            return ppisp_ != nullptr && params.optimization.use_ppisp && ppisp_->isFinalized();
+            return ppisp_ != nullptr && params.optimization.ppisp_active() && ppisp_->isFinalized();
+        }
+
+        /// Held-out eval appearance hook is installed iff PPISP was enabled and finalized.
+        [[nodiscard]] bool hasEvalAppearance() const {
+            return evaluator_ && evaluator_->has_appearance();
         }
 
         /// Check if PPISP controller is enabled and ready for novel views
@@ -238,17 +382,88 @@ namespace lfs::training {
         std::unique_ptr<PPISP> takePPISP() { return std::move(ppisp_); }
         std::unique_ptr<PPISPControllerPool> takePPISPControllerPool() { return std::move(ppisp_controller_pool_); }
 
-        // Checkpoint methods
-        std::expected<void, std::string> save_checkpoint(int iteration);
-        std::expected<void, std::string> save_checkpoint_to(const std::filesystem::path& output_path, int iteration);
+        // Project persistence. Standalone LFKP files are import-only; saves
+        // always publish a .licht generation.
+        // Trainer-initiated project writes are off by default; the owner that
+        // manages project persistence opts in per trigger. Explicit save requests
+        // (request_project_save / save_project_to with a destination) are not
+        // affected by this policy.
+        struct TrainerProjectSavePolicy {
+            bool on_completion = false;      // terminal save when training reaches its target
+            bool on_stop_or_error = false;   // terminal save on user stop or training error
+            bool at_step_boundaries = false; // save_steps + sparsity phase boundary
+        };
+        void set_trainer_project_save_policy(TrainerProjectSavePolicy policy);
+        [[nodiscard]] TrainerProjectSavePolicy
+        trainer_project_save_policy() const;
+        [[nodiscard]] std::optional<std::filesystem::path>
+        bound_project_path() const;
+        void set_live_project_snapshot(
+            std::optional<std::filesystem::path> path,
+            std::function<std::optional<
+                ProjectSnapshotDocumentContext>()>
+                context_provider = {},
+            std::optional<std::filesystem::path> headless_source_path = std::nullopt);
+        [[nodiscard]] bool can_flush_project_snapshot() const {
+            return project_snapshot_service_ && strategy_ &&
+                   scene_;
+        }
+        void restore_current_loss(const float loss) {
+            current_loss_.store(loss);
+        }
+        void set_pending_snapshot_finish_reason(
+            lfs::io::project::TrainingFinishReason reason) {
+            pending_snapshot_finish_reason_ = reason;
+        }
+        std::expected<std::filesystem::path, std::string>
+        save_project_to(
+            const std::filesystem::path& path,
+            int iteration,
+            std::optional<ProjectSnapshotDocumentContext>
+                document_context = std::nullopt);
         std::expected<int, std::string> load_checkpoint(const std::filesystem::path& checkpoint_path);
-        void save_final_ply_and_checkpoint(int iteration);
+        CheckpointLoadResult load_checkpoint(
+            std::istream& source,
+            std::uint64_t source_bytes,
+            std::string_view source_name = "embedded CKPT",
+            lfs::core::SplatData* preloaded_model = nullptr);
+        [[nodiscard]] ProjectSnapshotRuntimeMetrics
+        get_project_snapshot_metrics() const;
 
         // Orderly shutdown - GPU sync, wait for async saves, release resources. Idempotent.
         void shutdown();
 
     private:
+        friend class lfs::vis::VisualizerImplResetTest_TrainingSnapshotCleanupTerminalizesProjectWrite_Test;
+        friend class lfs::vis::VisualizerImplResetTest_TrainingSnapshotPrepareFailureTerminalizesProjectWrite_Test;
+        friend class lfs::vis::VisualizerImplResetTest_TrainingSnapshotSupersedeTerminalizesOldAndCompletesNew_Test;
+        friend class lfs::vis::VisualizerImplResetTest_CloseSaveRoutesTrainingSnapshotToLiveDocument_Test;
+        friend class lfs::vis::VisualizerImplResetTest_TrainerOwnedSaveTargetsLiveDocumentPath_Test;
+        friend class lfs::vis::VisualizerImplResetTest_StartConflictSeesDiskCheckpointAfterTrainerReplacement_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveAsRoutesThroughFinishedTrainer_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveWhilePausedTrainingRoutesThroughLiveTrainer_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveWhilePausedNoWorkerTrainerCompletes_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveWhileStoppingStillBlocksUntilSnapshotPublished_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveWhileTrainerWriterInFlightQueuesUntilCompletion_Test;
+        friend class lfs::vis::VisualizerImplResetTest_TemporaryPauseRequestIsObservedAtNextSafePoint_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveAsWhilePausedTrainingRoutesThroughLiveTrainer_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveAsRoutesThroughFailedTerminalSnapshotAftermath_Test;
+        friend class lfs::vis::VisualizerImplResetTest_InfoSurvivesFailedTerminalSnapshotAftermath_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AdoptCompletedTrainingSnapshotSkipsOpenWhenCountersEqual_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AdoptedStepBoundaryPublishRebasesAutosaveBase_Test;
+        friend class lfs::vis::VisualizerImplResetTest_LightAutosaveRebasesWhenSnapshotCountersMissNewMaster_Test;
+        friend class lfs::vis::VisualizerImplResetTest_ExplicitSaveAfterUnadoptedTrainerAppendUsesCurrentHead_Test;
+        friend class lfs::vis::VisualizerImplResetTest_ExplicitSaveAfterTrainerRewriteUsesCurrentHead_Test;
+        friend class lfs::vis::VisualizerImplResetTest_UntitledTrainerRewriteAdoptThenSaveAsUsesCurrentHead_Test;
+        friend class lfs::vis::VisualizerImplResetTest_EditModeSaveRetainsUnboundCheckpointHistory_Test;
+        friend class lfs::vis::VisualizerImplResetTest_UntitledTrainingSnapshotAdoptionRegistersProjectInMru_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveAsAfterAutoCreatedTrainingKeepsOriginalAndCheckpoint_Test;
+        friend class lfs::vis::VisualizerImplResetTest_CompletedAutoCreatedTrainingSavesRealMasterOnClose_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveAsAfterUntitledTrainingRoutesThroughFinishedTrainer_Test;
+        friend class lfs::vis::project::ProjectLifecycle;
+        friend struct TrainerBilateralGridTestAccess;
         friend struct TrainerRetryTestAccess;
+        friend struct TrainerCropboxMaskTestAccess;
 
         // Helper for deferred event emission to prevent deadlocks
         struct DeferredEvents {
@@ -298,6 +513,13 @@ namespace lfs::training {
         // Returns empty tensor if no background image is set
         lfs::core::Tensor get_background_image_for_camera(int width, int height);
         void clearBackgroundImageCache();
+        lfs::core::Tensor get_edge_weight_map(int camera_uid, const lfs::core::Tensor& gt_image);
+        void clearEdgeWeightCache();
+
+        // Release GPU state that is only needed while a train step is active.
+        // The model, optimizer, and source background image remain resident so
+        // a finished/stopped trainer can be resumed without reinitialization.
+        void release_training_transient_state_at_boundary();
 
         lfs::core::Tensor get_random_background_for_camera(int width, int height, int iteration);
 
@@ -306,7 +528,6 @@ namespace lfs::training {
             int iter,
             lfs::core::Camera* cam,
             lfs::core::Tensor gt_image,
-            RenderMode render_mode,
             std::stop_token stop_token = {});
 
         [[nodiscard]] static RetryDecision classify_forward_retry(
@@ -345,6 +566,7 @@ namespace lfs::training {
             lfs::core::Tensor grad_corrected;
             lfs::core::Tensor grad_raw;
             lfs::core::Tensor grad_alpha;
+            lfs::core::Tensor normal_pixel_weight;
         };
 
         // Masked photometric loss with optional alpha gradient
@@ -381,6 +603,11 @@ namespace lfs::training {
         void install_cropbox_step_damping(
             lfs::core::SplatData& model,
             AdamOptimizer& optimizer);
+        [[nodiscard]] bool morton_reorder_due(int iter) const;
+        void maybe_morton_reorder(int iter);
+        [[nodiscard]] bool normal_supervision_active(int iter) const {
+            return params_.optimization.normal_supervision_active(iter);
+        }
 
         // Cleanup method for re-initialization
         void cleanup();
@@ -400,34 +627,64 @@ namespace lfs::training {
             const std::filesystem::path& sidecar_path) const;
         [[nodiscard]] bool is_ppisp_frozen() const {
             const auto params = getParams();
-            return params.optimization.use_ppisp &&
+            return params.optimization.ppisp_active() &&
                    params.optimization.ppisp_freeze_from_sidecar;
         }
         [[nodiscard]] bool should_apply_ppisp_sidecar_on_init() const {
             const auto params = getParams();
-            return params.optimization.use_ppisp &&
+            return params.optimization.ppisp_active() &&
                    params.optimization.ppisp_freeze_from_sidecar &&
                    !params.resume_checkpoint.has_value() &&
+                   !params.resume_project.has_value() &&
                    !params.optimization.ppisp_sidecar_path.empty();
         }
         [[nodiscard]] PPISPControllerPool* controller_pool_for_save(int iteration) const;
-        [[nodiscard]] lfs::core::param::TrainingParameters params_for_checkpoint_save() const;
+        lfs::core::Tensor applyPPISPForEval(const lfs::core::Tensor& rgb, const lfs::core::Camera& cam) const;
+        [[nodiscard]] lfs::core::param::TrainingParameters params_for_project_snapshot() const;
         [[nodiscard]] TrainingProgress::Phase get_progress_phase(
             int iter,
             bool in_controller_phase = false) const;
 
         // Handle control requests
         void handle_control_requests(int iter, std::stop_token stop_token = {});
+        void prepare_project_snapshot_at_safe_point(
+            int capture_iteration,
+            const std::filesystem::path& path,
+            std::vector<std::byte> preview_png = {},
+            std::uint64_t request_id = 0,
+            ProjectSnapshotWriteKind write_kind =
+                ProjectSnapshotWriteKind::Explicit,
+            lfs::core::Uuid
+                base_explicit_commit_uuid = {},
+            std::uint64_t autosave_sequence = 0);
+        [[nodiscard]] lfs::Result<
+            std::shared_ptr<ProjectSnapshotChapters>>
+        reserve_project_snapshot_chapters() const;
+        [[nodiscard]] lfs::Result<void>
+        initialize_project_snapshot_service();
+        void capture_project_snapshot_at_safe_point(int iteration);
+        void consume_requested_project_snapshot(int iteration);
+        [[nodiscard]] int project_snapshot_iteration() const;
+        void attach_live_document_context(
+            std::optional<ProjectSnapshotDocumentContext>&
+                document_context) const;
+        void observe_training_step_duration(
+            int iteration,
+            double elapsed_ms,
+            bool topology_changed);
+        void join_finished_project_writer();
+        void finish_project_writer();
+        void fail_project_request_locked(
+            std::uint64_t request_id,
+            std::string_view message);
+        void abandon_pending_project_requests(
+            std::string_view reason);
+        void clear_prepared_project_request();
         void apply_pending_params_at_safe_point();
         void apply_param_side_effects(
             const lfs::core::param::TrainingParameters& params,
             bool background_image_path_changed);
 
-        std::expected<void, std::string> save_ply(const std::filesystem::path& save_path,
-                                                  const std::string& filename,
-                                                  int iter_num,
-                                                  bool join_threads = true,
-                                                  bool save_checkpoint = true);
         void updateGTLoadConfigSnapshot();
         void clearActiveImageLoader();
 
@@ -439,6 +696,7 @@ namespace lfs::training {
             lfs::core::Tensor ema_loss_stage_cpu;
             std::vector<std::array<float, 3>> published_colors;
             std::vector<uint8_t> published_valid;
+            std::uint64_t published_generation = 0;
             mutable std::shared_mutex snapshot_mutex;
             cudaStream_t copy_stream = nullptr;
             cudaEvent_t ready_event = nullptr;
@@ -457,7 +715,6 @@ namespace lfs::training {
             std::string_view reason);
 
         lfs::core::Scene* scene_ = nullptr;
-        std::shared_ptr<CameraDataset> base_dataset_;
         std::shared_ptr<CameraDataset> train_dataset_;
         std::shared_ptr<CameraDataset> val_dataset_;
         std::shared_ptr<lfs::io::PipelinedImageLoader> active_image_loader_;
@@ -468,7 +725,6 @@ namespace lfs::training {
         lfs::core::param::TrainingParameters params_;
         std::optional<lfs::core::param::TrainingParameters> pending_params_;
         lfs::core::SplatTensorAllocator splat_tensor_allocator_;
-        std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>> provided_splits_;
 
         lfs::core::Tensor background_{};
         lfs::core::Tensor bg_mix_buffer_;
@@ -486,10 +742,10 @@ namespace lfs::training {
         lfs::core::Tensor random_bg_buffer_{}; // Reusable buffer for random background
         std::unique_ptr<TrainingProgress> progress_;
         size_t train_dataset_size_ = 0;
-        size_t total_cameras_count_ = 0;
         std::shared_ptr<CameraLossHeatmapState> camera_loss_heatmap_;
 
         // Pre-loaded mask from pipelined dataloader (used in train_step)
+        // Sidecars are not ring-backed; if that changes, carry their ring lease here too.
         lfs::core::Tensor pipelined_mask_;
         lfs::core::Tensor pipelined_depth_;
         lfs::core::Tensor pipelined_normal_;
@@ -499,18 +755,107 @@ namespace lfs::training {
 
         // PPISP for physically-plausible ISP appearance modeling (optional)
         std::unique_ptr<PPISP> ppisp_;
+        // Train-set EXIF EV mean used by seed_exposure (0.5 * (ev - mean)). Unset
+        // when the seed was skipped or disabled; eval then uses exposure 0.
+        std::optional<float> ppisp_exif_exposure_mean_;
+        mutable std::atomic<int> eval_ppisp_applied_{0};
+        mutable std::atomic<int> eval_ppisp_exif_{0};
 
-        // PPISP controller pool for novel view synthesis (Phase 2 distillation)
+        // PPISP controller pool for novel-view distillation.
         // Shared CNN and per-camera FC weights for memory efficiency
         std::unique_ptr<PPISPControllerPool> ppisp_controller_pool_;
 
         std::unique_ptr<ISparsityOptimizer> sparsity_optimizer_;
+
+        std::unique_ptr<TrainingSnapshotService>
+            project_snapshot_service_;
+        std::optional<PreparedTrainingSnapshot>
+            prepared_project_snapshot_;
+        std::shared_ptr<ProjectSnapshotChapters>
+            prestaged_project_chapters_;
+        std::uint64_t
+            prestaged_project_request_id_ = 0;
+        std::filesystem::path prepared_project_path_;
+        std::vector<std::byte>
+            prepared_project_preview_png_;
+        int prepared_project_iteration_ = 0;
+        std::uint64_t
+            prepared_project_request_id_ = 0;
+        ProjectSnapshotWriteKind
+            prepared_project_write_kind_ =
+                ProjectSnapshotWriteKind::
+                    Explicit;
+        lfs::core::Uuid
+            prepared_project_base_commit_uuid_;
+        std::uint64_t
+            prepared_project_autosave_sequence_ = 0;
+        lfs::core::Uuid project_uuid_;
+        std::jthread project_writer_thread_;
+        std::atomic<bool> project_writer_done_{true};
+        std::atomic<bool> project_writer_in_flight_{false};
+        mutable std::mutex project_snapshot_mutex_;
+        std::optional<std::filesystem::path>
+            requested_project_path_;
+        std::vector<std::byte>
+            requested_project_preview_png_;
+        std::optional<std::uint64_t>
+            requested_project_request_id_;
+        ProjectSnapshotWriteKind
+            requested_project_write_kind_ =
+                ProjectSnapshotWriteKind::
+                    Explicit;
+        lfs::core::Uuid
+            requested_project_base_commit_uuid_;
+        std::uint64_t
+            requested_project_autosave_sequence_ = 0;
+        std::uint64_t
+            next_project_snapshot_request_id_ = 1;
+        std::uint64_t
+            last_completed_project_request_id_ =
+                0;
+        std::uint64_t
+            last_failed_project_request_id_ = 0;
+        std::uint64_t
+            last_completed_autosave_sequence_ = 0;
+        std::optional<
+            lfs::io::project::RecoverySession>
+            recovery_session_;
+        bool last_completed_was_autosave_ =
+            false;
+        TrainingStepRegressionTracker
+            project_step_regression_;
+        std::filesystem::path last_project_snapshot_path_;
+        std::string last_project_writer_error_;
+        std::optional<lfs::Error>
+            last_project_writer_typed_error_;
+        std::optional<std::filesystem::path>
+            live_project_path_;
+        // Used only to seed a fresh headless destination; never a GUI context.
+        std::optional<std::filesystem::path> headless_project_source_path_;
+        TrainerProjectSavePolicy trainer_project_save_policy_{};
+        std::function<std::optional<
+            ProjectSnapshotDocumentContext>()>
+            live_document_context_provider_;
+        lfs::io::project::TrainingFinishReason
+            pending_snapshot_finish_reason_ =
+                lfs::io::project::
+                    TrainingFinishReason::None;
 
         // Persistent photometric loss (workspace reuse across iterations)
         lfs::training::losses::PhotometricLoss photometric_loss_;
 
         // Cached GPU scalar to avoid per-iteration allocation
         core::Tensor loss_accumulator_;
+        // persistent FastGS scale/opacity reg loss scalars (filled in fused bwd)
+        core::Tensor fused_scale_reg_loss_;
+        core::Tensor fused_opacity_reg_loss_;
+        // cropbox damping mask cache (rebuild on cropbox/topology change only)
+        core::Tensor cropbox_damping_cached_mask_;
+        size_t cropbox_damping_cached_n_ = 0;
+        size_t cropbox_damping_geom_fp_ = 0;
+        float cropbox_damping_cached_scale_ = 1.0f;
+        bool cropbox_damping_cache_valid_ = false;
+        std::uint64_t cropbox_damping_rebuild_count_ = 0;
         core::Tensor depth_loss_scalar_;
         core::Tensor depth_loss_grad_;
         core::Tensor depth_loss_grad_alpha_;
@@ -537,18 +882,38 @@ namespace lfs::training {
 
         // Pre-allocated SSIM-map workspace for densification error maps.
         lfs::training::kernels::SSIMMapWorkspace densification_ssim_workspace_;
-        lfs::training::kernels::MaskedFusedL1SSIMWorkspace masked_fused_workspace_;
-        lfs::training::kernels::DecoupledFusedL1SSIMWorkspace decoupled_fused_workspace_;
-        lfs::training::kernels::MaskedDecoupledFusedL1SSIMWorkspace masked_decoupled_fused_workspace_;
+        // masked / decoupled / fused / pure-SSIM workspaces live in
+        // photometric_loss_.arena() (mutually exclusive, single grow-only region).
+
+        // Mask preprocess workspace: photometric weight / opacity penalty / alpha-consistent
+        // (fused kernels; grow-only for allocation-free steady state when masks/ROI on).
+        lfs::training::losses::MaskPreprocessWorkspace mask_preprocess_workspace_;
 
         // Pre-allocated error map buffer for densification (avoids per-iteration allocation)
         core::Tensor densification_error_map_;
 
         // Reusable buffer for Sobel edge map (lfs edge-importance densification)
         core::Tensor edge_map_buffer_;
+        struct EdgeWeightCacheEntry {
+            core::Tensor tensor;
+            size_t height = 0;
+            size_t width = 0;
+            size_t allocation_bytes = 0;
+            uint64_t preprocessing_generation = 0;
+            uint64_t last_used = 0;
+        };
+        static constexpr size_t EDGE_WEIGHT_CACHE_MAX_ENTRIES = 32;
+        static constexpr size_t EDGE_WEIGHT_CACHE_BUDGET_BYTES = 40ULL * 1024 * 1024;
+        std::unordered_map<int, EdgeWeightCacheEntry> edge_weight_cache_;
+        size_t edge_weight_cache_bytes_ = 0;
+        uint64_t edge_weight_cache_clock_ = 0;
+        uint64_t edge_weight_preprocessing_generation_ = 0;
+        bool edge_weight_scoring_active_ = false;
+        PositiveMedianScratch edge_weight_median_scratch_;
 
         // Metrics evaluator - handles all evaluation logic
         std::unique_ptr<lfs::training::MetricsEvaluator> evaluator_;
+        std::optional<std::filesystem::path> lpips_weights_path_;
 
         // Single mutex that protects the model during training
         mutable std::shared_mutex render_mutex_;
@@ -559,14 +924,17 @@ namespace lfs::training {
         mutable std::mutex active_image_loader_mutex_;
         mutable std::mutex camera_loss_heatmap_mutex_;
         mutable std::mutex gt_load_config_mutex_;
+        mutable std::mutex camera_metrics_input_cache_mutex_;
+        std::list<CameraMetricsInputCacheEntry> camera_metrics_input_cache_;
+        std::uint64_t camera_metrics_input_cache_clock_ = 0;
 
         // Control flags for thread communication
         std::atomic<bool> pause_requested_{false};
-        std::atomic<bool> save_requested_{false};
         std::atomic<bool> stop_requested_{false};
         std::atomic<bool> is_paused_{false};
         std::atomic<bool> is_running_{false};
         std::atomic<bool> training_complete_{false};
+        std::atomic<bool> saving_model_{false};
         std::atomic<bool> ready_to_start_{false};
         std::atomic<bool> initialized_{false};
         std::atomic<bool> shutdown_complete_{false};
@@ -641,7 +1009,7 @@ namespace lfs::training {
         std::array<LossReadbackSlot, LOSS_RING> loss_slots_{};
         size_t loss_slot_head_ = 0;
 
-        // Always-compiled fault-injection seam used only by the Phase 5 OOM
+        // Always-compiled fault-injection seam used only by the OOM
         // recovery tests. Empty in production, where cudaDeviceSynchronize is
         // called directly.
         std::function<cudaError_t()> recovery_sync_for_testing_;
@@ -653,6 +1021,51 @@ namespace lfs::training {
         std::vector<std::filesystem::path> python_scripts_;
 
         std::function<void()> on_iteration_start_;
+        std::function<bool()> exportable_densify_barrier_begin_;
+        std::function<bool()> exportable_densify_barrier_end_;
+        int exportable_densify_barrier_depth_ = 0;
         GTLoadConfigSnapshot gt_load_config_snapshot_;
+    };
+
+    enum class StaleTrainerDefaultRecovery : std::uint8_t {
+        FailLoudly,
+        RelocateAndFirstSave,
+    };
+
+    [[nodiscard]] constexpr StaleTrainerDefaultRecovery
+    stale_trainer_default_recovery(
+        const bool adopt_container_identity,
+        const bool open_failed,
+        const std::optional<lfs::ErrorCode> save_error) noexcept {
+        if (!adopt_container_identity) {
+            return StaleTrainerDefaultRecovery::FailLoudly;
+        }
+        if (open_failed ||
+            save_error == lfs::ErrorCode::Unsupported) {
+            return StaleTrainerDefaultRecovery::
+                RelocateAndFirstSave;
+        }
+        return StaleTrainerDefaultRecovery::FailLoudly;
+    }
+
+    [[nodiscard]] lfs::Result<std::filesystem::path>
+    relocate_unreadable_trainer_default_project(
+        const std::filesystem::path& destination,
+        const lfs::Error& cause);
+
+    // test hook for cropbox damping mask cache.
+    struct TrainerCropboxMaskTestAccess {
+        static void install(Trainer& t, core::SplatData& model, AdamOptimizer& optimizer) {
+            t.install_cropbox_step_damping(model, optimizer);
+        }
+        static void set_cropbox_lr_scale(Trainer& t, float scale) {
+            t.params_.optimization.cropbox_lr_scale = scale;
+        }
+        [[nodiscard]] static std::uint64_t rebuild_count(const Trainer& t) noexcept {
+            return t.cropbox_damping_rebuild_count_;
+        }
+        static void reset_rebuild_count(Trainer& t) noexcept {
+            t.cropbox_damping_rebuild_count_ = 0;
+        }
     };
 } // namespace lfs::training

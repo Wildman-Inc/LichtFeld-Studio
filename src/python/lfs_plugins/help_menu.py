@@ -5,6 +5,7 @@
 import lichtfeld as lf
 from .types import Operator
 from .layouts.menus import register_menu, menu_operator, menu_separator
+from .bug_report_panel import request_bug_report_open
 
 __lfs_menu_classes__ = ["HelpMenu"]
 
@@ -20,7 +21,7 @@ class GettingStartedOperator(Operator):
 
 class SetDefaultAppOperator(Operator):
     label = "file_association.menu_register"
-    description = "Open Windows default app settings for splat files (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz)"
+    description = "Open Windows default app settings for splat and project files (.ply, .sog, .ssog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht)"
 
     def execute(self, context) -> set:
         lf.ui.register_file_associations()
@@ -46,6 +47,51 @@ class AboutOperator(Operator):
         return {"FINISHED"}
 
 
+class GalleryTransfersOperator(Operator):
+    label = "gallery.transfer.action.details"
+    description = "Open the Projects panel"
+
+    def execute(self, context) -> set:
+        from .gallery_transfer_ui import open_projects_panel
+        open_projects_panel()
+        return {"FINISHED"}
+
+
+class PortalConnectionOperator(Operator):
+    label = "portal.status.connect"
+    description = "Connect or disconnect the LichtFeld Portal account"
+
+    def execute(self, context) -> set:
+        from .portal_account import get_portal_account_service
+
+        account = get_portal_account_service()
+        state = account.snapshot()
+        if state.disconnecting:
+            return {"FINISHED"}
+        if state.linking:
+            account.cancel_device_flow()
+        elif state.signed_in:
+            from .gallery_sync import get_gallery_sync
+
+            if get_gallery_sync().snapshot().get("relink_required"):
+                account.start_device_flow(reauthorize=True)
+            else:
+                account.disconnect_async()
+        else:
+            account.start_device_flow()
+        return {"FINISHED"}
+
+
+class BugReportOperator(Operator):
+    label = "bugreport.menu"
+    description = "Open the in-app bug report form"
+
+    def execute(self, context) -> set:
+        request_bug_report_open()
+        lf.ui.set_panel_enabled("lfs.bug_report", True)
+        return {"FINISHED"}
+
+
 @register_menu
 class HelpMenu:
     """Help menu for the menu bar."""
@@ -60,14 +106,18 @@ class HelpMenu:
             items.append(menu_separator())
             items.append(menu_operator(SetDefaultAppOperator))
         items.append(menu_separator())
+        items.append(menu_operator(BugReportOperator))
         items.append(menu_operator(AboutOperator))
         return items
 
 
 _operator_classes = [
+    GalleryTransfersOperator,
     GettingStartedOperator,
     SetDefaultAppOperator,
     UnsetDefaultAppOperator,
+    PortalConnectionOperator,
+    BugReportOperator,
     AboutOperator,
 ]
 

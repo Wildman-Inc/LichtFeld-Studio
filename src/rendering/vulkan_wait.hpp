@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <stop_token>
 #include <string_view>
 #include <vulkan/vulkan.h>
@@ -88,6 +89,50 @@ namespace lfs::rendering {
                                 std::uint64_t candidate_timeline = 0) noexcept;
 
     // ---------------------------------------------------------------------------
+    // GUI-frame timeline wait accounting (#1721)
+    //
+    // A Vulkan timeline wait is satisfied when the counter is >= the requested
+    // value, so repeating an already-covered wait is a no-op. The GUI present
+    // path re-requests the last VkSplat completion on frames that did not bump
+    // the timeline. Treating that as a contract violation made endFrame refuse
+    // submit, set framebuffer_resized_, and never recover.
+    //
+    // committed: last value included in a successful graphics-queue submit.
+    // pending:   max value queued on the current unsubmitted frame.
+    // ---------------------------------------------------------------------------
+
+    enum class FrameTimelineWaitAction : std::uint8_t {
+        Queue,            // requested > covered; add to this frame's submit
+        AlreadySatisfied, // requested <= covered; skip the wait
+    };
+
+    struct FrameTimelineWaitCursor {
+        std::uint64_t committed = 0;
+        std::uint64_t pending = 0;
+
+        [[nodiscard]] constexpr std::uint64_t covered() const noexcept {
+            return committed > pending ? committed : pending;
+        }
+
+        constexpr FrameTimelineWaitAction note(const std::uint64_t value) noexcept {
+            if (value <= covered()) {
+                return FrameTimelineWaitAction::AlreadySatisfied;
+            }
+            pending = value;
+            return FrameTimelineWaitAction::Queue;
+        }
+
+        constexpr void submit_accepted() noexcept {
+            if (pending > committed) {
+                committed = pending;
+            }
+            pending = 0;
+        }
+
+        constexpr void submit_rejected() noexcept { pending = 0; }
+    };
+
+    // ---------------------------------------------------------------------------
     // Vulkan PFN dispatch seam (Amendment 2: every begin→submit path call)
     // ---------------------------------------------------------------------------
 
@@ -105,17 +150,40 @@ namespace lfs::rendering {
         PFN_vkCmdPipelineBarrier2 cmd_pipeline_barrier2 = nullptr;
         PFN_vkCmdResetQueryPool cmd_reset_query_pool = nullptr;
         PFN_vkCmdWriteTimestamp cmd_write_timestamp = nullptr;
+        PFN_vkGetQueryPoolResults get_query_pool_results = nullptr;
         PFN_vkQueueSubmit queue_submit = nullptr;
         PFN_vkQueueWaitIdle queue_wait_idle = nullptr;
 
+        // Compute dispatch / transfer recording (epic #1496 tagged path + untagged seam)
+        PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
+        PFN_vkCmdPushConstants cmd_push_constants = nullptr;
+        PFN_vkCmdDispatch cmd_dispatch = nullptr;
+        PFN_vkCmdDispatchIndirect cmd_dispatch_indirect = nullptr;
+        PFN_vkCmdFillBuffer cmd_fill_buffer = nullptr;
+        PFN_vkCmdCopyBuffer cmd_copy_buffer = nullptr;
+
         // Fence lifecycle (reset/pre-wait row + post-submit fence path)
         PFN_vkResetFences reset_fences = nullptr;
-        PFN_vkCreateFence create_fence = nullptr;
-        PFN_vkDestroyFence destroy_fence = nullptr;
 
         // Production symbols. Safe to call once; returns a fully filled table.
         [[nodiscard]] static VulkanDispatch real() noexcept;
     };
+
+    // External queue synchronization for the graphics/present queue. Sparse
+    // binds may be issued from the training thread.
+    LFS_RENDERING_API void set_graphics_queue_external_sync(std::mutex* mutex,
+                                                            VkQueue graphics,
+                                                            VkQueue present) noexcept;
+    LFS_RENDERING_API VkResult vk_queue_submit_synced(VkQueue queue,
+                                                      uint32_t submit_count,
+                                                      const VkSubmitInfo* submits,
+                                                      VkFence fence);
+    LFS_RENDERING_API VkResult vk_queue_present_synced(VkQueue queue, const VkPresentInfoKHR* present_info);
+    LFS_RENDERING_API VkResult vk_queue_wait_idle_synced(VkQueue queue);
+    LFS_RENDERING_API VkResult vk_queue_bind_sparse_synced(VkQueue queue,
+                                                           uint32_t bind_info_count,
+                                                           const VkBindSparseInfo* bind_infos,
+                                                           VkFence fence);
 
     // Injectable clock for fake-time unit tests (spec §4.2 / AMB 9).
     using ClockNow = std::function<std::chrono::steady_clock::time_point()>;

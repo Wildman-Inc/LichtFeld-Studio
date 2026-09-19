@@ -111,7 +111,6 @@ namespace lfs::app {
                     "training.resumed",
                     "training.completed",
                     "training.stopped",
-                    "checkpoint.saved",
                     "disk_space.save_failed",
                 });
             }
@@ -194,6 +193,8 @@ namespace lfs::app {
                 return "idle";
             case vis::TrainingState::Ready:
                 return "ready";
+            case vis::TrainingState::Starting:
+                return "starting";
             case vis::TrainingState::Running:
                 return "running";
             case vis::TrainingState::Paused:
@@ -212,6 +213,8 @@ namespace lfs::app {
                 return "ply";
             case core::ExportFormat::SOG:
                 return "sog";
+            case core::ExportFormat::SSOG:
+                return "ssog";
             case core::ExportFormat::SPZ:
                 return "spz";
             case core::ExportFormat::HTML_VIEWER:
@@ -224,6 +227,11 @@ namespace lfs::app {
                 return "rad";
             case core::ExportFormat::COLMAP:
                 return "colmap";
+            case core::ExportFormat::GALLERY_SCENE:
+            case core::ExportFormat::GALLERY_SOG:
+            case core::ExportFormat::GALLERY_SSOG:
+            case core::ExportFormat::GALLERY_SPZ:
+                return "licht";
             }
             return "unknown";
         }
@@ -421,6 +429,7 @@ namespace lfs::app {
             const bool active = tasks.isExporting();
             const std::string error = tasks.getExportError();
             const std::string stage = tasks.getExportStage();
+            const std::string outcome = tasks.getExportOutcome();
             std::string path = core::path_to_utf8(tasks.getExportPath());
             json payload{
                 {"id", "export.scene"},
@@ -428,12 +437,13 @@ namespace lfs::app {
                 {"kind", "export"},
                 {"active", active},
                 {"status",
-                 active                                ? "running"
-                 : stage == "Cancelled"                ? "cancelled"
-                 : !error.empty() || stage == "Failed" ? "failed"
-                 : stage == "Complete"                 ? "finished"
-                                                       : "idle"},
+                 active                                  ? "running"
+                 : outcome == "cancelled"                ? "cancelled"
+                 : !error.empty() || outcome == "failed" ? "failed"
+                 : outcome == "completed"                ? "finished"
+                                                         : "idle"},
                 {"stage", stage},
+                {"outcome", outcome},
                 {"progress", tasks.getExportProgress()},
                 {"cancel_supported", active},
                 {"dismiss_supported", false},
@@ -466,33 +476,36 @@ namespace lfs::app {
             const bool show_completion = tasks.isImportCompletionShowing();
             const std::string error = tasks.getImportError();
             const std::string stage = tasks.getImportStage();
+            const std::string outcome = tasks.getImportOutcome();
             const bool success = tasks.getImportSuccess();
+            const bool cancellable = tasks.canCancelGalleryImport();
 
             std::string status = "idle";
             if (active) {
                 status = "running";
-            } else if (!error.empty() || stage == "Failed") {
+            } else if (!error.empty() || outcome == "failed") {
                 status = "failed";
-            } else if (stage == "Complete") {
+            } else if (outcome == "completed") {
                 status = "finished";
             }
 
             json payload{
                 {"id", "import.dataset"},
-                {"label", "Dataset Import"},
+                {"label", "Scene Import"},
                 {"kind", "import"},
                 {"active", active},
                 {"status", status},
                 {"stage", stage},
+                {"outcome", outcome},
                 {"progress", tasks.getImportProgress()},
-                {"cancel_supported", false},
+                {"cancel_supported", cancellable},
                 {"dismiss_supported", show_completion},
                 {"actions",
                  json{
                      {"start", false},
                      {"pause", false},
                      {"resume", false},
-                     {"cancel", false},
+                     {"cancel", cancellable},
                      {"dismiss", show_completion},
                  }},
                 {"details",
@@ -520,6 +533,7 @@ namespace lfs::app {
             const bool active = tasks.isExportingVideo();
             const std::string error = tasks.getVideoExportError();
             const std::string stage = tasks.getVideoExportStage();
+            const std::string outcome = tasks.getVideoExportOutcome();
 
             json payload{
                 {"id", "export.video"},
@@ -527,11 +541,13 @@ namespace lfs::app {
                 {"kind", "video_export"},
                 {"active", active},
                 {"status",
-                 active                                ? "running"
-                 : !error.empty() || stage == "Failed" ? "failed"
-                 : stage == "Complete"                 ? "finished"
-                                                       : "idle"},
+                 active                                  ? "running"
+                 : outcome == "cancelled"                ? "cancelled"
+                 : !error.empty() || outcome == "failed" ? "failed"
+                 : outcome == "completed"                ? "finished"
+                                                         : "idle"},
                 {"stage", stage},
+                {"outcome", outcome},
                 {"progress", tasks.getVideoExportProgress()},
                 {"cancel_supported", active},
                 {"dismiss_supported", false},
@@ -564,6 +580,7 @@ namespace lfs::app {
             const bool active = tasks.isMesh2SplatActive();
             const std::string error = tasks.getMesh2SplatError();
             const std::string stage = tasks.getMesh2SplatStage();
+            const std::string outcome = tasks.getMesh2SplatOutcome();
 
             json payload{
                 {"id", "mesh2splat"},
@@ -571,11 +588,12 @@ namespace lfs::app {
                 {"kind", "conversion"},
                 {"active", active},
                 {"status",
-                 active                                ? "running"
-                 : !error.empty() || stage == "Failed" ? "failed"
-                 : stage == "Complete"                 ? "finished"
-                                                       : "idle"},
+                 active                                  ? "running"
+                 : !error.empty() || outcome == "failed" ? "failed"
+                 : outcome == "completed"                ? "finished"
+                                                         : "idle"},
                 {"stage", stage},
+                {"outcome", outcome},
                 {"progress", tasks.getMesh2SplatProgress()},
                 {"cancel_supported", false},
                 {"dismiss_supported", false},
@@ -834,6 +852,10 @@ namespace lfs::app {
                     });
             }
 
+            ~RuntimeEventJournal() {
+                handlers_ = event::ScopedHandler{};
+            }
+
             void publish(const std::string& type, json payload) {
                 const auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                               std::chrono::system_clock::now().time_since_epoch())
@@ -985,6 +1007,8 @@ namespace lfs::app {
             }
 
             if (job_id == "import.dataset") {
+                if (action == "cancel" && gui && gui->asyncTasks().requestGalleryImportCancel())
+                    return {};
                 if (action != "dismiss") {
                     return std::unexpected("Action '" + action + "' is not supported for import.dataset");
                 }

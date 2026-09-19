@@ -8,7 +8,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #if defined(__CUDACC__)
@@ -23,6 +25,14 @@
 
 namespace lfs::core {
 
+    [[nodiscard]] LFS_LOGGER_API std::string truncate_log_tail(std::string_view text,
+                                                               std::size_t max_bytes);
+
+    // Resolve the current user's home directory without depending on lfs_core.
+    // This lives in the leaf lfs_logger library so startup code can use the same
+    // location as the durable logger before Logger::init().
+    [[nodiscard]] LFS_LOGGER_API std::filesystem::path lichtfeld_home_directory();
+
     enum class LogLevel : uint8_t {
         Trace = 0,
         Debug = 1,
@@ -34,22 +44,8 @@ namespace lfs::core {
         Off = 7
     };
 
-    enum class LogModule : uint8_t {
-        Core = 0,
-        Rendering = 1,
-        Visualizer = 2,
-        Loader = 3,
-        Scene = 4,
-        Training = 5,
-        Input = 6,
-        GUI = 7,
-        Window = 8,
-        Memory = 9,
-        Unknown = 10,
-        Count = 11
-    };
-
     struct LFS_LOGGER_API LogEntrySnapshot {
+        uint64_t sequence = 0;
         std::chrono::system_clock::time_point timestamp{};
         LogLevel level = LogLevel::Info;
         std::string file;
@@ -74,8 +70,8 @@ namespace lfs::core {
                   const std::string& log_file,
                   const std::string& filter_pattern,
                   bool use_stderr);
-        // default_log_dir_override replaces the resolved per-user LichtFeld directory
-        // (normally ~/.lichtfeld) used to place the always-on durable log; empty means
+        // default_log_dir_override replaces the resolved per-user LichtFeld root
+        // used to place the always-on durable log under its logs directory; empty means
         // use the real per-user directory. Exists so tests can redirect it without a
         // process-global env var.
         void init(LogLevel console_level,
@@ -106,14 +102,14 @@ namespace lfs::core {
         void log(LogLevel level, const SourceSite& loc, std::string_view msg);
 
         // Module control
-        void enable_module(LogModule module, bool enabled = true);
-        void set_module_level(LogModule module, LogLevel level);
         void set_level(LogLevel level);
         void flush();
         [[nodiscard]] LogLevel level() const;
         [[nodiscard]] size_t buffered_log_count() const;
         [[nodiscard]] uint64_t buffered_log_generation() const;
         [[nodiscard]] std::vector<LogEntrySnapshot> buffered_logs() const;
+        [[nodiscard]] std::vector<LogEntrySnapshot>
+        buffered_logs_since(uint64_t generation, size_t max_count) const;
         [[nodiscard]] std::string buffered_logs_as_text() const;
 
         bool is_enabled(LogLevel level) const {
@@ -215,25 +211,24 @@ namespace lfs::core {
 
         std::atomic<uint8_t> global_level_{static_cast<uint8_t>(LogLevel::Info)};
         std::atomic<bool> capture_all_to_file_{false};
-        std::array<std::atomic<bool>, static_cast<size_t>(LogModule::Count)> module_enabled_{};
-        std::array<std::atomic<uint8_t>, static_cast<size_t>(LogModule::Count)> module_level_{};
     };
 
     // Scoped timer for performance measurement
     class LFS_LOGGER_API ScopedTimer {
     public:
-        explicit ScopedTimer(std::string name, LogLevel level, SourceSite loc);
-        ScopedTimer(std::string name, double min_log_ms,
+        explicit ScopedTimer(std::string_view name, LogLevel level, SourceSite loc);
+        ScopedTimer(std::string_view name, double min_log_ms,
                     LogLevel level, SourceSite loc);
         ~ScopedTimer();
 
     private:
-        std::chrono::high_resolution_clock::time_point start_;
+        std::chrono::high_resolution_clock::time_point start_{};
         std::string name_;
         double min_log_ms_ = 0.0;
         LogLevel level_;
         SourceSite loc_;
         bool diagnostics_scope_active_ = false;
+        bool disabled_ = false;
     };
 
 } // namespace lfs::core
