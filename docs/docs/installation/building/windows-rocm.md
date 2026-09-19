@@ -83,7 +83,7 @@ Windows HIP synchronizes Vulkan and HIP through a D3D12 shared fence, imported a
 
 ## Verification status
 
-Results recorded on 2026-09-20 cover the integration of upstream commit [0e13e8ff469dee10a69814e3e512d6451e2ada98](https://github.com/MrNeRF/LichtFeld-Studio/commit/0e13e8ff469dee10a69814e3e512d6451e2ada98). The test system ran Windows 11 on Radeon 8060S (`gfx1151`), with ROCm SDK `10.1.0a20260909`, HIP `7.16.26362`, and AMD Clang `24.0.0git`.
+Results recorded on 2026-09-20 cover the integration of upstream commit [c1c0f3128bbe133fbf42f803c21df0b55d6e9cbc](https://github.com/MrNeRF/LichtFeld-Studio/commit/c1c0f3128bbe133fbf42f803c21df0b55d6e9cbc). The test system ran Windows 11 on Radeon 8060S (`gfx1151`), with ROCm SDK `10.1.0a20260909`, HIP `7.16.26362`, and AMD Clang `24.0.0git`.
 
 | Area | Status |
 | --- | --- |
