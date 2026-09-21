@@ -132,5 +132,31 @@ namespace {
         compare_with_gpu<uint8_t, 4>();
     }
 
+    TEST_P(ImageLanczosTest, ReusableWorkspaceQuantizesAfterLanczosAndAcceptsShapeChanges) {
+        const auto test = GetParam();
+        LanczosResizeWorkspace workspace;
+        for (const int divisor : {1, 2, 1}) {
+            const size_t h = std::max(1, test.height / divisor);
+            const size_t w = std::max(1, test.width / divisor);
+            auto host = Tensor::empty({h, w, 3}, Device::CPU, DataType::UInt8);
+            for (size_t i = 0; i < host.numel(); ++i)
+                host.ptr<uint8_t>()[i] = static_cast<uint8_t>((i * 71 + i / 7 + divisor * 31) % 256);
+            const auto input = host.to(Device::CUDA);
+            const size_t oh = test.out_height, ow = test.out_width;
+            auto output = Tensor::empty({3, oh, ow}, Device::CUDA, DataType::UInt8);
+            const auto reference = lanczos_resize(input, oh, ow, 2).to_vector();
+            for (int reuse = 0; reuse < 3; ++reuse) {
+                ASSERT_EQ(cudaMemset(output.data_ptr(), 0xcd, output.bytes()), cudaSuccess);
+                lanczos_resize_into(input, output, workspace);
+                const auto actual = output.to_vector_uint8();
+                ASSERT_EQ(actual.size(), reference.size());
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    const auto expected = static_cast<uint8_t>(std::clamp(reference[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+                    ASSERT_EQ(actual[i], expected) << "index=" << i << " reuse=" << reuse;
+                }
+            }
+        }
+    }
+
     INSTANTIATE_TEST_SUITE_P(Downscale, ImageLanczosTest, ::testing::Values(ResizeCase{97, 65, 2, 0, 48, 32}, ResizeCase{97, 65, 4, 0, 24, 16}, ResizeCase{97, 65, 8, 0, 12, 8}, ResizeCase{97, 65, 2, 17, 17, 11}, ResizeCase{65, 97, 1, 23, 15, 23}, ResizeCase{17, 1, 2, 0, 8, 1}, ResizeCase{1, 17, 8, 0, 1, 2}, ResizeCase{13, 9, 1, 1, 1, 1}));
 } // namespace

@@ -8615,6 +8615,9 @@ namespace lfs::training {
                 // normalization used by the original float decode path.
                 if (gt_image.dtype() == lfs::core::DataType::UInt8) {
                     gt_image.sync_to_stream(training_stream_);
+                    // The decoded-frame ring records this stream on lease
+                    // release before allowing the producer to overwrite it.
+                    gt_image.set_stream(training_stream_);
                     auto gt_image_fp32 = lfs::core::Tensor::empty(
                         gt_image.shape(), lfs::core::Device::CUDA,
                         lfs::core::DataType::Float32);

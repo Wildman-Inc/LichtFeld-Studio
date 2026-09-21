@@ -19,6 +19,6 @@ set(ROCJPEG_ROCM_DEVEL_PATH "${LFS_ROCM_DEVEL_PATH}")
 set(GPU_TARGETS "${HIP_ARCHITECTURES}")
 FetchContent_Declare(rocjpeg
     GIT_REPOSITORY https://github.com/Yasei-no-otoko/rocJPEG.git
-    GIT_TAG 4b1d92d448d421406647978d6c9722f28a8a08ac
+    GIT_TAG 67ff7a307d977744efbe10e916a6d41cf26a7b2c
     GIT_PROGRESS TRUE)
 FetchContent_MakeAvailable(rocjpeg)

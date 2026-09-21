@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/image_io.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include "io/pipelined_image_loader.hpp"
 #include "io/rocjpeg_image_loader.hpp"
 
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -21,6 +23,7 @@
 #include <process.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -226,6 +229,108 @@ namespace {
             EXPECT_TRUE(std::all_of(zeros.begin(), zeros.end(), [](float value) { return value == 0; }));
             EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         }
+    }
+
+    TEST_F(RocJpegLoaderTest, ReusesExclusiveOutputAcrossDecodeAndResizeChanges) {
+        DisableRocJpeg enabled(false);
+        RocJpegImageLoader loader;
+        ASSERT_TRUE(loader.available());
+        Tensor storage;
+        for (const bool uint8 : {true, false, true}) {
+            for (const int factor : {1, 2, 4, 1}) {
+                const auto reference = loader.decode(jpeg_, factor, 0, uint8).to_vector();
+                const auto first = loader.decode(jpeg_, factor, 0, uint8, &storage);
+                const auto pointer = first.data_ptr();
+                for (int repeat = 0; repeat < 5; ++repeat) {
+                    const auto decoded = loader.decode(jpeg_, factor, 0, uint8, &storage);
+                    EXPECT_EQ(decoded.data_ptr(), pointer);
+                    EXPECT_EQ(decoded.to_vector(), reference);
+                }
+            }
+        }
+    }
+
+    TEST_F(RocJpegLoaderTest, PrefetchKeepsLeasedOutputAliveUntilConsumerRelease) {
+        DisableRocJpeg enabled(false);
+        auto settings = config();
+        settings.decode_frame_ring_capacity = 4;
+        PipelinedImageLoader loader(settings);
+        for (const int factor : {1, 2}) {
+            LoadParams params;
+            params.output_uint8 = true;
+            params.resize_factor = factor;
+            loader.prefetch(0, jpeg_path_, params);
+            auto held = loader.try_get_for(std::chrono::seconds(10));
+            ASSERT_TRUE(held);
+            ASSERT_TRUE(held->error.empty()) << held->error;
+            ASSERT_FALSE(held->decoded_frame_leases.empty());
+            const auto expected = held->tensor.to_vector_uint8();
+            for (size_t sequence = 1; sequence <= 12; ++sequence) {
+                loader.prefetch(sequence, jpeg_path_, params);
+                auto ready = loader.try_get_for(std::chrono::seconds(10));
+                ASSERT_TRUE(ready);
+                ASSERT_TRUE(ready->error.empty()) << ready->error;
+                EXPECT_NE(held->tensor.data_ptr(), ready->tensor.data_ptr());
+                EXPECT_EQ(held->tensor.to_vector_uint8(), expected);
+                EXPECT_EQ(ready->tensor.to_vector_uint8(), expected);
+            }
+        }
+    }
+
+    TEST_F(RocJpegLoaderTest, ReuseWaitsForGpuConsumerAfterHostLeaseExpires) {
+        DisableRocJpeg enabled(false);
+        auto settings = config();
+        settings.decode_frame_ring_capacity = 1;
+        PipelinedImageLoader loader(settings);
+        LoadParams params;
+        params.output_uint8 = true;
+        auto dark = Tensor::empty({height, width, 3}, Device::CPU, DataType::UInt8);
+        std::fill_n(dark.ptr<uint8_t>(), dark.numel(), uint8_t{16});
+        const auto dark_path = directory_ / "dark.jpg";
+        save_image_u8(dark_path, dark, 95);
+        auto snapshot = Tensor::empty({3, height, width}, Device::CUDA, DataType::UInt8);
+        struct Consumer {
+            cudaStream_t stream = nullptr;
+            std::atomic<bool> entered{false}, proceed{false};
+            ~Consumer() {
+                proceed.store(true);
+                if (stream) {
+                    (void)cudaStreamSynchronize(stream);
+                    CudaMemoryPool::instance().release_stream(stream);
+                    (void)cudaStreamDestroy(stream);
+                }
+            }
+        } consumer;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&consumer.stream, cudaStreamNonBlocking), cudaSuccess);
+        loader.prefetch(0, jpeg_path_, params);
+        auto first = loader.try_get_for(std::chrono::seconds(10));
+        ASSERT_TRUE(first);
+        ASSERT_TRUE(first->error.empty()) << first->error;
+        const auto expected = first->tensor.to_vector_uint8();
+        const auto pointer = first->tensor.data_ptr();
+        first->tensor.set_stream(consumer.stream);
+        ASSERT_EQ(cudaLaunchHostFunc(consumer.stream, [](void* data) {
+            auto& gate = *static_cast<Consumer*>(data);
+            gate.entered.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!gate.proceed.load() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield(); }, &consumer), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(snapshot.data_ptr(), pointer, snapshot.bytes(), cudaMemcpyDeviceToDevice,
+                                  consumer.stream),
+                  cudaSuccess);
+        first.reset();
+        loader.prefetch(1, dark_path, params);
+        auto early = loader.try_get_for(std::chrono::milliseconds(50));
+        EXPECT_FALSE(early) << "Producer reused a slot before its GPU consumer finished";
+        consumer.proceed.store(true);
+        ASSERT_EQ(cudaStreamSynchronize(consumer.stream), cudaSuccess);
+        EXPECT_TRUE(consumer.entered.load());
+        EXPECT_EQ(snapshot.to_vector_uint8(), expected);
+        auto second = early ? std::move(early) : loader.try_get_for(std::chrono::seconds(10));
+        ASSERT_TRUE(second);
+        ASSERT_TRUE(second->error.empty()) << second->error;
+        EXPECT_EQ(second->tensor.data_ptr(), pointer);
+        EXPECT_NE(second->tensor.to_vector_uint8(), expected);
     }
 
     TEST_F(RocJpegLoaderTest, RejectsUnsupportedAndMalformedInputsWithoutPoisoningDecoder) {

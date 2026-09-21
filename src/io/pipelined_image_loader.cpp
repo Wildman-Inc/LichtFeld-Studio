@@ -53,6 +53,15 @@ namespace lfs::io {
         struct Slot {
             lfs::core::Tensor storage;
             bool in_use = false;
+            cudaEvent_t consumed = nullptr;
+            cudaError_t completion_status = cudaSuccess;
+            Slot() = default;
+            Slot(const Slot&) = delete;
+            Slot& operator=(const Slot&) = delete;
+            ~Slot() {
+                if (consumed)
+                    (void)cudaEventDestroy(consumed);
+            }
         };
 
         struct Lease {
@@ -75,6 +84,16 @@ namespace lfs::io {
         void release(const size_t index, const lfs::core::Tensor& storage) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (index < slots_.size() && slots_[index].in_use) {
+                // A host lease can expire before the GPU finishes reading.
+                // Record the consumer stream now; wait only in the producer
+                // when this slot is actually reused, never on the training CPU.
+                auto& slot = slots_[index];
+                if (storage.is_valid()) {
+                    if (!slot.consumed)
+                        slot.completion_status = cudaEventCreateWithFlags(&slot.consumed, cudaEventDisableTiming);
+                    if (slot.completion_status == cudaSuccess)
+                        slot.completion_status = cudaEventRecord(slot.consumed, storage.stream());
+                }
                 if (index < capacity_limit_)
                     slots_[index].storage = storage;
                 else
@@ -107,6 +126,17 @@ namespace lfs::io {
                         lease->owner = shared_from_this();
                         lease->index = static_cast<size_t>(std::distance(slots_.begin(), it));
                         leases.push_back(std::move(lease));
+                    }
+                    lock.unlock();
+                    for (const auto& lease : leases) {
+                        const auto& slot = slots_[lease->index];
+                        if (slot.completion_status != cudaSuccess)
+                            throw std::runtime_error(std::string("Record decode ring consumer completion: ") + cudaGetErrorString(slot.completion_status));
+                        if (const auto event = slot.consumed) {
+                            const auto status = cudaEventSynchronize(event);
+                            if (status != cudaSuccess)
+                                throw std::runtime_error(std::string("Decode ring consumer completion: ") + cudaGetErrorString(status));
+                        }
                     }
                     return leases;
                 }
@@ -3042,16 +3072,26 @@ namespace lfs::io {
                 } else {
                     lfs::core::Tensor decoded;
                     bool used_gpu = false;
+                    std::shared_ptr<DecodedFrameRing::Lease> decoded_frame_lease;
 
 #ifdef LFS_HAS_ROCJPEG
                     if (rocjpeg_loader_ && item.is_original_jpeg) {
                         try {
+                            if (!item.undistort) {
+                                auto leases = decoded_frame_ring_->acquire_batch(1);
+                                if (leases.empty())
+                                    continue;
+                                decoded_frame_lease = std::move(leases.front());
+                            }
                             decoded = rocjpeg_loader_->decode(item.raw_bytes, item.params.resize_factor,
-                                                             item.params.max_width, item.params.output_uint8);
+                                                             item.params.max_width, item.params.output_uint8,
+                                                             decoded_frame_lease ? &decoded_frame_lease->storage : nullptr);
                         } catch (const std::exception& error) {
                             LOG_DEBUG("[PipelinedImageLoader] rocJPEG decode failed; using CPU: {}", error.what());
                         }
                         used_gpu = decoded.is_valid();
+                        if (!used_gpu)
+                            decoded_frame_lease.reset();
                         if (used_gpu) {
                             std::lock_guard stats_lock(stats_mutex_);
                             ++stats_.rocjpeg_decode_calls;
@@ -3098,7 +3138,8 @@ namespace lfs::io {
                     }
 
                     try_complete_pair(item.sequence_id, item.loader_generation,
-                                      std::move(decoded), std::nullopt, nullptr);
+                                      std::move(decoded), std::nullopt, nullptr,
+                                      std::nullopt, std::nullopt, nullptr, std::move(decoded_frame_lease));
                 }
 
             } catch (...) {

@@ -21,9 +21,11 @@ namespace lfs::io {
 
         [[nodiscard]] bool available() const;
         // Returns an invalid tensor when hardware cannot decode this input.
+        // Reusable output must be exclusively owned and all prior GPU reads
+        // complete. The result aliases it; keep its lease until consumers finish.
         lfs::core::Tensor decode(std::span<const uint8_t> jpeg,
                                  int resize_factor, int max_width,
-                                 bool output_uint8);
+                                 bool output_uint8, lfs::core::Tensor* reusable_output = nullptr);
 
     private:
         struct Impl;

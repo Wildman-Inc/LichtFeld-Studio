@@ -10,6 +10,21 @@
 
 namespace lfs::core {
 
+    // A single caller owns this workspace. Calls complete before returning, so
+    // dimensions/streams may change between calls. Destroy on the same device.
+    class LanczosResizeWorkspace {
+        friend void lanczos_resize_into(const Tensor&, Tensor&, LanczosResizeWorkspace&,
+                                        int, cudaStream_t);
+        Tensor coefficients_x_, coefficients_y_;
+        int input_h_ = 0, input_w_ = 0, output_h_ = 0, output_w_ = 0, kernel_size_ = 0;
+    };
+
+    // RGB uint8 HWC -> preallocated, exclusively owned uint8/float32 CHW.
+    // Reuses coefficients and quantizes only after the full Lanczos sum.
+    void lanczos_resize_into(const Tensor& input, Tensor& output,
+                             LanczosResizeWorkspace& workspace,
+                             int kernel_size = 2, cudaStream_t cuda_stream = nullptr);
+
     /**
      * High-quality Lanczos resampling on GPU
      *

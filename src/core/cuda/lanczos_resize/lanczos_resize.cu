@@ -7,6 +7,7 @@
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
 #include "core/tensor/internal/cuda_memory_guard.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "lanczos_resize.hpp"
 
 #include <cmath>
@@ -16,6 +17,8 @@
 #include <device_launch_parameters.h>
 #include <limits>
 #include <optional>
+#include <stdexcept>
+#include <type_traits>
 
 #define BLOCK_X      16
 #define BLOCK_Y      16
@@ -188,7 +191,7 @@ namespace lfs::core {
             }
         }
 
-        template <uint32_t CHANNELS, typename T>
+        template <uint32_t CHANNELS, typename T, typename TOut = float>
         __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
             LanczosResampleCUDA(
                 const int input_h, const int input_w,
@@ -199,7 +202,7 @@ namespace lfs::core {
                 const float* __restrict__ pre_coef_x,
                 const float* __restrict__ pre_coef_y,
                 const T* __restrict__ input, // [H, W, C] T
-                float* __restrict__ output   // [C, H, W] float32
+                TOut* __restrict__ output    // [C, H, W]
             ) {
             const auto block = cg::this_thread_block();
             const uint32_t thread_idx_x = block.thread_index().x;
@@ -242,7 +245,12 @@ namespace lfs::core {
             const int H_out = output_h;
             const int W_out = output_w;
             for (int ch = 0; ch < CHANNELS; ch++) {
-                output[ch * (H_out * W_out) + pix.y * W_out + pix.x] = accumulator[ch];
+                if constexpr (std::is_same_v<TOut, uint8_t>) {
+                    const float value = fminf(fmaxf(accumulator[ch], 0.0f), 1.0f) * 255.0f;
+                    output[ch * (H_out * W_out) + pix.y * W_out + pix.x] = static_cast<uint8_t>(value + 0.5f);
+                } else {
+                    output[ch * (H_out * W_out) + pix.y * W_out + pix.x] = accumulator[ch];
+                }
             }
         }
 
@@ -421,6 +429,66 @@ namespace lfs::core {
         }
 
     } // namespace detail
+
+    void lanczos_resize_into(const Tensor& input, Tensor& output,
+                             LanczosResizeWorkspace& workspace,
+                             const int kernel_size, cudaStream_t cuda_stream) {
+        if (!input.is_valid() || !output.is_valid() ||
+            input.device() != Device::CUDA || output.device() != Device::CUDA ||
+            input.dtype() != DataType::UInt8 ||
+            (output.dtype() != DataType::UInt8 && output.dtype() != DataType::Float32) ||
+            input.ndim() != 3 || output.ndim() != 3 ||
+            input.size(2) != 3 || output.size(0) != 3 ||
+            !input.is_contiguous() || !output.is_contiguous() || kernel_size <= 0 ||
+            input.data_ptr() == output.data_ptr()) {
+            throw std::invalid_argument("Lanczos requires distinct contiguous GPU RGB uint8 HWC input and uint8/float32 CHW output");
+        }
+        for (const size_t dimension : {input.size(0), input.size(1), output.size(1), output.size(2)}) {
+            if (dimension == 0 || dimension > static_cast<size_t>(std::numeric_limits<int>::max()))
+                throw std::invalid_argument("Lanczos dimensions must be positive and fit in int");
+        }
+        const int ih = input.size(0), iw = input.size(1);
+        const int oh = output.size(1), ow = output.size(2);
+        const auto x = coefficient_layout(iw, ow, kernel_size);
+        const auto y = coefficient_layout(ih, oh, kernel_size);
+        if (!x || !y)
+            throw std::invalid_argument("Lanczos coefficient layout overflow");
+        const CUDAStreamGuard guard(cuda_stream);
+        if (workspace.input_h_ != ih || workspace.input_w_ != iw ||
+            workspace.output_h_ != oh || workspace.output_w_ != ow || workspace.kernel_size_ != kernel_size) {
+            if (workspace.coefficients_x_.numel() != x->count)
+                workspace.coefficients_x_ = Tensor::empty({x->count}, Device::CUDA, DataType::Float32);
+            if (workspace.coefficients_y_.numel() != y->count)
+                workspace.coefficients_y_ = Tensor::empty({y->count}, Device::CUDA, DataType::Float32);
+            const int threads = BLOCK_X * BLOCK_Y;
+            detail::PreComputeCoef<<<(ow + threads - 1) / threads, threads, 0, cuda_stream>>>(
+                iw, ow, kernel_size, x->stride, workspace.coefficients_x_.ptr<float>());
+            LFS_CUDA_CHECK(cudaGetLastError());
+            detail::PreComputeCoef<<<(oh + threads - 1) / threads, threads, 0, cuda_stream>>>(
+                ih, oh, kernel_size, y->stride, workspace.coefficients_y_.ptr<float>());
+            LFS_CUDA_CHECK(cudaGetLastError());
+        }
+        const dim3 grid((ow + BLOCK_X - 1) / BLOCK_X, (oh + BLOCK_Y - 1) / BLOCK_Y);
+        const dim3 block(BLOCK_X, BLOCK_Y);
+        if (output.dtype() == DataType::UInt8) {
+            detail::LanczosResampleCUDA<3, uint8_t, uint8_t><<<grid, block, 0, cuda_stream>>>(
+                ih, iw, oh, ow, kernel_size, x->stride, y->stride,
+                workspace.coefficients_x_.ptr<float>(), workspace.coefficients_y_.ptr<float>(),
+                input.ptr<uint8_t>(), output.ptr<uint8_t>());
+        } else {
+            detail::LanczosResampleCUDA<3, uint8_t><<<grid, block, 0, cuda_stream>>>(
+                ih, iw, oh, ow, kernel_size, x->stride, y->stride,
+                workspace.coefficients_x_.ptr<float>(), workspace.coefficients_y_.ptr<float>(),
+                input.ptr<uint8_t>(), output.ptr<float>());
+        }
+        LFS_CUDA_CHECK(cudaGetLastError());
+        LFS_CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+        workspace.input_h_ = ih;
+        workspace.input_w_ = iw;
+        workspace.output_h_ = oh;
+        workspace.output_w_ = ow;
+        workspace.kernel_size_ = kernel_size;
+    }
 
     Tensor lanczos_resize(
         const Tensor& input,

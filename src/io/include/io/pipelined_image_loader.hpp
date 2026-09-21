@@ -138,6 +138,8 @@ namespace lfs::io {
         // each carries its own event; consumers must wait on both.
         cudaEvent_t depth_ready_event = nullptr;
         cudaEvent_t normal_ready_event = nullptr;
+        // Keep until GPU work has been submitted, and set tensor.stream() to
+        // that consumer stream. The ring waits for it before overwriting storage.
         std::vector<std::shared_ptr<void>> decoded_frame_leases;
         std::string error; // Non-empty for a failed primary image request
     };
