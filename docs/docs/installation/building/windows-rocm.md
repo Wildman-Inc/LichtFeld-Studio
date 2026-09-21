@@ -144,3 +144,16 @@ four additional package-contract cases passed. A 40-step GUT/PPISP/Sparsity run
 reported 44 hardware JPEG decodes and zero CPU decodes; an original-resolution
 Float32 run reported eight hardware decodes and zero CPU decodes. Both saved a
 project and exported PLY files with all 12,000 and 30,000 points finite.
+
+The same integration also passed a compatibility check with the official
+`10.1.0a20260909` SDK / HIP `7.16.26362` installed in an isolated directory.
+The fork was rebuilt with that SDK using 32 parallel jobs, and all seven fork
+CTest cases passed. The LFS executables built with 10.2 were then run with the
+10.1 runtime DLLs, matching `gfx1151` rocRAND archive, and the 10.1-built
+rocJPEG DLL; this checks runtime compatibility, not a full LFS rebuild with
+10.1. All seven loader tests passed, including CPU fallback. The 40-step
+GUT/PPISP/Sparsity run again reported 44 hardware decodes and zero CPU decodes;
+the original-resolution Float32 run reported eight and zero. Both saved a
+project and exported finite PLY data (12,000 and 30,000 points respectively).
+SDK artifact hashes and the running processes' loaded DLL paths were checked,
+with only Windows directories on PATH. The installed 10.2 SDK was unchanged.
