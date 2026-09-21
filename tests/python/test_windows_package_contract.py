@@ -123,14 +123,13 @@ class WindowsPackageContractTests(unittest.TestCase):
         return {
             "bin/rocjpeg.dll": b"pinned Windows rocJPEG fork",
             "share/licenses/rocjpeg/LICENSE": b"rocJPEG MIT license",
-            "share/licenses/rocjpeg/AMF-LICENSE.txt": b"AMF MIT license",
         }
 
     def test_enabled_rocjpeg_is_separate_from_selected_sdk(self):
         archive = self.altered_archive(replace=self.rocjpeg_entries())
         self.validate(archive, success=True, rocjpeg="ON")
 
-    def test_enabled_rocjpeg_requires_decoder_and_both_licenses(self):
+    def test_enabled_rocjpeg_requires_decoder_and_license(self):
         for missing in self.rocjpeg_entries():
             with self.subTest(missing=missing):
                 entries = self.rocjpeg_entries()

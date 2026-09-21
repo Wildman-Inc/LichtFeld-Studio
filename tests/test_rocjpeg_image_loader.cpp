@@ -27,7 +27,7 @@ namespace {
     using namespace lfs::core;
     using namespace lfs::io;
 
-    void write_jpeg_variant(const std::filesystem::path& path, const Tensor& image, bool progressive) {
+    void write_jpeg_variant(const std::filesystem::path& path, const Tensor& image, bool progressive, bool grayscale = false) {
         jpeg_compress_struct encoder{};
         jpeg_error_mgr error{};
         encoder.err = jpeg_std_error(&error);
@@ -41,7 +41,9 @@ namespace {
         encoder.in_color_space = JCS_RGB;
         jpeg_set_defaults(&encoder);
         jpeg_set_quality(&encoder, 95, TRUE);
-        if (progressive) {
+        if (grayscale) {
+            jpeg_set_colorspace(&encoder, JCS_GRAYSCALE);
+        } else if (progressive) {
             jpeg_simple_progression(&encoder);
         } else {
             for (int i = 0; i < 3; ++i)
@@ -95,6 +97,7 @@ namespace {
             png_path_ = directory_ / "gradient.png";
             jpeg444_path_ = directory_ / "gradient444.jpg";
             progressive_path_ = directory_ / "progressive.jpg";
+            grayscale_path_ = directory_ / "grayscale.jpg";
 
             auto image = Tensor::empty({height, width, size_t{3}}, Device::CPU, DataType::UInt8);
             auto* pixels = image.ptr<uint8_t>();
@@ -110,6 +113,7 @@ namespace {
             save_image_u8(png_path_, image);
             write_jpeg_variant(jpeg444_path_, image, false);
             write_jpeg_variant(progressive_path_, image, true);
+            write_jpeg_variant(grayscale_path_, image, false, true);
             std::ifstream file(jpeg_path_, std::ios::binary);
             jpeg_.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
             ASSERT_GT(jpeg_.size(), 3u);
@@ -141,14 +145,14 @@ namespace {
             EXPECT_EQ(image.shape(), TensorShape({3, h, w}));
         }
 
-        std::filesystem::path directory_, jpeg_path_, png_path_, jpeg444_path_, progressive_path_;
+        std::filesystem::path directory_, jpeg_path_, png_path_, jpeg444_path_, progressive_path_, grayscale_path_;
         std::vector<uint8_t> jpeg_;
     };
 
     TEST_F(RocJpegLoaderTest, HardwareDecodeMatchesCpuRgbForOddDimensions) {
         DisableRocJpeg enabled(false);
         RocJpegImageLoader loader;
-        ASSERT_TRUE(loader.available()) << "AMF JPEG hardware is required for this opt-in suite";
+        ASSERT_TRUE(loader.available()) << "D3D11 MJPEG hardware is required for this opt-in suite";
         const auto decoded = loader.decode(jpeg_, 1, 0, true);
         ASSERT_NO_FATAL_FAILURE(expect_image(decoded, height, width, DataType::UInt8));
         const auto actual = decoded.to_vector_uint8();
@@ -290,7 +294,7 @@ namespace {
         DisableRocJpeg enabled(false);
         RocJpegImageLoader hardware;
         ASSERT_TRUE(hardware.available());
-        for (const auto& path : {jpeg444_path_, progressive_path_}) {
+        for (const auto& path : {jpeg444_path_, progressive_path_, grayscale_path_}) {
             SCOPED_TRACE(path.filename().string());
             std::ifstream file(path, std::ios::binary);
             const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),

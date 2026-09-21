@@ -31,7 +31,7 @@ endif()
 # Find GTest
 find_package(GTest CONFIG REQUIRED)
 
-# This opt-in suite requires an AMD GPU with AMF JPEG decode support. It uses
+# This opt-in suite requires an AMD GPU with D3D11 MJPEG decode support. It uses
 # generated fixtures and the production loader without the full Torch test suite.
 if(BUILD_ROCJPEG_TESTS)
     if(NOT WIN32 OR NOT USE_HIP OR NOT TARGET rocjpeg::rocjpeg)
@@ -39,6 +39,7 @@ if(BUILD_ROCJPEG_TESTS)
     endif()
     add_executable(lichtfeld_rocjpeg_tests EXCLUDE_FROM_ALL
         test_rocjpeg_image_loader.cpp
+        test_image_lanczos.cpp
     )
     target_compile_features(lichtfeld_rocjpeg_tests PRIVATE cxx_std_23)
     target_include_directories(lichtfeld_rocjpeg_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -639,6 +640,7 @@ set(TEST_FILES
     test_metrics_evaluator_appearance.cpp
     test_export_env_composite.cpp
     test_image_io.cpp
+    test_image_lanczos.cpp
     test_project_thumbnail_image.cpp
     test_camera_thumbnail_policy.cpp
     test_undistort.cpp

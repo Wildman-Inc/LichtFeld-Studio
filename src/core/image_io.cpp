@@ -8,6 +8,7 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cctype>
 #include <cmath>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numbers>
 #include <optional>
 #include <queue>
 #include <stdexcept>
@@ -204,45 +206,84 @@ namespace {
         return std::nullopt;
     }
 
-    template <typename T>
-    T* downscale_resample_nch(const T* src,
-                              int w, int h, int nw, int nh,
-                              int channels) {
-        const size_t outbytes = static_cast<size_t>(nw) * nh * channels * sizeof(T);
-        auto* out = static_cast<T*>(std::malloc(outbytes));
+    struct LanczosCoefficients {
+        struct Span {
+            int first;
+            int count;
+            size_t offset;
+        };
+        std::vector<Span> spans;
+        std::vector<float> weights;
+    };
+
+    LanczosCoefficients lanczos2_coefficients(const int input_size, const int output_size) {
+        LanczosCoefficients result;
+        result.spans.reserve(output_size);
+        const float scale = static_cast<float>(input_size) / output_size;
+        const auto sinc = [](const float x) {
+            const float angle = std::numbers::pi_v<float> * x;
+            return std::abs(x) < 1e-12f ? 1.0f : std::sin(angle) / angle;
+        };
+        for (int i = 0; i < output_size; ++i) {
+            // Match the GPU filter: pixel centers, scale-expanded support, and
+            // truncated/renormalized edge weights (no replicated edge pixels).
+            const float center = (i + 0.5f) * scale;
+            const int first = std::max(static_cast<int>(center - 2.0f * scale + 0.5f), 0);
+            const int end = std::min(static_cast<int>(center + 2.0f * scale + 0.5f), input_size);
+            const size_t offset = result.weights.size();
+            float norm = 0.0f;
+            for (int k = first; k < end; ++k) {
+                const float x = (k + 0.5f - center) / scale;
+                const float weight = std::abs(x) >= 2.0f ? 0.0f : sinc(x) * sinc(x / 2.0f);
+                result.weights.push_back(weight);
+                norm += weight;
+            }
+            for (size_t k = offset; k < result.weights.size(); ++k)
+                result.weights[k] /= norm;
+            result.spans.push_back({first, end - first, offset});
+        }
+        return result;
+    }
+
+    template <typename T, int Channels>
+    T* downscale_lanczos2(const T* src, int w, int h, int nw, int nh) {
+        const auto horizontal = lanczos2_coefficients(w, nw);
+        const auto vertical = lanczos2_coefficients(h, nh);
+        const size_t row_size = static_cast<size_t>(nw) * Channels;
+        // Separable passes avoid evaluating the full 2D kernel on the CPU.
+        // Keep signed float intermediates; clamp/round only the final pixels.
+        std::vector<float> intermediate(static_cast<size_t>(h) * row_size);
+        std::vector<float> row(row_size);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < nw; ++x) {
+                const auto& span = horizontal.spans[x];
+                std::array<float, Channels> pixel{};
+                for (int k = 0; k < span.count; ++k) {
+                    const auto* input = src + (static_cast<size_t>(y) * w + span.first + k) * Channels;
+                    const float weight = horizontal.weights[span.offset + k];
+                    for (int c = 0; c < Channels; ++c)
+                        pixel[c] += static_cast<float>(input[c]) * weight;
+                }
+                std::copy(pixel.begin(), pixel.end(), intermediate.data() + static_cast<size_t>(y) * row_size + x * Channels);
+            }
+        }
+        auto* out = static_cast<T*>(std::malloc(row_size * nh * sizeof(T)));
         if (!out)
             throw std::bad_alloc();
         for (int y = 0; y < nh; ++y) {
-            const float sy = (static_cast<float>(y) + 0.5f) * static_cast<float>(h) / nh - 0.5f;
-            const int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, h - 1);
-            const int y1 = std::min(y0 + 1, h - 1);
-            const float fy = sy - std::floor(sy);
-            for (int x = 0; x < nw; ++x) {
-                const float sx = (static_cast<float>(x) + 0.5f) * static_cast<float>(w) / nw - 0.5f;
-                const int x0 = std::clamp(static_cast<int>(std::floor(sx)), 0, w - 1);
-                const int x1 = std::min(x0 + 1, w - 1);
-                const float fx = sx - std::floor(sx);
-                for (int c = 0; c < channels; ++c) {
-                    const float top = static_cast<float>(src[(static_cast<size_t>(y0) * w + x0) * channels + c]) * (1.0f - fx) +
-                                      static_cast<float>(src[(static_cast<size_t>(y0) * w + x1) * channels + c]) * fx;
-                    const float bottom = static_cast<float>(src[(static_cast<size_t>(y1) * w + x0) * channels + c]) * (1.0f - fx) +
-                                         static_cast<float>(src[(static_cast<size_t>(y1) * w + x1) * channels + c]) * fx;
-                    const float value = top * (1.0f - fy) + bottom * fy;
-                    if constexpr (std::is_floating_point_v<T>)
-                        out[(static_cast<size_t>(y) * nw + x) * channels + c] = static_cast<T>(value);
-                    else
-                        out[(static_cast<size_t>(y) * nw + x) * channels + c] = static_cast<T>(std::clamp(std::lround(value), 0l, static_cast<long>(std::numeric_limits<T>::max())));
-                }
+            std::fill(row.begin(), row.end(), 0.0f);
+            const auto& span = vertical.spans[y];
+            for (int k = 0; k < span.count; ++k) {
+                const auto* input = intermediate.data() + static_cast<size_t>(span.first + k) * row_size;
+                const float weight = vertical.weights[span.offset + k];
+                for (size_t i = 0; i < row_size; ++i)
+                    row[i] += input[i] * weight;
             }
+            for (size_t i = 0; i < row_size; ++i)
+                out[static_cast<size_t>(y) * row_size + i] = static_cast<T>(
+                    std::clamp(std::lround(row[i]), 0l, static_cast<long>(std::numeric_limits<T>::max())));
         }
         return out;
-    }
-
-    template <typename T>
-    T* downscale_resample_direct(const T* src_rgb,
-                                 int w, int h, int nw, int nh,
-                                 int) {
-        return downscale_resample_nch<T>(src_rgb, w, h, nw, nh, 3);
     }
 
     template <typename T>
@@ -530,8 +571,8 @@ namespace {
             return {base, source_width, source_height, 3};
         T* resized = nullptr;
         try {
-            resized = downscale_resample_direct<T>(base, source_width, source_height,
-                                                   target_width, target_height, 0);
+            resized = downscale_lanczos2<T, 3>(base, source_width, source_height,
+                                               target_width, target_height);
         } catch (...) {
             std::free(base);
             throw;
@@ -598,7 +639,7 @@ namespace lfs::core {
         if (nw != decoded.width || nh != decoded.height) {
             unsigned char* resized = nullptr;
             try {
-                resized = downscale_resample_nch<unsigned char>(out, decoded.width, decoded.height, nw, nh, 4);
+                resized = downscale_lanczos2<unsigned char, 4>(out, decoded.width, decoded.height, nw, nh);
             } catch (...) {
                 std::free(out);
                 throw;

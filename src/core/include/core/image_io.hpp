@@ -24,6 +24,7 @@ namespace lfs::core {
 
     LFS_CORE_API std::tuple<int, int, int>
     get_image_info(std::filesystem::path p);
+    // RGB/RGBA integer image downscaling uses Lanczos2, matching GPU color loading.
     LFS_CORE_API std::tuple<unsigned char*, int, int, int>
     load_image_with_alpha(std::filesystem::path p, int res_div = -1, int max_width = 0);
     LFS_CORE_API std::tuple<unsigned char*, int, int, int>

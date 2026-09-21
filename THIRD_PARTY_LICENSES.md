@@ -82,7 +82,6 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 | [tinyply](https://github.com/ddiakopoulos/tinyply) | Lightweight PLY file loader | Public Domain / BSD-2 |
 | [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo) | JPEG codec | IJG License / BSD-3-Clause / zlib |
 | [rocJPEG Windows fork](https://github.com/Yasei-no-otoko/rocJPEG) | AMD VCN hardware JPEG decoding and HIP output on Windows, based on ROCm/rocm-systems | MIT |
-| [AMD AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF) | Headers for the driver-provided Windows VCN decoder | MIT |
 | [libpng](https://libpng.sourceforge.net/) | PNG codec | PNG Reference Library License v2 |
 | [libtiff](https://libtiff.gitlab.io/libtiff/) | TIFF codec | libtiff License, BSD-style |
 | [tinyexr](https://github.com/syoyo/tinyexr) | OpenEXR codec | BSD-3-Clause |

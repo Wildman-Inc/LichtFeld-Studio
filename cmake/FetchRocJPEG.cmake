@@ -5,7 +5,7 @@ set(_lfs_rocjpeg_default OFF)
 if(WIN32 AND USE_HIP)
     set(_lfs_rocjpeg_default ON)
 endif()
-option(LFS_ENABLE_ROCJPEG "Decode JPEG images with the Windows AMF/VCN rocJPEG backend" ${_lfs_rocjpeg_default})
+option(LFS_ENABLE_ROCJPEG "Decode JPEG images with the native Windows D3D11/VCN rocJPEG backend" ${_lfs_rocjpeg_default})
 if(NOT LFS_ENABLE_ROCJPEG)
     return()
 endif()
@@ -19,6 +19,6 @@ set(ROCJPEG_ROCM_DEVEL_PATH "${LFS_ROCM_DEVEL_PATH}")
 set(GPU_TARGETS "${HIP_ARCHITECTURES}")
 FetchContent_Declare(rocjpeg
     GIT_REPOSITORY https://github.com/Yasei-no-otoko/rocJPEG.git
-    GIT_TAG 061d6c8282a076406630590271083c25c756cb71
+    GIT_TAG 4b1d92d448d421406647978d6c9722f28a8a08ac
     GIT_PROGRESS TRUE)
 FetchContent_MakeAvailable(rocjpeg)

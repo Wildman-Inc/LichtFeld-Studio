@@ -361,7 +361,6 @@ function Test-PackageArchiveContract {
             if ($RocJpegEnabled) {
                 Assert-ZipEntry $Entries 'bin/rocjpeg.dll' 'Windows rocJPEG decoder'
                 Assert-ZipEntry $Entries 'share/licenses/rocjpeg/LICENSE' 'rocJPEG license'
-                Assert-ZipEntry $Entries 'share/licenses/rocjpeg/AMF-LICENSE.txt' 'AMF license'
             }
             if (-not $ArtifactManifestPath) {
                 throw 'HIP packages require a selected-SDK artifact manifest.'

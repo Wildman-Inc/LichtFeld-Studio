@@ -93,7 +93,7 @@ namespace lfs::io {
         }
         check_cuda(cudaStreamCreateWithFlags(&impl_->stream, cudaStreamNonBlocking),
                    "Create JPEG post-processing stream");
-        LOG_INFO("[RocJpegImageLoader] Windows AMF/VCN hardware JPEG enabled on GPU {}", impl_->device);
+        LOG_INFO("[RocJpegImageLoader] Windows D3D11/VCN hardware JPEG enabled on GPU {}", impl_->device);
     }
 
     RocJpegImageLoader::~RocJpegImageLoader() = default;

@@ -647,7 +647,7 @@ namespace lfs::io {
 
         LOG_INFO("[PipelinedImageLoader] Done: {} loaded, {} hits, {} misses",
                  stats_.total_images_loaded, stats_.hot_path_hits, stats_.cold_path_misses);
-        if (stats_.rocjpeg_decode_calls > 0)
+        if (stats_.rocjpeg_decode_calls > 0 || stats_.cpu_decode_calls > 0)
             LOG_INFO("[PipelinedImageLoader] rocJPEG hardware decodes: {}, CPU decodes: {}",
                      stats_.rocjpeg_decode_calls, stats_.cpu_decode_calls);
         {

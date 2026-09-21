@@ -81,21 +81,29 @@ Windows HIP builds enable `LFS_ENABLE_ROCJPEG` by default and fetch the
 [Windows rocJPEG fork](https://github.com/Yasei-no-otoko/rocJPEG) at a fixed
 commit. It follows rocJPEG 1.10.0 from
 [ROCm/rocm-systems](https://github.com/ROCm/rocm-systems/tree/73e42c4112d08e05170340f3fd2b5e291c2d4957/projects/rocjpeg),
-including its asynchronous public API. AMF headers are fetched at a fixed commit;
-the AMF decoder runtime comes from the installed AMD display driver.
+including its asynchronous public API. The pinned native Windows branch calls
+the AMD D3D11 MJPEG profile directly. No AMF SDK, headers, or runtime are used
+by this JPEG decoding path.
 
 Baseline JPEG images use the GPU's VCN decoder. Decoded pixels pass through
 shared D3D11/D3D12 buffers into HIP for color conversion, resizing, and CHW
 output. This path does not read decoded pixels back to the CPU. Windows hardware
-decoding supports 4:2:0, 4:2:2, and grayscale JPEGs. Progressive, CMYK, 4:4:4,
-4:4:0, unsupported dimensions, or unavailable hardware use the existing CPU
-decoder. The Windows backend rejects 4:4:4/4:4:0 before entering AMF because its
-BGRA decoder initialization crashed in the tested AMD driver. Encoding and
+decoding supports 4:2:0 and 4:2:2 JPEGs. Progressive, CMYK, 4:4:4,
+4:4:0, grayscale, unsupported dimensions, or unavailable hardware use the existing CPU
+decoder. Pixel comparison exposed an incorrect grayscale row layout in the
+tested AMD driver, including through the older AMF backend; grayscale now uses
+CPU fallback instead of returning corrupted pixels. Encoding and
 auxiliary mask/depth loading keep their existing paths.
 
 Set `LFS_DISABLE_ROCJPEG=1` in the process environment to select CPU JPEG
 decoding at runtime, or configure with `-DLFS_ENABLE_ROCJPEG=OFF` to omit this
 dependency. Logs report hardware availability and hardware/CPU decode counts.
+
+Color image downscaling uses Lanczos2 on both paths. The CPU implementation
+precomputes scale-expanded coefficients and applies separable horizontal and
+vertical passes, with the same pixel centers and normalized edge support as
+the GPU filter. It keeps float intermediates and rounds/clamps integer output
+only after both passes. RGB8, RGB16, and RGBA8 loaders share this filter.
 
 To run the loader's GPU regression suite on a supported AMD GPU:
 
@@ -104,6 +112,24 @@ cmake -S . -B build-rocm10 -DBUILD_ROCJPEG_TESTS=ON
 cmake --build build-rocm10 --config Release --target lichtfeld_rocjpeg_tests --parallel 32
 ctest --test-dir build-rocm10 -C Release -R lichtfeld_rocjpeg_tests --output-on-failure
 ```
+
+To compare the complete training pipeline with and without hardware JPEG:
+
+```powershell
+.\scripts\benchmark_rocjpeg.ps1 -Dataset C:\data\truck `
+  -OutputDirectory C:\results\rocjpeg-native `
+  -BuildDirectory .\build-rocm10 -Iterations 2000 -Repetitions 4
+```
+
+The script tests original resolution and 1/2 resolution, alternates ON/OFF
+order, fixes the splat count at 100,000, and verifies the selected decoder in
+every run. SH degree reaches three at iteration three. Each mode first gets a
+separate 300-iteration warmup run. Results retain logs, arguments, runtime
+hashes and training duration. Add `-CollectProfile` for diagnostic counters;
+their steady metrics exclude the first 1,100 iterations, including the
+optimizer's 1,000-iteration SH warmup. Use ordinary runs for the main speed
+comparison, since collecting counters adds overhead.
+Temporary configurations and training projects are removed automatically.
 
 ## Known constraints
 
@@ -157,3 +183,53 @@ the original-resolution Float32 run reported eight and zero. Both saved a
 project and exported finite PLY data (12,000 and 30,000 points respectively).
 SDK artifact hashes and the running processes' loaded DLL paths were checked,
 with only Windows directories on PATH. The installed 10.2 SDK was unchanged.
+
+The 2026-09-22 native update pins rocJPEG
+[`4b1d92d448d421406647978d6c9722f28a8a08ac`](https://github.com/Yasei-no-otoko/rocJPEG/commit/4b1d92d448d421406647978d6c9722f28a8a08ac).
+The direct D3D11 backend passed all eight fork CTest cases on the same 8060S,
+with AMD driver `32.0.31041.1004` and ROCm 10.2. LFS passed all 31 loader/resize
+tests: seven loader regressions (including grayscale fallback) and 24 CPU/GPU
+Lanczos2 comparisons covering 8/16-bit RGB, RGBA, odd sizes, 1/2 through 1/8
+scaling, maximum-side limits, and single-pixel axes. Quantized outputs differed
+by at most one level; the largest difference from the GPU's unrounded output
+was 0.500107 levels for 8-bit and 0.527344 levels for 16-bit data.
+
+A GUT/PPISP run with 30 regular and 10 sparsity iterations reported 44 hardware
+decodes and zero CPU decodes. A native-resolution Float32 run reported eight
+hardware decodes and zero CPU decodes. CPU fallback also completed training.
+All three saved projects and exported finite PLY data (4,800 / 12,000 / 12,000
+points). Their loaded modules included the new `rocjpeg.dll` and HIP runtime
+without any AMF module. SDK discovery, HIP header and package contract tests
+produced 21 passes and one platform-dependent skip. The package contract now
+requires the rocJPEG license without the removed AMF dependency's license.
+
+On the same machine, the `truck` dataset (251 JPEGs at 979×546) was compared
+with rocJPEG ON/OFF using 2,000 iterations, SH3, 100,000 fixed splats and the
+same seeded camera order. CPU and GPU both used Lanczos2 at 1/2 resolution
+(489×273). Each mode/resolution had a 300-iteration warmup and four measured
+runs with alternating ON/OFF order. All measured runs completed; ON reported
+2,002–2,003 hardware decodes and zero CPU decodes, and OFF reported zero
+hardware decodes and 2,002–2,004 CPU decodes. Extra decodes are prefetch work.
+
+| Resolution | CPU JPEG, seconds | Native rocJPEG, seconds | rocJPEG time increase |
+| --- | ---: | ---: | ---: |
+| Original, 979×546 | 16.699 | 18.350 | +9.9% |
+| 1/2, 489×273, Lanczos2 on both paths | 18.330 | 19.369 | +5.7% |
+
+These are medians of the application's full training duration, including its
+terminal save, with `--perf-bench` disabled. Individual ranges were
+15.963–17.474 / 17.903–19.966 seconds for CPU / rocJPEG at original resolution
+and 18.064–18.401 / 18.873–19.528 seconds at half resolution. Every matched
+ON/OFF pair favored CPU in this experiment. No hardware JPEG training speedup
+is established for this workload; this result does not cover larger images,
+other datasets, or other AMD GPUs.
+
+A separate set of four pairs with `-CollectProfile` also favored CPU, but
+reported larger time increases (+18.1% / +14.4%). Its steady dataloader waits
+were small: CPU 0.0174 / 0.0479 ms, rocJPEG 0.0148 / 0.0142 ms per iteration
+at original / half resolution. The collector's `steady_ms_per_iter` measures
+the host `train_step` scope and excludes time between steps; it is not the
+complete training throughput. Counter collection overhead is why the table
+above uses ordinary runs. The two runs also have different JPEG IDCT/chroma
+reconstruction, so matching resize filters does not imply identical training
+pixels or convergence.
