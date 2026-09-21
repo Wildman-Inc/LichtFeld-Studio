@@ -23,13 +23,51 @@ if(BUILD_LOCALIZATION_TESTS)
         USES_TERMINAL
     )
     message(STATUS "Registered headless localization contract tests (no LibTorch)")
-    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS AND NOT BUILD_GPU_MEMORY_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS AND NOT BUILD_GPU_MEMORY_TESTS AND NOT BUILD_GPU_NN_TESTS)
         return()
     endif()
 endif()
 
 # Find GTest
 find_package(GTest CONFIG REQUIRED)
+
+if(BUILD_GPU_NN_TESTS)
+    add_executable(lichtfeld_nn_tests EXCLUDE_FROM_ALL
+        test_nn_ops.cpp
+        test_nn_gemm.cpp
+    )
+    target_compile_features(lichtfeld_nn_tests PRIVATE cxx_std_23)
+    target_include_directories(lichtfeld_nn_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(lichtfeld_nn_tests PRIVATE PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}")
+    target_link_libraries(lichtfeld_nn_tests PRIVATE lfs_core GTest::gtest_main nlohmann_json::nlohmann_json)
+    set_target_properties(lichtfeld_nn_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    )
+    if(TARGET lfs_rocm_runtime)
+        add_dependencies(lichtfeld_nn_tests lfs_rocm_runtime)
+    endif()
+    if(NOT MSVC AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+        add_dependencies(lichtfeld_nn_tests lfs_msvc_runtime)
+    endif()
+    if(WIN32)
+        add_custom_command(TARGET lichtfeld_nn_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:lichtfeld_nn_tests>
+                "$<TARGET_FILE_DIR:lichtfeld_nn_tests>"
+            COMMAND_EXPAND_LISTS VERBATIM)
+    endif()
+    # The weight exporter exercises Python packaging, not GPU operators.
+    add_test(NAME lichtfeld_nn_tests COMMAND lichtfeld_nn_tests
+        --gtest_filter=-NnOpsTest.WeightFilePythonRoundTrip)
+    add_test(NAME lichtfeld_nn_fallback_tests COMMAND lichtfeld_nn_tests
+        --gtest_filter=NnGemm.*:NnOpsTest.Gemm*:NnOpsTest.Linear*:NnOpsTest.ConvTranspose*)
+    set_tests_properties(lichtfeld_nn_fallback_tests PROPERTIES ENVIRONMENT "LFS_DISABLE_HIP_WMMA=1")
+    set_tests_properties(lichtfeld_nn_tests lichtfeld_nn_fallback_tests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR} TIMEOUT 180 LABELS "gpu;nn")
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_LOCALIZATION_TESTS AND NOT BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS AND NOT BUILD_GPU_MEMORY_TESTS)
+        return()
+    endif()
+endif()
 
 if(BUILD_GPU_MEMORY_TESTS)
     add_executable(lichtfeld_gpu_memory_tests EXCLUDE_FROM_ALL
@@ -665,6 +703,7 @@ set(TEST_FILES
     test_modal_registry_regression.cpp
     test_tensor_nn_ops.cpp
     test_nn_ops.cpp
+    test_nn_gemm.cpp
     test_weight_file_paths.cpp
     test_moge2.cpp
     test_lpips.cpp

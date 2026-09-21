@@ -36,9 +36,10 @@ namespace lfs::core::nn {
         }
 
         Tensor empty_like_shape(const Tensor& like, const TensorShape& shape) {
-            auto out = Tensor::empty(shape, like.device(), like.dtype());
-            out.set_stream(like.stream());
-            return out;
+            // Allocate on the execution stream: changing only the tensor's
+            // stream tag would leave an async allocation pending elsewhere.
+            CUDAStreamGuard guard(like.stream());
+            return Tensor::empty(shape, like.device(), like.dtype());
         }
 
         const void* raw(const Tensor& t) {
@@ -159,8 +160,13 @@ namespace lfs::core::nn {
         }
 
         auto out = empty_like_shape(a_c, TensorShape(out_dims));
-        pin_operands({&a_c, &b_c});
+        pin_operands({&a_c, &b_c, bias_c, residual_c, scale_c});
         const cudaStream_t stream = prepare_inputs_for_stream({&a_c, &b_c}, out.stream());
+        for (const Tensor* operand : {bias_c, residual_c, scale_c}) {
+            if (operand) {
+                operand->sync_to_stream(stream);
+            }
+        }
         out.set_stream(stream);
 
         const long long stride_a = static_cast<long long>(m) * ka;
@@ -217,8 +223,13 @@ namespace lfs::core::nn {
         }
         out_dims.push_back(n);
         auto out = empty_like_shape(in_c, TensorShape(out_dims));
-        pin_operands({&in_2d, &w_c, residual_c});
+        pin_operands({&in_2d, &w_c, bias_c, residual_c});
         const cudaStream_t stream = prepare_inputs_for_stream({&in_2d, &w_c}, out.stream());
+        for (const Tensor* operand : {bias_c, residual_c}) {
+            if (operand) {
+                operand->sync_to_stream(stream);
+            }
+        }
         out.set_stream(stream);
         kernels::gemm(raw(in_2d), raw(w_c), raw_mut(out), static_cast<int>(m), static_cast<int>(n),
                       static_cast<int>(k), static_cast<long long>(m) * static_cast<long long>(k),
@@ -611,6 +622,9 @@ namespace lfs::core::nn {
         }
 
         pin_operands({&in_c, &w_c, b_c, weight_taps});
+        if (b_c) {
+            b_c->sync_to_stream(in_c.stream());
+        }
 
         if (pointwise) {
             auto nchw = empty_like_shape(
@@ -762,8 +776,11 @@ namespace lfs::core::nn {
                                                            static_cast<std::size_t>(cout),
                                                            static_cast<std::size_t>(out_h),
                                                            static_cast<std::size_t>(out_w)}});
-            pin_operands({&in_c, &w_c});
+            pin_operands({&in_c, &w_c, b_c});
             const cudaStream_t stream = prepare_inputs_for_stream({&in_c, &w_c}, out.stream());
+            if (b_c) {
+                b_c->sync_to_stream(stream);
+            }
             out.set_stream(stream);
             auto in_g = in_c.permute({0, 2, 3, 1})
                             .contiguous()
@@ -794,8 +811,11 @@ namespace lfs::core::nn {
                                                  static_cast<std::size_t>(out_h),
                                                  static_cast<std::size_t>(out_w)}},
             in_c.device(), in_c.dtype());
-        pin_operands({&in_c, &w_c});
+        pin_operands({&in_c, &w_c, b_c});
         const cudaStream_t stream = prepare_inputs_for_stream({&in_c, &w_c}, out.stream());
+        if (b_c) {
+            b_c->sync_to_stream(stream);
+        }
         out.set_stream(stream);
         scratch.set_stream(stream);
 

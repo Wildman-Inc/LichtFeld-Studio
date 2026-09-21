@@ -2,12 +2,14 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/cuda_error.hpp"
+#include "core/environment.hpp"
 #include "nn_device.cuh"
 #include "nn_kernels.hpp"
 #include "nn_nvtx.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #if !LFS_USE_HIP
@@ -777,12 +779,23 @@ namespace lfs::core::nn::kernels {
 #endif
         }
 
+#if LFS_USE_HIP
+#include "gemm_hip_wmma.cuh"
+#endif
+
         void launch_hgemm_wmma(const __half* a, const __half* b, __half* c, const __half* bias,
                                int m, int n, int k, long long stride_a, long long stride_b,
                                long long stride_c, int batch, bool trans_a, bool trans_b,
                                int activation, bool trans_c, cudaStream_t stream,
                                const __half* residual, const __half* scale, int scatter_h,
                                int scatter_w) {
+#if LFS_USE_HIP
+            if (hip_wmma::launch(a, b, c, bias, m, n, k, stride_a, stride_b, stride_c, batch,
+                                 trans_a, trans_b, activation, trans_c, stream, residual, scale,
+                                 scatter_h, scatter_w)) {
+                return;
+            }
+#endif
             // Linear / NT encoder GEMMs (SAM2 Hiera, MoGe ViT): K is a multiple of
             // 8 so every 16-byte vector is fully in-bounds or fully OOB. Keep the
             // generic 128×64 kernel for trans_a (1×1 NCHW), scatter (conv-transpose),
