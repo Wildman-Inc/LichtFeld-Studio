@@ -98,3 +98,7 @@ Results recorded on 2026-09-20 cover the integration of upstream commit [c1c0f31
 | Portable ZIP | SDK artifact hashes and ZIP policy passed; extracted executable started and completed GUT/PPISP/Sparsity training and export with only Windows directories on PATH |
 
 CUDA and Linux HIP paths are retained. Linux and CDNA compile coverage is tracked separately in the [Linux ROCm and CDNA build guide](linux-rocm.md); no physical CDNA runtime or training result is claimed here.
+
+The 2026-09-21 follow-up integrates upstream [9b960dfef13dcb31068ef25ca44ef7127110f0c9](https://github.com/MrNeRF/LichtFeld-Studio/commit/9b960dfef13dcb31068ef25ca44ef7127110f0c9). Its original-JPEG shortcut is restricted to builds with an active nvImageCodec decoder so HIP does not enqueue work without a consumer. On the same system, the Release build, 49 ROCm regression tests, 68 Unicode path tests, 36 visualizer tests, and 90 format tests passed (one optional format scale simulation was skipped). Original-size JPEG training completed with both UInt8 and Float32 output; a resized GUT/PPISP/Sparsity run completed 40 steps with project save and PLY export.
+
+The changed upstream Python suites, run with the bundled Python 3.12/native module, produced 848 passes, 2 skips, and 28 failures from existing Windows test assumptions: 25 require unavailable symlink privileges, and the remaining three assume nanosecond file timestamps, POSIX home-directory overrides, or POSIX path separators. These failures are separate from the 49 passing ROCm regression tests.
