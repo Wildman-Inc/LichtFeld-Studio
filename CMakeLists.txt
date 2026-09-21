@@ -24,7 +24,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LFS_VCPKG_OVERL
 # cache values are visible before project(), when the vcpkg toolchain resolves
 # manifest features.
 list(REMOVE_ITEM VCPKG_MANIFEST_FEATURES tests vulkan-validation)
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS OR BUILD_ROCJPEG_TESTS)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
 
@@ -227,6 +227,7 @@ add_custom_target(lfs_git_version ALL
 option(BUILD_TESTS "Build tests" OFF)
 option(BUILD_PANEL_LAYOUT_TESTS "Build focused panel layout and registry tests" OFF)
 option(BUILD_VISUALIZER_TESTS "Build CPU-only visualizer tests without LibTorch" OFF)
+option(BUILD_ROCJPEG_TESTS "Build Windows HIP hardware JPEG loader tests without LibTorch" OFF)
 option(BUILD_FORMAT_TESTS "Build only the CPU-only .licht format tests (no CUDA)" OFF)
 option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path tests (no CUDA runtime linkage)" OFF)
 option(BUILD_LOCALIZATION_TESTS "Register headless localization contract tests without LibTorch" OFF)
@@ -819,6 +820,8 @@ add_compile_definitions(
 # =============================================================================
 # LIBRARY MODULES
 # =============================================================================
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchRocJPEG.cmake")
+
 add_subdirectory(src/diagnostics) # Shared diagnostics/profiling module
 add_subdirectory(src/core)       # Core module (lfs::core namespace)
 add_subdirectory(src/training)   # Training module (lfs::training namespace)
@@ -956,6 +959,25 @@ endif()
 # The app embeds Python and loads the nanobind module at runtime for panels,
 # menus, and operators. Keep the runtime artifact in lockstep with the app.
 add_dependencies(${PROJECT_NAME} lfs_py)
+
+if(TARGET rocjpeg)
+    get_target_property(_lfs_rocjpeg_python_dir lfs_py BINARY_DIR)
+    add_custom_target(lfs_rocjpeg_runtime
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+            "$<TARGET_FILE_DIR:lfs_py>" "${_lfs_rocjpeg_python_dir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rocjpeg>"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rocjpeg>"
+            "$<TARGET_FILE_DIR:lfs_py>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rocjpeg>"
+            "${_lfs_rocjpeg_python_dir}"
+        DEPENDS rocjpeg
+        COMMENT "Staging the Windows rocJPEG decoder"
+        VERBATIM)
+    add_dependencies(${PROJECT_NAME} lfs_rocjpeg_runtime)
+    add_dependencies(lfs_py lfs_rocjpeg_runtime)
+endif()
 
 # Copy nvImageCodec shared libraries next to executable for easy deployment
 if(TARGET nvimgcodec)
@@ -1525,7 +1547,7 @@ endif()
 # =============================================================================
 # TESTING (Optional)
 # =============================================================================
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS OR BUILD_ROCJPEG_TESTS)
     enable_testing()
     add_subdirectory(tests)
     if(BUILD_UNICODE_TEST_ONLY)
@@ -1536,6 +1558,8 @@ if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZ
         message(STATUS "Panel layout tests enabled. Build target panel_layout_tests to run them")
     elseif(BUILD_VISUALIZER_TESTS AND NOT BUILD_TESTS)
         message(STATUS "CPU-only visualizer tests enabled. Build target lichtfeld_visualizer_tests and run with 'ctest -R lichtfeld_visualizer_tests'")
+    elseif(BUILD_ROCJPEG_TESTS AND NOT BUILD_TESTS)
+        message(STATUS "Windows HIP JPEG loader tests enabled. Build target lichtfeld_rocjpeg_tests and run with 'ctest -R lichtfeld_rocjpeg_tests'")
     elseif(NOT BUILD_TESTS)
         message(STATUS "Format tests enabled. Build with 'ninja lichtfeld_format_tests' and run with 'ctest -L format'")
     else()

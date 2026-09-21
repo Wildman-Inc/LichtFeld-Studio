@@ -31,6 +31,7 @@
 namespace lfs::io {
 
     class NvCodecImageLoader;
+    class RocJpegImageLoader;
 
     namespace config {
         constexpr size_t DEFAULT_BATCH_SIZE = 8;
@@ -184,6 +185,7 @@ namespace lfs::io {
             size_t total_bytes_read = 0;
             size_t total_decode_calls = 0;
             size_t cpu_decode_calls = 0;
+            size_t rocjpeg_decode_calls = 0;
             // Mask loading stats
             size_t masks_loaded = 0;
             size_t mask_cache_hits = 0;
@@ -491,6 +493,7 @@ namespace lfs::io {
         void publish_loader_vram_gauges() const;
 
         PipelinedLoaderConfig config_;
+        std::shared_ptr<RocJpegImageLoader> rocjpeg_loader_;
         std::atomic<bool> running_{false};
         std::vector<std::thread> io_threads_;
         std::thread gpu_decode_thread_;

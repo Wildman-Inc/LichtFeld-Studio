@@ -14,6 +14,9 @@
 #include "cuda/image_format_kernels.cuh"
 #include "diagnostics/vram_profiler.hpp"
 #include "io/nvcodec_image_loader.hpp"
+#ifdef LFS_HAS_ROCJPEG
+#include "io/rocjpeg_image_loader.hpp"
+#endif
 
 #include <cuda_runtime.h>
 #include <stb_image.h>
@@ -524,6 +527,13 @@ namespace lfs::io {
                  config_.use_16bit_color);
 
         const bool nvcodec_available = is_nvcodec_available();
+#ifdef LFS_HAS_ROCJPEG
+        try {
+            rocjpeg_loader_ = std::make_shared<RocJpegImageLoader>();
+        } catch (const std::exception& error) {
+            LOG_INFO("[PipelinedImageLoader] rocJPEG initialization failed; using CPU decode: {}", error.what());
+        }
+#endif
         LOG_INFO("[PipelinedImageLoader] host compressed cache cap: {:.1f} GiB",
                  config_.max_cache_bytes / (1024.0 * 1024.0 * 1024.0));
 
@@ -637,6 +647,9 @@ namespace lfs::io {
 
         LOG_INFO("[PipelinedImageLoader] Done: {} loaded, {} hits, {} misses",
                  stats_.total_images_loaded, stats_.hot_path_hits, stats_.cold_path_misses);
+        if (stats_.rocjpeg_decode_calls > 0)
+            LOG_INFO("[PipelinedImageLoader] rocJPEG hardware decodes: {}, CPU decodes: {}",
+                     stats_.rocjpeg_decode_calls, stats_.cpu_decode_calls);
         {
             std::lock_guard<std::mutex> cache_lock(jpeg_cache_mutex_);
             LOG_INFO("[PipelinedImageLoader] compressed run cache: {} RAM entries, {:.1f} MiB RAM, {} spill entries, {:.1f} MiB spill",
@@ -1014,10 +1027,29 @@ namespace lfs::io {
 
         if (is_original_jpeg) {
             auto data = std::make_shared<std::vector<uint8_t>>(read_file(path));
-            if (!needs_requested_processing) {
+            if (!needs_requested_processing && is_nvcodec_available()) {
                 put_in_jpeg_cache(cache_key, data);
             }
 
+#ifdef LFS_HAS_ROCJPEG
+            if (rocjpeg_loader_) {
+                lfs::core::Tensor tensor;
+                try {
+                    tensor = rocjpeg_loader_->decode(*data, params.resize_factor,
+                                                     params.max_width, params.output_uint8);
+                } catch (const std::exception& error) {
+                    LOG_DEBUG("[PipelinedImageLoader] rocJPEG decode failed; using CPU: {}", error.what());
+                }
+                if (tensor.is_valid()) {
+                    {
+                        std::lock_guard stats_lock(stats_mutex_);
+                        ++stats_.rocjpeg_decode_calls;
+                    }
+                    apply_requested_undistort(tensor, params);
+                    return tensor;
+                }
+            }
+#endif
             if (is_nvcodec_available()) {
                 try {
                     auto nvcodec = acquire_nvcodec_loader(config_.decoder_pool_size);
@@ -3011,7 +3043,22 @@ namespace lfs::io {
                     lfs::core::Tensor decoded;
                     bool used_gpu = false;
 
-                    if (is_nvcodec_available() && item.is_original_jpeg) {
+#ifdef LFS_HAS_ROCJPEG
+                    if (rocjpeg_loader_ && item.is_original_jpeg) {
+                        try {
+                            decoded = rocjpeg_loader_->decode(item.raw_bytes, item.params.resize_factor,
+                                                             item.params.max_width, item.params.output_uint8);
+                        } catch (const std::exception& error) {
+                            LOG_DEBUG("[PipelinedImageLoader] rocJPEG decode failed; using CPU: {}", error.what());
+                        }
+                        used_gpu = decoded.is_valid();
+                        if (used_gpu) {
+                            std::lock_guard stats_lock(stats_mutex_);
+                            ++stats_.rocjpeg_decode_calls;
+                        }
+                    }
+#endif
+                    if (!used_gpu && is_nvcodec_available() && item.is_original_jpeg) {
                         try {
                             const NvcodecSlotGuard slot;
                             decoded = nvcodec->load_image_gpu(

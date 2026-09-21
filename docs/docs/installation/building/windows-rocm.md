@@ -15,7 +15,7 @@ The ROCm target requires Windows x64, Visual Studio 2022 or newer with Desktop d
 
 The build additionally requires a Windows ROCm/HIP SDK. ROCm 10.x Python wheels use `_rocm_sdk_core`, `_rocm_sdk_devel`, and the multi-architecture `_rocm_sdk_libraries` package. Initialize the development files with `py -3.13 -m rocm_sdk init` after installing these packages in Python 3.13. The selected core's sibling development and runtime directories take precedence over other Python environments. Older per-architecture runtime wheels are used only when the multi-architecture runtime is absent.
 
-ROCm release numbers and HIP component versions differ: the installed ROCm `10.1.0a20260909` SDK reports HIP `7.16.26362` and AMD Clang `24.0.0git`. A HIP `7.x` version in the CMake summary therefore does not mean an older ROCm release was selected. Check `_rocm_sdk_core/.info/version` for the ROCm release.
+ROCm release numbers and HIP component versions differ: the tested ROCm `10.2.0` SDK reports HIP `7.16.26373` and AMD Clang `24.0.0git`. A HIP `7.x` version in the CMake summary therefore does not mean an older ROCm release was selected. Check `_rocm_sdk_core/.info/version` for the ROCm release.
 
 Initialize the shared prerequisites from PowerShell:
 
@@ -75,6 +75,36 @@ LichtFeld Studio for ROCm includes dataset loading, HIP training, the Vulkan/VkS
 
 Windows HIP synchronizes Vulkan and HIP through a D3D12 shared fence, imported as a Vulkan timeline semaphore and a HIP D3D12 fence. Vulkan allocates shared model buffers that HIP maps directly. HIP writes RGBA8 and R32F scene output into shared linear buffers; Vulkan copies those buffers into images for presentation. The selected GPU and driver must support these fence and buffer imports.
 
+## Hardware JPEG decoding
+
+Windows HIP builds enable `LFS_ENABLE_ROCJPEG` by default and fetch the
+[Windows rocJPEG fork](https://github.com/Yasei-no-otoko/rocJPEG) at a fixed
+commit. It follows rocJPEG 1.10.0 from
+[ROCm/rocm-systems](https://github.com/ROCm/rocm-systems/tree/73e42c4112d08e05170340f3fd2b5e291c2d4957/projects/rocjpeg),
+including its asynchronous public API. AMF headers are fetched at a fixed commit;
+the AMF decoder runtime comes from the installed AMD display driver.
+
+Baseline JPEG images use the GPU's VCN decoder. Decoded pixels pass through
+shared D3D11/D3D12 buffers into HIP for color conversion, resizing, and CHW
+output. This path does not read decoded pixels back to the CPU. Windows hardware
+decoding supports 4:2:0, 4:2:2, and grayscale JPEGs. Progressive, CMYK, 4:4:4,
+4:4:0, unsupported dimensions, or unavailable hardware use the existing CPU
+decoder. The Windows backend rejects 4:4:4/4:4:0 before entering AMF because its
+BGRA decoder initialization crashed in the tested AMD driver. Encoding and
+auxiliary mask/depth loading keep their existing paths.
+
+Set `LFS_DISABLE_ROCJPEG=1` in the process environment to select CPU JPEG
+decoding at runtime, or configure with `-DLFS_ENABLE_ROCJPEG=OFF` to omit this
+dependency. Logs report hardware availability and hardware/CPU decode counts.
+
+To run the loader's GPU regression suite on a supported AMD GPU:
+
+```powershell
+cmake -S . -B build-rocm10 -DBUILD_ROCJPEG_TESTS=ON
+cmake --build build-rocm10 --config Release --target lichtfeld_rocjpeg_tests --parallel 32
+ctest --test-dir build-rocm10 -C Release -R lichtfeld_rocjpeg_tests --output-on-failure
+```
+
 ## Known constraints
 
 - Runtime results below cover Windows 11 and Radeon 8060S (`gfx1151`) only. Other AMD architectures can be selected with `LFS_AMDGPU_ARCH`; CDNA coverage remains compile-only.
@@ -102,3 +132,15 @@ CUDA and Linux HIP paths are retained. Linux and CDNA compile coverage is tracke
 The 2026-09-21 follow-up integrates upstream [9b960dfef13dcb31068ef25ca44ef7127110f0c9](https://github.com/MrNeRF/LichtFeld-Studio/commit/9b960dfef13dcb31068ef25ca44ef7127110f0c9). Its original-JPEG shortcut is restricted to builds with an active nvImageCodec decoder so HIP does not enqueue work without a consumer. On the same system, the Release build, 49 ROCm regression tests, 68 Unicode path tests, 36 visualizer tests, and 90 format tests passed (one optional format scale simulation was skipped). Original-size JPEG training completed with both UInt8 and Float32 output; a resized GUT/PPISP/Sparsity run completed 40 steps with project save and PLY export.
 
 The changed upstream Python suites, run with the bundled Python 3.12/native module, produced 848 passes, 2 skips, and 28 failures from existing Windows test assumptions: 25 require unavailable symlink privileges, and the remaining three assume nanosecond file timestamps, POSIX home-directory overrides, or POSIX path separators. These failures are separate from the 49 passing ROCm regression tests.
+
+The Windows JPEG integration was subsequently verified on ROCm `10.2.0` / HIP
+`7.16.26373` with the same GPU. The fetched rocJPEG commit
+[`061d6c8282a076406630590271083c25c756cb71`](https://github.com/Yasei-no-otoko/rocJPEG/commit/061d6c8282a076406630590271083c25c756cb71)
+passed all seven fork CTest cases, including 406 GPU conversion cases and all
+13 public APIs. All seven LFS loader tests passed, covering CPU RGB comparison,
+UInt8/Float32 resizing, tensor lifetime, repeated immediate/prefetch loading,
+and CPU fallback for progressive/4:4:4 JPEG and PNG. The 49 ROCm regressions and
+four additional package-contract cases passed. A 40-step GUT/PPISP/Sparsity run
+reported 44 hardware JPEG decodes and zero CPU decodes; an original-resolution
+Float32 run reported eight hardware decodes and zero CPU decodes. Both saved a
+project and exported PLY files with all 12,000 and 30,000 points finite.

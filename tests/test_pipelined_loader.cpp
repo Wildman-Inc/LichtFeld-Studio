@@ -164,7 +164,7 @@ TEST_F(PipelinedImageLoaderTest, OriginalJpegUsesAvailableDecoderWithoutReencodi
         EXPECT_EQ(ready->tensor.dtype(), high_precision ? DataType::Float32 : DataType::UInt8);
         const auto stats = loader.get_stats();
         EXPECT_EQ(stats.cold_path_misses, gpu_decode ? 0u : 1u);
-        EXPECT_EQ(stats.cpu_decode_calls, gpu_decode ? 0u : 1u);
+        EXPECT_EQ(stats.cpu_decode_calls + stats.rocjpeg_decode_calls, gpu_decode ? 0u : 1u);
         EXPECT_EQ(stats.hot_path_hits, gpu_decode ? 1u : 0u);
         input.sequence_id = 1;
         loader.prefetch({input});
@@ -172,6 +172,14 @@ TEST_F(PipelinedImageLoaderTest, OriginalJpegUsesAvailableDecoderWithoutReencodi
         ASSERT_TRUE(repeated) << "Repeated JPEG load did not complete";
         EXPECT_EQ(ready->tensor.to(DataType::Float32).cpu().to_vector(),
                   repeated->tensor.to(DataType::Float32).cpu().to_vector());
+        const auto immediate = loader.load_image_immediate(input.path, input.params);
+        ASSERT_TRUE(immediate.is_valid());
+        input.sequence_id = 2;
+        loader.prefetch({input});
+        const auto after_immediate = loader.try_get_for(std::chrono::seconds{10});
+        ASSERT_TRUE(after_immediate) << "Immediate JPEG cache must not feed an unserviced queue";
+        EXPECT_EQ(immediate.to(DataType::Float32).cpu().to_vector(),
+                  after_immediate->tensor.to(DataType::Float32).cpu().to_vector());
     }
 }
 

@@ -23,13 +23,54 @@ if(BUILD_LOCALIZATION_TESTS)
         USES_TERMINAL
     )
     message(STATUS "Registered headless localization contract tests (no LibTorch)")
-    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS)
         return()
     endif()
 endif()
 
 # Find GTest
 find_package(GTest CONFIG REQUIRED)
+
+# This opt-in suite requires an AMD GPU with AMF JPEG decode support. It uses
+# generated fixtures and the production loader without the full Torch test suite.
+if(BUILD_ROCJPEG_TESTS)
+    if(NOT WIN32 OR NOT USE_HIP OR NOT TARGET rocjpeg::rocjpeg)
+        message(FATAL_ERROR "BUILD_ROCJPEG_TESTS requires Windows HIP and LFS_ENABLE_ROCJPEG")
+    endif()
+    add_executable(lichtfeld_rocjpeg_tests EXCLUDE_FROM_ALL
+        test_rocjpeg_image_loader.cpp
+    )
+    target_compile_features(lichtfeld_rocjpeg_tests PRIVATE cxx_std_23)
+    target_include_directories(lichtfeld_rocjpeg_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(lichtfeld_rocjpeg_tests PRIVATE lfs_io lfs_core GTest::gtest_main JPEG::JPEG)
+    set_target_properties(lichtfeld_rocjpeg_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    )
+    add_dependencies(lichtfeld_rocjpeg_tests lfs_rocjpeg_runtime)
+    if(TARGET lfs_rocm_runtime)
+        add_dependencies(lichtfeld_rocjpeg_tests lfs_rocm_runtime)
+    endif()
+    if(NOT MSVC AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+        # Defined later by the parent directory for the ROCm Clang toolchain.
+        add_dependencies(lichtfeld_rocjpeg_tests lfs_msvc_runtime)
+    endif()
+    add_custom_command(TARGET lichtfeld_rocjpeg_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:lichtfeld_rocjpeg_tests>
+            "$<TARGET_FILE_DIR:lichtfeld_rocjpeg_tests>"
+        COMMAND_EXPAND_LISTS
+        VERBATIM
+    )
+    add_test(NAME lichtfeld_rocjpeg_tests COMMAND lichtfeld_rocjpeg_tests)
+    set_tests_properties(lichtfeld_rocjpeg_tests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        TIMEOUT 120
+        LABELS "gpu;rocjpeg"
+    )
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_LOCALIZATION_TESTS AND NOT BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_VISUALIZER_TESTS)
+        return()
+    endif()
+endif()
 
 # =============================================================================
 # CPU-only visualizer tests (no LibTorch)

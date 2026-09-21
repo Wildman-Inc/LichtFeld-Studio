@@ -69,7 +69,7 @@ class WindowsPackageContractTests(unittest.TestCase):
         cls.manifest = cls.build / "rocm-artifact-sha256-manifest.txt"
         cls.runner = cls.root / "validate.ps1"
         cls.runner.write_text(
-            "param([string]$ArchivePath, [string]$ManifestPath, [string]$ChecksumPath)\n"
+            "param([string]$ArchivePath, [string]$ManifestPath, [string]$ChecksumPath, [string]$RocJpegValue)\n"
             "$ErrorActionPreference = 'Stop'\n"
             "$tokens = $null; $parseErrors = $null\n"
             "$ast = [System.Management.Automation.Language.Parser]::ParseFile(\n"
@@ -78,20 +78,24 @@ class WindowsPackageContractTests(unittest.TestCase):
             "$ast.FindAll({ param($node)\n"
             "    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]\n"
             "}, $false) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }\n"
-            "Test-PackageArchiveContract $ArchivePath HIP $ManifestPath\n"
+            '$enabled = (Get-CMakeCacheValue "LFS_ENABLE_ROCJPEG:BOOL=$RocJpegValue" '
+            "'LFS_ENABLE_ROCJPEG') -match '^(1|ON|YES|TRUE|Y)$'\n"
+            "Test-PackageArchiveContract $ArchivePath HIP $ManifestPath -RocJpegEnabled $enabled\n"
             "if ($ChecksumPath) { Test-PackageChecksum $ArchivePath $ChecksumPath }\n",
             encoding="utf-8",
         )
 
-    def validate(self, archive, *, success, checksum=""):
+    def validate(self, archive, *, success, checksum="", rocjpeg="OFF", error=""):
         result = subprocess.run(
             [POWERSHELL, "-NoProfile", "-File", str(self.runner), str(archive),
-             str(self.manifest), str(checksum)], capture_output=True, text=True,
+             str(self.manifest), str(checksum), rocjpeg], capture_output=True, text=True,
         )
         if success:
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         else:
             self.assertNotEqual(0, result.returncode, result.stdout + result.stderr)
+            if error:
+                self.assertIn(error, result.stdout + result.stderr)
 
     def altered_archive(self, *, replace=None, omit=None):
         output = self.root / f"{self._testMethodName}.zip"
@@ -113,6 +117,37 @@ class WindowsPackageContractTests(unittest.TestCase):
 
     def test_changed_runtime_is_rejected(self):
         self.validate(self.altered_archive(replace={"bin/amdhip64_7.dll": b"other SDK"}), success=False)
+
+    @staticmethod
+    def rocjpeg_entries():
+        return {
+            "bin/rocjpeg.dll": b"pinned Windows rocJPEG fork",
+            "share/licenses/rocjpeg/LICENSE": b"rocJPEG MIT license",
+            "share/licenses/rocjpeg/AMF-LICENSE.txt": b"AMF MIT license",
+        }
+
+    def test_enabled_rocjpeg_is_separate_from_selected_sdk(self):
+        archive = self.altered_archive(replace=self.rocjpeg_entries())
+        self.validate(archive, success=True, rocjpeg="ON")
+
+    def test_enabled_rocjpeg_requires_decoder_and_both_licenses(self):
+        for missing in self.rocjpeg_entries():
+            with self.subTest(missing=missing):
+                entries = self.rocjpeg_entries()
+                del entries[missing]
+                self.validate(self.altered_archive(replace=entries), success=False,
+                              rocjpeg="ON", error=missing)
+
+    def test_disabled_rocjpeg_does_not_allow_stale_decoder(self):
+        self.validate(self.altered_archive(replace=self.rocjpeg_entries()), success=False,
+                      error="ROCm package artifacts do not match")
+
+    def test_enabled_rocjpeg_keeps_sdk_closure_strict(self):
+        for stale in ("bin/rocblas_old.dll", "bin/rocjpeg_old.dll", "bin/hiprtc_old.dll"):
+            with self.subTest(stale=stale):
+                entries = {**self.rocjpeg_entries(), stale: b"unexpected runtime"}
+                self.validate(self.altered_archive(replace=entries), success=False,
+                              rocjpeg="ON", error="ROCm package artifacts do not match")
 
     def test_missing_device_archive_is_rejected(self):
         self.validate(self.altered_archive(omit=".kpack/rand_lib_gfx1151.kpack"), success=False)

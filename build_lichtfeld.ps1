@@ -327,7 +327,8 @@ function Test-PackageArchiveContract {
     param(
         [Parameter(Mandatory = $true)][string]$ArchivePath,
         [Parameter(Mandatory = $true)][string]$Backend,
-        [string]$ArtifactManifestPath = ''
+        [string]$ArtifactManifestPath = '',
+        [bool]$RocJpegEnabled = $false
     )
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -357,6 +358,11 @@ function Test-PackageArchiveContract {
         Assert-ZipEntry $Entries 'licenses/THIRD_PARTY_LICENSES.md' 'Studio third-party license notice'
 
         if ($Backend -eq 'HIP') {
+            if ($RocJpegEnabled) {
+                Assert-ZipEntry $Entries 'bin/rocjpeg.dll' 'Windows rocJPEG decoder'
+                Assert-ZipEntry $Entries 'share/licenses/rocjpeg/LICENSE' 'rocJPEG license'
+                Assert-ZipEntry $Entries 'share/licenses/rocjpeg/AMF-LICENSE.txt' 'AMF license'
+            }
             if (-not $ArtifactManifestPath) {
                 throw 'HIP packages require a selected-SDK artifact manifest.'
             }
@@ -378,12 +384,15 @@ function Test-PackageArchiveContract {
             if ((Get-ZipEntrySha256 $Archive $ManifestEntry) -cne $ManifestHash) {
                 throw 'Packaged ROCm artifact manifest differs from the configured SDK inputs.'
             }
-            # Reject extra runtimes/assets or stale notices from an older SDK.
+            # rocJPEG is built from the pinned fork, outside the selected SDK.
+            # Its DLL and notices are checked above when enabled; all other ROCm
+            # runtimes/assets must still exactly match the SDK manifest.
             $ExpectedArtifacts = @($Artifacts | ForEach-Object { $_.Key.ToLowerInvariant() } |
                 Sort-Object -Unique)
             $ActualArtifacts = @($EntryNames | Where-Object {
                 $_.ToLowerInvariant() -in $ExpectedArtifacts -or
-                $_ -match '^bin/(?:amd_comgr|amdhip.*|hip.*|roc.*)[.]dll$' -or
+                ($_ -match '^bin/(?:amd_comgr|amdhip.*|hip.*|roc.*)[.]dll$' -and
+                    (-not $RocJpegEnabled -or $_ -ine 'bin/rocjpeg.dll')) -or
                 $_ -match '^[.]kpack/' -or
                 ($_.StartsWith('licenses/ROCm/', [System.StringComparison]::OrdinalIgnoreCase) -and
                     $_ -ne $ManifestEntry)
@@ -1176,8 +1185,10 @@ function Build-LichtFeldStudio {
             }
             $PackageArchivePath = (Resolve-Path -LiteralPath $PackageArchivePath).Path
             $PackageChecksumPath = (Resolve-Path -LiteralPath $PackageChecksumPath).Path
+            $PackageCacheContent = Get-Content -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt') -Raw
+            $RocJpegEnabled = (Get-CMakeCacheValue $PackageCacheContent 'LFS_ENABLE_ROCJPEG') -match '^(1|ON|YES|TRUE|Y)$'
             Test-PackageChecksum $PackageArchivePath $PackageChecksumPath
-            Test-PackageArchiveContract $PackageArchivePath $GpuBackend $ArtifactManifestPath
+            Test-PackageArchiveContract $PackageArchivePath $GpuBackend $ArtifactManifestPath -RocJpegEnabled $RocJpegEnabled
         }
 
         Write-Host ""

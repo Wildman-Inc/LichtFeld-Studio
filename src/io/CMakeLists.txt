@@ -445,13 +445,20 @@ target_link_libraries(lfs_io
 )
 target_compile_definitions(lfs_io PRIVATE nsel_CONFIG_SELECT_EXPECTED=1)
 
+if(TARGET rocjpeg::rocjpeg)
+    target_sources(lfs_io PRIVATE rocjpeg_image_loader.cpp)
+    target_link_libraries(lfs_io PRIVATE rocjpeg::rocjpeg)
+    target_compile_definitions(lfs_io PRIVATE LFS_HAS_ROCJPEG=1)
+    message(STATUS "Linking Windows AMF/VCN rocJPEG to lfs_io")
+endif()
+
 # Link nvImageCodec if available
 if(TARGET nvimgcodec)
     target_link_libraries(lfs_io PRIVATE nvimgcodec)
     add_dependencies(lfs_io nvimgcodec)
     message(STATUS "Linking nvImageCodec to lfs_io")
 else()
-    message(STATUS "nvImageCodec target not found - JPEG hardware decode disabled")
+    message(STATUS "nvImageCodec target not found - NVIDIA image codecs disabled")
 endif()
 
 if(TARGET nvimgcodec_imgproc_static)
