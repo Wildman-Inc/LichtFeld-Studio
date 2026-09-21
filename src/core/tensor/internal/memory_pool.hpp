@@ -5,6 +5,7 @@
 
 #include "allocation_profiler.hpp"
 #include "core/alloc_counter.hpp"
+#include "core/cuda/stream_ordered_allocator.hpp"
 #include "core/cuda_error.hpp"
 #include "core/export.hpp"
 #include "core/logger.hpp"
@@ -168,7 +169,7 @@ namespace lfs::core {
                 }
             }
 
-            if (bytes <= BUCKET_ALLOC_THRESHOLD) {
+            if (bytes <= BUCKET_ALLOC_THRESHOLD && stream_ordered_allocation_supported()) {
                 ptr = SizeBucketedPool::instance().try_allocate_cached(bytes, stream);
                 if (ptr) {
                     stats_.bucket_cache_hits.fetch_add(1, std::memory_order_relaxed);
@@ -182,7 +183,7 @@ namespace lfs::core {
 
                 const size_t bucket_size = SizeBucketedPool::get_bucket_size(bytes);
 
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
                 const auto pre_call_state = sample_cuda_pre_call_state(stream);
                 cudaError_t err = cudaMallocAsync(&ptr, bucket_size, stream);
                 if (err == cudaSuccess) {
@@ -205,8 +206,8 @@ namespace lfs::core {
 #endif
             }
 
-#if CUDART_VERSION >= 12080
-            {
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
+            if (stream_ordered_allocation_supported()) {
                 const auto pre_call_state = sample_cuda_pre_call_state(stream);
                 cudaError_t err = cudaMallocAsync(&ptr, bytes, stream);
                 if (err == cudaSuccess) {
@@ -258,7 +259,10 @@ namespace lfs::core {
             }
 
             std::shared_lock stream_routing_lock(stream_routing_mutex_);
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
+            if (!stream_ordered_allocation_supported()) {
+                return try_allocate_direct(bytes, failure_status);
+            }
             void* ptr = nullptr;
             const auto pre_call_state = sample_cuda_pre_call_state(stream);
             const cudaError_t err = cudaMallocAsync(&ptr, bytes, stream);
@@ -421,9 +425,11 @@ namespace lfs::core {
                 return;
             }
 
-#if CUDART_VERSION >= 12080
+#if !LFS_USE_HIP && CUDART_VERSION >= 12080
             const cudaError_t free_status = cudaFreeAsync(ptr, stream);
 #else
+            // An untracked pointer can come from a classic/external allocation.
+            // Only tracked async allocations enter hipFreeAsync on HIP.
             const cudaError_t free_status = cudaFree(ptr);
 #endif
             if (free_status != cudaSuccess) {
@@ -451,7 +457,12 @@ namespace lfs::core {
         }
 
         void configure() {
-#if CUDART_VERSION >= 12080
+            slab_enabled_ = true;
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
+            if (!stream_ordered_allocation_supported()) {
+                LOG_INFO("Stream-ordered memory pool unavailable or disabled; using direct allocations");
+                return;
+            }
             const auto pre_call_state = sample_cuda_pre_call_state();
             int device;
             cudaError_t err = cudaGetDevice(&device);
@@ -489,12 +500,11 @@ namespace lfs::core {
                 return;
             }
 
-            LOG_DEBUG("CUDA memory pool configured for device " + std::to_string(device) + " (CUDA " + std::to_string(CUDART_VERSION) + ")");
+            LOG_INFO("Stream-ordered memory pool enabled for device {} (64 MiB release threshold)", device);
 #else
             LOG_WARN("CUDA memory pooling not available (requires CUDA >= 12.8)");
 #endif
 
-            slab_enabled_ = true;
             LOG_DEBUG("Slab allocator enabled (lazy, ≤256KB)");
             LOG_DEBUG("Size-bucketed pool enabled (256KB-16GB, reduces fragmentation)");
         }
@@ -513,7 +523,7 @@ namespace lfs::core {
             oss << "  Direct: " << stats_.direct_allocs.load() << " allocs ("
                 << (stats_.direct_bytes.load() / 1024.0 / 1024.0) << " MB)\n";
 
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
             int device = -1;
             cudaMemPool_t pool = nullptr;
             if (try_get_default_pool(device, pool, "memory-pool statistics")) {
@@ -550,7 +560,7 @@ namespace lfs::core {
 
         void trim() {
             SizeBucketedPool::instance().trim_cache();
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
             trim_default_pool("memory-pool trim");
 #endif
         }
@@ -589,7 +599,7 @@ namespace lfs::core {
             SizeBucketedPool::instance().retag_all_streams(nullptr);
             SizeBucketedPool::instance().trim_cache();
 
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
             trim_default_pool("cached-memory trim");
 #endif
             record_trim();
@@ -599,7 +609,7 @@ namespace lfs::core {
         // the CUDA pool has meaningful reclaimable slack, but avoid a device
         // sync for small transient fluctuations.
         void trim_cached_memory_if_reserved_unused_exceeds(const size_t threshold_bytes) {
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
             int device = -1;
             cudaMemPool_t pool = nullptr;
             if (!try_get_default_pool(device, pool, "conditional memory-pool trim")) {
@@ -714,10 +724,12 @@ namespace lfs::core {
         // the edges — no host sync, no deferred retention.
         void free_routed(void* ptr, const AllocationInfo& info) {
             for (cudaStream_t extra : info.extra_streams) {
-                // Skip null / home-equal extras. Bridging a destroyed capture stream
+                // The legacy stream is a real consumer too; a nonblocking home
+                // stream does not implicitly wait for its work. Skip only equal
+                // or explicitly retired streams. Bridging a destroyed capture stream
                 // can SIGSEGV inside the driver — callers should rehome first,
                 // but free must stay best-effort.
-                if (extra == nullptr || extra == info.home_stream || is_stream_retired(extra))
+                if (extra == info.home_stream || is_stream_retired(extra))
                     continue;
                 bridgeStreams(extra, info.home_stream);
             }
@@ -742,7 +754,7 @@ namespace lfs::core {
                 break;
             }
 
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
             const cudaError_t free_status = cudaFreeAsync(ptr, info.home_stream);
 #else
             const cudaError_t free_status = cudaFree(ptr);
@@ -775,7 +787,7 @@ namespace lfs::core {
                     AllocationProfiler::instance().print_tensor_allocations(30);
                 }
 
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
                 int device = -1;
                 cudaMemPool_t pool = nullptr;
                 if (!try_get_default_pool(device, pool, "periodic memory-pool statistics")) {
@@ -816,10 +828,13 @@ namespace lfs::core {
             }
         }
 
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
         static bool try_get_default_pool(int& device,
                                          cudaMemPool_t& pool,
                                          const std::string_view context) {
+            if (!stream_ordered_allocation_supported()) {
+                return false;
+            }
             const cudaError_t device_status = cudaGetDevice(&device);
             if (device_status != cudaSuccess) {
                 ensure_cuda_success(

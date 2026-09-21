@@ -3,10 +3,12 @@
 
 #include "internal/cuda_stream_context.hpp"
 #include "core/cuda_error.hpp"
+#include "core/pinned_memory_allocator.hpp"
 #include "internal/cuda_event_pool.hpp"
 #include "internal/stream_lifetime.hpp"
 #include "internal/tensor_impl.hpp"
 
+#include <cstring>
 #include <format>
 
 namespace lfs::core {
@@ -72,13 +74,37 @@ namespace lfs::core {
 
     cudaError_t memcpy_ordered(void* const dst, const void* const src, const size_t bytes,
                                const cudaMemcpyKind kind, const cudaStream_t stream) {
+        if (stream != nullptr && kind == cudaMemcpyHostToDevice && bytes != 0) {
+            if (!dst || !src) {
+                return cudaErrorInvalidValue;
+            }
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            const cudaError_t capture_status = cudaStreamIsCapturing(stream, &capture);
+            if (capture_status != cudaSuccess) {
+                return capture_status;
+            }
+            // A graph can replay after a staging block has been recycled.
+            if (capture != cudaStreamCaptureStatusNone) {
+                return cudaErrorStreamCaptureUnsupported;
+            }
+            // An async allocation (or a cached block with pending consumers)
+            // is only writable in its home stream. A legacy-stream upload can
+            // overtake both allocation and prior use, even if home waits on the
+            // upload afterwards. Keep an owned host copy until the DMA finishes.
+            auto& pinned = PinnedMemoryAllocator::instance();
+            void* staging = pinned.allocate(bytes);
+            if (!staging) {
+                return cudaErrorMemoryAllocation;
+            }
+            std::memcpy(staging, src, bytes);
+            const cudaError_t status = cudaMemcpyAsync(dst, staging, bytes, kind, stream);
+            pinned.deallocate(staging, stream);
+            return status;
+        }
         if (stream != nullptr && kind == cudaMemcpyDeviceToHost) {
             bridgeStreams(stream, nullptr);
         }
         const cudaError_t status = cudaMemcpy(dst, src, bytes, kind);
-        if (status == cudaSuccess && stream != nullptr && kind == cudaMemcpyHostToDevice) {
-            bridgeStreams(nullptr, stream);
-        }
         return status;
     }
 

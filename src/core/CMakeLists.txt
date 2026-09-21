@@ -73,6 +73,7 @@ set(CORE_SOURCES
         host_metrics.cpp
         failure_report.cpp
         cuda/memory_arena_owner.cpp
+        cuda/stream_ordered_allocator.cpp
         cuda/vmm_device_buffer.cpp
         memory_pressure.cpp
         memory_domain.cpp

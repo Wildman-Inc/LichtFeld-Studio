@@ -84,14 +84,12 @@ namespace gsplat_lfs {
             bool has_bound_stream = false;
 
             IntersectBufferCache() {
-#if CUDART_VERSION >= 11020
                 void* ptr = nullptr;
                 if (cudaMallocHost(&ptr, sizeof(int64_t)) == cudaSuccess) {
                     h_n_isects_pinned = static_cast<int64_t*>(ptr);
                     h_n_isects_is_pinned = true;
                     *h_n_isects_pinned = 0;
                 }
-#endif
                 if (!h_n_isects_pinned) {
                     h_n_isects_pinned = new int64_t(0);
                     h_n_isects_is_pinned = false;

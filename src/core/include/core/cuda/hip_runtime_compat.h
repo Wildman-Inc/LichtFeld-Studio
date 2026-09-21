@@ -405,6 +405,17 @@ using cudaGraphNode_t = hipGraphNode_t;
 #define cudaMemPoolCreate hipMemPoolCreate
 #define cudaMemPoolDestroy hipMemPoolDestroy
 #endif
+using cudaMemPool_t = hipMemPool_t;
+#define cudaDeviceGetDefaultMemPool hipDeviceGetDefaultMemPool
+#define cudaMemPoolSetAttribute hipMemPoolSetAttribute
+#define cudaMemPoolGetAttribute hipMemPoolGetAttribute
+#define cudaMemPoolTrimTo hipMemPoolTrimTo
+#define cudaMemPoolAttrReleaseThreshold hipMemPoolAttrReleaseThreshold
+#define cudaMemPoolAttrUsedMemCurrent hipMemPoolAttrUsedMemCurrent
+#define cudaMemPoolAttrReservedMemCurrent hipMemPoolAttrReservedMemCurrent
+#define cudaMemPoolAttrUsedMemHigh hipMemPoolAttrUsedMemHigh
+#define cudaMemPoolAttrReservedMemHigh hipMemPoolAttrReservedMemHigh
+#define cudaDevAttrMemoryPoolsSupported hipDeviceAttributeMemoryPoolsSupported
 #ifndef cudaMemAddressReserve
 #define cudaMemAddressReserve hipMemAddressReserve
 #endif

@@ -4,6 +4,7 @@
 #include "lfs/training/perf_bench.hpp"
 
 #include "core/alloc_counter.hpp"
+#include "core/cuda/stream_ordered_allocator.hpp"
 #include "core/logger.hpp"
 #include "core/pinned_memory_allocator.hpp"
 #include "diagnostics/vram_ledger_model.hpp"
@@ -58,7 +59,10 @@ namespace lfs::training {
         void sample_pool_hwm(std::size_t& used_high, std::size_t& reserved_high,
                              std::size_t& used_cur, std::size_t& reserved_cur) {
             used_high = reserved_high = used_cur = reserved_cur = 0;
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
+            if (!core::stream_ordered_allocation_supported()) {
+                return;
+            }
             int device = 0;
             if (cudaGetDevice(&device) != cudaSuccess) {
                 return;

@@ -4,6 +4,7 @@
 
 #include "memory_arena.hpp"
 
+#include "core/cuda/stream_ordered_allocator.hpp"
 #include "core/logger.hpp"
 #include "diagnostics/vram_profiler.hpp"
 
@@ -39,10 +40,10 @@ namespace lfs::core {
 
         std::uint64_t pool_used = 0;
         std::uint64_t pool_reserved = 0;
-#if CUDART_VERSION >= 12080
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
         int device = 0;
         cudaMemPool_t pool = nullptr;
-        if (cudaGetDevice(&device) == cudaSuccess &&
+        if (stream_ordered_allocation_supported() && cudaGetDevice(&device) == cudaSuccess &&
             cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
             (void)cudaMemPoolGetAttribute(
                 pool, cudaMemPoolAttrUsedMemCurrent, &pool_used);

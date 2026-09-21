@@ -25,14 +25,11 @@ namespace lfs::core {
         std::initializer_list<const Tensor*> inputs,
         std::optional<cudaStream_t> execution_stream = std::nullopt);
 
-    // Synchronous host<->device copy ordered against `stream`, the tensor's
-    // home stream. cudaMemcpy runs on the legacy default stream, which a
-    // non-blocking home stream neither waits for nor is waited on by: an
-    // upload from pageable memory returns while its DMA is still in flight,
-    // and a download may read before the home stream's producer finished.
-    // Downloads make the legacy stream wait for `stream` first; uploads make
-    // `stream` wait for the legacy stream afterwards. The host never waits on
-    // `stream` itself, so a gated or capturing home stream cannot deadlock.
+    // Host<->device copy ordered against `stream`, the tensor's home stream.
+    // Downloads complete on the host after waiting for that stream's writes.
+    // Non-default-stream uploads stage an owned copy in cached pinned memory,
+    // then enqueue the DMA on home, after allocation and previous use. The
+    // source can expire on return; staging is retained until DMA completion.
     LFS_CORE_API cudaError_t memcpy_ordered(void* dst, const void* src, size_t bytes,
                                             cudaMemcpyKind kind, cudaStream_t stream);
 

@@ -23,13 +23,54 @@ if(BUILD_LOCALIZATION_TESTS)
         USES_TERMINAL
     )
     message(STATUS "Registered headless localization contract tests (no LibTorch)")
-    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS AND NOT BUILD_GPU_MEMORY_TESTS)
         return()
     endif()
 endif()
 
 # Find GTest
 find_package(GTest CONFIG REQUIRED)
+
+if(BUILD_GPU_MEMORY_TESTS)
+    add_executable(lichtfeld_gpu_memory_tests EXCLUDE_FROM_ALL
+        test_stream_ordered_allocator.cpp
+        test_cuda_pool_stream_teardown.cpp
+        test_stale_stream_teardown.cpp
+        test_cuda_event_pool.cpp
+        test_tensor_stream.cpp
+        test_pinned_stream_teardown.cpp
+        test_allocator_hygiene.cpp
+    )
+    target_compile_features(lichtfeld_gpu_memory_tests PRIVATE cxx_std_23)
+    target_include_directories(lichtfeld_gpu_memory_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(lichtfeld_gpu_memory_tests PRIVATE lfs_core GTest::gtest_main)
+    set_target_properties(lichtfeld_gpu_memory_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    )
+    if(TARGET lfs_rocm_runtime)
+        add_dependencies(lichtfeld_gpu_memory_tests lfs_rocm_runtime)
+    endif()
+    if(NOT MSVC AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+        add_dependencies(lichtfeld_gpu_memory_tests lfs_msvc_runtime)
+    endif()
+    if(WIN32)
+        add_custom_command(TARGET lichtfeld_gpu_memory_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:lichtfeld_gpu_memory_tests>
+                "$<TARGET_FILE_DIR:lichtfeld_gpu_memory_tests>"
+            COMMAND_EXPAND_LISTS VERBATIM)
+    endif()
+    add_test(NAME lichtfeld_gpu_memory_tests COMMAND lichtfeld_gpu_memory_tests)
+    add_test(NAME lichtfeld_gpu_memory_fallback_tests
+        COMMAND lichtfeld_gpu_memory_tests --gtest_filter=StreamOrderedAllocator.*)
+    set_tests_properties(lichtfeld_gpu_memory_fallback_tests PROPERTIES
+        ENVIRONMENT "LFS_DISABLE_ASYNC_ALLOCATOR=1")
+    set_tests_properties(lichtfeld_gpu_memory_tests lichtfeld_gpu_memory_fallback_tests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR} TIMEOUT 120 LABELS "gpu;memory")
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_LOCALIZATION_TESTS AND NOT BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS)
+        return()
+    endif()
+endif()
 
 # This opt-in suite requires an AMD GPU with D3D11 MJPEG decode support. It uses
 # generated fixtures and the production loader without the full Torch test suite.
@@ -413,6 +454,7 @@ set(TEST_FILES
     test_allocator_hygiene.cpp
     test_pinned_stream_teardown.cpp
     test_cuda_pool_stream_teardown.cpp
+    test_stream_ordered_allocator.cpp
     test_stale_stream_teardown.cpp
     test_fastgs_sort_buffers.cpp
     test_warp_cull_blend.cpp

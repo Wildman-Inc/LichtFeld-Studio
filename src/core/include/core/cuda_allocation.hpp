@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/assert.hpp"
+#include "core/cuda/stream_ordered_allocator.hpp"
 #include "core/cuda_error.hpp"
 
 #include <cuda_runtime.h>
@@ -40,21 +41,26 @@ namespace lfs::core {
     struct StreamOrderedCudaAllocator {
         [[nodiscard]] void* allocate(const size_t bytes,
                                      const cudaStream_t stream,
-                                     const std::string_view label) const {
+                                     const std::string_view label) {
             void* ptr = nullptr;
-#if CUDART_VERSION >= 11020
-            LFS_CUDA_CHECK_MSG(cudaMallocAsync(&ptr, bytes, stream),
-                               "stream-ordered CUDA allocation '{}' ({} bytes)", label, bytes);
-#else
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
+            async_ = stream_ordered_allocation_supported();
+            if (async_) {
+                LFS_CUDA_CHECK_MSG(cudaMallocAsync(&ptr, bytes, stream),
+                                   "stream-ordered CUDA allocation '{}' ({} bytes)", label, bytes);
+                return ptr;
+            }
+#endif
             LFS_CUDA_CHECK_MSG(cudaMalloc(&ptr, bytes),
                                "CUDA allocation '{}' ({} bytes)", label, bytes);
-#endif
             return ptr;
         }
 
         void deallocate(void* ptr, const cudaStream_t stream) const noexcept {
-#if CUDART_VERSION >= 11020
-            const cudaError_t status = cudaFreeAsync(ptr, stream);
+#if LFS_HAS_STREAM_ORDERED_ALLOCATOR
+            // Keep the allocation's method across moves and device switches;
+            // never infer how a pointer was allocated from today's capability.
+            const cudaError_t status = async_ ? cudaFreeAsync(ptr, stream) : cudaFree(ptr);
 #else
             const cudaError_t status = cudaFree(ptr);
 #endif
@@ -65,6 +71,9 @@ namespace lfs::core {
                 cudaGetLastError();
             }
         }
+
+    private:
+        bool async_ = false;
     };
 
     struct NoCudaAllocationHooks {

@@ -25,11 +25,9 @@ namespace lfs::training::cuda_scratch {
         void after_allocate(void* ptr,
                             const size_t bytes,
                             const std::string_view label) const noexcept {
-#if CUDART_VERSION >= 11020
-            constexpr auto method = diagnostics::VramAllocationMethod::Async;
-#else
-            constexpr auto method = diagnostics::VramAllocationMethod::Direct;
-#endif
+            const auto method = core::stream_ordered_allocation_supported()
+                                    ? diagnostics::VramAllocationMethod::Async
+                                    : diagnostics::VramAllocationMethod::Direct;
             try {
                 diagnostics::VramProfiler::instance().recordAllocation(ptr, bytes, method, label);
             } catch (...) {
