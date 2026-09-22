@@ -221,6 +221,12 @@ namespace lfs::core {
         RasterizerMemoryArena(RasterizerMemoryArena&&) noexcept;
         RasterizerMemoryArena& operator=(RasterizerMemoryArena&&) noexcept;
 
+        // True only for a range in this arena's own device allocation: malloc
+        // backing or committed VMM chunks created with PINNED + DEVICE, flags=0.
+        // External imports are excluded. This proves coarse-grained storage for
+        // device-only operations; it does not validate a caller's frame lifetime.
+        [[nodiscard]] bool owns_device_allocation(const void* ptr, size_t bytes) const;
+
         // Stream-aware frames chain begin→end with a GPU event edge: begin_frame
         // waits (on `stream`) for the previous frame's completion event instead of
         // a device-wide sync, and end_frame records the event on `stream` — which

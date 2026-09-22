@@ -619,6 +619,25 @@ namespace fast_lfs::rasterization {
                                      "cudaMemsetAsync(grad_w2c)");
             }
 
+            // Only our own hipMalloc/device-VMM arena is proven coarse-grained.
+            // Imported/managed/host-backed storage keeps the safe atomic
+            // path. Caller-owned densification and camera gradients are never
+            // covered by this permission.
+            bool native_gradient_atomics = false;
+#if defined(LFS_USE_HIP) && LFS_USE_HIP
+            if (visible_count > 0) {
+                auto& arena = lfs::core::GlobalArenaManager::instance().get_arena();
+                native_gradient_atomics =
+                    arena.owns_device_allocation(grad_mean2d_helper, visible_count * sizeof(float2)) &&
+                    arena.owns_device_allocation(grad_conic_helper, visible_count * sizeof(float3)) &&
+                    arena.owns_device_allocation(grad_depth_helper, visible_count * sizeof(float)) &&
+                    arena.owns_device_allocation(grad_opacity_helper, visible_count * sizeof(float)) &&
+                    arena.owns_device_allocation(grad_color_helper, visible_count * sizeof(float3)) &&
+                    (!grad_normal_helper ||
+                     arena.owns_device_allocation(grad_normal_helper, visible_count * sizeof(float3)));
+            }
+#endif
+
             // Call the actual backward implementation
             backward(
                 densification_error_map_ptr,
@@ -669,7 +688,8 @@ namespace fast_lfs::rasterization {
                 mean_step_far_mask_n,
                 edge_weight_map,
                 edge_score_out,
-                stream);
+                stream,
+                native_gradient_atomics);
 
             // Mark frame as complete
             release_forward_context(forward_ctx);

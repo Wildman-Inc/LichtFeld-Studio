@@ -63,6 +63,7 @@ namespace fast_lfs::rasterization {
         const int mean_step_far_mask_n,
         const float* edge_weight_map,
         float* edge_score_out,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool native_gradient_atomics = false);
 
 } // namespace fast_lfs::rasterization

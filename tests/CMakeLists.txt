@@ -23,13 +23,42 @@ if(BUILD_LOCALIZATION_TESTS)
         USES_TERMINAL
     )
     message(STATUS "Registered headless localization contract tests (no LibTorch)")
-    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS AND NOT BUILD_GPU_MEMORY_TESTS AND NOT BUILD_GPU_NN_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS AND NOT BUILD_GPU_MEMORY_TESTS AND NOT BUILD_GPU_NN_TESTS AND NOT BUILD_GPU_LOSS_TESTS)
         return()
     endif()
 endif()
 
 # Find GTest
 find_package(GTest CONFIG REQUIRED)
+
+if(BUILD_GPU_LOSS_TESTS)
+    add_executable(lichtfeld_loss_tests EXCLUDE_FROM_ALL test_fused_l1_ssim.cpp)
+    target_compile_features(lichtfeld_loss_tests PRIVATE cxx_std_23)
+    target_include_directories(lichtfeld_loss_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(lichtfeld_loss_tests PRIVATE lfs_training GTest::gtest_main)
+    set_target_properties(lichtfeld_loss_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    )
+    if(TARGET lfs_rocm_runtime)
+        add_dependencies(lichtfeld_loss_tests lfs_rocm_runtime)
+    endif()
+    if(NOT MSVC AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+        add_dependencies(lichtfeld_loss_tests lfs_msvc_runtime)
+    endif()
+    if(WIN32)
+        add_custom_command(TARGET lichtfeld_loss_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:lichtfeld_loss_tests>
+                "$<TARGET_FILE_DIR:lichtfeld_loss_tests>"
+            COMMAND_EXPAND_LISTS VERBATIM)
+    endif()
+    add_test(NAME lichtfeld_loss_tests COMMAND lichtfeld_loss_tests)
+    set_tests_properties(lichtfeld_loss_tests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR} TIMEOUT 180 LABELS "gpu;loss")
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_LOCALIZATION_TESTS AND NOT BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_VISUALIZER_TESTS AND NOT BUILD_ROCJPEG_TESTS AND NOT BUILD_GPU_MEMORY_TESTS AND NOT BUILD_GPU_NN_TESTS)
+        return()
+    endif()
+endif()
 
 if(BUILD_GPU_NN_TESTS)
     add_executable(lichtfeld_nn_tests EXCLUDE_FROM_ALL
@@ -70,6 +99,13 @@ if(BUILD_GPU_NN_TESTS)
 endif()
 
 if(BUILD_GPU_MEMORY_TESTS)
+    lfs_add_gpu_library(hip_native_atomic_test_kernels STATIC hip_native_atomic_cuda.cu)
+    target_include_directories(hip_native_atomic_test_kernels PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/core/include)
+    target_link_libraries(hip_native_atomic_test_kernels PUBLIC ${GPU_RUNTIME_LIBRARY})
+    if(USE_CUDA)
+        set_target_properties(hip_native_atomic_test_kernels PROPERTIES CUDA_STANDARD 20)
+    endif()
     add_executable(lichtfeld_gpu_memory_tests EXCLUDE_FROM_ALL
         test_stream_ordered_allocator.cpp
         test_cuda_pool_stream_teardown.cpp
@@ -78,10 +114,11 @@ if(BUILD_GPU_MEMORY_TESTS)
         test_tensor_stream.cpp
         test_pinned_stream_teardown.cpp
         test_allocator_hygiene.cpp
+        test_hip_native_atomics.cpp
     )
     target_compile_features(lichtfeld_gpu_memory_tests PRIVATE cxx_std_23)
     target_include_directories(lichtfeld_gpu_memory_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(lichtfeld_gpu_memory_tests PRIVATE lfs_core GTest::gtest_main)
+    target_link_libraries(lichtfeld_gpu_memory_tests PRIVATE lfs_core lfs_core_cuda GTest::gtest_main hip_native_atomic_test_kernels)
     set_target_properties(lichtfeld_gpu_memory_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
     )

@@ -13,15 +13,86 @@
 #include <gtest/gtest.h>
 
 #include "core/tensor.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "lfs/kernels/l1_loss.cuh"
 #include "lfs/kernels/ssim.cuh"
 #include "training/losses/photometric_loss.hpp"
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <iostream>
 #include <limits>
+#include <vector>
 
 using namespace lfs::core;
 using namespace lfs::training::kernels;
+
+namespace {
+    // Independent backward oracle: convolve the saved, quantized forward
+    // partials directly in two dimensions using double accumulation. This does
+    // not call a GPU SSIM backward or reproduce its separable tile algorithm.
+    std::vector<double> cpu_backward_from_saved_partials(const FusedL1SSIMContext& ctx) {
+        constexpr std::array<float, 11> weights{
+            0.001028380123898387f, 0.0075987582094967365f,
+            0.036000773310661316f, 0.10936068743467331f,
+            0.21300552785396576f, 0.26601171493530273f,
+            0.21300552785396576f, 0.10936068743467331f,
+            0.036000773310661316f, 0.0075987582094967365f,
+            0.001028380123898387f};
+        const auto prediction = ctx.img1.cpu().to_vector();
+        auto target = ctx.img2.to(DataType::Float32).cpu().to_vector();
+        if (ctx.img2.dtype() == DataType::UInt8) {
+            for (auto& value : target) {
+                value *= 1.0f / 255.0f;
+            }
+        }
+        const std::array<std::vector<float>, 3> partials{
+            ctx.dm_dmu1.to(DataType::Float32).cpu().to_vector(),
+            ctx.dm_dsigma1_sq.to(DataType::Float32).cpu().to_vector(),
+            ctx.dm_dsigma12.to(DataType::Float32).cpu().to_vector()};
+        const int height = ctx.H;
+        const int width = ctx.W;
+        const size_t plane_size = static_cast<size_t>(height) * width;
+        const size_t planes = prediction.size() / plane_size;
+        const bool crop = ctx.apply_valid_padding && height > 10 && width > 10;
+        const double normalization = 1.0 / static_cast<double>(
+                                               planes * (crop ? height - 10 : height) * (crop ? width - 10 : width));
+        const auto inside = [&](int y, int x) {
+            return y >= 0 && y < height && x >= 0 && x < width &&
+                   (!crop || (y >= 5 && y < height - 5 && x >= 5 && x < width - 5));
+        };
+        std::vector<double> result(prediction.size());
+        for (size_t plane = 0; plane < planes; ++plane) {
+            const size_t base = plane * plane_size;
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    std::array<double, 3> convolved{};
+                    for (int dy = -5; dy <= 5; ++dy) {
+                        for (int dx = -5; dx <= 5; ++dx) {
+                            if (!inside(y + dy, x + dx)) {
+                                continue;
+                            }
+                            const size_t source = base + (y + dy) * width + x + dx;
+                            const double weight = static_cast<double>(weights[dy + 5]) *
+                                                  weights[dx + 5] * (-ctx.ssim_weight) * normalization;
+                            for (size_t component = 0; component < convolved.size(); ++component) {
+                                convolved[component] += weight * partials[component][source];
+                            }
+                        }
+                    }
+                    const size_t index = base + y * width + x;
+                    const double delta = static_cast<double>(prediction[index]) - target[index];
+                    const double sign = (delta > 0.0) - (delta < 0.0);
+                    const double l1 = inside(y, x) ? (1.0 - ctx.ssim_weight) * sign * normalization : 0.0;
+                    result[index] = convolved[0] + 2.0 * prediction[index] * convolved[1] +
+                                    target[index] * convolved[2] + l1;
+                }
+            }
+        }
+        return result;
+    }
+} // namespace
 
 class FusedL1SSIMTest : public ::testing::Test {
 protected:
@@ -397,6 +468,130 @@ TEST_F(FusedL1SSIMTest, UInt8TargetMatchesFloatReference) {
     auto diff = (grad - ref_grad).abs();
     EXPECT_LT(diff.max().item<float>(), 1e-3f);
     EXPECT_LT(diff.mean().item<float>(), 1e-5f);
+}
+
+TEST_F(FusedL1SSIMTest, BackwardTileEdgesMatchIndependentCpuConvolution) {
+    const std::array<std::array<size_t, 4>, 5> shapes{{{1, 1, 1, 1}, {1, 3, 7, 31}, {1, 3, 31, 7}, {2, 4, 19, 35}, {2, 1, 9, 65}}};
+    for (const auto& dims : shapes) {
+        const TensorShape shape(std::vector<size_t>(dims.begin(), dims.end()));
+        const size_t elements = dims[0] * dims[1] * dims[2] * dims[3];
+        std::vector<float> pred_data(elements), target_data(elements);
+        for (size_t i = 0; i < elements; ++i) {
+            pred_data[i] = 0.05f + static_cast<float>((i * 37 + 11) % 229) / 255.0f;
+            target_data[i] = static_cast<float>((i * 17 + 29) % 251);
+        }
+        auto prediction = Tensor::from_vector(pred_data, shape, Device::CUDA);
+        auto target_bytes = Tensor::from_vector(target_data, shape, Device::CUDA).to(DataType::UInt8);
+        for (const bool byte_target : {false, true}) {
+            auto target = byte_target ? target_bytes : target_bytes.to(DataType::Float32) * (1.0f / 255.0f);
+            for (const bool valid_padding : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "shape=" << shape.str()
+                                                  << " uint8=" << byte_target
+                                                  << " valid_padding=" << valid_padding);
+                FusedL1SSIMWorkspace workspace;
+                auto [loss, ctx] = fused_l1_ssim_forward(
+                    prediction, target, 0.2f, workspace, valid_padding);
+                (void)loss;
+                const auto actual = fused_l1_ssim_backward(ctx, workspace).cpu().to_vector();
+                const auto expected = cpu_backward_from_saved_partials(ctx);
+                ASSERT_EQ(actual.size(), expected.size());
+                double max_error = 0.0;
+                double max_value = 0.0;
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    ASSERT_TRUE(std::isfinite(actual[i])) << "index=" << i;
+                    max_error = std::max(max_error, std::abs(actual[i] - expected[i]));
+                    max_value = std::max(max_value, std::abs(expected[i]));
+                }
+                EXPECT_LE(max_error, 2.0e-6 + 1.0e-5 * max_value);
+            }
+        }
+    }
+}
+
+TEST_F(FusedL1SSIMTest, BackwardTruckShapesMatchUnfusedReference) {
+    for (const auto& hw : {std::array<size_t, 2>{546, 979}, {273, 489}}) {
+        const TensorShape shape({1, 3, hw[0], hw[1]});
+        auto prediction = Tensor::rand(shape, Device::CUDA);
+        auto target = (Tensor::rand(shape, Device::CUDA) * 255.0f).to(DataType::UInt8);
+        const auto float_target = target.to(DataType::Float32) * (1.0f / 255.0f);
+        FusedL1SSIMWorkspace workspace;
+        auto [loss, ctx] = fused_l1_ssim_forward(prediction, target, 0.2f, workspace, true);
+        const auto actual = fused_l1_ssim_backward(ctx, workspace);
+        const auto [reference_loss, reference_grad] = compute_reference_loss_and_grad(
+            prediction, float_target, 0.2f);
+        const auto difference = (actual - reference_grad).abs();
+        SCOPED_TRACE(::testing::Message() << "height=" << hw[0] << " width=" << hw[1]);
+        EXPECT_NEAR(loss.item<float>(), reference_loss, 1.0e-5f);
+        EXPECT_LT(difference.max().item<float>(), 1.0e-6f);
+        EXPECT_LT(difference.mean().item<float>(), 1.0e-8f);
+    }
+}
+
+TEST_F(FusedL1SSIMTest, BackwardTallImagePreservesPortableGridFallback) {
+    // An eight-row tile needs 65,536 y blocks; the original sixteen-row tile
+    // stays within the portable 65,535-block limit for this valid input.
+    constexpr int height = 524281;
+    const TensorShape shape({1, 1, height, 1});
+    auto prediction = Tensor::rand(shape, Device::CUDA);
+    auto target = Tensor::rand(shape, Device::CUDA);
+    FusedL1SSIMWorkspace workspace;
+    auto [loss, ctx] = fused_l1_ssim_forward(prediction, target, 0.2f, workspace, false);
+    (void)loss;
+    const auto actual = fused_l1_ssim_backward(ctx, workspace);
+    const auto [reference_loss, reference_grad] = compute_reference_loss_and_grad(
+        prediction, target, 0.2f, false);
+    (void)reference_loss;
+    const auto difference = (actual - reference_grad).abs();
+    EXPECT_LT(difference.max().item<float>(), 1.0e-6f);
+    EXPECT_LT(difference.mean().item<float>(), 1.0e-8f);
+}
+
+// Explicit opt-in: --gtest_also_run_disabled_tests
+// --gtest_filter=FusedL1SSIMTest.DISABLED_BackwardBenchmark
+TEST_F(FusedL1SSIMTest, DISABLED_BackwardBenchmark) {
+    constexpr int warmup = 50;
+    constexpr int iterations = 250;
+    constexpr size_t samples = 9;
+    const cudaStream_t stream = getCurrentCUDAStream();
+    for (const auto& hw : {std::array<size_t, 2>{546, 979}, {273, 489}}) {
+        for (const bool byte_target : {false, true}) {
+            const TensorShape shape({1, 3, hw[0], hw[1]});
+            auto prediction = Tensor::rand(shape, Device::CUDA);
+            auto target = Tensor::rand(shape, Device::CUDA);
+            if (byte_target) {
+                target = (target * 255.0f).to(DataType::UInt8);
+            }
+            FusedL1SSIMWorkspace workspace;
+            auto [loss, ctx] = fused_l1_ssim_forward(prediction, target, 0.2f, workspace, true);
+            (void)loss;
+            for (int iteration = 0; iteration < warmup; ++iteration) {
+                (void)fused_l1_ssim_backward(ctx, workspace);
+            }
+            cudaEvent_t start{}, stop{};
+            ASSERT_EQ(cudaEventCreate(&start), cudaSuccess);
+            ASSERT_EQ(cudaEventCreate(&stop), cudaSuccess);
+            std::array<float, samples> timings{};
+            for (auto& microseconds : timings) {
+                ASSERT_EQ(cudaEventRecord(start, stream), cudaSuccess);
+                for (int iteration = 0; iteration < iterations; ++iteration) {
+                    (void)fused_l1_ssim_backward(ctx, workspace);
+                }
+                ASSERT_EQ(cudaEventRecord(stop, stream), cudaSuccess);
+                ASSERT_EQ(cudaEventSynchronize(stop), cudaSuccess);
+                float milliseconds = 0.0f;
+                ASSERT_EQ(cudaEventElapsedTime(&milliseconds, start, stop), cudaSuccess);
+                microseconds = milliseconds * 1000.0f / iterations;
+            }
+            ASSERT_EQ(cudaEventDestroy(start), cudaSuccess);
+            ASSERT_EQ(cudaEventDestroy(stop), cudaSuccess);
+            std::sort(timings.begin(), timings.end());
+            std::cout << "SSIM_BACKWARD_BENCH height=" << hw[0] << " width=" << hw[1]
+                      << " dtype=" << (byte_target ? "uint8" : "float32")
+                      << " samples=" << samples << " iterations=" << iterations
+                      << " median_us=" << timings[samples / 2]
+                      << " min_us=" << timings.front() << " max_us=" << timings.back() << '\n';
+        }
+    }
 }
 
 // ============================================================================
@@ -776,6 +971,62 @@ TEST_F(FusedL1SSIMTest, DecoupledMatchesStandardWhenCorrectedEqualsRaw) {
     auto diff = (combined_grad - standard_grad).abs();
     EXPECT_LT(diff.max().item<float>(), 1e-3f);
     EXPECT_LT(diff.mean().item<float>(), 1e-5f);
+}
+
+TEST_F(FusedL1SSIMTest, DecoupledBatchedUInt8EdgesMatchIndependentCpuConvolution) {
+    constexpr int height = 19;
+    constexpr int width = 35;
+    const TensorShape shape({2, 4, height, width});
+    const auto raw = Tensor::rand(shape, Device::CUDA);
+    const auto corrected = raw * 0.7f + 0.1f;
+    const auto target = (Tensor::rand(shape, Device::CUDA) * 255.0f).to(DataType::UInt8);
+    const auto zero_sigma = Tensor::zeros(shape, Device::CUDA, DataType::Float16);
+    for (const bool valid_padding : {false, true}) {
+        DecoupledFusedL1SSIMWorkspace workspace;
+        auto [loss, ctx] = decoupled_fused_l1_ssim_forward(
+            corrected, raw, target, 0.2f, workspace, valid_padding);
+        (void)loss;
+        const auto gradients = decoupled_fused_l1_ssim_backward(ctx, workspace);
+        const std::array<Tensor, 2> actual_gradients{
+            gradients.grad_corrected, gradients.grad_raw};
+        const std::array<FusedL1SSIMContext, 2> oracle_contexts{
+            FusedL1SSIMContext{
+                .img1 = ctx.corrected_img,
+                .img2 = ctx.gt_img,
+                .dm_dmu1 = ctx.app_dm_dmu1,
+                .dm_dsigma1_sq = zero_sigma,
+                .dm_dsigma12 = zero_sigma,
+                .ssim_weight = ctx.ssim_weight,
+                .H = height,
+                .W = width,
+                .apply_valid_padding = valid_padding},
+            FusedL1SSIMContext{
+                .img1 = ctx.raw_img,
+                .img2 = ctx.gt_img,
+                .dm_dmu1 = ctx.raw_dm_dmu1,
+                .dm_dsigma1_sq = ctx.raw_dm_dsigma1_sq,
+                .dm_dsigma12 = ctx.raw_dm_dsigma12,
+                // Raw partials already contain lambda; this branch has no L1.
+                .ssim_weight = 1.0f,
+                .H = height,
+                .W = width,
+                .apply_valid_padding = valid_padding}};
+        for (size_t branch = 0; branch < actual_gradients.size(); ++branch) {
+            SCOPED_TRACE(::testing::Message() << "branch=" << (branch == 0 ? "corrected" : "raw")
+                                              << " valid_padding=" << valid_padding);
+            const auto actual = actual_gradients[branch].cpu().to_vector();
+            const auto expected = cpu_backward_from_saved_partials(oracle_contexts[branch]);
+            ASSERT_EQ(actual.size(), expected.size());
+            double max_error = 0.0;
+            double max_value = 0.0;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                ASSERT_TRUE(std::isfinite(actual[i])) << "index=" << i;
+                max_error = std::max(max_error, std::abs(actual[i] - expected[i]));
+                max_value = std::max(max_value, std::abs(expected[i]));
+            }
+            EXPECT_LE(max_error, 2.0e-6 + 1.0e-5 * max_value);
+        }
+    }
 }
 
 TEST_F(MaskedFusedL1SSIMTest, DecoupledMatchesStandardWhenCorrectedEqualsRaw) {

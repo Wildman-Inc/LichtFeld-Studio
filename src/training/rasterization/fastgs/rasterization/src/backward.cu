@@ -4,6 +4,7 @@
 
 #include "backward.h"
 #include "buffer_utils.h"
+#include "core/environment.hpp"
 #include "forward.h"
 #include "helper_math.h"
 #include "kernels_backward.cuh"
@@ -13,6 +14,40 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+
+namespace {
+    bool native_gradient_atomics_supported() {
+#if defined(LFS_USE_HIP) && LFS_USE_HIP
+        static const bool disabled = lfs::core::environment::flag("LFS_DISABLE_HIP_FASTGS_NATIVE_ATOMICS");
+        if (disabled) {
+            return false;
+        }
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) {
+            return false;
+        }
+        static thread_local int cached_device = -1;
+        static thread_local bool supported = false;
+        if (device != cached_device) {
+            cudaDeviceProp properties{};
+            if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+                return false;
+            }
+            const auto* arch = properties.gcnArchName;
+            supported = std::strncmp(arch, "gfx1100", 7) == 0 ||
+                        std::strncmp(arch, "gfx1101", 7) == 0 ||
+                        std::strncmp(arch, "gfx1102", 7) == 0 ||
+                        std::strncmp(arch, "gfx1103", 7) == 0 ||
+                        std::strncmp(arch, "gfx1150", 7) == 0 ||
+                        std::strncmp(arch, "gfx1151", 7) == 0;
+            cached_device = device;
+        }
+        return supported;
+#else
+        return false;
+#endif
+    }
+} // namespace
 
 void fast_lfs::rasterization::backward(
     const float* densification_error_map,
@@ -65,7 +100,8 @@ void fast_lfs::rasterization::backward(
     const int mean_step_far_mask_n,
     const float* edge_weight_map,
     float* edge_score_out,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool native_gradient_atomics) {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const uint64_t n_tiles_u64 = static_cast<uint64_t>(grid.x) * static_cast<uint64_t>(grid.y);
     const int n_tiles = checked_to_int(n_tiles_u64, "n_tiles exceeds int range");
@@ -90,8 +126,10 @@ void fast_lfs::rasterization::backward(
         // DensificationType::None and no normal channel, so those two stay off the
         // production nest.
         auto launch_blend_backward_typed =
-            [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, int WARP_CULL_MODE>() {
-                kernels::backward::blend_backward_cu<DENS_TYPE, NORMAL_CHANNEL, WARP_CULL_MODE>
+            [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL, int WARP_CULL_MODE,
+                bool NATIVE_GRADIENT_ATOMICS = false>() {
+                kernels::backward::blend_backward_cu<DENS_TYPE, NORMAL_CHANNEL, WARP_CULL_MODE,
+                                                     NATIVE_GRADIENT_ATOMICS>
                     <<<n_tiles, config::block_size_blend_backward, 0, stream>>>(
                         per_tile_buffers.instance_ranges,
                         sorted_primitive_indices,
@@ -129,12 +167,22 @@ void fast_lfs::rasterization::backward(
                         blend_batch_override);
                 LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.backward.blend_backward");
             };
-        auto launch_production = [&]<DensificationType DENS_TYPE>() {
+        auto launch_production_typed = [&]<DensificationType DENS_TYPE, bool NATIVE_GRADIENT_ATOMICS>() {
             if (grad_normal != nullptr && grad_normal_helper != nullptr) {
-                launch_blend_backward_typed.template operator()<DENS_TYPE, true, 0>();
+                launch_blend_backward_typed.template operator()<DENS_TYPE, true, 0, NATIVE_GRADIENT_ATOMICS>();
             } else {
-                launch_blend_backward_typed.template operator()<DENS_TYPE, false, 0>();
+                launch_blend_backward_typed.template operator()<DENS_TYPE, false, 0, NATIVE_GRADIENT_ATOMICS>();
             }
+        };
+        const bool use_native_atomics = native_gradient_atomics && native_gradient_atomics_supported();
+        auto launch_production = [&]<DensificationType DENS_TYPE>() {
+#if defined(LFS_USE_HIP) && LFS_USE_HIP
+            if (use_native_atomics) {
+                launch_production_typed.template operator()<DENS_TYPE, true>();
+                return;
+            }
+#endif
+            launch_production_typed.template operator()<DENS_TYPE, false>();
         };
         if (warp_cull_mode == 1) {
             launch_blend_backward_typed.template operator()<DensificationType::None, false, 1>();

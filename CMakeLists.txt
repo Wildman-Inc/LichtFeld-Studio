@@ -24,7 +24,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LFS_VCPKG_OVERL
 # cache values are visible before project(), when the vcpkg toolchain resolves
 # manifest features.
 list(REMOVE_ITEM VCPKG_MANIFEST_FEATURES tests vulkan-validation)
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS OR BUILD_ROCJPEG_TESTS OR BUILD_GPU_MEMORY_TESTS OR BUILD_GPU_NN_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS OR BUILD_ROCJPEG_TESTS OR BUILD_GPU_MEMORY_TESTS OR BUILD_GPU_NN_TESTS OR BUILD_GPU_LOSS_TESTS)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
 
@@ -230,6 +230,7 @@ option(BUILD_VISUALIZER_TESTS "Build CPU-only visualizer tests without LibTorch"
 option(BUILD_ROCJPEG_TESTS "Build Windows HIP hardware JPEG loader tests without LibTorch" OFF)
 option(BUILD_GPU_MEMORY_TESTS "Build GPU allocator and stream tests without LibTorch" OFF)
 option(BUILD_GPU_NN_TESTS "Build GPU neural-network operator tests without LibTorch" OFF)
+option(BUILD_GPU_LOSS_TESTS "Build GPU photometric loss tests without LibTorch" OFF)
 option(BUILD_FORMAT_TESTS "Build only the CPU-only .licht format tests (no CUDA)" OFF)
 option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path tests (no CUDA runtime linkage)" OFF)
 option(BUILD_LOCALIZATION_TESTS "Register headless localization contract tests without LibTorch" OFF)
@@ -1549,7 +1550,7 @@ endif()
 # =============================================================================
 # TESTING (Optional)
 # =============================================================================
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS OR BUILD_ROCJPEG_TESTS OR BUILD_GPU_MEMORY_TESTS OR BUILD_GPU_NN_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS OR BUILD_ROCJPEG_TESTS OR BUILD_GPU_MEMORY_TESTS OR BUILD_GPU_NN_TESTS OR BUILD_GPU_LOSS_TESTS)
     enable_testing()
     add_subdirectory(tests)
     if(BUILD_UNICODE_TEST_ONLY)
@@ -1566,6 +1567,8 @@ if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZ
         message(STATUS "GPU allocator tests enabled. Build target lichtfeld_gpu_memory_tests and run with 'ctest -R lichtfeld_gpu_memory'")
     elseif(BUILD_GPU_NN_TESTS AND NOT BUILD_TESTS)
         message(STATUS "GPU NN tests enabled. Build target lichtfeld_nn_tests and run with 'ctest -R lichtfeld_nn'")
+    elseif(BUILD_GPU_LOSS_TESTS AND NOT BUILD_TESTS)
+        message(STATUS "GPU loss tests enabled. Build target lichtfeld_loss_tests and run with 'ctest -R lichtfeld_loss'")
     elseif(NOT BUILD_TESTS)
         message(STATUS "Format tests enabled. Build with 'ninja lichtfeld_format_tests' and run with 'ctest -L format'")
     else()

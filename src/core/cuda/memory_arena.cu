@@ -2258,6 +2258,40 @@ namespace lfs::core {
         }
     }
 
+    bool RasterizerMemoryArena::owns_device_allocation(const void* ptr, const size_t bytes) const {
+        if (ptr == nullptr || bytes == 0) {
+            return false;
+        }
+        const auto address = reinterpret_cast<std::uintptr_t>(ptr);
+        std::lock_guard<std::mutex> lock(arena_mutex_);
+        for (const auto& [device, storage] : device_arenas_) {
+            if (!storage || storage->external_backing) {
+                continue;
+            }
+            if (storage->d_ptr != 0) {
+                // commit_more_memory creates every owned chunk with
+                // PINNED + LOCATION_DEVICE and zero flags. HIP's PINNED here
+                // means non-migrating device storage, not pinned host memory.
+                const auto base = reinterpret_cast<std::uintptr_t>(
+                    reinterpret_cast<const void*>(storage->d_ptr));
+                if (address >= base && address - base < storage->committed_size &&
+                    bytes <= storage->committed_size - (address - base)) {
+                    return true;
+                }
+                continue;
+            }
+            if (!storage->fallback_buffer || !storage->owns_fallback_buffer) {
+                continue;
+            }
+            const auto base = reinterpret_cast<std::uintptr_t>(storage->fallback_buffer);
+            if (address >= base && address - base < storage->capacity &&
+                bytes <= storage->capacity - (address - base)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     RasterizerMemoryArena::Statistics RasterizerMemoryArena::get_statistics() const {
         Statistics stats;
 
