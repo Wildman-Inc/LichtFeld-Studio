@@ -6,6 +6,8 @@ Windows と PowerShell 7、およびビルド済み LFS が必要です。標準
 
 展示用の既定値は MRNF、30,000 iteration、最大 100 万 Gaussian、画像を 1/2 に縮小です。起動ごとに「ドキュメント」の `LichtFeld-Exhibition/truck-日時-識別子` を作り、学習結果、`lichtfeld.log`、起動引数を記録した `launch.json` を保存します。
 
+Portable build の起動ロゴを表示したままでも、学習は自動で進みます。ロゴを閉じたい場合はウィンドウ内をクリックしてください。
+
 PowerShell から設定を変更できます。
 
 ```powershell
