@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="24" failures="2" disabled="1" errors="0" time="0.654" timestamp="2026-10-20T18:39:28.307" name="AllTests">
+  <testsuite name="FusedL1SSIMTest" tests="15" failures="1" disabled="1" skipped="0" errors="0" time="0.564" timestamp="2026-10-20T18:39:28.307">
+    <testcase name="ForwardMatchesReference" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="109" status="run" result="completed" time="0.487" timestamp="2026-10-20T18:39:28.307" classname="FusedL1SSIMTest" />
+    <testcase name="BackwardMatchesReference" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="135" status="run" result="completed" time="0.008" timestamp="2026-10-20T18:39:28.794" classname="FusedL1SSIMTest" />
+    <testcase name="VariousSSIMWeights" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="162" status="run" result="completed" time="0.01" timestamp="2026-10-20T18:39:28.802" classname="FusedL1SSIMTest" />
+    <testcase name="NoValidPadding" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="182" status="run" result="completed" time="0.002" timestamp="2026-10-20T18:39:28.813" classname="FusedL1SSIMTest">
+      <failure message="<amd-base-source>/tests/test_fused_l1_ssim.cpp:196&#x0A;Expected: (loss.item&lt;float&gt;()) &gt; (0.0f), actual: 0 vs 0&#x0A;" type=""><![CDATA[<amd-base-source>/tests/test_fused_l1_ssim.cpp:196
+Expected: (loss.item<float>()) > (0.0f), actual: 0 vs 0
+]]></failure>
+    </testcase>
+    <testcase name="ErrorMapForwardMatchesSSIMReduction" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="203" status="run" result="completed" time="0.003" timestamp="2026-10-20T18:39:28.817" classname="FusedL1SSIMTest" />
+    <testcase name="FusedChannelMeanMapSupportsInPlaceErrorMap" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="221" status="run" result="completed" time="0.003" timestamp="2026-10-20T18:39:28.821" classname="FusedL1SSIMTest" />
+    <testcase name="ThreeDimensionalInput" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="249" status="run" result="completed" time="0." timestamp="2026-10-20T18:39:28.824" classname="FusedL1SSIMTest" />
+    <testcase name="LargerImageSize" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="265" status="run" result="completed" time="0.006" timestamp="2026-10-20T18:39:28.824" classname="FusedL1SSIMTest" />
+    <testcase name="IdenticalImages" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="282" status="run" result="completed" time="0." timestamp="2026-10-20T18:39:28.831" classname="FusedL1SSIMTest" />
+    <testcase name="WorkspaceReuse" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="296" status="run" result="completed" time="0." timestamp="2026-10-20T18:39:28.831" classname="FusedL1SSIMTest" />
+    <testcase name="PhotometricLossUsesFusedKernel" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="323" status="run" result="completed" time="0.001" timestamp="2026-10-20T18:39:28.832" classname="FusedL1SSIMTest" />
+    <testcase name="UInt8TargetMatchesFloatReference" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="339" status="run" result="completed" time="0.028" timestamp="2026-10-20T18:39:28.834" classname="FusedL1SSIMTest" />
+    <testcase name="DecoupledMatchesStandardWhenCorrectedEqualsRaw" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="607" status="run" result="completed" time="0.004" timestamp="2026-10-20T18:39:28.863" classname="FusedL1SSIMTest" />
+    <testcase name="DecoupledRoutesContrastStructureGradientToRawBranch" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="661" status="run" result="completed" time="0.002" timestamp="2026-10-20T18:39:28.868" classname="FusedL1SSIMTest" />
+    <testcase name="DISABLED_PerformanceBenchmark" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="682" status="notrun" result="suppressed" time="0." timestamp="1970-01-01T09:00:00.000" classname="FusedL1SSIMTest" />
+  </testsuite>
+  <testsuite name="MaskedFusedL1SSIMTest" tests="9" failures="1" disabled="0" skipped="0" errors="0" time="0.089" timestamp="2026-10-20T18:39:28.871">
+    <testcase name="ForwardBasic" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="423" status="run" result="completed" time="0.002" timestamp="2026-10-20T18:39:28.871" classname="MaskedFusedL1SSIMTest">
+      <failure message="<amd-base-source>/tests/test_fused_l1_ssim.cpp:442&#x0A;Expected: (loss.item&lt;float&gt;()) &gt; (0.0f), actual: -3.95753901e-08 vs 0&#x0A;" type=""><![CDATA[<amd-base-source>/tests/test_fused_l1_ssim.cpp:442
+Expected: (loss.item<float>()) > (0.0f), actual: -3.95753901e-08 vs 0
+]]></failure>
+    </testcase>
+    <testcase name="BackwardBasic" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="445" status="run" result="completed" time="0.047" timestamp="2026-10-20T18:39:28.874" classname="MaskedFusedL1SSIMTest" />
+    <testcase name="FullMaskMatchesReference" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="476" status="run" result="completed" time="0.004" timestamp="2026-10-20T18:39:28.922" classname="MaskedFusedL1SSIMTest" />
+    <testcase name="PartialMask" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="496" status="run" result="completed" time="0.006" timestamp="2026-10-20T18:39:28.926" classname="MaskedFusedL1SSIMTest" />
+    <testcase name="AllZeroMask" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="521" status="run" result="completed" time="0.001" timestamp="2026-10-20T18:39:28.933" classname="MaskedFusedL1SSIMTest" />
+    <testcase name="WorkspaceReuse" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="536" status="run" result="completed" time="0.006" timestamp="2026-10-20T18:39:28.935" classname="MaskedFusedL1SSIMTest" />
+    <testcase name="UInt8TargetMatchesFloatReference" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="556" status="run" result="completed" time="0.007" timestamp="2026-10-20T18:39:28.942" classname="MaskedFusedL1SSIMTest" />
+    <testcase name="UInt8TargetAndMaskMatchFloatReference" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="579" status="run" result="completed" time="0.007" timestamp="2026-10-20T18:39:28.950" classname="MaskedFusedL1SSIMTest" />
+    <testcase name="DecoupledMatchesStandardWhenCorrectedEqualsRaw" file="<amd-base-source>/tests/test_fused_l1_ssim.cpp" line="633" status="run" result="completed" time="0.003" timestamp="2026-10-20T18:39:28.957" classname="MaskedFusedL1SSIMTest" />
+  </testsuite>
+</testsuites>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="3" failures="0" disabled="0" errors="0" time="0.267" timestamp="2026-10-20T19:23:30.461" name="AllTests">
+  <testsuite name="FastGSNativeAtomics" tests="3" failures="0" disabled="0" skipped="0" errors="0" time="0.266" timestamp="2026-10-20T19:23:30.461">
+    <testcase name="ArenaOwnershipRejectsInvalidAndExternalRanges" file="<combined-source>/tests/test_fastgs_native_atomics.cpp" line="65" status="run" result="completed" time="0.248" timestamp="2026-10-20T19:23:30.461" classname="FastGSNativeAtomics" />
+    <testcase name="NativeAndSafeAddsMatchOnArenaStorage" file="<combined-source>/tests/test_fastgs_native_atomics.cpp" line="101" status="run" result="completed" time="0.013" timestamp="2026-10-20T19:23:30.709" classname="FastGSNativeAtomics" />
+    <testcase name="BlendBackwardSafeAndNativeKernelsMatchWithOverlappingInstances" file="<combined-source>/tests/test_fastgs_native_atomics.cpp" line="129" status="run" result="completed" time="0.004" timestamp="2026-10-20T19:23:30.723" classname="FastGSNativeAtomics" />
+  </testsuite>
+</testsuites>

@@ -1,0 +1,83 @@
+exe=<amd-base-test-exe>
+filter=FusedL1SSIMTest.*:MaskedFusedL1SSIMTest.*
+runtime=C:\Windows\System32\amdhip64_7.dll
+runtime_sha256=AD0296AF6B860A028835B4C349571645BBCF5F526CD94AC879DA4D2AA19FB0E2
+held_adjacent_sha256=5D7B12587955DD58EE37E2FDAB8C09D5F2ED101ECF181E88A998169138058CFC
+[18:39:27.966] [32m[info][0m pinned_memory_allocator.cpp:293  Pre-warming pinned memory cache with common sizes...
+[18:39:28.305] [32m[info][0m pinned_memory_allocator.cpp:333  Pre-warming complete: 413 MB cached in 9 sizes (338 ms)
+Note: Google Test filter = FusedL1SSIMTest.*:MaskedFusedL1SSIMTest.*
+[==========] Running 23 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 14 tests from FusedL1SSIMTest
+[ RUN      ] FusedL1SSIMTest.ForwardMatchesReference
+[18:39:28.307] [33m[warn][0m memory_pool.hpp:266  CUDA memory pooling not available (requires CUDA >= 12.8)
+64x64: Fused=0 Ref=0 Diff=0 (-nan(ind)%)
+[       OK ] FusedL1SSIMTest.ForwardMatchesReference (487 ms)
+[ RUN      ] FusedL1SSIMTest.BackwardMatchesReference
+Gradient: MaxDiff=0 MeanDiff=0
+[       OK ] FusedL1SSIMTest.BackwardMatchesReference (8 ms)
+[ RUN      ] FusedL1SSIMTest.VariousSSIMWeights
+[       OK ] FusedL1SSIMTest.VariousSSIMWeights (10 ms)
+[ RUN      ] FusedL1SSIMTest.NoValidPadding
+<amd-base-source>/tests/test_fused_l1_ssim.cpp(196): error: Expected: (loss.item<float>()) > (0.0f), actual: 0 vs 0
+
+[  FAILED  ] FusedL1SSIMTest.NoValidPadding (2 ms)
+[ RUN      ] FusedL1SSIMTest.ErrorMapForwardMatchesSSIMReduction
+[       OK ] FusedL1SSIMTest.ErrorMapForwardMatchesSSIMReduction (3 ms)
+[ RUN      ] FusedL1SSIMTest.FusedChannelMeanMapSupportsInPlaceErrorMap
+[       OK ] FusedL1SSIMTest.FusedChannelMeanMapSupportsInPlaceErrorMap (3 ms)
+[ RUN      ] FusedL1SSIMTest.ThreeDimensionalInput
+[       OK ] FusedL1SSIMTest.ThreeDimensionalInput (0 ms)
+[ RUN      ] FusedL1SSIMTest.LargerImageSize
+[       OK ] FusedL1SSIMTest.LargerImageSize (6 ms)
+[ RUN      ] FusedL1SSIMTest.IdenticalImages
+[       OK ] FusedL1SSIMTest.IdenticalImages (0 ms)
+[ RUN      ] FusedL1SSIMTest.WorkspaceReuse
+[       OK ] FusedL1SSIMTest.WorkspaceReuse (0 ms)
+[ RUN      ] FusedL1SSIMTest.PhotometricLossUsesFusedKernel
+[       OK ] FusedL1SSIMTest.PhotometricLossUsesFusedKernel (1 ms)
+[ RUN      ] FusedL1SSIMTest.UInt8TargetMatchesFloatReference
+[       OK ] FusedL1SSIMTest.UInt8TargetMatchesFloatReference (28 ms)
+[ RUN      ] FusedL1SSIMTest.DecoupledMatchesStandardWhenCorrectedEqualsRaw
+[       OK ] FusedL1SSIMTest.DecoupledMatchesStandardWhenCorrectedEqualsRaw (4 ms)
+[ RUN      ] FusedL1SSIMTest.DecoupledRoutesContrastStructureGradientToRawBranch
+[       OK ] FusedL1SSIMTest.DecoupledRoutesContrastStructureGradientToRawBranch (2 ms)
+[ DISABLED ] FusedL1SSIMTest.DISABLED_PerformanceBenchmark
+[----------] 14 tests from FusedL1SSIMTest (564 ms total)
+
+[----------] 9 tests from MaskedFusedL1SSIMTest
+[ RUN      ] MaskedFusedL1SSIMTest.ForwardBasic
+<amd-base-source>/tests/test_fused_l1_ssim.cpp(442): error: Expected: (loss.item<float>()) > (0.0f), actual: -3.95753901e-08 vs 0
+
+[  FAILED  ] MaskedFusedL1SSIMTest.ForwardBasic (2 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.BackwardBasic
+[       OK ] MaskedFusedL1SSIMTest.BackwardBasic (47 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.FullMaskMatchesReference
+[       OK ] MaskedFusedL1SSIMTest.FullMaskMatchesReference (4 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.PartialMask
+[       OK ] MaskedFusedL1SSIMTest.PartialMask (6 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.AllZeroMask
+[       OK ] MaskedFusedL1SSIMTest.AllZeroMask (1 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.WorkspaceReuse
+[       OK ] MaskedFusedL1SSIMTest.WorkspaceReuse (6 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.UInt8TargetMatchesFloatReference
+[       OK ] MaskedFusedL1SSIMTest.UInt8TargetMatchesFloatReference (7 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.UInt8TargetAndMaskMatchFloatReference
+[       OK ] MaskedFusedL1SSIMTest.UInt8TargetAndMaskMatchFloatReference (7 ms)
+[ RUN      ] MaskedFusedL1SSIMTest.DecoupledMatchesStandardWhenCorrectedEqualsRaw
+[       OK ] MaskedFusedL1SSIMTest.DecoupledMatchesStandardWhenCorrectedEqualsRaw (3 ms)
+[----------] 9 tests from MaskedFusedL1SSIMTest (89 ms total)
+
+[----------] Global test environment tear-down
+[==========] 23 tests from 2 test suites ran. (654 ms total)
+[  PASSED  ] 21 tests.
+[  FAILED  ] 2 tests, listed below:
+[  FAILED  ] FusedL1SSIMTest.NoValidPadding
+[  FAILED  ] MaskedFusedL1SSIMTest.ForwardBasic
+
+ 2 FAILED TESTS
+  YOU HAVE 1 DISABLED TEST
+
+[18:39:29.148] [32m[info][0m memory_pool.hpp:55  Shutting down CudaMemoryPool...
+[18:39:29.148] [32m[info][0m pinned_memory_allocator.cpp:93  Shutting down PinnedMemoryAllocator...
+exit_code=1

@@ -1,0 +1,21 @@
+EXEC variant=combined-native sha256=C04F5FDD4C10A669B98B0495587B50D9B3F735DD7D9CC87BCEFBD8B392508CEC exe=<combined-build>/integrated_bench/Release/lfs_external_integrated_bench.exe scene=half round=1 warmups=50 samples=50
+ssim_oracle count=400491 nonzero=400491 max_abs=4.81765664824e-11 max_reference_abs=2.94919290632e-05 relative_l2=6.46830448552e-07 limit=0.005
+gradient_group=mean max_abs=2.2513683e-07
+gradient_group=conic max_abs=0.00100025104
+gradient_group=opacity max_abs=0.00239263964
+gradient_group=color max_abs=3.11625081e-05
+safe_native_group=mean max_abs_diff=2.84217094e-14 max_relative_diff=2.84217094e-08 relative_l2=6.16497872e-08
+safe_native_group=conic max_abs_diff=1.16415322e-10 max_relative_diff=1.16386104e-07 relative_l2=3.3209894e-08
+safe_native_group=opacity max_abs_diff=4.65661287e-10 max_relative_diff=1.94622402e-07 relative_l2=3.90245715e-08
+safe_native_group=color max_abs_diff=3.63797881e-12 max_relative_diff=1.16742171e-07 relative_l2=3.74234119e-08
+gradient_group=mean max_abs=2.2513683e-07
+gradient_group=conic max_abs=0.00100025104
+gradient_group=opacity max_abs=0.00239263964
+gradient_group=color max_abs=3.11625045e-05
+gradient_group=mean max_abs=2.2513683e-07
+gradient_group=conic max_abs=0.00100025104
+gradient_group=opacity max_abs=0.00239263964
+gradient_group=color max_abs=3.11625045e-05
+samples_wall_us=384.181250,410.356250,388.401563,394.959375,405.757812,401.796875,396.982813,404.470312,390.304688,403.218750,400.487500,410.487500,395.531250,392.392187,392.350000,406.856250,386.557813,402.253125,386.496875,387.551562,385.768750,402.860937,396.439062,392.110937,386.800000,382.235937,382.264063,384.685938,407.798437,388.260938,389.256250,390.165625,376.221875,384.632812,394.231250,387.600000,407.193750,396.760938,380.576563,377.548437,376.981250,389.034375,381.604688,410.079687,385.815625,406.746875,405.592188,391.189062,399.732813,397.265625
+samples_event_us=378.021866,401.123434,380.660951,385.389060,337.658912,337.809533,388.531238,396.785945,342.276573,394.284368,392.675012,403.270304,386.451572,383.082807,384.337515,400.496870,379.864067,392.487496,378.282815,382.907808,379.432827,391.339064,387.481242,383.440614,381.217182,375.868738,374.787509,376.637489,394.535929,382.442176,382.873446,381.670326,370.804697,374.404699,336.079210,335.640013,397.634387,388.512492,372.796863,373.134375,328.494519,380.878121,374.384373,401.635945,377.510935,398.689061,395.014048,383.392185,392.023444,388.456255
+INTEGRATED variant=native source_sha=cf312e294ccb6208af502bdb7df018f0607c5a02 scene=half device="AMD Radeon(TM) 8060S Graphics" total_global_mem=85672067072 runtime_version=70260201 driver_version=70260201 runtime_module="C:\Windows\SYSTEM32\amdhip64_7.dll" core_module="<combined-build>/Release/lfs_core.dll" width=489 height=273 pixels=133497 tiles=558 instances=26784 primitives=6912 instances_per_tile=48 grad_alpha=zero prediction=CPU_mirrored_forward target=deterministic_bounded standard_sigma_partials=on timing_scope=SSIM_forward_backward_plus_FastGS_blend_backward_plus_output_zeroing timer=steady_clock_batch_synced_primary HIP_events_secondary batch_calls=64 warmups=50 samples=50 median_wall_us=392.230469 min_wall_us=376.221875 max_wall_us=410.487500 checksum=-2.57961689489
